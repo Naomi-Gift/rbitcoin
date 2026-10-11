@@ -9,6 +9,22 @@ before 1.0).
 
 ## [Unreleased]
 
+## [0.8.1] — 2026-10-11
+
+Tagged on the **0.8.0** maintenance line (`v0.8.x`). Schema 26 unchanged.
+Replace a 0.8.0 binary in place (same datadir).
+
+### Highlights
+
+- **Block download no longer waits on confirm lookup.** Hash presence is a
+  map on the body-queue lock, and lookup's decoded bodies use a separate
+  lock, so a lookup wave cannot stall getdata into RAM.
+
+### Fixed
+
+
+- **IBD block accept no longer scans the body queue under the lock lookup uses.** Hash presence is a map lookup, and lookup's decoded stash is its own lock, so a presence check cannot stall confirm lookup.
+
 ## [0.8.0] — 2026-10-09
 
 Named published **0.8** line. **Not 1.0.** Patch branch is `v0.8.x`. Schema 26

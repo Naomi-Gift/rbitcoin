@@ -1,6 +1,6 @@
 # Experimental mainnet runbook
 
-**Status:** **0.8.0** is lab-to-operator: **early production / high-scrutiny**,
+**Status:** **0.8.1** is lab-to-operator: **early production / high-scrutiny**,
 not a soak-certified badge. **Not** 1.0. **Not** a Bitcoin Core or Fulcrum
 replacement. Default mainnet milestone is block 840000
 (`0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5`): script/sig
@@ -143,7 +143,7 @@ peers than a dual-stack Core node. The user-agent is `/rbitcoin:VERSION/`, which
 | Peer scarcity | [`OPERATOR.md`](../OPERATOR.md) § P2P transport (`x809` seeds + `P2P_V2` gossip). `/rbitcoin:VERSION/` is not a Core user-agent, so some peers still refuse inbound |
 | Mempool | Libre policy (0.1 sat/vB, full RBF + pure RBFR 1.25×, no dust ban, Libre annex); cluster **64 / 101 kvB**; **scripts verified on accept** |
 | Confirm lookup/load | **Load** recvs load-sized batches (soft **8000** inputs / hard **144** blocks) from `loadq=14`. Dense mainnet is typically **a few blocks per batch**. IBD **lookup** TipOnly-resolves at most **64000** inputs or **1080** BQ-ready heights per wave, in order from `path_lo`. Real queues loadq=14 · scriptq=4 · writeq=14 |
-| Not Core/Fulcrum | No production SLA; 0.8.0 is high-scrutiny 0.x; schema unstable until 1.0; schema 24/25 open in place (rewrite to 26); occupied 0.6.x stores refuse (wipe + IBD) |
+| Not Core/Fulcrum | No production SLA; 0.8.1 is high-scrutiny 0.x; schema unstable until 1.0; schema 24/25 open in place (rewrite to 26); occupied 0.6.x stores refuse (wipe + IBD) |
 
 ## Related docs
 
