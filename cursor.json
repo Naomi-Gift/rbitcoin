@@ -1,8 +1,8 @@
 {
   "new_base": "cdfdaa0ef2b1fea88a1580adce5e42b6213aebac",
   "new_skip": 2268,
-  "old_index": 1259,
+  "old_index": 1657,
   "new_cap_used": true,
   "run_id": "38118325400",
-  "old_name": "crates/rbitcoin-consensus/src/silent_payments.rs:322:28: replace + with - in input_hash_mul_a"
+  "old_name": "crates/rbitcoin-consensus/src/confirm_run/pin.rs:315:20: replace == with != in denserels_by_stamped_range"
 }

@@ -146,3 +146,50 @@ MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:280:35: replace < with
 MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:292:32: replace < with == in build_tx_and_prevouts in 7s build + 68s test
 MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:292:32: replace < with <= in build_tx_and_prevouts in 8s build + 67s test
 MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:317:14: replace < with <= in input_hash_mul_a in 8s build + 66s test
+# 38118325400 2 ca87380a3442d3a83b94bf7cafbef6557e303184
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:421:18: replace < with <= in witness_version in 9s build + 77s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:421:35: replace > with == in witness_version in 9s build + 82s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:421:35: replace > with < in witness_version in 8s build + 98s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:421:35: replace > with >= in witness_version in 8s build + 87s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:425:9: delete match arm 0x00 in witness_version in 8s build + 84s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:426:30: replace - with / in witness_version in 9s build + 78s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:430:31: replace || with && in witness_version in 8s build + 78s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:430:8: delete ! in witness_version in 8s build + 100s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:430:44: replace != with == in witness_version in 8s build + 81s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:430:49: replace + with * in witness_version in 8s build + 81s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:471:20: replace < with <= in nums_h_script_path in 8s build + 104s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:475:17: replace < with > in nums_h_script_path in 9s build + 90s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:548:35: replace && with || in is_p2sh_p2wpkh_redeem in 9s build + 76s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:548:19: replace && with || in is_p2sh_p2wpkh_redeem in 8s build + 78s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/bq_resolve.rs:84:19: replace < with <= in bq_resolve_wave_hold_partial in 8s build + 80s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/bq_resolve.rs:93:11: replace > with >= in bq_resolve_wave_hold_partial in 9s build + 87s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/bq_resolve.rs:159:22: delete ! in push_resolve_keys in 8s build + 90s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/bq_resolve.rs:216:35: delete ! in confirm_bq_resolve_wave_capped in 8s build + 92s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/bq_resolve.rs:233:34: replace && with || in confirm_bq_resolve_wave_capped in 8s build + 79s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/bq_resolve.rs:233:72: replace < with <= in confirm_bq_resolve_wave_capped in 8s build + 102s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/bq_resolve.rs:234:42: replace < with > in confirm_bq_resolve_wave_capped in 8s build + 79s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/bq_resolve.rs:266:58: delete ! in confirm_bq_resolve_wave_capped in 8s build + 81s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/head_drain.rs:106:9: replace <impl Drop for HeadDrainHandle<'_>>::drop with () in 24s build + 76s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/lookup.rs:399:12: delete ! in confirm_wire_load_from_plan in 8s build + 91s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/lookup.rs:532:42: replace || with && in check_carried_header_lens in 8s build + 79s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/lookup.rs:660:18: replace > with == in lookup_note_stamp in 8s build + 105s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/lookup.rs:663:18: replace > with == in lookup_note_stamp in 8s build + 81s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/lookup.rs:666:19: replace > with == in lookup_note_stamp in 8s build + 79s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/lookup.rs:669:16: replace > with == in lookup_note_stamp in 8s build + 77s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/phases.rs:59:31: replace != with == in assemble_parent_mtp_and_bits in 8s build + 80s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/phases.rs:91:31: replace != with == in assemble_chained_header in 9s build + 82s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/phases.rs:164:21: replace > with == in assemble_run in 9s build + 77s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/phases.rs:209:30: replace > with == in assemble_run in 9s build + 80s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/phases.rs:209:30: replace > with >= in assemble_run in 9s build + 78s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/phases.rs:210:39: replace - with / in assemble_run in 9s build + 78s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/pin.rs:19:29: replace == with != in spend_edges_from_plan in 73s build + 93s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/pin.rs:157:23: replace > with == in fill_pins in 9s build + 79s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/pin.rs:173:12: delete ! in apply_plan_pins in 9s build + 80s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/pin.rs:176:44: replace > with == in apply_plan_pins in 9s build + 83s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/pin.rs:176:44: replace > with < in apply_plan_pins in 8s build + 81s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/pin.rs:176:44: replace > with >= in apply_plan_pins in 8s build + 78s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/pin.rs:182:33: replace || with && in apply_plan_pins in 8s build + 76s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/pin.rs:194:46: replace > with < in apply_plan_pins in 8s build + 82s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/pin.rs:284:15: replace > with == in denserels_by_stamped_range in 8s build + 82s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/pin.rs:288:16: replace > with == in denserels_by_stamped_range in 8s build + 78s test
+MISSED   crates/rbitcoin-consensus/src/confirm_run/pin.rs:291:15: replace > with == in denserels_by_stamped_range in 8s build + 80s test
