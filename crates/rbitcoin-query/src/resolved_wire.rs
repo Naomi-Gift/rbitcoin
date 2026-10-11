@@ -40,7 +40,7 @@ impl ResolvedWire {
     }
 }
 
-/// One mutex snapshot of unresolved heights: still-raw vs already promoted.
+/// Lookup snapshot of unresolved heights: still-raw vs already promoted.
 ///
 /// `raw` is **(height, n_inputs, header_fk, sender)** — no payload clone. Lookup
 /// packs/holds from the stamped count; decode clones via

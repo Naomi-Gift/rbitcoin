@@ -91,10 +91,13 @@ pub struct QueuedBlockMeta {
 /// compatibility and to optionally ignore/remove a legacy `block_queue/` dir.
 pub struct BlockQueue {
     next_id: AtomicU64,
-    /// id → entry (payload owned)
+    /// id → entry (payload owned). Ascending id is enqueue order.
     index: BTreeMap<u64, IndexEntry>,
-    /// First-wins height → id. Height APIs must not walk `index.values()`.
-    height_to_id: HashMap<u32, u64>,
+    /// First-wins height → id. Ordered so max/min height are the ends.
+    /// Height APIs must not walk `index.values()`.
+    height_to_id: BTreeMap<u32, u64>,
+    /// Hash → heights that still hold that hash. `has_hash` is one map lookup.
+    by_hash: HashMap<[u8; 32], Vec<u32>>,
     bytes: u64,
     raw_clones: AtomicU64,
 }
@@ -119,13 +122,19 @@ impl BlockQueue {
         if legacy.exists() {
             let _ = std::fs::remove_dir_all(&legacy);
         }
-        Ok(Self {
+        Ok(Self::empty())
+    }
+
+    /// Empty queue with no legacy-directory cleanup.
+    pub fn empty() -> Self {
+        Self {
             next_id: AtomicU64::new(1),
             index: BTreeMap::new(),
-            height_to_id: HashMap::new(),
+            height_to_id: BTreeMap::new(),
+            by_hash: HashMap::new(),
             bytes: 0,
             raw_clones: AtomicU64::new(0),
-        })
+        }
     }
 
     pub fn bytes(&self) -> u64 {
@@ -170,6 +179,9 @@ impl BlockQueue {
         n_inputs: u32,
         sender: Option<u64>,
     ) -> Result<u64, StoreError> {
+        if let Some(&id) = self.height_to_id.get(&height) {
+            return Ok(id);
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         self.bytes = self.bytes.saturating_add(payload.len() as u64);
         self.index.insert(
@@ -184,8 +196,36 @@ impl BlockQueue {
                 sender,
             },
         );
-        self.height_to_id.entry(height).or_insert(id);
+        self.height_to_id.insert(height, id);
+        self.remember_hash(hash, height);
         Ok(id)
+    }
+
+    fn remember_hash(&mut self, hash: [u8; 32], height: u32) {
+        let heights = self.by_hash.entry(hash).or_default();
+        if !heights.contains(&height) {
+            heights.push(height);
+        }
+    }
+
+    fn forget_hash(&mut self, hash: &[u8; 32], height: u32) {
+        let Some(heights) = self.by_hash.get_mut(hash) else {
+            return;
+        };
+        heights.retain(|h| *h != height);
+        if heights.is_empty() {
+            self.by_hash.remove(hash);
+        }
+    }
+
+    /// True if any row still carries `hash`. One map lookup, no row scan.
+    pub fn has_hash(&self, hash: &[u8; 32]) -> bool {
+        self.by_hash.get(hash).is_some_and(|h| !h.is_empty())
+    }
+
+    /// Heights whose row hash is `hash` (first-wins order).
+    pub fn heights_for_hash(&self, hash: &[u8; 32]) -> Vec<u32> {
+        self.by_hash.get(hash).cloned().unwrap_or_default()
     }
 
     /// Load payload by id.
@@ -220,10 +260,8 @@ impl BlockQueue {
         self.bytes = self.bytes.saturating_sub(e.body.charge());
         if self.height_to_id.get(&e.height) == Some(&id) {
             self.height_to_id.remove(&e.height);
-            if let Some((&nid, _)) = self.index.iter().find(|(_, x)| x.height == e.height) {
-                self.height_to_id.insert(e.height, nid);
-            }
         }
+        self.forget_hash(&e.hash, e.height);
         Ok(true)
     }
 
@@ -249,16 +287,12 @@ impl BlockQueue {
         Some(out)
     }
 
-    /// Dequeue all records for a confirmed height (may be 0 or 1 in normal path).
+    /// Dequeue the row at `height` (0 or 1; a second body at the same height is not stored).
     pub fn dequeue_height(&mut self, height: u32) -> Result<usize, StoreError> {
-        let mut n = 0usize;
-        while let Some(&id) = self.height_to_id.get(&height) {
-            if !self.dequeue(id)? {
-                break;
-            }
-            n += 1;
-        }
-        Ok(n)
+        let Some(&id) = self.height_to_id.get(&height) else {
+            return Ok(0);
+        };
+        Ok(usize::from(self.dequeue(id)?))
     }
 
     /// Contiguous unresolved heights from `path_lo`. Stops at the first height
@@ -316,19 +350,19 @@ impl BlockQueue {
         self.height_to_id.contains_key(&height)
     }
 
-    /// Heights currently on the queue.
+    /// Heights currently on the queue (ascending).
     pub fn heights(&self) -> Vec<u32> {
-        self.index.values().map(|e| e.height).collect()
+        self.height_to_id.keys().copied().collect()
     }
 
     /// Highest height among recs (`None` if empty).
     pub fn max_height(&self) -> Option<u32> {
-        self.index.values().map(|e| e.height).max()
+        self.height_to_id.last_key_value().map(|(&h, _)| h)
     }
 
     /// Lowest height among recs (`None` if empty).
     pub fn min_height(&self) -> Option<u32> {
-        self.index.values().map(|e| e.height).min()
+        self.height_to_id.first_key_value().map(|(&h, _)| h)
     }
 
     /// First queue id for `height`, if any.
@@ -488,6 +522,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[test]
+    fn second_enqueue_at_height_keeps_the_first_body() {
+        let mut q = BlockQueue::empty();
+        let first = q.enqueue(1, [1u8; 32], 1, b"aaaa").unwrap();
+        let again = q.enqueue(1, [2u8; 32], 9, b"bbbbbbbb").unwrap();
+        assert_eq!(again, first);
+        assert_eq!(q.count(), 1);
+        assert_eq!(q.bytes(), 4);
+        assert_eq!(q.hash_at_height(1), Some([1u8; 32]));
+        assert!(q.has_hash(&[1u8; 32]));
+        assert!(!q.has_hash(&[2u8; 32]));
+        assert_eq!(q.dequeue_height(1).unwrap(), 1);
+        assert!(!q.has_hash(&[1u8; 32]));
+        assert_eq!(q.count(), 0);
     }
 
     #[test]
