@@ -107,3 +107,42 @@ MISSED   crates/rbitcoin-consensus/src/script_pool.rs:220:5: replace help_steal 
 MISSED   crates/rbitcoin-consensus/src/signet.rs:226:19: replace > with >= in extract_header_payload in 12s build + 75s test
 MISSED   crates/rbitcoin-consensus/src/signet.rs:286:18: replace < with <= in read_script in 13s build + 68s test
 MISSED   crates/rbitcoin-consensus/src/signet.rs:302:22: replace < with <= in read_witness_stack in 13s build + 67s test
+# 38118325400 1 ca87380a3442d3a83b94bf7cafbef6557e303184
+MISSED   crates/rbitcoin-net/src/peer_dos.rs:81:33: replace - with + in PeerRateLimiter::note_at in 29s build + 67s test
+MISSED   crates/rbitcoin-net/src/peers.rs:2314:52: delete - in PeerHub::register_with_id_net in 7s build + 71s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:1297:18: replace > with == in MempoolHub::remove_expired_roots in 7s build + 68s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:1424:29: replace == with != in MempoolHub::purge_confirmed_on_chain in 6s build + 75s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:1429:29: delete ! in MempoolHub::purge_confirmed_on_chain in 6s build + 78s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:2259:34: replace && with || in MempoolHub::unindex_if_absent in 6s build + 68s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:2259:12: delete ! in MempoolHub::unindex_if_absent in 6s build + 67s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:2259:37: delete ! in MempoolHub::unindex_if_absent in 6s build + 74s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:2517:29: replace * with + in MempoolHub::refresh_fee_snapshot in 6s build + 69s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:2517:29: replace * with / in MempoolHub::refresh_fee_snapshot in 6s build + 70s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:3028:45: replace || with && in MempoolHub::take_due_parent_getdata in 7s build + 81s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:3505:9: replace MempoolHub::default_cluster_limits -> (u32, u64) with (0, 0) in 6s build + 67s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:3505:9: replace MempoolHub::default_cluster_limits -> (u32, u64) with (0, 1) in 6s build + 66s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:3505:9: replace MempoolHub::default_cluster_limits -> (u32, u64) with (1, 0) in 6s build + 72s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:3505:9: replace MempoolHub::default_cluster_limits -> (u32, u64) with (1, 1) in 6s build + 66s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:3644:25: replace && with || in MempoolHub::submit_package_rpc_eval in 7s build + 67s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:3651:66: replace && with || in MempoolHub::submit_package_rpc_eval in 7s build + 66s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:3661:29: replace && with || in MempoolHub::submit_package_rpc_eval in 6s build + 69s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:4034:44: replace += with *= in MempoolHub::note_block_fee_history in 6s build + 67s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:4043:47: replace >= with < in MempoolHub::note_block_fee_history in 6s build + 76s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:4168:44: replace | with & in MempoolHub::log_fee_readiness in 7s build + 72s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:4168:44: replace | with ^ in MempoolHub::log_fee_readiness in 6s build + 65s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:4168:37: replace << with >> in MempoolHub::log_fee_readiness in 6s build + 69s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:4169:61: replace != with == in MempoolHub::log_fee_readiness in 6s build + 67s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:4179:47: replace < with == in MempoolHub::log_fee_history_progress in 6s build + 74s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:4179:47: replace < with > in MempoolHub::log_fee_history_progress in 6s build + 68s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:4179:47: replace < with <= in MempoolHub::log_fee_history_progress in 6s build + 72s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:4219:65: replace && with || in MempoolHub::backfill_block_fee_history in 6s build + 74s test
+MISSED   crates/rbitcoin-net/src/tx_relay.rs:4219:32: replace < with <= in MempoolHub::backfill_block_fee_history in 7s build + 85s test
+MISSED   crates/rbitcoin-consensus/src/signet.rs:321:24: replace > with < in modified_merkle_root in 7s build + 71s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:235:27: replace < with > in taproot_outs_from_records in 8s build + 78s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:240:32: replace < with <= in taproot_outs_from_records in 8s build + 80s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:280:35: replace < with == in build_tx_and_prevouts in 6s build + 67s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:280:35: replace < with > in build_tx_and_prevouts in 7s build + 68s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:280:35: replace < with <= in build_tx_and_prevouts in 7s build + 66s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:292:32: replace < with == in build_tx_and_prevouts in 7s build + 68s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:292:32: replace < with <= in build_tx_and_prevouts in 8s build + 67s test
+MISSED   crates/rbitcoin-consensus/src/silent_payments.rs:317:14: replace < with <= in input_hash_mul_a in 8s build + 66s test

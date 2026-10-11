@@ -1,8 +1,8 @@
 {
   "new_base": "cdfdaa0ef2b1fea88a1580adce5e42b6213aebac",
-  "new_skip": 1873,
-  "old_index": 1237,
+  "new_skip": 2268,
+  "old_index": 1259,
   "new_cap_used": true,
-  "run_id": "38030947097",
-  "old_name": "crates/rbitcoin-consensus/src/signet.rs:321:24: replace > with == in modified_merkle_root"
+  "run_id": "38118325400",
+  "old_name": "crates/rbitcoin-consensus/src/silent_payments.rs:322:28: replace + with - in input_hash_mul_a"
 }
