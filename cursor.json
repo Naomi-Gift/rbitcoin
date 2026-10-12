@@ -1,8 +1,8 @@
 {
   "new_base": "cdfdaa0ef2b1fea88a1580adce5e42b6213aebac",
   "new_skip": 2469,
-  "old_index": 1761,
+  "old_index": 2386,
   "new_cap_used": true,
   "run_id": "38213419176",
-  "old_name": "crates/rbitcoin-consensus/src/script/interpreter.rs:137:19: replace += with *= in tapscript_has_op_success"
+  "old_name": "crates/rbitcoin-consensus/src/script/p2wpkh.rs:22:28: replace != with == in verify"
 }
