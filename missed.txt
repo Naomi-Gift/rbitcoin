@@ -277,3 +277,51 @@ MISSED   crates/rbitcoin-consensus/src/script/interpreter.rs:1395:50: replace ||
 MISSED   crates/rbitcoin-consensus/src/script/p2pkh.rs:57:55: replace && with || in parse_two_pushes in 8s build + 77s test
 MISSED   crates/rbitcoin-consensus/src/script/p2pkh.rs:57:47: replace >= with < in parse_two_pushes in 8s build + 87s test
 MISSED   crates/rbitcoin-consensus/src/script/p2pkh.rs:57:69: replace <= with > in parse_two_pushes in 8s build + 84s test
+# 38360817015 1 34bac2f7cd875d479816bbbd954844a58a82cf8e
+MISSED   crates/rbitcoin-net/src/ibd/assign.rs:422:16: replace < with == in assign_densify in 7s build + 87s test
+MISSED   crates/rbitcoin-net/src/ibd/assign.rs:422:16: replace < with <= in assign_densify in 7s build + 90s test
+MISSED   crates/rbitcoin-net/src/ibd/assign.rs:565:33: replace < with == in rewind_densify_scan_lo in 7s build + 87s test
+MISSED   crates/rbitcoin-net/src/ibd/assign.rs:565:33: replace < with > in rewind_densify_scan_lo in 7s build + 106s test
+MISSED   crates/rbitcoin-net/src/ibd/assign.rs:686:52: replace * with + in 7s build + 88s test
+MISSED   crates/rbitcoin-net/src/ibd/assign.rs:954:13: replace || with && in demote_zombie_pending_for_fetch in 7s build + 83s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:326:54: replace > with >= in read_line_capped in 89s build + 95s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:841:36: replace == with != in silentpayments_unsubscribe in 5s build + 84s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1113:71: delete ! in serve_tweaks_empty_last in 5s build + 87s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1202:17: replace && with || in serve_tweaks_follow_waves in 5s build + 87s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1331:33: replace > with >= in tick_scan in 4s build + 88s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1491:9: replace || with && in method_needs_sh_index in 6s build + 84s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1645:22: replace > with >= in broadcast_raw_tx in 5s build + 84s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1652:18: replace > with == in broadcast_raw_tx in 5s build + 83s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1652:18: replace > with >= in broadcast_raw_tx in 5s build + 92s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1687:22: replace > with >= in broadcast_package in 5s build + 86s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1691:22: replace > with == in broadcast_package in 5s build + 85s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1691:22: replace > with >= in broadcast_package in 5s build + 85s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1796:61: replace == with != in dispatch_pinned in 5s build + 86s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1800:24: replace || with && in dispatch_pinned in 4s build + 82s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1861:25: replace && with || in dispatch_pinned in 5s build + 100s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1861:16: delete ! in dispatch_pinned in 5s build + 90s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:1874:61: replace == with != in dispatch_pinned in 5s build + 82s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:2006:27: replace > with >= in dispatch_pinned in 5s build + 91s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:2162:42: replace && with || in protocol_ge_1_6 in 5s build + 99s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:2242:22: replace < with == in pick_dotted in 4s build + 98s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:2242:22: replace < with <= in pick_dotted in 5s build + 93s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:2243:22: replace < with <= in pick_dotted in 5s build + 85s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:2329:22: replace < with == in parse_get_history_window in 5s build + 83s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:2329:22: replace < with <= in parse_get_history_window in 5s build + 91s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:2333:32: replace > with >= in parse_get_history_window in 5s build + 89s test
+MISSED   crates/rbitcoin-electrum/src/server.rs:2467:12: delete ! in verbose_vin in 5s build + 83s test
+MISSED   crates/rbitcoin-electrum/src/silent_scan.rs:37:9: delete match arm None | Some(Value::Null) in parse_sub in 5s build + 89s test
+MISSED   crates/rbitcoin-electrum/src/silent_scan.rs:39:35: replace match guard s.contains('-') with true in parse_sub in 4s build + 87s test
+MISSED   crates/rbitcoin-electrum/src/silent_scan.rs:47:14: replace > with >= in parse_sub in 4s build + 82s test
+MISSED   crates/rbitcoin-electrum/src/silent_scan.rs:65:21: replace > with >= in parse_sub in 4s build + 92s test
+MISSED   crates/rbitcoin-electrum/src/silent_scan.rs:123:20: replace > with == in tx_matches in 5s build + 84s test
+MISSED   crates/rbitcoin-electrum/src/tweaks.rs:66:14: replace > with >= in last_height in 5s build + 83s test
+MISSED   crates/rbitcoin-electrum/src/tweaks.rs:102:26: replace match guard !batch.is_empty() with false in height_map_json in 9s build + 88s test
+MISSED   crates/rbitcoin-electrum/src/tweaks.rs:176:14: replace > with == in first_subscribe_wave in 4s build + 105s test
+MISSED   crates/rbitcoin-electrum/src/tweaks.rs:176:14: replace > with >= in first_subscribe_wave in 4s build + 92s test
+MISSED   crates/rbitcoin-electrum/src/tweaks.rs:285:14: replace > with == in load_thin_batch in 5s build + 96s test
+MISSED   crates/rbitcoin-electrum/src/tweaks.rs:285:14: replace > with >= in load_thin_batch in 5s build + 95s test
+MISSED   crates/rbitcoin-electrum/src/tweaks.rs:335:16: delete ! in retain_unspent_taproot in 4s build + 94s test
+MISSED   crates/rbitcoin-electrum/src/tweaks.rs:449:26: replace * with + in push_hex in 4s build + 99s test
+MISSED   crates/rbitcoin-electrum/src/tweaks.rs:449:26: replace * with / in push_hex in 4s build + 83s test
+MISSED   crates/rbitcoin-electrum/src/tweaks.rs:479:51: delete ! in subscribe in 4s build + 84s test
