@@ -1,15 +1,15 @@
 {
   "schemaVersion": 1,
   "label": "coverage",
-  "message": "93.61%",
+  "message": "93.63%",
   "color": "brightgreen",
-  "pct": 93.61,
-  "lh": 151885,
-  "lf": 162260,
+  "pct": 93.63,
+  "lh": 152204,
+  "lf": 162561,
   "gate": 93,
   "scope": "production",
-  "sha": "f867d9fdad18",
-  "date": "2026-10-12",
+  "sha": "5e61e2795b49",
+  "date": "2026-10-13",
   "crates": [
     {
       "name": "rbitcoin-cli",
@@ -19,20 +19,20 @@
     },
     {
       "name": "rbitcoin-consensus",
-      "lh": 19400,
-      "lf": 20284,
-      "pct": 95.64
+      "lh": 19591,
+      "lf": 20452,
+      "pct": 95.79
     },
     {
       "name": "rbitcoin-electrum",
-      "lh": 3286,
-      "lf": 3646,
+      "lh": 3289,
+      "lf": 3649,
       "pct": 90.13
     },
     {
       "name": "rbitcoin-esplora",
-      "lh": 5360,
-      "lf": 5899,
+      "lh": 5356,
+      "lf": 5895,
       "pct": 90.86
     },
     {
@@ -43,21 +43,21 @@
     },
     {
       "name": "rbitcoin-mempool",
-      "lh": 8061,
-      "lf": 8338,
-      "pct": 96.68
+      "lh": 8057,
+      "lf": 8332,
+      "pct": 96.7
     },
     {
       "name": "rbitcoin-net",
-      "lh": 50060,
-      "lf": 53210,
-      "pct": 94.08
+      "lh": 50186,
+      "lf": 53311,
+      "pct": 94.14
     },
     {
       "name": "rbitcoin-node",
-      "lh": 5650,
-      "lf": 6614,
-      "pct": 85.42
+      "lh": 5660,
+      "lf": 6625,
+      "pct": 85.43
     },
     {
       "name": "rbitcoin-primitives",
@@ -67,21 +67,21 @@
     },
     {
       "name": "rbitcoin-query",
-      "lh": 13225,
-      "lf": 14059,
-      "pct": 94.07
+      "lh": 13242,
+      "lf": 14061,
+      "pct": 94.18
     },
     {
       "name": "rbitcoin-rpc",
-      "lh": 9369,
+      "lh": 9372,
       "lf": 9957,
-      "pct": 94.09
+      "pct": 94.12
     },
     {
       "name": "rbitcoin-store",
-      "lh": 34675,
-      "lf": 37313,
-      "pct": 92.93
+      "lh": 34652,
+      "lf": 37339,
+      "pct": 92.8
     },
     {
       "name": "rbitcoin-sv2",
