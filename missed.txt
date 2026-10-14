@@ -399,3 +399,67 @@ MISSED   crates/rbitcoin-log/src/lib.rs:165:33: replace + with * in civil_utc in
 MISSED   crates/rbitcoin-log/src/lib.rs:169:18: replace - with / in civil_utc in 10s build + 78s test
 MISSED   crates/rbitcoin-log/src/lib.rs:170:30: replace + with - in civil_utc in 10s build + 76s test
 MISSED   crates/rbitcoin-log/src/lib.rs:170:30: replace + with * in civil_utc in 9s build + 80s test
+# 38516921540 1 ac80c864f8552ecebdbbcb4e21d5833eed942472
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:579:34: replace > with >= in rearm_after_reject in 7s build + 68s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:750:32: replace < with == in publish_confirm_progress in 7s build + 77s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:750:32: replace < with > in publish_confirm_progress in 6s build + 82s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:750:32: replace < with <= in publish_confirm_progress in 6s build + 76s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:831:65: replace * with + in 6s build + 68s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:831:65: replace * with / in 6s build + 67s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:831:58: replace * with + in 6s build + 72s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:831:58: replace * with / in 6s build + 72s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:901:9: replace InflightRetain::extra -> u32 with 0 in 6s build + 81s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:901:9: replace InflightRetain::extra -> u32 with 1 in 5s build + 67s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:1509:29: replace && with || in check_missing_parent in 6s build + 67s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:1510:34: replace || with && in check_missing_parent in 5s build + 73s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:1511:35: replace + with - in check_missing_parent in 5s build + 72s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:1513:19: replace || with && in check_missing_parent in 6s build + 66s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:1513:37: replace >= with < in check_missing_parent in 6s build + 70s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:1514:32: replace && with || in check_missing_parent in 6s build + 87s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:1514:35: delete ! in check_missing_parent in 6s build + 70s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:1523:27: replace || with && in check_missing_parent in 6s build + 77s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:1523:15: replace || with && in check_missing_parent in 6s build + 65s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:2016:28: delete ! in spawn_confirm_engine in 7s build + 66s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:2111:25: replace || with && in spawn_confirm_engine in 6s build + 75s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:2111:34: replace == with != in spawn_confirm_engine in 5s build + 74s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:2233:30: delete ! in spawn_confirm_engine in 5s build + 84s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:2559:82: replace && with || in spawn_confirm_engine in 6s build + 67s test
+MISSED   crates/rbitcoin-net/src/ibd/confirm/mod.rs:2700:37: replace match guard !wave.items.is_empty() || wave.undecodable.is_some() with true in spawn_confirm_engine in 8s build + 68s test
+MISSED   crates/rbitcoin-log/src/lib.rs:170:46: replace - with / in civil_utc in 54s build + 69s test
+MISSED   crates/rbitcoin-log/src/lib.rs:195:8: delete ! in log_at_style in 8s build + 71s test
+MISSED   crates/rbitcoin-log/src/lib.rs:200:45: replace && with || in log_at_style in 8s build + 69s test
+MISSED   crates/rbitcoin-log/src/api_log.rs:22:12: delete ! in init_api_log in 50s build + 70s test
+MISSED   crates/rbitcoin-log/src/api_log.rs:46:5: replace close_api_log with () in 8s build + 67s test
+MISSED   crates/rbitcoin-log/src/api_log.rs:56:15: replace > with == in compact_params in 8s build + 80s test
+MISSED   crates/rbitcoin-log/src/api_log.rs:57:13: replace -= with += in compact_params in 7s build + 67s test
+MISSED   crates/rbitcoin-log/src/api_log.rs:57:13: replace -= with /= in compact_params in 7s build + 65s test
+MISSED   crates/rbitcoin-log/src/api_log.rs:232:18: replace match guard c.is_control() with false in json_escape in 16s build + 65s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:546:9: replace ActiveMempool::min_relay_sat_kvb -> u64 with 0 in 7s build + 67s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:546:9: replace ActiveMempool::min_relay_sat_kvb -> u64 with 1 in 6s build + 77s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:655:9: replace ActiveMempool::generation -> u64 with 0 in 6s build + 70s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:655:9: replace ActiveMempool::generation -> u64 with 1 in 5s build + 66s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:664:9: replace ActiveMempool::persist_if_dirty -> Result<(), MempoolError> with Ok(()) in 7s build + 69s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:669:9: replace ActiveMempool::persist_due -> Result<(), MempoolError> with Ok(()) in 6s build + 68s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:727:9: replace ActiveMempool::maybe_compact -> Result<Option<(u32, usize)>, MempoolError> with Ok(None) in 11s build + 71s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:728:17: replace == with != in ActiveMempool::maybe_compact in 11s build + 66s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:732:58: replace || with && in ActiveMempool::maybe_compact in 6s build + 66s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:732:28: replace || with && in ActiveMempool::maybe_compact in 6s build + 68s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:732:17: replace * with + in ActiveMempool::maybe_compact in 6s build + 72s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:732:17: replace * with / in ActiveMempool::maybe_compact in 6s build + 67s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:732:37: replace > with == in ActiveMempool::maybe_compact in 6s build + 66s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:732:80: replace > with == in ActiveMempool::maybe_compact in 6s build + 68s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:1212:27: replace == with != in ActiveMempool::plan_after_script in 8s build + 66s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:1351:51: replace || with && in ActiveMempool::evict_worst_chunks in 6s build + 65s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:1354:27: replace += with *= in ActiveMempool::evict_worst_chunks in 6s build + 70s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:1424:38: replace < with <= in ActiveMempool::check_package_shape in 6s build + 67s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:1435:22: replace < with > in ActiveMempool::package_is_child_with_direct_parents in 6s build + 67s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:1435:22: replace < with <= in ActiveMempool::package_is_child_with_direct_parents in 5s build + 71s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:1443:25: replace - with / in ActiveMempool::package_is_child_with_direct_parents in 6s build + 65s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:1450:22: replace < with > in ActiveMempool::package_is_child_with_parents in 6s build + 80s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:1862:38: replace >= with < in ActiveMempool::note_invalid in 6s build + 70s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:1873:49: replace != with == in ActiveMempool::note_extra in 6s build + 70s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:1874:37: replace >= with < in ActiveMempool::note_extra in 6s build + 70s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:2160:24: replace || with && in pure_rbfr_pays in 6s build + 67s test
+MISSED   crates/rbitcoin-mempool/src/accept.rs:2165:19: replace || with && in pure_rbfr_pays in 6s build + 73s test
+MISSED   crates/rbitcoin-mempool/src/fee_est.rs:77:40: replace + with - in bucket_count in 6s build + 71s test
+MISSED   crates/rbitcoin-mempool/src/fee_est.rs:77:40: replace + with * in bucket_count in 6s build + 65s test
