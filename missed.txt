@@ -463,3 +463,82 @@ MISSED   crates/rbitcoin-mempool/src/accept.rs:2160:24: replace || with && in pu
 MISSED   crates/rbitcoin-mempool/src/accept.rs:2165:19: replace || with && in pure_rbfr_pays in 6s build + 73s test
 MISSED   crates/rbitcoin-mempool/src/fee_est.rs:77:40: replace + with - in bucket_count in 6s build + 71s test
 MISSED   crates/rbitcoin-mempool/src/fee_est.rs:77:40: replace + with * in bucket_count in 6s build + 65s test
+# 38516921540 2 ac80c864f8552ecebdbbcb4e21d5833eed942472
+MISSED   crates/rbitcoin-mempool/src/fee_est.rs:252:22: replace - with / in percentile_sat in 7s build + 109s test
+MISSED   crates/rbitcoin-mempool/src/fee_est.rs:366:21: replace > with >= in enforce_monotone_desc in 8s build + 82s test
+MISSED   crates/rbitcoin-mempool/src/fee_flow.rs:63:39: replace / with * in FeeFlowMeter::note_admit in 7s build + 86s test
+MISSED   crates/rbitcoin-mempool/src/fee_flow.rs:64:25: replace - with + in FeeFlowMeter::note_admit in 7s build + 132s test
+MISSED   crates/rbitcoin-mempool/src/fee_flow.rs:64:25: replace - with / in FeeFlowMeter::note_admit in 8s build + 104s test
+MISSED   crates/rbitcoin-mempool/src/fee_flow.rs:64:57: replace / with % in FeeFlowMeter::note_admit in 8s build + 99s test
+MISSED   crates/rbitcoin-mempool/src/fee_flow.rs:64:57: replace / with * in FeeFlowMeter::note_admit in 8s build + 83s test
+MISSED   crates/rbitcoin-mempool/src/fee_flow.rs:64:52: replace * with + in FeeFlowMeter::note_admit in 8s build + 91s test
+MISSED   crates/rbitcoin-mempool/src/fee_flow.rs:64:52: replace * with / in FeeFlowMeter::note_admit in 8s build + 108s test
+MISSED   crates/rbitcoin-mempool/src/fee_flow.rs:65:49: replace * with + in FeeFlowMeter::note_admit in 8s build + 90s test
+MISSED   crates/rbitcoin-mempool/src/fee_flow.rs:65:49: replace * with / in FeeFlowMeter::note_admit in 8s build + 84s test
+MISSED   crates/rbitcoin-mempool/src/fee_flow.rs:65:56: replace - with + in FeeFlowMeter::note_admit in 7s build + 87s test
+MISSED   crates/rbitcoin-mempool/src/fee_flow.rs:65:56: replace - with / in FeeFlowMeter::note_admit in 8s build + 84s test
+MISSED   crates/rbitcoin-mempool/src/fee_flow.rs:65:74: replace * with + in FeeFlowMeter::note_admit in 7s build + 93s test
+MISSED   crates/rbitcoin-mempool/src/fee_flow.rs:65:74: replace * with / in FeeFlowMeter::note_admit in 8s build + 86s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:313:9: replace TxGraph::cluster_weight_limit -> u64 with 0 in 8s build + 83s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:313:9: replace TxGraph::cluster_weight_limit -> u64 with 1 in 7s build + 102s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:355:39: replace < with == in TxGraph::index_cluster_of in 8s build + 91s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:355:39: replace < with > in TxGraph::index_cluster_of in 7s build + 86s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:355:39: replace < with <= in TxGraph::index_cluster_of in 7s build + 84s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:368:9: replace TxGraph::is_empty -> bool with true in 9s build + 92s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:368:9: replace TxGraph::is_empty -> bool with false in 8s build + 90s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:586:61: replace || with && in TxGraph::insert in 8s build + 96s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:883:34: replace <= with > in TxGraph::linearize_delta in 7s build + 96s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:896:30: replace > with >= in TxGraph::linearize_delta in 7s build + 92s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:896:52: replace && with || in TxGraph::linearize_delta in 7s build + 89s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:896:45: replace == with != in TxGraph::linearize_delta in 7s build + 86s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:896:65: replace || with && in TxGraph::linearize_delta in 7s build + 90s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:896:59: replace > with == in TxGraph::linearize_delta in 7s build + 86s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:896:59: replace > with < in TxGraph::linearize_delta in 7s build + 83s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:896:79: replace && with || in TxGraph::linearize_delta in 8s build + 98s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:896:72: replace == with != in TxGraph::linearize_delta in 7s build + 82s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:896:84: replace < with == in TxGraph::linearize_delta in 8s build + 99s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:896:84: replace < with > in TxGraph::linearize_delta in 9s build + 91s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:896:84: replace < with <= in TxGraph::linearize_delta in 10s build + 94s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:1150:49: replace || with && in TxGraph::rebuild_from in 8s build + 86s test
+MISSED   crates/rbitcoin-mempool/src/graph.rs:1150:25: delete ! in TxGraph::rebuild_from in 8s build + 94s test
+MISSED   crates/rbitcoin-mempool/src/orphanage.rs:81:9: replace Orphanage::is_empty -> bool with true in 9s build + 111s test
+MISSED   crates/rbitcoin-mempool/src/orphanage.rs:85:9: replace Orphanage::total_weight -> u64 with 0 in 7s build + 105s test
+MISSED   crates/rbitcoin-mempool/src/orphanage.rs:85:9: replace Orphanage::total_weight -> u64 with 1 in 8s build + 84s test
+MISSED   crates/rbitcoin-mempool/src/orphanage.rs:161:61: replace > with == in Orphanage::insert_from_at in 8s build + 101s test
+MISSED   crates/rbitcoin-mempool/src/orphanage.rs:161:61: replace > with >= in Orphanage::insert_from_at in 8s build + 87s test
+MISSED   crates/rbitcoin-mempool/src/orphanage.rs:163:16: delete ! in Orphanage::insert_from_at in 7s build + 105s test
+MISSED   crates/rbitcoin-mempool/src/orphanage.rs:168:13: replace || with && in Orphanage::insert_from_at in 7s build + 81s test
+MISSED   crates/rbitcoin-mempool/src/orphanage.rs:168:57: replace > with == in Orphanage::insert_from_at in 7s build + 83s test
+MISSED   crates/rbitcoin-mempool/src/orphanage.rs:168:57: replace > with >= in Orphanage::insert_from_at in 7s build + 92s test
+MISSED   crates/rbitcoin-mempool/src/orphanage.rs:250:50: replace <= with > in Orphanage::announcers_within_reserve in 7s build + 85s test
+MISSED   crates/rbitcoin-mempool/src/orphanage.rs:345:26: replace == with != in Orphanage::take_children_of in 8s build + 91s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:17:29: replace << with >> in 88s build + 94s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:18:32: replace << with >> in 7s build + 94s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:19:33: replace << with >> in 7s build + 92s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:117:23: replace || with && in decode_packed in 8s build + 87s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:117:13: replace > with == in decode_packed in 7s build + 91s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:117:13: replace > with >= in decode_packed in 7s build + 90s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:117:32: replace > with == in decode_packed in 7s build + 83s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:117:32: replace > with >= in decode_packed in 8s build + 89s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:162:15: replace |= with &= in encode_vin in 7s build + 88s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:165:15: replace |= with &= in encode_vin in 7s build + 95s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:168:15: replace |= with &= in encode_vin in 7s build + 88s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:233:16: replace > with == in decode_vin in 7s build + 92s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:233:16: replace > with >= in decode_vin in 7s build + 89s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:252:20: replace > with == in decode_vin in 7s build + 83s test
+MISSED   crates/rbitcoin-mempool/src/packed.rs:252:20: replace > with >= in decode_vin in 7s build + 83s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:261:9: replace Mempool::clear_dirty with () in 8s build + 90s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:279:54: replace * with / in Mempool::pwrite_live_slots_since in 8s build + 84s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:284:25: replace < with > in Mempool::pwrite_live_slots_since in 7s build + 84s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:287:31: replace + with * in Mempool::pwrite_live_slots_since in 8s build + 83s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:289:25: replace == with != in Mempool::pwrite_live_slots_since in 7s build + 81s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:326:26: replace > with == in Mempool::append_live_tx in 7s build + 92s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:326:26: replace > with >= in Mempool::append_live_tx in 7s build + 82s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:344:54: replace * with / in Mempool::abandon_live in 8s build + 87s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:397:9: replace Mempool::slot_stats -> (u32, u32, u32) with (0, 1, 0) in 7s build + 88s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:397:9: replace Mempool::slot_stats -> (u32, u32, u32) with (1, 1, 0) in 7s build + 85s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:404:35: replace += with *= in Mempool::slot_stats in 7s build + 104s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:405:27: replace += with *= in Mempool::slot_stats in 7s build + 87s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:440:55: replace || with && in Mempool::compact in 8s build + 112s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:440:67: replace < with == in Mempool::compact in 8s build + 110s test
+MISSED   crates/rbitcoin-mempool/src/store.rs:440:67: replace < with <= in Mempool::compact in 8s build + 88s test
