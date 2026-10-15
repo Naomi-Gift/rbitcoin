@@ -1159,6 +1159,263 @@ mod tests {
         assert!(cr.contains("CR"), "{cr}");
         tor.apply_kv("tor_control_password", "pw").unwrap();
         assert_eq!(tor.tor.password.as_deref(), Some("pw"));
+
+        // Authority secret file, redaction, and key-utils base58check.
+        {
+            let dir = tmp_datadir();
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut c = NodeConfig::default().with_datadir(dir.clone());
+            let key = dir.join("sv2-authority.key");
+            std::fs::write(&key, format!("{}\n", "07".repeat(32))).unwrap();
+            let path = key.to_str().unwrap();
+            assert_eq!(
+                c.apply_kv("sv2_tp_authority_sec_file", path).unwrap(),
+                ConfApply::Applied
+            );
+            assert_eq!(
+                c.sv2_tp_authority_sec,
+                Some(crate::config::Sv2AuthoritySecret([7; 32]))
+            );
+            let bad = dir.join("sv2-bad.key");
+            std::fs::write(&bad, "00".repeat(32)).unwrap();
+            let missing = dir.join("sv2-missing.key");
+            for p in [&bad, &missing] {
+                let e = format!(
+                    "{}",
+                    c.apply_kv("sv2_tp_authority_sec_file", p.to_str().unwrap())
+                        .unwrap_err()
+                );
+                assert!(e.contains("sv2_tp_authority_sec_file"), "{e}");
+                assert!(!e.contains(&"00".repeat(32)), "never echo the key: {e}");
+            }
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        {
+            let hex = "07".repeat(32);
+            let mut c = NodeConfig::default();
+            c.apply_kv("sv2_tp_authority_sec", &hex).unwrap();
+            let dbg = format!("{c:?}");
+            assert!(dbg.contains("sv2_tp_authority_sec"), "{dbg}");
+            assert!(!dbg.contains("[7, 7"), "never print the key: {dbg}");
+            assert!(!dbg.contains(&hex), "never print the key: {dbg}");
+            let e = format!(
+                "{}",
+                c.apply_kv("sv2_tp_authority_sec_file", &hex).unwrap_err()
+            );
+            assert!(e.contains("sv2_tp_authority_sec_file"), "{e}");
+            assert!(!e.contains(&hex), "never echo the key: {e}");
+        }
+        {
+            let secret = "zmBEmPhqo3A92FkiLVvyCz6htc3e53ph3ZbD4ASqGaLjwnFLi";
+            let dir = tmp_datadir();
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("sv2-authority.key");
+            std::fs::write(&file, format!("{secret}\n")).unwrap();
+            for (k, v) in [
+                ("sv2_tp_authority_sec", secret),
+                ("sv2_tp_authority_sec_file", file.to_str().unwrap()),
+            ] {
+                let mut c = NodeConfig::default().with_datadir(dir.clone());
+                assert_eq!(c.apply_kv(k, v).unwrap(), ConfApply::Applied);
+                let kp = bitcoin::secp256k1::Keypair::from_seckey_slice(
+                    &bitcoin::secp256k1::Secp256k1::new(),
+                    &c.sv2_tp_authority_sec.unwrap().0,
+                )
+                .unwrap();
+                let mut pk = vec![1, 0];
+                pk.extend(kp.x_only_public_key().0.serialize());
+                assert_eq!(
+                    bitcoin::base58::encode_check(&pk),
+                    "9bDuixKmZqAJnrmP746n8zU1wyAQRrus7th9dxnkPg6RzQvCnan"
+                );
+            }
+            let mut c = NodeConfig::default();
+            let bad_check = format!("{}1", &secret[..secret.len() - 1]);
+            let e = format!(
+                "{}",
+                c.apply_kv("sv2_tp_authority_sec", &bad_check).unwrap_err()
+            );
+            assert!(e.contains("sv2_tp_authority_sec"), "{e}");
+            assert!(!e.contains(&bad_check), "never echo the key: {e}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // Scripthash create cap and Esplora block-template default.
+        {
+            let mut c = NodeConfig::default();
+            assert_eq!(c.max_sh_creates, rbitcoin_query::DEFAULT_MAX_SH_CREATES);
+            assert!(!c.esplora_block_template);
+            assert_eq!(
+                c.apply_kv("max_sh_creates", "100").unwrap(),
+                ConfApply::Applied
+            );
+            assert_eq!(c.max_sh_creates, 100);
+            match c.apply_kv("maxshcreates", "7").unwrap() {
+                ConfApply::Unknown(k) => assert_eq!(k, "maxshcreates"),
+                other => panic!("{other:?}"),
+            }
+            assert_eq!(c.apply_kv("sh_index", "1").unwrap(), ConfApply::Applied);
+            assert!(c.shindex);
+            assert_eq!(c.apply_kv("sp_tweaks", "1").unwrap(), ConfApply::Applied);
+            assert!(c.sptweaks);
+            assert_eq!(
+                c.apply_kv("sp_tweaks_dust", "546").unwrap(),
+                ConfApply::Applied
+            );
+            assert_eq!(c.sptweaks_dust, 546);
+            assert_eq!(c.max_sh_creates, 100);
+            let bad = c.apply_kv("max_sh_creates", "nope").unwrap_err();
+            assert!(
+                format!("{bad}").contains("max_sh_creates"),
+                "garbage must name the knob: {bad}"
+            );
+            assert_eq!(
+                c.apply_kv("esplora_block_template", "1").unwrap(),
+                ConfApply::Applied
+            );
+            assert!(c.esplora_block_template);
+            match c.apply_kv("esplorablocktemplate", "0").unwrap() {
+                ConfApply::Unknown(k) => assert_eq!(k, "esplorablocktemplate"),
+                other => panic!("{other:?}"),
+            }
+            assert!(c.esplora_block_template);
+        }
+
+        // Default datadir is cwd-relative, with native separators.
+        {
+            let p = NodeConfig::default_datadir();
+            assert_eq!(p, PathBuf::from(".").join("datadir"));
+            assert_eq!(NodeConfig::default().datadir.path(), p.as_path());
+            let store = p.join("store");
+            #[cfg(windows)]
+            {
+                let s = store.to_string_lossy();
+                assert!(
+                    !s.contains('/'),
+                    "default datadir must use Windows separators, got {s}"
+                );
+                assert_eq!(p.to_str(), Some(r".\datadir"));
+            }
+            #[cfg(not(windows))]
+            {
+                assert_eq!(p.to_str(), Some("./datadir"));
+                assert_eq!(store.to_str(), Some("./datadir/store"));
+            }
+        }
+
+        // Inbound env is read once and not written back. This test already holds the env lock.
+        {
+            let prev_in = std::env::var_os("RBITCOIN_P2P_MAX_INBOUND");
+            std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", "99");
+            let mut cfg = NodeConfig::default();
+            assert!(!cfg.listen.max_inbound_explicit);
+            cfg.absorb_inbound_env();
+            assert_eq!(cfg.listen.max_inbound, 99);
+            assert_eq!(
+                std::env::var("RBITCOIN_P2P_MAX_INBOUND").as_deref(),
+                Ok("99"),
+                "absorb must not rewrite process env"
+            );
+            let mut explicit = NodeConfig::default();
+            explicit.listen.max_inbound = 12;
+            explicit.listen.max_inbound_explicit = true;
+            explicit.absorb_inbound_env();
+            assert_eq!(
+                explicit.listen.max_inbound, 12,
+                "explicit CLI/conf wins over env"
+            );
+            match prev_in {
+                Some(v) => std::env::set_var("RBITCOIN_P2P_MAX_INBOUND", v),
+                None => std::env::remove_var("RBITCOIN_P2P_MAX_INBOUND"),
+            }
+        }
+
+        // max_inbound in conf is explicit. Core maxconnections is not a node key.
+        {
+            let dir = tmp_datadir();
+            std::fs::create_dir_all(&dir).unwrap();
+            let conf = dir.join("mi.conf");
+            std::fs::write(&conf, "max_inbound=40\n").unwrap();
+            let mut cfg = NodeConfig::default().with_datadir(dir.join("d"));
+            cfg.merge_conf_file(&conf).unwrap();
+            assert_eq!(cfg.listen.max_inbound, 40);
+            assert!(cfg.listen.max_inbound_explicit);
+            let conf2 = dir.join("mc.conf");
+            std::fs::write(&conf2, "maxconnections=32\n").unwrap();
+            let mut cfg2 = NodeConfig::default().with_datadir(dir.join("d2"));
+            cfg2.merge_conf_file(&conf2).unwrap();
+            assert_eq!(
+                cfg2.listen.max_inbound,
+                crate::config::DEFAULT_MAX_INBOUND,
+                "Core maxconnections is unknown on the node (shim-only)"
+            );
+            assert!(!cfg2.listen.max_inbound_explicit);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // A file where store/ should be is a datadir error.
+        {
+            let dir = tmp_datadir();
+            let cfg = NodeConfig::default().with_datadir(&dir);
+            cfg.ensure_datadir().unwrap();
+            let _ = std::fs::remove_dir_all(dir.join("store"));
+            std::fs::write(dir.join("store"), b"x").unwrap();
+            let err = cfg.ensure_datadir().unwrap_err();
+            let msg = format!("{err}");
+            assert!(
+                msg.contains("store") || msg.contains("datadir") || msg.contains("File exists"),
+                "{msg}"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // Cookie file is checked at validate, before RPC binds.
+        {
+            let dir = tmp_datadir();
+            std::fs::create_dir_all(&dir).unwrap();
+            let cookie = dir.join("rpc.cookie");
+            let mut cfg = NodeConfig::default().with_datadir(dir.clone());
+            cfg.rpc.cookie_file = Some(cookie.clone());
+            cfg.rpc.listen_default = true;
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("read RPC cookie"), "missing file: {err}");
+            std::fs::write(&cookie, "__cookie__:secret\n").unwrap();
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("line ending"), "{err}");
+            std::fs::write(&cookie, "__cookie__:secret").unwrap();
+            cfg.validate()
+                .expect("Core-format cookie with --rpc-listen");
+            cfg.rpc.listen_default = false;
+            let err = cfg.validate().unwrap_err().to_string();
+            assert!(err.contains("TCP only"), "{err}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // Hostnames are DNS connects. An empty connect and an onion are refused.
+        {
+            let mut cfg = NodeConfig::default();
+            cfg.apply_kv("head_scale", "tiny").unwrap();
+            assert_eq!(cfg.head_scale, HeadScale::Tiny);
+            cfg.apply_kv("connect", "tank-0001:18444").unwrap();
+            cfg.apply_kv("connect", "bad").unwrap();
+            cfg.apply_kv("connect", "tank-0").unwrap();
+            cfg.apply_kv("connect", "127.0.0.1:18444").unwrap();
+            assert!(cfg
+                .listen
+                .connect_dns
+                .iter()
+                .any(|h| h == "tank-0001:18444"));
+            assert!(cfg.listen.connect_dns.iter().any(|h| h == "bad"));
+            assert!(cfg.listen.connect_dns.iter().any(|h| h == "tank-0"));
+            assert_eq!(cfg.listen.connect.len(), 1);
+            assert!(cfg.apply_kv("connect", "").is_err());
+            assert!(cfg
+                .apply_kv("connect", "short.onion:8333")
+                .unwrap_err()
+                .to_string()
+                .contains("bad"));
+            assert!(cfg.listen.has_pinned_connect());
+        }
     }
 
     include!("overlay_config_journey.rs");
