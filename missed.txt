@@ -801,3 +801,52 @@ MISSED   crates/rbitcoin-net/src/chain.rs:1649:40: replace && with || in ChainHu
 MISSED   crates/rbitcoin-net/src/chain.rs:1768:41: delete ! in ChainHub::note_confirmed_tip in 7s build + 68s test
 MISSED   crates/rbitcoin-net/src/chain.rs:1900:20: replace > with == in ChainHub::generate_to_script in 6s build + 69s test
 MISSED   crates/rbitcoin-net/src/chain.rs:1900:20: replace > with >= in ChainHub::generate_to_script in 6s build + 69s test
+# 38854276078 2 4055146e793b6201c6ad67b58a500f111e4f9683
+MISSED   crates/rbitcoin-net/src/chain.rs:1995:16: delete ! in ChainHub::invalidate_block_inner in 97s build + 84s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2026:16: delete ! in ChainHub::try_apply_after_invalidate in 13s build + 84s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2083:13: replace || with && in ChainHub::reconsider_block_inner in 7s build + 109s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2077:13: replace || with && in ChainHub::reconsider_block_inner in 7s build + 92s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2076:13: replace || with && in ChainHub::reconsider_block_inner in 7s build + 85s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2075:13: replace || with && in ChainHub::reconsider_block_inner in 7s build + 87s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2101:37: replace == with != in ChainHub::reconsider_block_inner in 7s build + 93s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2136:16: delete ! in ChainHub::reconsider_block_inner in 7s build + 82s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2144:12: delete ! in ChainHub::reconsider_block_inner in 7s build + 98s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2169:21: replace || with && in ChainHub::take_related_invalidated_paths in 7s build + 102s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2181:28: replace == with != in ChainHub::take_related_invalidated_paths in 7s build + 90s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2233:42: replace || with && in ChainHub::accept_incoming in 7s build + 95s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2248:42: replace || with && in ChainHub::accept_incoming in 8s build + 92s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2393:60: replace != with == in ChainHub::accept_branch_genesis_fill in 7s build + 95s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2402:31: replace - with + in ChainHub::accept_branch_genesis_fill in 7s build + 96s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2402:31: replace - with / in ChainHub::accept_branch_genesis_fill in 7s build + 82s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2638:24: replace > with == in ChainHub::rewind_to_height_inner in 7s build + 83s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2638:24: replace > with >= in ChainHub::rewind_to_height_inner in 7s build + 85s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2671:21: delete match arm Some(o @AcceptOutcome::Accepted{..}) in ChainHub::accept_received_block_inner in 7s build + 99s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2775:44: replace > with >= in ChainHub::trim_held_bodies in 7s build + 92s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2804:42: replace > with >= in ChainHub::hold_body in 8s build + 86s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2820:9: replace ChainHub::cache_body_count -> usize with 0 in 8s build + 89s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2820:9: replace ChainHub::cache_body_count -> usize with 1 in 7s build + 87s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2837:41: replace || with && in ChainHub::held_missing_parents in 7s build + 98s test
+MISSED   crates/rbitcoin-net/src/chain.rs:2897:16: delete ! in ChainHub::best_held_branch in 9s build + 94s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3055:29: delete ! in ChainHub::connect_at in 7s build + 96s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3059:18: replace > with == in ChainHub::connect_at in 7s build + 89s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3121:22: replace > with == in ChainHub::disconnect_to_in_commit in 7s build + 86s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3135:44: replace + with * in ChainHub::disconnect_to_in_commit in 8s build + 100s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3248:20: replace > with == in ChainHub::ensure_chain_work_prefix in 8s build + 83s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3248:20: replace > with >= in ChainHub::ensure_chain_work_prefix in 7s build + 86s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3807:14: replace <= with > in spawn_confirmed_seed in 7s build + 86s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3817:36: replace || with && in spawn_confirmed_seed in 7s build + 82s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3817:28: replace >= with < in spawn_confirmed_seed in 7s build + 86s test
+MISSED   crates/rbitcoin-net/src/chain.rs:3817:41: replace == with != in spawn_confirmed_seed in 7s build + 91s test
+MISSED   crates/rbitcoin-net/src/codec.rs:41:21: replace > with >= in encode_is_cpu_heavy in 7s build + 108s test
+MISSED   crates/rbitcoin-net/src/codec.rs:157:30: replace match guard sl.is_empty() with true in FramedMessage::decode in 8s build + 83s test
+MISSED   crates/rbitcoin-net/src/codec.rs:478:9: delete match arm "addr" in decode_cmd_payload in 14s build + 82s test
+MISSED   crates/rbitcoin-net/src/codec.rs:494:9: delete match arm "cfilter" in decode_cmd_payload in 11s build + 102s test
+MISSED   crates/rbitcoin-net/src/codec.rs:496:9: delete match arm "cfheaders" in decode_cmd_payload in 14s build + 97s test
+MISSED   crates/rbitcoin-net/src/codec.rs:498:9: delete match arm "cfcheckpt" in decode_cmd_payload in 12s build + 86s test
+MISSED   crates/rbitcoin-net/src/codec.rs:499:9: delete match arm "reject" in decode_cmd_payload in 14s build + 120s test
+MISSED   crates/rbitcoin-net/src/codec.rs:500:9: delete match arm "alert" in decode_cmd_payload in 13s build + 86s test
+MISSED   crates/rbitcoin-net/src/codec.rs:512:24: replace || with && in decode_cmd_payload in 8s build + 83s test
+MISSED   crates/rbitcoin-net/src/codec.rs:512:20: replace < with == in decode_cmd_payload in 7s build + 90s test
+MISSED   crates/rbitcoin-net/src/codec.rs:512:20: replace < with <= in decode_cmd_payload in 7s build + 88s test
+MISSED   crates/rbitcoin-net/src/codec.rs:512:31: replace > with == in decode_cmd_payload in 7s build + 102s test
+MISSED   crates/rbitcoin-net/src/codec.rs:512:31: replace > with >= in decode_cmd_payload in 7s build + 86s test
