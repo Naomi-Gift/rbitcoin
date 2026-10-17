@@ -905,3 +905,59 @@ MISSED   crates/rbitcoin-net/src/compact.rs:195:40: replace > with >= in reconst
 MISSED   crates/rbitcoin-net/src/compact.rs:422:33: replace += with *= in reconstruct_stats in 8s build + 116s test
 MISSED   crates/rbitcoin-net/src/compact.rs:436:33: replace += with *= in reconstruct_stats in 8s build + 107s test
 MISSED   crates/rbitcoin-net/src/compact.rs:439:31: replace += with *= in reconstruct_stats in 8s build + 104s test
+# 39004835061 2 9d912f87d0aaaafc6ae2708d36f2d44b94ee17c7
+MISSED   crates/rbitcoin-net/src/compact.rs:441:28: replace += with -= in reconstruct_stats in 7s build + 81s test
+MISSED   crates/rbitcoin-net/src/compact.rs:441:28: replace += with *= in reconstruct_stats in 6s build + 78s test
+MISSED   crates/rbitcoin-net/src/compact.rs:442:32: replace += with -= in reconstruct_stats in 6s build + 83s test
+MISSED   crates/rbitcoin-net/src/compact.rs:442:32: replace += with *= in reconstruct_stats in 6s build + 89s test
+MISSED   crates/rbitcoin-net/src/compact.rs:472:36: replace > with >= in prefill_indexes in 7s build + 79s test
+MISSED   crates/rbitcoin-net/src/eviction.rs:109:15: replace || with && in protect_by_netgroup in 6s build + 76s test
+MISSED   crates/rbitcoin-net/src/eviction.rs:109:10: replace == with != in protect_by_netgroup in 6s build + 88s test
+MISSED   crates/rbitcoin-net/src/eviction.rs:115:48: replace += with *= in protect_by_netgroup in 6s build + 76s test
+MISSED   crates/rbitcoin-net/src/eviction.rs:122:30: replace >= with < in protect_by_netgroup in 6s build + 76s test
+MISSED   crates/rbitcoin-net/src/eviction.rs:127:36: replace == with != in protect_by_netgroup in 6s build + 78s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:87:9: delete match arm NetError::Io(_) | NetError::Disconnected in session_dead in 30s build + 80s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:92:17: replace || with && in session_dead in 8s build + 76s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:112:9: delete match arm NetError::Io(_) | NetError::Disconnected in sam_retry in 7s build + 84s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:113:9: delete match arm NetError::Encode(s) in sam_retry in 8s build + 78s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:120:17: replace || with && in sam_retry in 8s build + 92s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:119:17: replace || with && in sam_retry in 6s build + 79s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:118:17: replace || with && in sam_retry in 6s build + 92s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:117:17: replace || with && in sam_retry in 6s build + 77s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:116:17: replace || with && in sam_retry in 6s build + 85s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:128:9: delete match arm NetError::Io(_) | NetError::Disconnected in stream_retry in 6s build + 81s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:137:17: replace || with && in stream_retry in 8s build + 79s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:136:17: replace || with && in stream_retry in 6s build + 77s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:135:17: replace || with && in stream_retry in 6s build + 80s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:134:17: replace || with && in stream_retry in 6s build + 86s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:133:17: replace || with && in stream_retry in 7s build + 80s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:275:27: replace match guard stream_retry(&e) with true in I2pSam::stream_forward in 7s build + 79s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:313:27: replace match guard stream_retry(&e) with true in I2pDialer::stream_connect in 7s build + 88s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:416:13: delete match arm '-' | '+' in decode_i2p_b64 in 6s build + 77s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:417:13: delete match arm '~' | '/' in decode_i2p_b64 in 6s build + 77s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:415:35: replace - with + in decode_i2p_b64 in 6s build + 79s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:415:35: replace - with / in decode_i2p_b64 in 6s build + 93s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:424:26: replace | with ^ in decode_i2p_b64 in 6s build + 77s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:502:39: replace || with && in hello in 9s build + 92s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:536:22: replace > with == in read_line in 7s build + 78s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:536:22: replace > with >= in read_line in 6s build + 78s test
+MISSED   crates/rbitcoin-net/src/i2p_sam.rs:536:27: replace * with + in read_line in 7s build + 77s test
+MISSED   crates/rbitcoin-net/src/ibd/mod.rs:400:42: replace - with + in ibd_cancellable in 7s build + 86s test
+MISSED   crates/rbitcoin-net/src/ibd/mod.rs:427:29: replace > with == in ibd_cancellable in 7s build + 78s test
+MISSED   crates/rbitcoin-net/src/ibd/mod.rs:439:18: replace match guard n > 0 with true in ibd_cancellable in 7s build + 84s test
+MISSED   crates/rbitcoin-net/src/ibd/mod.rs:439:18: replace match guard n > 0 with false in ibd_cancellable in 7s build + 92s test
+MISSED   crates/rbitcoin-net/src/ibd/mod.rs:439:20: replace > with == in ibd_cancellable in 7s build + 77s test
+MISSED   crates/rbitcoin-net/src/ibd/mod.rs:453:18: replace match guard n > 0 with true in ibd_cancellable in 7s build + 85s test
+MISSED   crates/rbitcoin-net/src/ibd/mod.rs:453:18: replace match guard n > 0 with false in ibd_cancellable in 7s build + 80s test
+MISSED   crates/rbitcoin-net/src/ibd/mod.rs:453:20: replace > with == in ibd_cancellable in 7s build + 81s test
+MISSED   crates/rbitcoin-net/src/msg_decode.rs:19:5: replace block_decode_permits -> usize with 1 in 6s build + 78s test
+MISSED   crates/rbitcoin-net/src/msg_decode.rs:27:5: replace ctrl_decode_permits -> usize with 1 in 7s build + 80s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:13:49: replace | with ^ in 7s build + 83s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:15:43: replace | with ^ in 6s build + 84s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:15:37: replace << with >> in 6s build + 82s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:26:13: replace | with ^ in 6s build + 84s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:25:13: replace | with ^ in 6s build + 81s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:24:13: replace | with ^ in 6s build + 80s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:23:13: replace | with ^ in 6s build + 87s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:21:13: replace | with ^ in 6s build + 83s test
+MISSED   crates/rbitcoin-net/src/net_permissions.rs:38:9: replace NetPermissionFlags::clear_implicit with () in 6s build + 77s test
