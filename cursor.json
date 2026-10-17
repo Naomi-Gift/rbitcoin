@@ -1,8 +1,8 @@
 {
   "new_base": "cdfdaa0ef2b1fea88a1580adce5e42b6213aebac",
-  "new_skip": 3246,
-  "old_index": 5242,
+  "new_skip": 3446,
+  "old_index": 5254,
   "new_cap_used": true,
-  "run_id": "38854276078",
-  "old_name": "crates/rbitcoin-net/src/codec.rs:530:24: replace != with == in decode_cmd_payload"
+  "run_id": "39004835061",
+  "old_name": "crates/rbitcoin-net/src/compact.rs:441:28: replace += with -= in reconstruct_stats"
 }
