@@ -47,6 +47,7 @@ into `AGENTS.md`.
 | [`experimental-mainnet.md`](./experimental-mainnet.md) | 0.x mainnet runbook (early production / high-scrutiny). |
 | [`rpc.md`](./rpc.md) | Core-class JSON-RPC subset. |
 | [`consensus-tests.md`](./consensus-tests.md) | Rules we own vs Core corpora. |
+| [`btc-lean-census.md`](./btc-lean-census.md) | Each vendored btc-lean consensus-census row, and the rbitcoin file or the reason it is unmapped. |
 | [`core-functional.md`](./core-functional.md) | Core v31.1 functional harness. |
 | [`overlay-functional.md`](./overlay-functional.md) | Private Tor / i2pd / cjdns mesh harness (labeled / nightly). |
 | [`how-we-plan.md`](./how-we-plan.md) | Agent contract (cycle, Agent RAM, keep-compiling), then human rationale. |
