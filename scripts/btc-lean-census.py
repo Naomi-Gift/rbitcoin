@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Tie docs/btc-lean-census.md lines to // btc-lean: comments.
+"""Confirm // btc-lean: comments cover the vendored consensus census.
 
-A mapped row cites `path` line N. Line N is the statement. The comment lines
-immediately above it name the census ids. This script fails when those disagree.
-It does not read the btc-lean submodule (CI does not check that gitlink out).
+The pin is the third_party/btc-lean gitlink. This script reads that
+checkout's spec/db/rules.yaml, docs/btc-lean-gaps.md, and the comments in
+this tree. It runs in the qc job after
+`git submodule update --init --depth 1 third_party/btc-lean`.
+
+A proven row is covered when some // btc-lean: comment names it, or when
+docs/btc-lean-gaps.md gives a reason. status: obsolete is the reason for a
+retired row, and that id must not be commented or listed as a gap. A
+comment is an index of the statement under it. It is not a claim that a
+Lean theorem holds of the Rust.
 """
 from __future__ import annotations
 
@@ -13,39 +20,74 @@ import tempfile
 from pathlib import Path
 
 COMMENT = re.compile(r"^\s*// btc-lean:((?:\s+[A-Z]{3}-\d{3})+)\s*$")
-LOC = re.compile(r"^- (production|test): `([^`]+)` line (\d+)\s*$")
-IDH = re.compile(r"^### ([A-Z]{3}-\d{3})\s*$")
+RULE_ID = re.compile(r"^- id: ([A-Z]{3}-\d{3})\s*$")
+RULE_STATUS = re.compile(r"^\s+status:\s+(\S+)\s*$")
+SECTION = re.compile(r"(?m)^## .+$")
+TICK_ID = re.compile(r"`([A-Z]{3}-\d{3})`")
+RULES_REL = Path("third_party/btc-lean/spec/db/rules.yaml")
+GAPS_REL = Path("docs/btc-lean-gaps.md")
 
 
-def parse_census(text: str) -> list[dict]:
-    rows = []
-    cur = None
-    for ln in text.splitlines():
-        m = IDH.match(ln)
-        if m:
-            if cur:
-                rows.append(cur)
-            cur = {"id": m.group(1), "prod": None, "test": None, "unmapped": False}
+def load_rules(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    rows: dict[str, str] = {}
+    cur: str | None = None
+    for n, ln in enumerate(path.read_text().splitlines(), 1):
+        mid = RULE_ID.match(ln)
+        if mid:
+            if cur is not None:
+                raise SystemExit(f"{path}:{n}: {cur} has no status")
+            cur = mid.group(1)
+            if cur in rows:
+                raise SystemExit(f"{path}:{n}: duplicate id {cur}")
             continue
-        if cur is None:
-            continue
-        if ln.startswith("- unmapped:"):
-            reason = ln[len("- unmapped:") :].strip()
-            if not reason:
-                raise SystemExit(f"{cur['id']}: empty unmapped reason")
-            cur["unmapped"] = True
-        else:
-            loc = LOC.match(ln)
-            if loc:
-                key = "prod" if loc.group(1) == "production" else "test"
-                cur[key] = (loc.group(2), int(loc.group(3)))
-    if cur:
-        rows.append(cur)
+        mstatus = RULE_STATUS.match(ln)
+        if mstatus and cur is not None:
+            rows[cur] = mstatus.group(1)
+            cur = None
+    if cur is not None:
+        raise SystemExit(f"{path}: {cur} has no status")
+    if not rows:
+        raise SystemExit(f"{path}: no rule ids")
     return rows
 
 
-def comment_sites(root: Path) -> list[tuple[str, int, list[str]]]:
-    sites = []
+class GapError(Exception):
+    pass
+
+
+def load_gaps(path: Path) -> dict[str, str]:
+    """Map each gap id to its reason. The first line of a section is ids."""
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    text = path.read_text()
+    marks = list(SECTION.finditer(text))
+    if not marks:
+        raise GapError(f"{path}: no gap sections")
+    out: dict[str, str] = {}
+    for i, mark in enumerate(marks):
+        end = marks[i + 1].start() if i + 1 < len(marks) else len(text)
+        lines = text[mark.end() : end].strip().splitlines()
+        title = mark.group(0)
+        if not lines:
+            raise GapError(f"{path}: empty section {title}")
+        ids = TICK_ID.findall(lines[0])
+        if not ids or lines[0].replace("`", "").split() != ids:
+            raise GapError(f"{path}: {title} must open with `ID` tokens")
+        reason = " ".join(ln.strip() for ln in lines[1:] if ln.strip())
+        if not reason:
+            raise GapError(f"{path}: {ids[0]} has an empty reason")
+        for rid in ids:
+            if rid in out:
+                raise GapError(f"{path}: duplicate gap {rid}")
+            out[rid] = reason
+    return out
+
+
+def comment_ids(root: Path) -> tuple[set[str], list[str]]:
+    found: set[str] = set()
+    errs: list[str] = []
     for path in sorted(root.rglob("*.rs")):
         rel = path.relative_to(root).as_posix()
         if rel.startswith("target/") or "/target/" in rel:
@@ -53,103 +95,140 @@ def comment_sites(root: Path) -> list[tuple[str, int, list[str]]]:
         lines = path.read_text().splitlines()
         i = 0
         while i < len(lines):
-            m = COMMENT.match(lines[i])
-            if not m:
+            if not COMMENT.match(lines[i]):
                 i += 1
                 continue
             ids: list[str] = []
             while i < len(lines) and (m := COMMENT.match(lines[i])):
                 ids.extend(m.group(1).split())
                 i += 1
-            if i >= len(lines):
-                raise SystemExit(f"{rel}: btc-lean comment has no statement under it")
-            if not lines[i].strip() or lines[i].lstrip().startswith("//"):
-                raise SystemExit(f"{rel}:{i+1}: btc-lean comment is not on the next code line")
-            sites.append((rel, i + 1, ids))
-            i += 1
-    return sites
+            if i >= len(lines) or not lines[i].strip() or lines[i].lstrip().startswith("//"):
+                errs.append(f"{rel}:{i}: btc-lean comment is not on the next code line")
+                continue
+            for rid in sorted({x for x in ids if ids.count(x) > 1}):
+                errs.append(f"{rel}:{i + 1}: {rid} repeated in one comment")
+            found.update(ids)
+    return found, errs
 
 
 def check(root: Path) -> list[str]:
-    census = root / "docs" / "btc-lean-census.md"
-    rows = parse_census(census.read_text())
-    if not rows:
-        return ["census has no rows"]
-    errs: list[str] = []
-    seen = set()
-    mapped: dict[str, dict] = {}
-    for row in rows:
-        if row["id"] in seen:
-            errs.append(f"duplicate census id {row['id']}")
-        seen.add(row["id"])
-        if row["unmapped"]:
-            if row["prod"] or row["test"]:
-                errs.append(f"{row['id']}: unmapped row also cites a line")
+    path = root / RULES_REL
+    try:
+        rules = load_rules(path)
+    except FileNotFoundError:
+        return [
+            f"{RULES_REL} is not checked out; "
+            "git submodule update --init --depth 1 third_party/btc-lean"
+        ]
+    try:
+        reasons = load_gaps(root / GAPS_REL)
+    except FileNotFoundError:
+        return [f"{GAPS_REL} is missing"]
+    except GapError as exc:
+        return [str(exc)]
+    commented, errs = comment_ids(root)
+    for rid in sorted(commented):
+        if rid not in rules:
+            errs.append(f"{rid}: comment is not in {RULES_REL}")
+    for rid, reason in reasons.items():
+        if rid not in rules:
+            errs.append(f"{rid}: gap is not in {RULES_REL}")
             continue
-        if not row["prod"] or not row["test"]:
-            errs.append(f"{row['id']}: mapped row needs a production line and a test line")
+        if rules[rid] == "obsolete":
+            errs.append(f"{rid}: obsolete row does not need a gap reason")
+        if rid in commented:
+            errs.append(f"{rid}: gap row also has a // btc-lean: comment")
+        if not reason.strip():
+            errs.append(f"{rid}: empty gap reason")
+    for rid, status in rules.items():
+        if status == "obsolete":
+            if rid in commented:
+                errs.append(f"{rid}: obsolete row must not have a // btc-lean: comment")
             continue
-        mapped[row["id"]] = row
-        for role in ("prod", "test"):
-            path, line = row[role]
-            file = root / path
-            if not file.is_file():
-                errs.append(f"{row['id']}: missing {path}")
-                continue
-            src = file.read_text().splitlines()
-            if line < 1 or line > len(src):
-                errs.append(f"{row['id']}: {path}:{line} is past EOF")
-
-    sites = comment_sites(root)
-    at: dict[str, list[tuple[str, int]]] = {}
-    for rel, line, ids in sites:
-        dup = [i for i in ids if ids.count(i) > 1]
-        for i in sorted(set(dup)):
-            errs.append(f"{rel}:{line}: {i} repeated in one comment")
-        for i in ids:
-            at.setdefault(i, []).append((rel, line))
-
-    for rid, row in mapped.items():
-        want = {row["prod"], row["test"]}
-        got = set(at.get(rid, []))
-        if got != want:
-            errs.append(f"{rid}: comment sites {sorted(got)} != census {sorted(want)}")
-    for rid, places in at.items():
-        if rid not in mapped:
-            errs.append(f"{rid}: comment has no mapped census row ({places[0]})")
+        if rid in reasons or rid in commented:
+            continue
+        errs.append(f"{rid}: status {status} has no // btc-lean: comment and no gap reason")
     return errs
 
 
+def _write(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text)
+
+
+def _fixture(root: Path, rust: str) -> None:
+    _write(
+        root / RULES_REL,
+        "- id: INV-001\n  status: proven\n"
+        "- id: INV-002\n  status: obsolete\n"
+        "- id: INV-003\n  status: proven\n"
+        "- id: INV-004\n  status: proven\n",
+    )
+    _write(
+        root / GAPS_REL,
+        "# gaps\n\n## no site\n\n`INV-003`\n\nno production site. see INV-004.\n",
+    )
+    _write(
+        root / "src" / "a.rs",
+        rust,
+    )
+
+
 def self_test() -> None:
+    clean = (
+        "// btc-lean: INV-001 INV-004\n"
+        "fn prod() {}\n"
+        "// btc-lean: INV-001\n"
+        "fn test_it() {}\n"
+    )
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
-        (root / "docs").mkdir()
-        (root / "src").mkdir()
-        (root / "src" / "a.rs").write_text(
-            "// btc-lean: INV-001\n"
-            "fn prod() {}\n"
-            "// btc-lean: INV-001\n"
-            "fn test_it() {}\n"
-        )
-        (root / "docs" / "btc-lean-census.md").write_text(
-            "### INV-001\n"
-            "- summary: empty vin\n"
-            "- census: proven consensus\n"
-            "- production: `src/a.rs` line 2\n"
-            "- test: `src/a.rs` line 4\n"
-            "### INV-002\n"
-            "- summary: retired\n"
-            "- census: obsolete\n"
-            "- unmapped: retired in the vendored census\n"
-        )
+        _fixture(root, clean)
         errs = check(root)
         if errs:
             raise SystemExit("self-test clean tree failed:\n" + "\n".join(errs))
-        text = (root / "docs" / "btc-lean-census.md").read_text().replace("line 2", "line 3")
-        (root / "docs" / "btc-lean-census.md").write_text(text)
+
+        _fixture(root, "fn prod() {}\n")
         errs = check(root)
-        if not any("INV-001" in e for e in errs):
-            raise SystemExit("self-test did not notice a drifted line")
+        if not any("INV-001" in e and "no // btc-lean:" in e for e in errs):
+            raise SystemExit("self-test did not notice a missing comment:\n" + "\n".join(errs))
+
+        _fixture(root, "// btc-lean: INV-001 INV-003 INV-004\nfn prod() {}\n")
+        errs = check(root)
+        if not any("INV-003" in e and "gap row" in e for e in errs):
+            raise SystemExit("self-test did not notice a commented gap:\n" + "\n".join(errs))
+
+        _fixture(root, "// btc-lean: INV-001 INV-002 INV-004\nfn prod() {}\n")
+        errs = check(root)
+        if not any("INV-002" in e and "obsolete" in e for e in errs):
+            raise SystemExit("self-test did not notice an obsolete comment:\n" + "\n".join(errs))
+
+        _fixture(root, "// btc-lean: INV-001 INV-004 INV-999\nfn prod() {}\n")
+        errs = check(root)
+        if not any("INV-999" in e for e in errs):
+            raise SystemExit("self-test did not notice an unknown id:\n" + "\n".join(errs))
+
+        _fixture(root, "// btc-lean: INV-001 INV-004\n// still a comment\n")
+        errs = check(root)
+        if not any("not on the next code line" in e for e in errs):
+            raise SystemExit("self-test did not notice a dangling comment:\n" + "\n".join(errs))
+
+        _fixture(root, clean)
+        _write(root / GAPS_REL, "# gaps\n\n## no site\n\n`INV-003`\n")
+        errs = check(root)
+        if not any("empty reason" in e for e in errs):
+            raise SystemExit("self-test did not notice an empty reason:\n" + "\n".join(errs))
+
+        (root / RULES_REL).unlink()
+        errs = check(root)
+        if not any("not checked out" in e for e in errs):
+            raise SystemExit("self-test did not notice a missing submodule:\n" + "\n".join(errs))
+
+        _fixture(root, clean)
+        (root / GAPS_REL).unlink()
+        errs = check(root)
+        if not any(str(GAPS_REL) in e for e in errs):
+            raise SystemExit("self-test did not notice a missing gaps file:\n" + "\n".join(errs))
     print("btc-lean-census self-test ok")
 
 
@@ -166,7 +245,15 @@ def main() -> None:
         for e in errs[:80]:
             print(e, file=sys.stderr)
         raise SystemExit(1)
-    print(f"btc-lean census: comments match docs/btc-lean-census.md")
+    rules = load_rules(root / RULES_REL)
+    reasons = load_gaps(root / GAPS_REL)
+    commented, _ = comment_ids(root)
+    obsolete = sum(1 for s in rules.values() if s == "obsolete")
+    print(
+        "btc-lean census: "
+        f"{len(rules)} rules, {len(commented)} commented, "
+        f"{len(reasons)} gaps, {obsolete} obsolete"
+    )
 
 
 if __name__ == "__main__":
