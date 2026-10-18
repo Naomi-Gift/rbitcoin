@@ -570,27 +570,66 @@ struct PlanRow {
     tx_index: u32,
 }
 
+/// Newest in-batch create of this txid strictly before `spender`.
+///
+/// `repeats` holds every fk when the txid occurs more than once (below BIP34).
+/// Otherwise `latest` is the only copy. A copy created later in the wave is
+/// not a coin yet.
+pub(crate) fn batch_copy_before(
+    latest: Option<Fk>,
+    repeats: Option<&[Fk]>,
+    spender: Fk,
+) -> Option<Fk> {
+    match repeats {
+        Some(fks) => fks.iter().rev().find(|f| f.0 < spender.0).copied(),
+        None => latest.filter(|f| f.0 < spender.0),
+    }
+}
+
+/// Parents to resolve outside this batch. A txid this batch only creates after
+/// the spend is asked for when `outside` can have it (an earlier copy); otherwise
+/// it stays a later in-batch create, which structural rejects as not yet a coin.
 fn collect_plan_need_external(
     work: &[PlanRow],
     batch_map: &crate::TxidMap<Fk>,
+    batch_repeats: &crate::TxidMap<Vec<Fk>>,
     carried_need: Option<&[[u8; 32]]>,
+    outside: impl Fn(&[u8; 32]) -> bool,
 ) -> Vec<[u8; 32]> {
     let mut need_external: crate::TxidSet = crate::TxidSet::with_hasher(Default::default());
     if let Some(keys) = carried_need {
+        let mut created_here = false;
         for &prev in keys {
-            if prev == [0u8; 32] || batch_map.contains_key(&prev) {
+            if prev == [0u8; 32] {
+                continue;
+            }
+            if batch_map.contains_key(&prev) {
+                created_here = true;
                 continue;
             }
             need_external.insert(prev);
         }
-        return need_external.into_iter().collect();
+        // The wave asked about a txid this batch creates (below BIP34, or a
+        // spend before its create): only a per-input walk knows which copy.
+        if !created_here {
+            return need_external.into_iter().collect();
+        }
     }
     for row in work {
         for inp in row.ins.iter() {
-            if inp.is_coinbase {
+            if inp.is_coinbase || inp.prev_txid == [0u8; 32] {
                 continue;
             }
-            if batch_map.contains_key(&inp.prev_txid) || inp.prev_txid == [0u8; 32] {
+            if batch_copy_before(
+                batch_map.get(&inp.prev_txid).copied(),
+                batch_repeats.get(&inp.prev_txid).map(Vec::as_slice),
+                row.tx_fk,
+            )
+            .is_some()
+            {
+                continue;
+            }
+            if batch_map.contains_key(&inp.prev_txid) && !outside(&inp.prev_txid) {
                 continue;
             }
             need_external.insert(inp.prev_txid);
@@ -1069,8 +1108,8 @@ impl Query {
     ///
     /// Does not build [`TxApply`]. `body_est` uses packed encoded lengths.
     /// Same txid in one block is Corrupt. Same txid across headers in the wave
-    /// is BIP30 (91842/91880): both rows are planned; `batch_map` keeps the
-    /// later fk.
+    /// is BIP30 (91842/91880, or regtest below BIP34): both rows are planned,
+    /// and a spend uses the newest copy created before it.
     pub fn archive_plan_batch_from_wire(
         &self,
         need: &[WirePlanNeed<'_>],
@@ -1091,6 +1130,7 @@ impl Query {
 
         let t_assign = Instant::now();
         let mut batch_map: crate::TxidMap<Fk> = crate::TxidMap::default();
+        let mut batch_repeats: crate::TxidMap<Vec<Fk>> = crate::TxidMap::default();
         let mut work: Vec<PlanRow> = Vec::new();
         let mut per_header_ranges: Vec<(Fk, Fk, u32)> = Vec::with_capacity(need.len());
 
@@ -1113,7 +1153,12 @@ impl Query {
                 }
                 let tx_fk = Fk(next_tx);
                 next_tx += 1;
-                batch_map.insert(*txid, tx_fk);
+                if let Some(prev) = batch_map.insert(*txid, tx_fk) {
+                    batch_repeats
+                        .entry(*txid)
+                        .or_insert_with(|| vec![prev])
+                        .push(tx_fk);
+                }
                 let rec = tx_record_from_wire(tx, *txid);
                 let ins: Vec<PlanIn> = tx.input.iter().map(plan_in_from_txin).collect();
                 work.push(PlanRow {
@@ -1130,6 +1175,7 @@ impl Query {
         let plan = self.finish_archive_plan(
             work,
             batch_map,
+            batch_repeats,
             per_header_ranges,
             n_headers,
             assign_ns,
@@ -1145,6 +1191,7 @@ impl Query {
         &self,
         work: Vec<PlanRow>,
         batch_map: crate::TxidMap<Fk>,
+        batch_repeats: crate::TxidMap<Vec<Fk>>,
         per_header_ranges: Vec<(Fk, Fk, u32)>,
         n_headers: u64,
         assign_ns: u64,
@@ -1157,7 +1204,12 @@ impl Query {
         let index_tx = self.tx_index_enabled();
 
         let t_collect = Instant::now();
-        let need_vec = collect_plan_need_external(&work, &batch_map, carried_need);
+        // With a skeleton, a key the wave did not resolve is Corrupt, so ask
+        // only for what in-flight or the skeleton holds.
+        let need_vec =
+            collect_plan_need_external(&work, &batch_map, &batch_repeats, carried_need, |t| {
+                skeleton.is_none_or(|s| s.get(t).is_some()) || in_flight.get_create_fk(t).is_some()
+            });
         let collect_ns = t_collect.elapsed().as_nanos() as u64;
 
         let ext = crate::stamp_external_parents(
@@ -1209,11 +1261,19 @@ impl Query {
                     });
                     continue;
                 }
-                let create_fk = if let Some(&cfk) = batch_map.get(&inp.prev_txid) {
+                let create_fk = if let Some(cfk) = batch_copy_before(
+                    batch_map.get(&inp.prev_txid).copied(),
+                    batch_repeats.get(&inp.prev_txid).map(Vec::as_slice),
+                    tx_fk,
+                ) {
                     batch_stamp = batch_stamp.saturating_add(1);
                     cfk
                 } else if let Some(&cfk) = resolved.get(&inp.prev_txid) {
                     resolved_stamp = resolved_stamp.saturating_add(1);
+                    cfk
+                } else if let Some(&cfk) = batch_map.get(&inp.prev_txid) {
+                    // Only a later copy here: not a coin yet; structural rejects it.
+                    batch_stamp = batch_stamp.saturating_add(1);
                     cfk
                 } else {
                     return Err(StoreError::Corrupt(
@@ -2725,6 +2785,30 @@ mod tests {
             spend[0].create_fk,
             Fk(2),
             "same-wave spend binds newest BIP30 create"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A spend sitting between two copies of one txid must bind the copy that
+    /// already exists, not the copy this wave creates later.
+    #[test]
+    fn plan_batch_spend_between_repeated_txid_binds_the_earlier_copy() {
+        let (dir, q) = temp_query("bip30-between");
+        let txid = coinbase_apply(1).tx.txid;
+        let child = child_spend(txid, 0x99);
+        let need = vec![
+            (Fk(1), vec![coinbase_apply(1)]),
+            (Fk(2), vec![child]),
+            (Fk(3), vec![coinbase_apply(1)]),
+        ];
+        let plan = plan_applies(&q, &need, 1, &crate::InFlight::new(), None)
+            .expect("spend between two copies of one txid");
+        let spend = plan.edges.get(&2).expect("child");
+        assert_eq!(
+            spend[0].create_fk,
+            Fk(1),
+            "spend between two copies binds the earlier one, got {:?}",
+            spend[0].create_fk
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

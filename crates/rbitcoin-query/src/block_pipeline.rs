@@ -193,6 +193,7 @@ pub fn assemble_block_prevouts(
     let t_loop = Instant::now();
 
     let lock_time_cutoff = assemble_lock_time_cutoff(ctx, block, prev_mtp);
+    let txids_can_repeat = !ctx.params.bip34_active_at(ctx.height.0);
 
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
@@ -230,6 +231,9 @@ pub fn assemble_block_prevouts(
         let create_fk = spend_fk.unwrap_or(rbitcoin_primitives::Fk::NULL);
         if !create_fk.is_null() {
             pending_creates.insert(txid, create_fk);
+        }
+        if txids_can_repeat {
+            release_repeated_outputs(pending_spent, txid, tx.output.len());
         }
     }
 
@@ -1172,7 +1176,7 @@ fn reject_bip30_unspent_overwrite(
     query: &Query,
     block: &Block,
     ctx: &rbitcoin_consensus::ValidationContext<'_>,
-    pending_spent: &rbitcoin_consensus::OutPointSet,
+    pending_spent: &mut rbitcoin_consensus::OutPointSet,
     scratch: &mut StructuralScratch,
 ) -> Result<(), ConfirmError> {
     if ctx.params.is_bip30_repeat(ctx.height.0, block.block_hash())
@@ -1185,6 +1189,7 @@ fn reject_bip30_unspent_overwrite(
         .iter()
         .map(|tx| tx.compute_txid().to_byte_array())
         .collect();
+    let txids_can_repeat = !ctx.params.bip34_active_at(ctx.height.0);
     // An earlier block of this batch is not connected yet, so the store
     // lookup below cannot see its creates.
     for txid in &create_txids {
@@ -1200,7 +1205,7 @@ fn reject_bip30_unspent_overwrite(
         .store()
         .get_fk_by_txid_batch(&create_txids)
         .map_err(ConfirmError::from)?;
-    for (_txid, row) in hits {
+    for (txid, row) in hits {
         let Some((old_fk, _)) = row else {
             continue;
         };
@@ -1224,10 +1229,12 @@ fn reject_bip30_unspent_overwrite(
             if rbitcoin_consensus::policy::is_unspendable(&out.script) {
                 continue;
             }
-            let spent = query
-                .store()
-                .has_confirmed_strong_spender_create(old_fk, v, None)
-                .map_err(ConfirmError::from)?;
+            // A spend earlier in this batch is not connected yet either.
+            let spent = pending_spent.contains(&(txid, v))
+                || query
+                    .store()
+                    .has_confirmed_strong_spender_create(old_fk, v, None)
+                    .map_err(ConfirmError::from)?;
             if !spent {
                 unspent = true;
                 break;
@@ -1241,7 +1248,11 @@ fn reject_bip30_unspent_overwrite(
             )?;
         }
     }
+    if !txids_can_repeat {
+        return Ok(());
+    }
     for (txid, tx) in create_txids.into_iter().zip(&block.txdata) {
+        release_repeated_outputs(pending_spent, txid, tx.output.len());
         let lo = scratch.batch_vouts.len() as u32;
         scratch.batch_vouts.extend(
             (0u32..)
@@ -1255,6 +1266,19 @@ fn reject_bip30_unspent_overwrite(
         scratch.batch_creates.insert(txid, (ctx.height.0, lo, hi));
     }
     Ok(())
+}
+
+/// Below BIP34 a txid can repeat once its first copy is spent. Its outputs are
+/// coins again (Core overwrites them in the view), so this batch's earlier
+/// spends of the old copy no longer block spending the new one.
+fn release_repeated_outputs(
+    pending_spent: &mut rbitcoin_consensus::OutPointSet,
+    txid: [u8; 32],
+    n_out: usize,
+) {
+    for v in 0..n_out as u32 {
+        pending_spent.remove(&(txid, v));
+    }
 }
 
 fn bip34_ancestry_skips_bip30(

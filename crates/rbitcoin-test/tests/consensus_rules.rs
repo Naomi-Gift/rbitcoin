@@ -753,6 +753,151 @@ fn bip30_duplicate_coinbase_in_one_batch() {
     assert_eq!(q.tip_height(), Some(Height(1)));
 }
 
+/// Below BIP34 a coinbase can repeat once its first copy is spent. Core 31.1
+/// accepts `repeated_coinbase_chain(203, 48 BTC, true)`: h1 creates X, h102
+/// spends X:0, h103 creates X again, h203 spends the recreated X:0.
+type Chain = Vec<(Height, bitcoin::Block)>;
+
+fn repeated_coinbase_chain(
+    second_spend_height: u32,
+    second_spend_sat: u64,
+    recreate: bool,
+) -> Chain {
+    let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+    let g = regtest_genesis();
+    let mut run: Chain = Vec::new();
+    let mut x: Option<bitcoin::Transaction> = None;
+    for h in 1..=second_spend_height.max(103) {
+        let (prev, time) = run
+            .last()
+            .map(|(_, b)| (b.block_hash(), b.header.time + 600))
+            .unwrap_or((g.block_hash(), g.header.time + 600));
+        let spend = |sat: u64| {
+            let x = x.as_ref().expect("X before its spends");
+            spend_anyone_can_spend(x.compute_txid(), 0, Amount::from_sat(sat))
+        };
+        let txs = match h {
+            102 => vec![spend(49_0000_0000)],
+            h if h == second_spend_height => vec![spend(second_spend_sat)],
+            _ => vec![],
+        };
+        let mut b = rbitcoin_consensus::mine_regtest_paying(prev, time, h, op_true.clone(), txs);
+        match (h, &x) {
+            (1, _) => x = Some(b.txdata[0].clone()),
+            (103, Some(first)) if recreate => {
+                b.txdata[0] = first.clone();
+                b.header.merkle_root = b.compute_merkle_root().unwrap();
+                rbitcoin_consensus::grind_regtest_pow(&mut b.header);
+            }
+            _ => {}
+        }
+        run.push((Height(h), b));
+    }
+    run
+}
+
+const BATCH_CUTS: [&[usize]; 9] = [
+    &[101, 102, 103, 149, 202],
+    &[],
+    &[101],
+    &[102],
+    &[54],
+    &[102, 150],
+    &[103],
+    &[101, 103],
+    &[54, 103],
+];
+
+/// Connect `chain` split into confirm batches at `cuts`; the first error ends it.
+fn connect_in_batches(
+    chain: &[(Height, bitcoin::Block)],
+    cuts: &[usize],
+) -> Result<Option<Height>, String> {
+    let (_td, q, mut params) = regtest_q();
+    params.apply_test_activation_height("bip34", 1_000).unwrap();
+    connect_genesis(&q, &params);
+    let mut lo = 0usize;
+    for hi in cuts
+        .iter()
+        .copied()
+        .filter(|&c| c < chain.len())
+        .chain([chain.len()])
+    {
+        confirm_wire_run(&q, &params, Milestone::NONE, &chain[lo..hi])
+            .map_err(|e| format!("heights {}..={}: {e:?}", lo + 1, hi))?;
+        lo = hi;
+    }
+    Ok(q.tip_height())
+}
+
+/// The Core-valid chain above connects however IBD splits it into batches.
+#[test]
+fn repeated_coinbase_chain_connects_in_any_batch_split() {
+    let chain = repeated_coinbase_chain(203, 48_0000_0000, true);
+    for cuts in BATCH_CUTS {
+        assert_eq!(
+            connect_in_batches(&chain, cuts),
+            Ok(Some(Height(203))),
+            "cuts {cuts:?}"
+        );
+    }
+}
+
+/// What Core rejects around a repeated coinbase stays rejected in any split.
+#[test]
+fn repeated_coinbase_chain_rejects_what_core_rejects() {
+    let cases: [(&str, Chain, &[&str]); 3] = [
+        (
+            "h203 repeats h102's spend while its output is unspent",
+            repeated_coinbase_chain(203, 49_0000_0000, true),
+            &["BIP30"],
+        ),
+        (
+            "h203 spends X:0 again without a new X",
+            repeated_coinbase_chain(203, 48_0000_0000, false),
+            &[
+                "PrevoutSpent",
+                "double spend",
+                "MissingPrevout",
+                "missingorspent",
+            ],
+        ),
+        (
+            "h150 spends the new X before it matures",
+            repeated_coinbase_chain(150, 48_0000_0000, true),
+            &["immature"],
+        ),
+    ];
+    for (what, chain, want) in &cases {
+        for cuts in BATCH_CUTS {
+            let got = connect_in_batches(chain, cuts);
+            assert!(
+                matches!(&got, Err(e) if want.iter().any(|w| e.contains(w))),
+                "{what}, cuts {cuts:?}: got {got:?}, want one of {want:?}"
+            );
+        }
+    }
+}
+
+/// A failed batch archives every body before Class C. Retrying the valid
+/// prefix must bind through the archived stamp, not the fresh plan.
+#[test]
+fn repeated_coinbase_archived_retry_connects_the_valid_prefix() {
+    let chain = repeated_coinbase_chain(150, 48_0000_0000, true);
+    let (_td, q, mut params) = regtest_q();
+    params.apply_test_activation_height("bip34", 1_000).unwrap();
+    connect_genesis(&q, &params);
+    let err = confirm_wire_run(&q, &params, Milestone::NONE, &chain);
+    assert!(
+        matches!(err, Err(ConfirmError::Rules(ConsensusError::BadTx(s))) if s.contains("immature")),
+        "immature spend of the recreated coinbase: {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height::GENESIS));
+    confirm_wire_run(&q, &params, Milestone::NONE, &chain[..103])
+        .expect("archived retry of h1..=h103");
+    assert_eq!(q.tip_height(), Some(Height(103)));
+}
+
 // ─── Script flags (Core `GetBlockScriptFlags`) ──────────────────────────────
 
 /// Core sets WITNESS on every block, not from the segwit height. Below the
