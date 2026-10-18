@@ -1061,6 +1061,25 @@ fn repeated_coinbase_chain_rejects_what_core_rejects() {
     }
 }
 
+/// A failed batch archives every body before Class C. Retrying the valid
+/// prefix must bind through the archived stamp, not the fresh plan.
+#[test]
+fn repeated_coinbase_archived_retry_connects_the_valid_prefix() {
+    let chain = repeated_coinbase_chain(150, 48_0000_0000, true);
+    let (_td, q, mut params) = regtest_q();
+    params.apply_test_activation_height("bip34", 1_000).unwrap();
+    connect_genesis(&q, &params);
+    let err = confirm_wire_run(&q, &params, Milestone::NONE, &chain);
+    assert!(
+        matches!(err, Err(ConfirmError::Rules(ConsensusError::BadTx(s))) if s.contains("immature")),
+        "immature spend of the recreated coinbase: {err:?}"
+    );
+    assert_eq!(q.tip_height(), Some(Height::GENESIS));
+    confirm_wire_run(&q, &params, Milestone::NONE, &chain[..103])
+        .expect("archived retry of h1..=h103");
+    assert_eq!(q.tip_height(), Some(Height(103)));
+}
+
 // ─── Script flags (Core `GetBlockScriptFlags`) ──────────────────────────────
 
 /// Core sets WITNESS on every block, not from the segwit height. Below the

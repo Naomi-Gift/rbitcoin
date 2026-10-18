@@ -570,18 +570,19 @@ struct PlanRow {
     tx_index: u32,
 }
 
-/// The newest copy of `txid` this batch creates before `spender`. Below BIP34
-/// a txid can repeat once its first copy is spent; a spend uses the copy that
-/// exists at its height.
-fn batch_copy_before(
-    batch_map: &crate::TxidMap<Fk>,
-    batch_repeats: &crate::TxidMap<Vec<Fk>>,
-    txid: &[u8; 32],
+/// Newest in-batch create of this txid strictly before `spender`.
+///
+/// `repeats` holds every fk when the txid occurs more than once. Otherwise
+/// `latest` is the only copy. A copy created later in the wave is not a coin yet.
+/// The fresh plan and the archived stamp share this.
+pub(crate) fn batch_copy_before(
+    latest: Option<Fk>,
+    repeats: Option<&[Fk]>,
     spender: Fk,
 ) -> Option<Fk> {
-    match batch_repeats.get(txid) {
+    match repeats {
         Some(fks) => fks.iter().rev().find(|f| f.0 < spender.0).copied(),
-        None => batch_map.get(txid).copied().filter(|f| f.0 < spender.0),
+        None => latest.filter(|f| f.0 < spender.0),
     }
 }
 
@@ -619,7 +620,13 @@ fn collect_plan_need_external(
             if inp.is_coinbase || inp.prev_txid == [0u8; 32] {
                 continue;
             }
-            if batch_copy_before(batch_map, batch_repeats, &inp.prev_txid, row.tx_fk).is_some() {
+            if batch_copy_before(
+                batch_map.get(&inp.prev_txid).copied(),
+                batch_repeats.get(&inp.prev_txid).map(Vec::as_slice),
+                row.tx_fk,
+            )
+            .is_some()
+            {
                 continue;
             }
             if batch_map.contains_key(&inp.prev_txid) && !outside(&inp.prev_txid) {
@@ -1254,9 +1261,11 @@ impl Query {
                     });
                     continue;
                 }
-                let create_fk = if let Some(cfk) =
-                    batch_copy_before(&batch_map, &batch_repeats, &inp.prev_txid, tx_fk)
-                {
+                let create_fk = if let Some(cfk) = batch_copy_before(
+                    batch_map.get(&inp.prev_txid).copied(),
+                    batch_repeats.get(&inp.prev_txid).map(Vec::as_slice),
+                    tx_fk,
+                ) {
                     batch_stamp = batch_stamp.saturating_add(1);
                     cfk
                 } else if let Some(&cfk) = resolved.get(&inp.prev_txid) {
@@ -2776,6 +2785,30 @@ mod tests {
             spend[0].create_fk,
             Fk(2),
             "same-wave spend binds newest BIP30 create"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A spend sitting between two copies of one txid must bind the copy that
+    /// already exists, not the copy this wave creates later.
+    #[test]
+    fn plan_batch_spend_between_repeated_txid_binds_the_earlier_copy() {
+        let (dir, q) = temp_query("bip30-between");
+        let txid = coinbase_apply(1).tx.txid;
+        let child = child_spend(txid, 0x99);
+        let need = vec![
+            (Fk(1), vec![coinbase_apply(1)]),
+            (Fk(2), vec![child]),
+            (Fk(3), vec![coinbase_apply(1)]),
+        ];
+        let plan = plan_applies(&q, &need, 1, &crate::InFlight::new(), None)
+            .expect("spend between two copies of one txid");
+        let spend = plan.edges.get(&2).expect("child");
+        assert_eq!(
+            spend[0].create_fk,
+            Fk(1),
+            "spend between two copies binds the earlier one, got {:?}",
+            spend[0].create_fk
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -60,6 +60,7 @@ fn spend_edges_from_stamp(
     metas: &[BodyMeta],
     wire_blocks: &[Arc<Block>],
 ) -> (crate::SpendEdges, U64Map<Vec<u32>>) {
+    let copies = super::lookup::batch_copies_from_metas(metas);
     let mut spend_edges = crate::SpendEdges::default();
     let mut parent_vouts: U64Map<Vec<u32>> = U64Map::default();
     for (m, block) in metas.iter().zip(wire_blocks.iter()) {
@@ -67,6 +68,7 @@ fn spend_edges_from_stamp(
             let Some(sfk) = m.tx_fks.get(ti).and_then(|f| f.get()) else {
                 continue;
             };
+            let spender = rbitcoin_primitives::Fk(sfk);
             let mut edges = Vec::with_capacity(tx.input.len());
             for (vin, inp) in tx.input.iter().enumerate() {
                 let vin = vin as u32;
@@ -74,7 +76,7 @@ fn spend_edges_from_stamp(
                     edges.push(crate::SpendEdge {
                         prev_txid: [0u8; 32],
                         vout: u32::MAX,
-                        spend_fk: rbitcoin_primitives::Fk(sfk),
+                        spend_fk: spender,
                         create_fk: rbitcoin_primitives::Fk::NULL,
                         vin,
                     });
@@ -82,11 +84,29 @@ fn spend_edges_from_stamp(
                 }
                 let prev_txid = inp.previous_output.txid.to_byte_array();
                 let vout = inp.previous_output.vout;
-                if let Some(&pid) = parent_pin.resolved.get(&prev_txid) {
+                let repeats: Option<Vec<rbitcoin_primitives::Fk>> = copies
+                    .repeats
+                    .get(&prev_txid)
+                    .map(|ids| ids.iter().copied().map(rbitcoin_primitives::Fk).collect());
+                // Newest copy before this spend, else a connected copy, else
+                // the later in-batch copy (structural rejects that as not a coin).
+                let pid = crate::archive::batch_copy_before(
+                    copies
+                        .latest
+                        .get(&prev_txid)
+                        .copied()
+                        .map(rbitcoin_primitives::Fk),
+                    repeats.as_deref(),
+                    spender,
+                )
+                .map(|fk| fk.0)
+                .or_else(|| parent_pin.resolved.get(&prev_txid).copied())
+                .or_else(|| copies.latest.get(&prev_txid).copied());
+                if let Some(pid) = pid {
                     edges.push(crate::SpendEdge {
                         prev_txid,
                         vout,
-                        spend_fk: rbitcoin_primitives::Fk(sfk),
+                        spend_fk: spender,
                         create_fk: rbitcoin_primitives::Fk(pid),
                         vin,
                     });
@@ -96,7 +116,7 @@ fn spend_edges_from_stamp(
                 edges.push(crate::SpendEdge {
                     prev_txid,
                     vout,
-                    spend_fk: rbitcoin_primitives::Fk(sfk),
+                    spend_fk: spender,
                     create_fk: rbitcoin_primitives::Fk::NULL,
                     vin,
                 });

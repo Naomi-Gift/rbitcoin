@@ -166,6 +166,129 @@ pub fn confirm_wire_lookup_stamp(
     })
 }
 
+/// One fk per txid (`latest`), plus every fk when a txid is created again.
+pub(super) struct BatchCopies {
+    pub latest: crate::TxidMap<u64>,
+    pub repeats: crate::TxidMap<Vec<u64>>,
+}
+
+/// Record each meta's creates in order. A second fk for one txid starts `repeats`.
+pub(super) fn batch_copies_from_metas(metas: &[BodyMeta]) -> BatchCopies {
+    let mut latest: crate::TxidMap<u64> = crate::TxidMap::default();
+    let mut repeats: crate::TxidMap<Vec<u64>> = crate::TxidMap::default();
+    for m in metas {
+        for (tid, fk) in m.txids.iter().zip(m.tx_fks.iter()) {
+            let Some(id) = fk.get() else {
+                continue;
+            };
+            let Some(prev) = latest.insert(*tid, id) else {
+                continue;
+            };
+            repeats.entry(*tid).or_insert_with(|| vec![prev]).push(id);
+        }
+    }
+    BatchCopies { latest, repeats }
+}
+
+/// Carried keys this skeleton does not already hold as an in-batch create.
+/// Returns whether any carried key is also created in this batch.
+fn carried_keys_outside_batch(
+    latest: &crate::TxidMap<u64>,
+    carried_need: Option<&[[u8; 32]]>,
+    need_external: &mut crate::TxidMap<bool>,
+) -> bool {
+    let mut created_here = false;
+    for &prev in carried_need.unwrap_or(&[]) {
+        if prev == [0u8; 32] {
+            continue;
+        }
+        if latest.contains_key(&prev) {
+            created_here = true;
+            continue;
+        }
+        need_external.insert(prev, true);
+    }
+    created_here
+}
+
+fn spend_needs_external_parent(
+    copies: &BatchCopies,
+    prev: &[u8; 32],
+    spender: rbitcoin_primitives::Fk,
+    outside: bool,
+) -> bool {
+    let repeats: Option<Vec<rbitcoin_primitives::Fk>> = copies
+        .repeats
+        .get(prev)
+        .map(|ids| ids.iter().copied().map(rbitcoin_primitives::Fk).collect());
+    if crate::archive::batch_copy_before(
+        copies
+            .latest
+            .get(prev)
+            .copied()
+            .map(rbitcoin_primitives::Fk),
+        repeats.as_deref(),
+        spender,
+    )
+    .is_some()
+    {
+        return false;
+    }
+    if copies.latest.contains_key(prev) && !outside {
+        return false;
+    }
+    true
+}
+
+/// Wire spends with no earlier in-batch copy. `true` means the input spends it.
+fn note_spends_without_earlier_copy(
+    metas: &[BodyMeta],
+    wire_blocks: &[Arc<Block>],
+    copies: &BatchCopies,
+    outside: impl Fn(&[u8; 32]) -> bool,
+    need_external: &mut crate::TxidMap<bool>,
+) {
+    for (m, block) in metas.iter().zip(wire_blocks.iter()) {
+        for (ti, tx) in block.txdata.iter().enumerate() {
+            let Some(sfk) = m.tx_fks.get(ti).and_then(|f| f.get()) else {
+                continue;
+            };
+            let spender = rbitcoin_primitives::Fk(sfk);
+            for inp in &tx.input {
+                if inp.previous_output.is_null() {
+                    continue;
+                }
+                let prev = inp.previous_output.txid.to_byte_array();
+                if prev == [0u8; 32]
+                    || !spend_needs_external_parent(copies, &prev, spender, outside(&prev))
+                {
+                    continue;
+                }
+                need_external.insert(prev, true);
+            }
+        }
+    }
+}
+
+fn stamp_batch_idents(stamp: &mut ParentPinStamp, copies: &BatchCopies) {
+    for (tid, id) in &copies.latest {
+        stamp
+            .idents
+            .entry(*id)
+            .or_insert_with(|| crate::ParentIdent::new(*tid))
+            .txid = *tid;
+    }
+    for (tid, ids) in &copies.repeats {
+        for id in ids {
+            stamp
+                .idents
+                .entry(*id)
+                .or_insert_with(|| crate::ParentIdent::new(*tid))
+                .txid = *tid;
+        }
+    }
+}
+
 /// plan=None rehydrate: stamp external parent create_fk + body_range + txid
 /// via the shared query helper so load never probes those tables.
 ///
@@ -180,48 +303,26 @@ pub(super) fn stamp_parent_pin_archived(
     skeleton: Option<&crate::BatchParentIds>,
     carried_need: Option<&[[u8; 32]]>,
 ) -> Result<ParentPinStamp, ConfirmError> {
-    let mut same_batch: crate::TxidMap<u64> = crate::TxidMap::default();
-    for m in metas {
-        for (tid, fk) in m.txids.iter().zip(m.tx_fks.iter()) {
-            if let Some(id) = fk.get() {
-                same_batch.insert(*tid, id);
-            }
-        }
-    }
+    let copies = batch_copies_from_metas(metas);
+    let outside = |prev: &[u8; 32]| {
+        skeleton.is_none_or(|s| s.get(prev).is_some())
+            || in_flight.is_some_and(|ifo| ifo.get_create_fk(prev).is_some())
+    };
     // Value: a wire input spends this txid (BIP30 probes are `false`).
+    // Empty carried_need must not walk wire inputs. A carried key that this
+    // batch also creates needs the walk: the spend may be before that create.
     let mut need_external: crate::TxidMap<bool> = crate::TxidMap::default();
-    if skeleton.is_some() {
-        for &prev in carried_need.unwrap_or(&[]) {
-            if same_batch.contains_key(&prev) {
-                continue;
-            }
-            if prev != [0u8; 32] {
-                need_external.insert(prev, true);
-            }
-        }
-    } else {
-        for block in wire_blocks {
-            for tx in &block.txdata {
-                for inp in &tx.input {
-                    if inp.previous_output.is_null() {
-                        continue;
-                    }
-                    let prev = inp.previous_output.txid.to_byte_array();
-                    if same_batch.contains_key(&prev) {
-                        continue;
-                    }
-                    if prev != [0u8; 32] {
-                        need_external.insert(prev, true);
-                    }
-                }
-            }
-        }
+    let walk_inputs = skeleton.is_none()
+        || carried_keys_outside_batch(&copies.latest, carried_need, &mut need_external);
+    if walk_inputs {
+        note_spends_without_earlier_copy(metas, wire_blocks, &copies, outside, &mut need_external);
     }
     for m in metas {
-        if !params.bip34_active_at(m.height.0) {
-            for p in m.pres.iter() {
-                need_external.entry(p.txid).or_insert(false);
-            }
+        if params.bip34_active_at(m.height.0) {
+            continue;
+        }
+        for p in m.pres.iter() {
+            need_external.entry(p.txid).or_insert(false);
         }
     }
     let empty = crate::InFlight::new();
@@ -242,26 +343,19 @@ pub(super) fn stamp_parent_pin_archived(
         rbitcoin_consensus::block::reject_unresolved_spend(true)?;
     }
     let mut stamp = ParentPinStamp {
-        resolved: crate::TxidMap::with_capacity_and_hasher(
-            ext.resolved.len().saturating_add(same_batch.len()),
-            Default::default(),
-        ),
+        // External parents only. Same-batch copies live in `idents`; edges
+        // pick the copy that exists at the spend.
+        resolved: crate::TxidMap::with_capacity_and_hasher(ext.resolved.len(), Default::default()),
         idents: ext.idents,
         parent_vouts: U64Map::default(),
     };
     for (tid, fk) in ext.resolved {
-        if let Some(id) = fk.get() {
-            stamp.resolved.insert(tid, id);
-        }
-    }
-    for (tid, id) in same_batch {
+        let Some(id) = fk.get() else {
+            continue;
+        };
         stamp.resolved.insert(tid, id);
-        stamp
-            .idents
-            .entry(id)
-            .or_insert_with(|| crate::ParentIdent::new(tid))
-            .txid = tid;
     }
+    stamp_batch_idents(&mut stamp, &copies);
     // Identities are stamped from wire prev_txid at insert time — never soft-fill
     // from txid.body here (that would be a dual path after lookup promised identity).
     if skeleton.is_none() {
