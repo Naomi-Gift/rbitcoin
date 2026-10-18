@@ -1,6 +1,6 @@
 # Known btc-lean gaps
 
-Proven rows in the `third_party/btc-lean` census (`spec/db/rules.yaml` at `4f5c4f858fb9ca0743042644453cfa92d30dd271`) that have no `// btc-lean:` comment. `status: obsolete` is not listed: the vendored status is the reason, and those ids must not be commented. `scripts/btc-lean-census.sh` fails when a proven id is in neither a comment nor this file, or when an id here also has a comment. A gap is not a claim about a Lean theorem.
+Proven rows in the `third_party/btc-lean` census (`spec/db/rules.yaml` at `c6e8f5e91f30b1c690b4d0320404517120a8b52d`) that have no `// btc-lean:` comment. `status: obsolete` is not listed: the vendored status is the reason, and those ids must not be commented. `scripts/btc-lean-census.sh` fails when a proven id is in neither a comment nor this file, or when an id here also has a comment. A gap is not a claim about a Lean theorem.
 
 ## MAX_MONEY does not cap an input sum or the block fee
 
