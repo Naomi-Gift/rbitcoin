@@ -2,7 +2,7 @@
   "new_base": "cdfdaa0ef2b1fea88a1580adce5e42b6213aebac",
   "new_skip": 3646,
   "old_index": 5548,
-  "new_cap_used": true,
-  "run_id": "39099728067",
+  "new_cap_used": false,
+  "run_id": "39204318317",
   "old_name": "crates/rbitcoin-net/src/peer.rs:2994:19: replace == with != in on_sendcmpct"
 }
