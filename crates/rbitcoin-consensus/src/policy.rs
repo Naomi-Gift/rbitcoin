@@ -115,7 +115,7 @@ pub fn check_libre_annex(tx: &Transaction) -> PolicyResult {
 }
 
 /// Core `CScript::IsUnspendable`: leading `OP_RETURN`, or over `MAX_SCRIPT_SIZE`.
-// btc-lean: BLK-093 BLK-094 INV-112 TXV-066 TXV-067
+// btc-lean: BLK-093 BLK-094 INV-112 SCR-070 TXV-066 TXV-067
 pub fn is_unspendable(script: &[u8]) -> bool {
     script.first() == Some(&0x6a) || script.len() > 10_000
 }

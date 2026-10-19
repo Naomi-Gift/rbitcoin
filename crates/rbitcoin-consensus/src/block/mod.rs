@@ -291,7 +291,7 @@ pub fn validate_block_structure_with_pres(
 }
 
 /// Witness commitment before weight. Padding is not the block hash's fault.
-// btc-lean: BLK-015 BLK-016 BLK-017 BLK-018 BLK-019 BLK-020 SWT-029 SWT-030 SWT-031 SWT-032 SWT-033
+// btc-lean: BLK-015 BLK-016 BLK-018 BLK-019 BLK-020 SWT-029 SWT-031 SWT-032 SWT-033
 // btc-lean: SWT-034 SWT-035
 fn reject_witness_malleation(
     block: &Block,
@@ -584,6 +584,7 @@ fn check_witness_commitment_with_wtxids(
     }
     let mut buf = [0u8; 64];
     buf[0..32].copy_from_slice(&witness_root);
+    // btc-lean: BLK-017 SWT-030
     buf[32..64].copy_from_slice(reserved);
     let hash = sha256d::Hash::hash(&buf);
     if hash.to_byte_array() != committed {

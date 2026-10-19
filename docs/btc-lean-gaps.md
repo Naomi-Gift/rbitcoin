@@ -1,6 +1,6 @@
 # Known btc-lean gaps
 
-Proven rows in the `third_party/btc-lean` census (`spec/db/rules.yaml` at `c6e8f5e91f30b1c690b4d0320404517120a8b52d`) that have no `// btc-lean:` comment. `status: obsolete` is not listed: the vendored status is the reason, and those ids must not be commented. `scripts/btc-lean-census.sh` fails when a proven id is in neither a comment nor this file, or when an id here also has a comment. A gap is not a claim about a Lean theorem.
+Proven rows in the `third_party/btc-lean` census (`spec/db/rules.yaml` at `d390f7932e64a134aec3cca1614bed3276539f2d`) that have no `// btc-lean:` comment. `status: obsolete` is not listed: the vendored status is the reason, and those ids must not be commented. `scripts/btc-lean-census.sh` fails when a proven id is in neither a comment nor this file, or when an id here also has a comment. A gap is not a claim about a Lean theorem.
 
 ## MAX_MONEY does not cap an input sum or the block fee
 
@@ -120,7 +120,7 @@ Core's script execution cache keyed by (wtxid, flags) is an equivalence lemma ab
 
 `TXV-069`
 
-Value arithmetic uses i64 and rejects overflow in fee_from_values / add_value_in (crates/rbitcoin-consensus/src/block/facts.rs), but a summed input value is not rejected for exceeding MAX_MONEY before that overflow check. This row is Core's incremental MoneyRange on every amount fold, which is only partly present, so the row is left unmapped rather than cited as done.
+The row is Core's MoneyRange (0 ≤ x ≤ MAX_MONEY) on each input value, the running input sum, and the fee. Outputs are capped separately. fee_from_values and add_value_in (crates/rbitcoin-consensus/src/block/facts.rs) reject i64 overflow and value-in below value-out, and they do not apply that MoneyRange. The row stays unmapped.
 
 ## wtxid mempool identity is relay
 

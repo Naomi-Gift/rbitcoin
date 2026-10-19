@@ -606,6 +606,7 @@ pub(crate) mod crypto {
     }
 
     /// SHA256 of `compact_size(annex) || annex` (BIP341, annex includes `0x50`).
+    // btc-lean: TPR-006
     pub fn annex_hash(annex: &[u8]) -> [u8; 32] {
         use bitcoin::consensus::encode::VarInt;
         use bitcoin::consensus::Encodable;

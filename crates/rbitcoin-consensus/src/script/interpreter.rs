@@ -285,6 +285,7 @@ impl<'a> EvalContext<'a> {
             minimal_if: false,
             witness_pubkeytype: false,
             const_scriptcode: false,
+            // btc-lean: SCR-167
             codeseparator_pos: Cell::new(0xFFFF_FFFF),
             codeseparator_script_off: Cell::new(None),
             cache: RefCell::new(None),
@@ -498,6 +499,7 @@ pub(crate) fn eval_script(
     // Prefer instruction_indices so OP_CODESEPARATOR can set Base/WitnessV0
     // scriptCode byte offsets (BIP143 / Core pbegincodehash).
     for item in script.instruction_indices() {
+        // btc-lean: SCR-045
         let (byte_index, ins) = item.map_err(|_| ConsensusError::Script("script parse".into()))?;
         let this_pos = opcode_pos;
         opcode_pos = opcode_pos.saturating_add(1);
@@ -594,7 +596,7 @@ pub(crate) fn eval_script(
                     )));
                 }
                 // CONST_SCRIPTCODE: OP_CODESEPARATOR rejected in Base even unexecuted.
-                // btc-lean: SCR-100 SCR-112
+                // btc-lean: SCR-100
                 if code == 0xab && ctx.const_scriptcode && ctx.sig_version == SigVersion::Base {
                     return Err(ConsensusError::Script("OP_CODESEPARATOR".into()));
                 }
@@ -857,7 +859,7 @@ pub(crate) fn eval_script(
                     0xab => {
                         // Tapscript: instruction index. Base/v0: scriptCode after this opcode.
                         // CONST_SCRIPTCODE already returned above, including unexecuted.
-                        // btc-lean: INV-057 SCR-096 SCR-097
+                        // btc-lean: INV-057 SCR-096 SCR-097 SCR-167
                         ctx.codeseparator_pos.set(this_pos);
                         ctx.codeseparator_script_off
                             .set(Some(byte_index.saturating_add(1)));
@@ -941,12 +943,13 @@ pub(crate) fn eval_script(
                             return Err(ConsensusError::Script("CSV".into()));
                         }
                     }
+                    // btc-lean: SCR-071 SCR-072
                     0xb0 | 0xb3 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xb9 => {}
                     _ => {
                         // OP_SUCCESS returned before this loop. Disabled opcodes
                         // already returned above.
                         return Err(ConsensusError::Script(format!(
-                            // btc-lean: SCR-045 SCR-066 SCR-069 SCR-070 SCR-071 SCR-072 SCR-174
+                            // btc-lean: SCR-066 SCR-069 SCR-174
                             "unknown opcode 0x{code:02x}"
                         )));
                     }
@@ -1062,7 +1065,7 @@ fn op_checksig_tapscript(
     Ok(())
 }
 
-// btc-lean: SCR-040
+// btc-lean: SCR-040 TPR-022 TPR-071
 fn tapscript_init_weight(tx: &Transaction, input_index: usize, sig_version: SigVersion) -> i64 {
     if sig_version != SigVersion::TapScript {
         return 0;
@@ -1088,6 +1091,7 @@ fn tapscript_sig_result(
             return Err(ConsensusError::Script("tapscript validation weight".into()));
         }
     }
+    // btc-lean: INV-054
     if pubkey.is_empty() {
         return Err(ConsensusError::Script("tapscript empty pubkey".into()));
     }
@@ -1398,6 +1402,7 @@ fn ecdsa_sig_matches(
     let Ok((ecdsa_sig, sighash_ty)) = crypto::parse_der_sig(sig, false) else {
         return Ok(false);
     };
+    // btc-lean: SCR-112
     let Ok(pk) = crypto::parse_pubkey(pubkey) else {
         return Ok(false);
     };
@@ -1430,7 +1435,7 @@ fn checksig_legacy_encodings(
     Ok(())
 }
 
-// btc-lean: INV-050 INV-051 INV-052 INV-053 INV-055 SCR-041 SCR-042 SCR-102 SCR-103 SCR-104 SCR-106
+// btc-lean: INV-050 INV-051 INV-052 INV-053 SCR-041 SCR-042 SCR-102 SCR-103 SCR-104 SCR-106
 // btc-lean: SCR-107 SCR-108 SCR-110 SCR-179 SGN-111 SWT-058 SWT-059 SWT-060 SWT-061
 fn check_signature_encoding(sig: &[u8], ctx: &EvalContext<'_>) -> Result<(), ConsensusError> {
     let need_der = ctx.bip66_active || ctx.low_s || ctx.strictenc;
@@ -1452,7 +1457,7 @@ fn check_signature_encoding(sig: &[u8], ctx: &EvalContext<'_>) -> Result<(), Con
 }
 
 /// BIP340 Schnorr verify for a 32-byte x-only pubkey in tapscript (leaf sighash).
-// btc-lean: INV-054 TPR-057 TPR-058
+// btc-lean: INV-055 TPR-057 TPR-058
 fn checksig_schnorr(
     sig: &[u8],
     pubkey: &[u8],

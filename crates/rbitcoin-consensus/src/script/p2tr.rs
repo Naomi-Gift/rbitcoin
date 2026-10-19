@@ -18,7 +18,7 @@ use super::interpreter::{self, EvalContext, SigVersion};
 use crate::block::ScriptCheckJob;
 use crate::error::ConsensusError;
 
-// btc-lean: SCR-142 SCR-143 SCR-149 SCR-150 SCR-151 SCR-157 SCR-158 SCR-160 SCR-163 SCR-167 SCR-168
+// btc-lean: SCR-142 SCR-143 SCR-149 SCR-150 SCR-151 SCR-157 SCR-158 SCR-160 SCR-163 SCR-168
 // btc-lean: TPR-001 TPR-002 TPR-003 TPR-004 TPR-012 TPR-013 TPR-016 TPR-017 TPR-034 TPR-035 TPR-036
 // btc-lean: TPR-037 TPR-038 TPR-040 TPR-041 TPR-047 TPR-048 TPR-049 TPR-050 TPR-052 TPR-053 TPR-054
 pub(crate) fn verify(
@@ -46,7 +46,7 @@ pub(crate) fn verify(
 }
 
 /// BIP341 annex: last witness item, only when `len ≥ 2` and first byte is `0x50`.
-// btc-lean: INV-075 TPR-005 TPR-006 TPR-007 TPR-022 TPR-033 TPR-039 TPR-071
+// btc-lean: INV-075 TPR-005 TPR-033 TPR-039
 fn bip341_annex(witness: &Witness) -> Option<&[u8]> {
     if witness.len() < 2 {
         return None;
@@ -107,6 +107,7 @@ fn verify_key_path(
         &single,
     )?;
     let msg = Message::from_digest(sighash);
+    // btc-lean: TPR-007
     crypto::SECP.with(|secp| {
         secp.verify_schnorr(&sig, &msg, &xonly)
             .map_err(|_| ConsensusError::Script("p2tr schnorr".into()))

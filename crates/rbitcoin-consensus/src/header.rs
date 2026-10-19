@@ -54,7 +54,7 @@ pub fn check_header(
     }
     let mtp = median_time_past_times(mtp_times)
         .map_err(|_| ConsensusError::BadHeader("empty median time"))?;
-    // btc-lean: BLK-056 BLK-057 INV-099
+    // btc-lean: BLK-057 INV-099
     if header.time <= mtp {
         return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
     }
