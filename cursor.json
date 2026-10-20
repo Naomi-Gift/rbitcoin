@@ -1,8 +1,8 @@
 {
   "new_base": "cdfdaa0ef2b1fea88a1580adce5e42b6213aebac",
   "new_skip": 4939,
-  "old_index": 6789,
+  "old_index": 9056,
   "new_cap_used": true,
   "run_id": "39374682351",
-  "old_name": "crates/rbitcoin-net/src/tx_relay.rs:1528:36: replace >= with < in MempoolHub::any_tx_inv_due"
+  "old_name": "crates/rbitcoin-node/src/config.rs:1272:13: delete match arm \"persist_mempool\" in NodeConfig::apply_kv"
 }
