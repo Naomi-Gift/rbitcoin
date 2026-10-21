@@ -7,7 +7,9 @@
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+#[cfg(debug_assertions)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
