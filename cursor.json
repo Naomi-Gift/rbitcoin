@@ -1,8 +1,8 @@
 {
   "new_base": "cdfdaa0ef2b1fea88a1580adce5e42b6213aebac",
-  "new_skip": 4939,
-  "old_index": 9056,
+  "new_skip": 5254,
+  "old_index": 9392,
   "new_cap_used": true,
-  "run_id": "39374682351",
-  "old_name": "crates/rbitcoin-node/src/config.rs:1272:13: delete match arm \"persist_mempool\" in NodeConfig::apply_kv"
+  "run_id": "39549148028",
+  "old_name": "crates/rbitcoin-query/src/archive.rs:1157:35: replace != with == in Query::archive_plan_batch_from_wire"
 }
