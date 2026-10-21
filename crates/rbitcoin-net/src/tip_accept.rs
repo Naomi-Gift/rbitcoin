@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
@@ -17,6 +17,10 @@ pub const TIP_ACCEPT_THREAD_NAME: &str = "tip-accept";
 
 #[doc(hidden)]
 pub const QUEUE_CAP: usize = 8;
+
+/// Times a full async enqueue yield-looped. A parked wait stays at zero.
+#[doc(hidden)]
+pub static FULL_QUEUE_SPINS: AtomicUsize = AtomicUsize::new(0);
 
 #[doc(hidden)]
 pub type Job = Box<dyn FnOnce() + Send>;
@@ -116,6 +120,10 @@ pub fn sender() -> SyncSender<Job> {
             .name(TIP_ACCEPT_THREAD_NAME.into())
             .spawn(move || {
                 while let Ok(job) = rx.recv() {
+                    // The recv freed a queue slot. Wake one async sender that
+                    // found the channel full. A permit with no waiter is kept
+                    // for the next `Notified::enable`.
+                    slot_freed().notify_one();
                     let _ = panic::catch_unwind(AssertUnwindSafe(job));
                 }
             })
@@ -127,6 +135,11 @@ pub fn sender() -> SyncSender<Job> {
 
 pub fn on_tip_accept_thread() -> bool {
     thread::current().name() == Some(TIP_ACCEPT_THREAD_NAME)
+}
+
+fn slot_freed() -> &'static tokio::sync::Notify {
+    static N: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    N.get_or_init(tokio::sync::Notify::new)
 }
 
 #[doc(hidden)]
@@ -210,7 +223,13 @@ pub async fn run_on_tip_accept_async<R: Send + 'static>(
             Ok(()) => break,
             Err(TrySendError::Full(j)) => {
                 job = j;
-                tokio::task::yield_now().await;
+                let notified = slot_freed().notified();
+                tokio::pin!(notified);
+                // Register before the next try. `enable` consumes a permit
+                // that arrived after the failed send, so that wakeup is not lost.
+                if !notified.as_mut().enable() {
+                    notified.await;
+                }
             }
             Err(TrySendError::Disconnected(_)) => panic!("tip-accept thread"),
         }

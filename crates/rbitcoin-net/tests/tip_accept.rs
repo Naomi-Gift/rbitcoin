@@ -172,6 +172,73 @@ impl Drop for ReleaseOnDrop {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn full_lane_parks_instead_of_spinning() {
+    use std::sync::mpsc;
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    let (holder_tx, holder_rx) = mpsc::sync_channel(1);
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let _wake = ReleaseOnDrop(Arc::clone(&release));
+    let rel = Arc::clone(&release);
+    let holder = thread::spawn(move || {
+        run_on_tip_accept(move || {
+            holder_tx.send(()).ok();
+            let (lock, cv) = &*rel;
+            let mut g = lock.lock().unwrap();
+            while !*g {
+                g = cv.wait(g).unwrap();
+            }
+        });
+    });
+    holder_rx.recv().expect("holder running");
+
+    let (filled_tx, filled_rx) = mpsc::sync_channel(QUEUE_CAP);
+    let filler = thread::spawn(move || {
+        for _ in 0..QUEUE_CAP {
+            let (tx, rx) = mpsc::sync_channel::<()>(1);
+            sender()
+                .send(Box::new(move || {
+                    let _ = rx.recv();
+                }))
+                .expect("queue the filler");
+            filled_tx.send(tx).expect("hand the release");
+        }
+    });
+    filler.join().expect("filler queued");
+    let mut releases = Vec::with_capacity(QUEUE_CAP);
+    for _ in 0..QUEUE_CAP {
+        releases.push(filled_rx.recv().expect("filler release"));
+    }
+
+    FULL_QUEUE_SPINS.store(0, std::sync::atomic::Ordering::Relaxed);
+    let ninth = tokio::spawn(async { run_on_tip_accept_async(|| 9u8).await });
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    let spins = FULL_QUEUE_SPINS.load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        spins, 0,
+        "a full tip-accept queue must park the sender, not yield-spin"
+    );
+    assert!(!ninth.is_finished(), "the ninth job must still be waiting");
+
+    {
+        let (lock, cv) = &*release;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+    for tx in releases {
+        tx.send(()).ok();
+    }
+    let got = tokio::time::timeout(Duration::from_secs(2), ninth)
+        .await
+        .expect("ninth job parked forever")
+        .expect("ninth");
+    assert_eq!(got, 9);
+    holder.join().expect("holder");
+    wait_idle();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owned_job_finishes_after_waiter_abort() {
     use std::sync::atomic::{AtomicU8, Ordering};
     use std::sync::mpsc;
