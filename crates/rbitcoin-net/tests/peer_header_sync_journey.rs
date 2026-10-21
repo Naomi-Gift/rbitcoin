@@ -616,6 +616,7 @@ fn ctrl_headers_are_applied_while_the_header_thread_has_room() {
         Arc::clone(&hub),
         rx,
         empty_header_fk_bus(),
+        rbitcoin_store::HeaderThreadProbe::new(),
     );
     let gen = hub.tip_hash().unwrap();
     let hdr = mine(gen, 7);

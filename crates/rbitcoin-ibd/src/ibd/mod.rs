@@ -108,10 +108,39 @@ use rbitcoin_net::error::NetError;
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
+
+/// Coordinator hold of `shared`. The flag drops with the guard.
+struct HeldShared<'a> {
+    guard: MutexGuard<'a, state::IbdWorkState>,
+    _coord: rbitcoin_store::CoordSharedLock,
+}
+
+impl<'a> HeldShared<'a> {
+    fn lock(shared: &'a std::sync::Mutex<state::IbdWorkState>) -> Self {
+        let guard = shared.lock().unwrap_or_else(|err| err.into_inner());
+        Self {
+            guard,
+            _coord: rbitcoin_store::CoordSharedLock::enter(),
+        }
+    }
+}
+
+impl std::ops::Deref for HeldShared<'_> {
+    type Target = state::IbdWorkState;
+    fn deref(&self) -> &state::IbdWorkState {
+        &self.guard
+    }
+}
+
+impl std::ops::DerefMut for HeldShared<'_> {
+    fn deref_mut(&mut self) -> &mut state::IbdWorkState {
+        &mut self.guard
+    }
+}
 
 /// Default max **concurrent** unique block downloads (in-flight getdata).
 ///
@@ -554,8 +583,15 @@ pub async fn ibd_cancellable(
     update_confirm_lag(&confirm_lag, hub.tip_height(), st.max_ready_height);
 
     let shared = Arc::new(std::sync::Mutex::new(st));
-    let header_thread =
-        spawn_header_thread(Arc::clone(&shared), Arc::clone(&hub), header_rx, header_fks);
+    let header_probe = rbitcoin_store::HeaderThreadProbe::arm();
+    rbitcoin_query::reset_header_lookups_under_coord_lock();
+    let header_thread = spawn_header_thread(
+        Arc::clone(&shared),
+        Arc::clone(&hub),
+        header_rx,
+        header_fks,
+        header_probe,
+    );
     hub.query.publish_progress_snapshots();
     let _ = header_tx.try_send(HeaderCmd::Reseed);
     let _ = header_tx.try_send(HeaderCmd::Ask);
@@ -585,7 +621,7 @@ pub async fn ibd_cancellable(
         }
 
         let pending_redial = {
-            let mut st_guard = shared.lock().unwrap_or_else(|err| err.into_inner());
+            let mut st_guard = HeldShared::lock(&shared);
             let st = &mut *st_guard;
             let tip_before_confirm = hub.tip_height();
             apply_confirm_events(
@@ -817,7 +853,7 @@ pub async fn ibd_cancellable(
         if let Some(h) = pending_redial {
             match h.await {
                 Ok(result) => {
-                    let mut st_guard = shared.lock().unwrap_or_else(|err| err.into_inner());
+                    let mut st_guard = HeldShared::lock(&shared);
                     let st = &mut *st_guard;
                     apply_dial_result(
                         peer_sess.book_mut(),
@@ -874,7 +910,7 @@ pub async fn ibd_cancellable(
         // When *all* peers are dead (network blip), do not wait for the 15s
         // interval — redial immediately so we never race the exit check.
         {
-            let mut st_guard = shared.lock().unwrap_or_else(|err| err.into_inner());
+            let mut st_guard = HeldShared::lock(&shared);
             let st = &mut *st_guard;
             let alive_n = st.slots.iter().filter(|s| s.alive).count();
             let target = cfg.target_peers.max(1);
@@ -1083,7 +1119,7 @@ pub async fn ibd_cancellable(
                     break;
                 }
                 let Some(ev) = peer_ev else { break };
-                let mut st_guard = shared.lock().unwrap_or_else(|err| err.into_inner());
+                let mut st_guard = HeldShared::lock(&shared);
                 let st = &mut *st_guard;
                 apply_peer_event(
                     st,
@@ -1101,7 +1137,7 @@ pub async fn ibd_cancellable(
                     break;
                 }
                 let Some(ev) = peer_ev else { break };
-                let mut st_guard = shared.lock().unwrap_or_else(|err| err.into_inner());
+                let mut st_guard = HeldShared::lock(&shared);
                 let st = &mut *st_guard;
                 apply_peer_event(
                     st,
@@ -1118,7 +1154,7 @@ pub async fn ibd_cancellable(
                     warn!("ibd: cancel requested — stopping IBD");
                     break;
                 }
-                let mut st_guard = shared.lock().unwrap_or_else(|err| err.into_inner());
+                let mut st_guard = HeldShared::lock(&shared);
                 let st = &mut *st_guard;
                 offer_confirm_ready(
                     &confirm_feed,
@@ -1180,7 +1216,7 @@ pub async fn ibd_cancellable(
     let _ = status_thread.join();
     drop(header_tx);
     {
-        let mut st = shared.lock().unwrap_or_else(|err| err.into_inner());
+        let mut st = HeldShared::lock(&shared);
         st.header_cmd = None;
         disconnect_all_peers(&mut st);
     }

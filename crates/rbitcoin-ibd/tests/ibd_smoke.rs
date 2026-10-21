@@ -292,3 +292,50 @@ async fn ibd_dials_a_second_wave_when_the_first_reaches_no_one() {
     let _ = std::fs::remove_dir_all(&seed_dir);
     let _ = std::fs::remove_dir_all(&peer_dir);
 }
+
+/// The coordinator task does no header lookup and no store read while it holds
+/// `shared`, across a seeded header batch and the getdata that connects it.
+/// The header thread still reads the store on its own.
+#[tokio::test(flavor = "current_thread")]
+async fn coord_shared_lock_skips_header_and_store_io() {
+    let seed_dir = tmp_dir("seed-coord-lock");
+    let peer_dir = tmp_dir("peer-coord-lock");
+    let seed = start_node(&seed_dir).await;
+    seed_chain(&seed, 2);
+    let peer = start_node(&peer_dir).await;
+    peer.hub.ensure_genesis().unwrap();
+    let mut cfg = IbdConfig::for_test();
+    cfg.target_peers = 1;
+    let finished = tokio::time::timeout(
+        Duration::from_secs(20),
+        rbitcoin_ibd::sync_cancellable(
+            &peer,
+            &[rbitcoin_net::NetAddr::Ip(seed.local_addr)],
+            cfg,
+            None,
+        ),
+    )
+    .await;
+    assert!(finished.is_ok(), "seeded catch-up did not finish");
+    let synced = finished.expect("timeout").expect("sync");
+    assert!(synced >= 2, "getdata drain accepted {synced}");
+    assert_eq!(peer.tip_height(), Some(2));
+    assert_eq!(
+        rbitcoin_query::header_lookups_under_coord_lock(),
+        0,
+        "header lookups while shared was held"
+    );
+    assert_eq!(
+        rbitcoin_store::coord_lock_store_reads(),
+        0,
+        "store reads while shared was held"
+    );
+    assert!(
+        rbitcoin_store::header_thread_store_reads() > 0,
+        "header thread still reads the store"
+    );
+    seed.shutdown().await;
+    peer.shutdown().await;
+    let _ = std::fs::remove_dir_all(&seed_dir);
+    let _ = std::fs::remove_dir_all(&peer_dir);
+}

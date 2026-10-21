@@ -23,6 +23,8 @@ pub mod bulk_io;
 pub mod chain;
 #[doc(hidden)]
 pub mod compact;
+#[doc(hidden)]
+pub mod coord_io;
 pub mod create_loc;
 #[doc(hidden)]
 pub mod delta_loc;
@@ -125,6 +127,10 @@ pub use address_head::{is_probe_exhausted_error, is_store_corrupt_display};
 pub use block_filter::{BlockFilterRecord, BlockFilterSlot, BlockFilterTable, StoredBlockFilter};
 pub use block_queue::{BlockQueue, QueuedBlockMeta, TakenRaw};
 pub use block_wire::block_wire_input_count;
+pub use coord_io::{
+    coord_lock_store_reads, coord_shared_lock_held, header_thread_store_reads, note_store_read,
+    CoordSharedLock, HeaderThreadProbe,
+};
 pub use create_loc::CreateLocPair;
 pub use error::StoreError;
 pub use file::ensure_nofile_budget;

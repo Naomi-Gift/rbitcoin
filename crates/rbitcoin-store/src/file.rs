@@ -232,6 +232,7 @@ pub fn handle_pread_all(
     if buf.is_empty() {
         return Ok(());
     }
+    crate::coord_io::note_store_read();
     let handle = IoHandle::from_file(file);
     let mut done = 0usize;
     while done < buf.len() {

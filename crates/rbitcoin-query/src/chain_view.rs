@@ -57,6 +57,7 @@ pub fn note_header_io_under_index_lock() {
 
 thread_local! {
     static HEADER_LOOKUP_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static HEADER_LOOKUP_UNDER_COORD: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 /// Header-store lookups on this thread.
@@ -65,8 +66,22 @@ pub fn header_lookup_count() -> u64 {
     HEADER_LOOKUP_N.with(|c| c.get())
 }
 
+/// Lookups on this thread while the IBD coordinator holds its shared lock.
+#[doc(hidden)]
+pub fn header_lookups_under_coord_lock() -> u64 {
+    HEADER_LOOKUP_UNDER_COORD.with(|c| c.get())
+}
+
+#[doc(hidden)]
+pub fn reset_header_lookups_under_coord_lock() {
+    HEADER_LOOKUP_UNDER_COORD.with(|c| c.set(0));
+}
+
 pub fn note_header_lookup() {
     HEADER_LOOKUP_N.with(|c| c.set(c.get().saturating_add(1)));
+    if rbitcoin_store::coord_shared_lock_held() {
+        HEADER_LOOKUP_UNDER_COORD.with(|c| c.set(c.get().saturating_add(1)));
+    }
 }
 
 /// Published best-chain prefix a confirmed-tx read was built against.

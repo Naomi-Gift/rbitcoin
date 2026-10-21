@@ -17,8 +17,10 @@ pub fn spawn_header_thread(
     hub: Arc<ChainHub>,
     mut rx: Receiver<HeaderCmd>,
     header_fks: super::peer_io::HeaderFkBus,
+    probe: rbitcoin_store::HeaderThreadProbe,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
+        probe.bind_header_thread();
         while let Some(cmd) = rx.blocking_recv() {
             match cmd {
                 HeaderCmd::Batch { peer, headers } => {
