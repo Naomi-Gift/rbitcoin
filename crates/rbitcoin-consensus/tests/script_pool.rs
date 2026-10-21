@@ -323,6 +323,50 @@ fn wait_all_idle(n: usize) {
     wait_until("workers idle", || idle_waiter_count() >= n);
 }
 
+/// Publish while every worker is parked, and require that publish to unpark
+/// `k` of them. A worker that left `park` in the gap claims the chunk and
+/// leaves the unpark count at 0. Finish that attempt and try again. A publish
+/// that wakes nobody stays at `entered == 0` and the wait fails.
+fn publish_waking(n: usize, k: usize, items: Vec<u32>) -> HeldWave {
+    let start = Instant::now();
+    loop {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "clean wake of {k} not observed: idle={} entered={} unparks={}",
+            idle_waiter_count(),
+            HOLD_ENTERED.load(Ordering::SeqCst),
+            STEAL_UNPARKS.load(Ordering::Relaxed)
+        );
+        wait_all_idle(n);
+        reset_hold();
+        STEAL_UNPARKS.store(0, Ordering::Relaxed);
+        if idle_waiter_count() < n {
+            continue;
+        }
+        let wave = HeldWave::publish(items.clone());
+        let spin = Instant::now();
+        loop {
+            let entered = HOLD_ENTERED.load(Ordering::SeqCst);
+            let unparks = STEAL_UNPARKS.load(Ordering::Relaxed);
+            if entered >= k && unparks == k {
+                return wave;
+            }
+            if entered >= k && unparks == 0 {
+                wave.finish().expect("retry wave");
+                break;
+            }
+            if entered >= k {
+                assert_eq!(unparks, k, "publish must unpark {k} workers");
+            }
+            assert!(
+                spin.elapsed() < Duration::from_secs(2),
+                "claim of {k} stalled: entered={entered} unparks={unparks}"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 /// One published chunk wakes one idle worker. K chunks wake K workers, capped
 /// at the pool. A larger wave still drains, and a parked worker is not left
 /// beside a queued chunk.
@@ -333,43 +377,19 @@ fn steal_publish_wakes_idle_workers() {
     assert!(n >= 1);
     wait_all_idle(n);
 
-    reset_hold();
-    STEAL_UNPARKS.store(0, Ordering::Relaxed);
-    let one = HeldWave::publish(vec![1u32]);
-    wait_until("one chunk claimed", || {
-        HOLD_ENTERED.load(Ordering::SeqCst) >= 1
-    });
-    assert_eq!(
-        STEAL_UNPARKS.load(Ordering::Relaxed),
-        1,
-        "one chunk unparks one worker"
-    );
+    let one = publish_waking(n, 1, vec![1u32]);
     assert_eq!(idle_waiter_count(), n - 1, "the other workers stay parked");
     one.finish().unwrap();
     wait_all_idle(n);
 
     let k = n.min(2);
-    reset_hold();
-    STEAL_UNPARKS.store(0, Ordering::Relaxed);
-    let many = HeldWave::publish((0..k as u32).collect());
-    wait_until("k chunks claimed", || {
-        HOLD_ENTERED.load(Ordering::SeqCst) >= k
-    });
-    assert_eq!(STEAL_UNPARKS.load(Ordering::Relaxed), k);
+    let many = publish_waking(n, k, (0..k as u32).collect());
     assert_eq!(idle_waiter_count(), n - k);
     many.finish().unwrap();
     wait_all_idle(n);
 
     let chunks = n + 2;
-    reset_hold();
-    STEAL_UNPARKS.store(0, Ordering::Relaxed);
-    let wide = HeldWave::publish((0..chunks as u32).collect());
-    wait_until("pool claimed", || HOLD_ENTERED.load(Ordering::SeqCst) >= n);
-    assert_eq!(
-        STEAL_UNPARKS.load(Ordering::Relaxed),
-        n,
-        "wake is capped at the pool"
-    );
+    let wide = publish_waking(n, n, (0..chunks as u32).collect());
     assert_eq!(
         idle_waiter_count(),
         0,
