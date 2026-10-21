@@ -95,6 +95,9 @@ listener and, when `services.prometheus.enable` is set, a scrape job for
 the health address. Leave `health.openFirewall` off: the listener is
 unauthenticated.
 
+The default module is a validating listener. `services.rbitcoin.trustPeer`
+is the one-peer option (`docs/operator/operations.md`).
+
 The daemon does not terminate TLS. Keep its application listeners on loopback
 and compose them with a proxy. This example serves Esplora and RPC over HTTPS,
 and Electrum as TLS-wrapped TCP on port 50002, using one ACME certificate:

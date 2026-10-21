@@ -70,6 +70,7 @@ after tip (see below). Slow or constrained uplinks: [`OPERATOR.md`](../OPERATOR.
 | *(default mainnet)* | Height **840000** anchored to `0000000000000000000320283a032748cef8227873ff4872689bf23f1cda83a5`. Script/sig checks skip when this block and that anchor hash are the header-path occupants at their heights. Chain work is not required. Prevouts, double-spend, maturity, and fees still run, and an unspendable output is still not a coin. The difference from Core assumevalid is in [`COMPAT.md`](../COMPAT.md). |
 | `--milestone HEIGHT` | Height-only skip at/below `HEIGHT` (operator speed switch). |
 | `--milestone 0` | Full script validation for all heights (slower; signet’s default; use for consensus labs). |
+| `--trust-peer ADDR` | Compare against one peer. Consensus checks still run and warn; this is not a faster sync. The fault list is [`COMPAT.md`](../COMPAT.md). |
 
 Default is an **assumevalid-style speed tradeoff**, not “we validated all
 historical scripts.” State this honestly when reporting experimental mainnet

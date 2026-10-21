@@ -73,6 +73,7 @@ Clean smoke:
 | `--only-net NET` | `only_net=` | all nets; repeatable `ipv4` / `ipv6` / `onion` / `i2p` / `cjdns` |
 | `--cjdns-reachable` | `cjdns_reachable=` | **off** — `fc00::/8` is unroutable until set; `--only-net=cjdns` requires it |
 | `--connect ADDR` | `connect=` (repeatable) | seeds; `IP:port`, Tor v3 `.onion:port`, or `{52}.b32.i2p:port` |
+| `--trust-peer ADDR` | `trustpeer=` | unset. One address, the same grammar as `--connect`. That address is the only dial target: no DNS or fixed seeds, no `--seed-node`, no peers-file dials, P2P listen off, `max-inbound` 0. A missing value, a second address, a different `--connect`, `--seed-node`, `--listen`, `--listen-onion`, or `--max-inbound` greater than 0 is a start error before the store opens. The same address also given as `--connect` is accepted. `addnode` / `addconnection` of any other address fails and names this peer. Consensus checks still run. Warn-and-apply versus warn-and-do-not-apply is the [`COMPAT.md`](../../COMPAT.md) row. A signet block that does not parse is warn-and-apply from that session. `--proxy` or `--onion` does not turn on isolated local-tx broadcast while this flag is set, so this node's own transactions are announced on that one session and no other peer is dialed. Bitcoin Core will not serve its active chain's headers to a peer that lacks the `download` permission while Core's tip has less work than Core's minimum chain work. Core answers `getheaders` with an empty `headers` message so the peer is not treated as unresponsive ([v31.1, `net_processing.cpp` around the `MinimumChainWork` check](https://github.com/bitcoin/bitcoin/blob/9be056a8a72b624dae9623b2f7bded92c2a21c91/src/net_processing.cpp#L4412-L4421)). From Core's side this node is inbound, so the Core operator grants `-whitelist=download@ADDR` (narrow) or `-whitelist=noban@ADDR` (`noban` includes `download`; this repo's `explicit_noban_implies_download` test pins that). A synced mainnet Core whose tip is already above minimum chain work serves headers without this grant. The grant matters while that Core is catching up, and on signet or testnet while its tip is below its own minimum chain work. The sentence configures Core, not rbitcoin |
 | `--proxy HOST:PORT` | `proxy=` | unset — SOCKS5 for all P2P outbound |
 | `--onion HOST:PORT` | `onion=` | unset — SOCKS5 for onion destinations |
 | `--proxy-randomize[=0\|1]` | `proxy_randomize=` | **on** — fresh SOCKS username per peer (Tor circuit isolation) |
@@ -158,7 +159,7 @@ mempool_size_mb=100
 (system `tor`, not Arti). DNS seeds are not resolved locally on that path —
 pass `--connect ADDR` (or reuse a `peers` file). `--proxy-randomize` (default
 on) uses a fresh SOCKS username per peer so Tor isolates circuits.
-`--proxy` or `--onion` also turns on **isolated local-tx broadcast**:
+`--proxy` or `--onion` also turns on **isolated local-tx broadcast**, unless `--trust-peer` is set (that session is the only announcement path):
 `sendrawtransaction`, Electrum `transaction.broadcast`, and Esplora
 `POST /tx` (and packages) are not INV'd on standing peers. After mempool
 accept the node opens a short-lived SOCKS circuit (fresh isolation

@@ -14,6 +14,10 @@ Run signet first, then mainnet with monitoring. See
 [`docs/experimental-mainnet.md`](./docs/experimental-mainnet.md)
 and [`OPERATOR.md`](./OPERATOR.md).
 
+`--trust-peer` stores and serves a chain rbitcoin considers invalid. Do not
+point a wallet at that node unless you accept that peer. The fault list is
+[`COMPAT.md`](./COMPAT.md).
+
 ## Supported versions
 
 | Version | Support |

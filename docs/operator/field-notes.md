@@ -26,6 +26,19 @@ mkdir -p ./datadir-custom-signet
   --log-level info
 ```
 
+One trusted signet peer, with listen left off. The warn list is
+[`COMPAT.md`](../../COMPAT.md); the flag is
+[`operations.md`](operations.md). A Bitcoin Core peer that is still under
+its minimum chain work needs a download whitelist on Core's side; that
+grant is in [`operations.md`](operations.md).
+
+```bash
+./target/release/rbitcoin-node \
+  --datadir ./datadir-signet \
+  --network signet \
+  --trust-peer 192.0.2.1:38333
+```
+
 The equivalent conf-file keys are `signet_challenge` and `signet_block_time`.
 Replace the illustrative `OP_TRUE` challenge and documentation-only peer with
 the parameters supplied by the custom Signet operator.
