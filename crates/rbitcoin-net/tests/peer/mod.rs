@@ -289,7 +289,12 @@ fn ignored_full_header_batch_does_not_page() {
     }
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut follow = PeerFollowState::new();
-    on_headers(&hub, &tx, &mut follow, None, &headers).unwrap();
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(on_headers(&hub, &tx, &mut follow, None, &headers))
+        .unwrap();
     assert!(
         rx.try_recv().is_err(),
         "an ignored 2,000-header batch does not ask for the next page"
@@ -4938,6 +4943,51 @@ include!("../peer_tip_announce_journey.rs");
 include!("../peer_header_dos_journey.rs");
 include!("../peer_header_sync_journey.rs");
 include!("../peer_blocksonly_journey.rs");
+
+/// A headers batch and a getheaders reply must not read or write the store
+/// on the session worker.
+#[test]
+fn headers_store_runs_off_the_reactor() {
+    use bitcoin::block::{Header, Version};
+    use bitcoin::p2p::message_blockdata::GetHeadersMessage;
+    use bitcoin::CompactTarget;
+    use bitcoin::TxMerkleNode;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("headers-off-reactor");
+    hub.ensure_genesis().unwrap();
+    let prev = hub.tip_hash().unwrap();
+    let hdr = Header {
+        version: Version::TWO,
+        prev_blockhash: prev,
+        merkle_root: TxMerkleNode::from_byte_array([1u8; 32]),
+        time: 1_700_000_000,
+        bits: CompactTarget::from_consensus(0x207fffff),
+        nonce: 1,
+    };
+    let hub = hub.into_arc();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("tokio-rt-worker")
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        tokio::spawn(async move {
+            let (out_tx, _rx) = mpsc::unbounded_channel();
+            let mut follow = PeerFollowState::new();
+            let gh = GetHeadersMessage::new(vec![], BlockHash::from_byte_array([0u8; 32]));
+            on_getheaders(&hub, &out_tx, &mut follow, None, &gh)
+                .await
+                .expect("getheaders");
+            on_headers(&hub, &out_tx, &mut follow, None, &[hdr])
+                .await
+                .expect("headers");
+        })
+        .await
+        .expect("reactor task")
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
 
 /// Inbound compact reconstruction must not run on the session worker.
 #[test]

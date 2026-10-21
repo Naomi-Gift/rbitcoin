@@ -2761,6 +2761,11 @@ pub async fn handle_decoded_peer_msg(
 ) -> Result<(), NetError> {
     match msg.into_payload() {
         NetworkMessage::GetData(inv) => serve_getdata(hub, out_tx, follow, session, inv).await?,
+        NetworkMessage::GetHeaders(gh) => on_getheaders(hub, out_tx, follow, session, &gh).await?,
+        NetworkMessage::GetBlocks(gb) => on_getblocks(hub, out_tx, follow, session, &gb).await?,
+        NetworkMessage::Headers(headers) => {
+            on_headers(hub, out_tx, follow, session, &headers).await?
+        }
         NetworkMessage::Block(block) => on_block(hub, out_tx, follow, session, &block).await?,
         NetworkMessage::CmpctBlock(cb) => on_cmpctblock(hub, out_tx, follow, session, &cb).await?,
         NetworkMessage::BlockTxn(BlockTxn { transactions: bt }) => {
@@ -2997,11 +3002,8 @@ pub fn handle_peer_inventory_msg(
     match payload {
         NetworkMessage::Addr(list) => on_addr_list(follow, session, list)?,
         NetworkMessage::AddrV2(list) => on_addrv2(follow, session, list)?,
-        NetworkMessage::GetHeaders(gh) => on_getheaders(hub, out_tx, follow, session, gh)?,
-        NetworkMessage::GetBlocks(gb) => on_getblocks(hub, out_tx, follow, session, gb)?,
         NetworkMessage::Inv(items) => on_inv(hub, out_tx, follow, session, items)?,
         NetworkMessage::NotFound(items) => on_notfound(hub, session, items),
-        NetworkMessage::Headers(headers) => on_headers(hub, out_tx, follow, session, headers)?,
         NetworkMessage::MemPool
         | NetworkMessage::FilterLoad(_)
         | NetworkMessage::FilterAdd(_)
@@ -3241,7 +3243,35 @@ pub fn on_addrv2(
 }
 
 #[doc(hidden)]
-pub fn on_getheaders(
+async fn header_pool_permit() -> Result<tokio::sync::OwnedSemaphorePermit, NetError> {
+    crate::msg_decode::ctrl_decode_semaphore()
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| NetError::Protocol("decode semaphore closed"))
+}
+
+/// Store work for headers. A live node holds `hub` in an `Arc` and runs `job`
+/// on the blocking pool. A stack hub (unit tests) runs `job` on the caller.
+async fn run_header_job<T, F>(hub: &ChainHub, job: F) -> Result<T, NetError>
+where
+    T: Send + 'static,
+    F: FnOnce(&ChainHub) -> T + Send + 'static,
+{
+    let Some(owned) = hub.shared_arc() else {
+        return Ok(job(hub));
+    };
+    let permit = header_pool_permit().await?;
+    tokio::task::spawn_blocking(move || {
+        let _region = crate::reactor::BlockingRegion::enter();
+        let _permit = permit;
+        job(owned.as_ref())
+    })
+    .await
+    .map_err(|_| NetError::Protocol("header job join failed"))
+}
+
+pub async fn on_getheaders(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     follow: &mut PeerFollowState,
@@ -3252,17 +3282,14 @@ pub fn on_getheaders(
         punish_disconnect(&mut follow.ban_score, session);
         return Ok(());
     }
-    let headers = headers_reply_for_getheaders(hub, gh)?;
-    let withhold_stale = headers.is_empty()
-        && gh.locator_hashes.is_empty()
-        && gh.stop_hash.to_byte_array() != [0u8; 32]
-        && hub.header_of(&gh.stop_hash).is_some()
-        && !hub.stale_relay_allowed(&gh.stop_hash);
+    let gh = gh.clone();
+    let (headers, withhold_stale, empty_tip) =
+        run_header_job(hub, move |hub| getheaders_apply(hub, &gh)).await??;
     if !withhold_stale {
         if let Some(s) = session {
             if let Some(last) = headers.last() {
                 s.note_best_header_sent(last.block_hash());
-            } else if let Some(tip) = hub.tip_hash() {
+            } else if let Some(tip) = empty_tip {
                 s.note_best_header_sent(tip);
             }
         }
@@ -3271,8 +3298,26 @@ pub fn on_getheaders(
     Ok(())
 }
 
+fn getheaders_apply(
+    hub: &ChainHub,
+    gh: &GetHeadersMessage,
+) -> Result<(Vec<bitcoin::block::Header>, bool, Option<BlockHash>), NetError> {
+    let headers = headers_reply_for_getheaders(hub, gh)?;
+    let withhold_stale = headers.is_empty()
+        && gh.locator_hashes.is_empty()
+        && gh.stop_hash.to_byte_array() != [0u8; 32]
+        && hub.header_of(&gh.stop_hash).is_some()
+        && !hub.stale_relay_allowed(&gh.stop_hash);
+    let empty_tip = if headers.is_empty() {
+        hub.tip_hash()
+    } else {
+        None
+    };
+    Ok((headers, withhold_stale, empty_tip))
+}
+
 #[doc(hidden)]
-pub fn on_getblocks(
+pub async fn on_getblocks(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     follow: &mut PeerFollowState,
@@ -3283,15 +3328,15 @@ pub fn on_getblocks(
         punish_disconnect(&mut follow.ban_score, session);
         return Ok(());
     }
-    let headers = headers_for_peer(
-        hub.cache.as_ref(),
-        hub.query.as_ref(),
-        &GetHeadersMessage {
-            version: gb.version,
-            locator_hashes: gb.locator_hashes.clone(),
-            stop_hash: gb.stop_hash,
-        },
-    )?;
+    let gh = GetHeadersMessage {
+        version: gb.version,
+        locator_hashes: gb.locator_hashes.clone(),
+        stop_hash: gb.stop_hash,
+    };
+    let headers = run_header_job(hub, move |hub| {
+        headers_for_peer(hub.cache.as_ref(), hub.query.as_ref(), &gh)
+    })
+    .await??;
     let inv: Vec<Inventory> = headers
         .into_iter()
         .take(500)
@@ -3854,37 +3899,59 @@ pub fn on_inv_wtxid(
     None
 }
 
-#[doc(hidden)]
-pub fn on_headers(
+struct HeadersApply {
+    from_peer: Vec<BlockHash>,
+    best_known: Vec<BlockHash>,
+    admits: Vec<(BlockHash, bitcoin::block::Header)>,
+    misbehave: bool,
+    /// `(announced height, our tip)` when the peer is a stale fork.
+    disconnect: Option<(u32, u32)>,
+    sync_height: Option<u32>,
+    ignore_height: Option<u32>,
+    /// Asks `release_asks_off_path` already forgot on the hub.
+    drop_asks: Vec<BlockHash>,
+    want_bodies: Vec<BlockHash>,
+    /// Locator for one follow-up `getheaders`, if the batch still wants a page.
+    getheaders: Option<Vec<BlockHash>>,
+}
+
+fn classify_headers(
     hub: &ChainHub,
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
-    follow: &mut PeerFollowState,
-    session: Option<&crate::peers::LivePeer>,
     headers: &[bitcoin::block::Header],
-) -> Result<(), NetError> {
+    pending_before: &HashMap<BlockHash, bitcoin::block::Header>,
+    requested_before: &HashSet<BlockHash>,
+    have_bodies: &HashSet<BlockHash>,
+    noban: bool,
+) -> HeadersApply {
     let n = headers.len();
-    hub.note_headers_reply();
-    let _ = session.is_some_and(|s| s.take_awaiting_headers());
+    let mut pending = pending_before.clone();
+    let mut apply = HeadersApply {
+        from_peer: Vec::new(),
+        best_known: Vec::new(),
+        admits: Vec::new(),
+        misbehave: false,
+        disconnect: None,
+        sync_height: None,
+        ignore_height: None,
+        drop_asks: Vec::new(),
+        want_bodies: Vec::new(),
+        getheaders: None,
+    };
     let mut ignored_below_floor = false;
     if n == 0 {
         // Empty headers is a failed getheaders response, not an announcement.
-    } else if n > 0
-        && !session.is_some_and(|s| s.session_noban())
-        && headers_are_below_floor(hub, &follow.pending_headers, headers)
-    {
+    } else if n > 0 && !noban && headers_are_below_floor(hub, pending_before, headers) {
         // Work stays under the floor from the pending headers alone. Do not
         // read parent headers, do not move this peer's best-known tip, and
         // do not ask for the next page of a batch we refused.
         for hdr in headers.iter().take(n) {
             let hash = hdr.block_hash();
-            if let Some(s) = session {
-                s.note_block_from_peer(hash);
-            }
-            admit_pending_header(&mut follow.pending_headers, hash, *hdr);
+            apply.from_peer.push(hash);
+            admit_pending_header(&mut pending, hash, *hdr);
+            apply.admits.push((hash, *hdr));
         }
         let last = headers[n - 1].block_hash();
-        let announced_h = pending_announced_height(&follow.pending_headers, last);
-        rbitcoin_log::info!("{}", ignoring_low_work_chain_log(announced_h));
+        apply.ignore_height = Some(pending_announced_height(&pending, last));
         ignored_below_floor = true;
     } else if let Some(first) = headers.first() {
         let prev = first.prev_blockhash;
@@ -3896,80 +3963,167 @@ pub fn on_headers(
         {
             // Headers on a cached-invalid chain: disconnect
             // (`p2p_unrequested_blocks` step 8 follow-up header).
-            misbehaving(&mut follow.ban_score, session);
-            return Ok(());
+            apply.misbehave = true;
+            return apply;
         }
-        let connecting = header_announcement_connects(hub, &follow.pending_headers, prev);
+        let connecting = header_announcement_connects(hub, pending_before, prev);
         for hdr in headers.iter().take(n) {
             let hash = hdr.block_hash();
-            if let Some(s) = session {
-                s.note_block_from_peer(hash);
-                s.note_best_known(hash);
-            }
-            admit_pending_header(&mut follow.pending_headers, hash, *hdr);
+            apply.from_peer.push(hash);
+            apply.best_known.push(hash);
+            admit_pending_header(&mut pending, hash, *hdr);
+            apply.admits.push((hash, *hdr));
         }
         if !connecting {
             if n < MAX_HEADERS_RESULTS {
-                let _ = queue_getheaders(out_tx, hub, session, true, None);
+                apply.getheaders = Some(headers_sync_locator(hub, None));
             }
         } else {
             let last = headers[n - 1].block_hash();
-            let noban = session.is_some_and(|s| s.session_noban());
             // Core `chain_start.nHeight + headers.size()`. One-header
             // tip announces still accumulate via `follow.pending_headers`
             // (`p2p_headers_sync_with_minchainwork` height=14).
-            let announced_h = announced_headers_height(hub, &follow.pending_headers, last);
-            let work_cmp = announced_work_cmp(hub, &follow.pending_headers, last);
+            let announced_h = announced_headers_height(hub, &pending, last);
+            let work_cmp = announced_work_cmp(hub, &pending, last);
             let our_tip = hub.tip_height().unwrap_or(0);
             if announced_tip_is_hopeless(our_tip, announced_h, work_cmp) && !noban {
-                rbitcoin_log::info!(
-                    "p2p: disconnect stale fork tip announced={announced_h} our={our_tip}"
-                );
-                if let Some(s) = session {
-                    s.request_disconnect();
-                }
-                return Ok(());
+                apply.disconnect = Some((announced_h, our_tip));
+                return apply;
             }
-            if !header_path_meets_minwork(hub, &follow.pending_headers, last) {
+            if !header_path_meets_minwork(hub, &pending, last) {
                 if noban {
-                    persist_pending_header_path(hub, &follow.pending_headers, last);
-                    rbitcoin_log::info!("{}", synchronizing_blockheaders_log(announced_h));
+                    persist_pending_header_path(hub, &pending, last);
+                    apply.sync_height = Some(announced_h);
                 } else {
-                    rbitcoin_log::info!("{}", ignoring_low_work_chain_log(announced_h));
+                    apply.ignore_height = Some(announced_h);
                     ignored_below_floor = true;
                 }
                 // Core: do not download bodies until the chain meets
                 // `-minimumchainwork` (`p2p_headers_sync_with_minchainwork`).
             } else {
-                persist_pending_header_path(hub, &follow.pending_headers, last);
-                rbitcoin_log::info!("{}", synchronizing_blockheaders_log(announced_h));
-                let keep = connecting_header_path(hub, &follow.pending_headers, last);
-                release_asks_off_path(hub, &mut follow.requested_blocks, &keep);
+                persist_pending_header_path(hub, &pending, last);
+                apply.sync_height = Some(announced_h);
+                let keep = connecting_header_path(hub, &pending, last);
+                let mut requested = requested_before.clone();
+                release_asks_off_path(hub, &mut requested, &keep);
+                apply.drop_asks = requested_before
+                    .iter()
+                    .copied()
+                    .filter(|h| !requested.contains(h))
+                    .collect();
                 let mut want = fetchable_header_path_bodies(
                     hub,
-                    &follow.pending_headers,
+                    &pending,
                     last,
-                    &follow.pending_blocks,
-                    &follow.requested_blocks,
+                    &PendingBlocks::new(),
+                    &requested,
                 );
-                want.retain(|h| !follow.requested_blocks.contains(h));
-                want.truncate(MAX_SERVE_BLOCKS.saturating_sub(follow.requested_blocks.len()));
-                queue_block_getdata(
-                    hub,
-                    out_tx,
-                    session,
-                    &mut follow.requested_blocks,
-                    &want,
-                    getdata_use_compact(hub, follow.cmpct_version),
-                )?;
+                want.retain(|h| !have_bodies.contains(h) && !requested.contains(h));
+                want.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested.len()));
+                apply.want_bodies = want;
             }
         }
     }
     if n >= MAX_HEADERS_RESULTS && !ignored_below_floor {
         let from = headers.get(n - 1).map(|h| h.block_hash());
-        let _ = queue_getheaders(out_tx, hub, session, true, from);
+        apply.getheaders = Some(headers_sync_locator(hub, from));
+    }
+    apply
+}
+
+fn apply_headers(
+    apply: HeadersApply,
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) -> Result<(), NetError> {
+    if apply.misbehave {
+        misbehaving(&mut follow.ban_score, session);
+        return Ok(());
+    }
+    for hash in apply.from_peer {
+        if let Some(s) = session {
+            s.note_block_from_peer(hash);
+        }
+    }
+    for hash in apply.best_known {
+        if let Some(s) = session {
+            s.note_best_known(hash);
+        }
+    }
+    for (hash, hdr) in apply.admits {
+        admit_pending_header(&mut follow.pending_headers, hash, hdr);
+    }
+    if let Some((announced_h, our_tip)) = apply.disconnect {
+        rbitcoin_log::info!("p2p: disconnect stale fork tip announced={announced_h} our={our_tip}");
+        if let Some(s) = session {
+            s.request_disconnect();
+        }
+        return Ok(());
+    }
+    if let Some(announced_h) = apply.sync_height {
+        rbitcoin_log::info!("{}", synchronizing_blockheaders_log(announced_h));
+    }
+    if let Some(announced_h) = apply.ignore_height {
+        rbitcoin_log::info!("{}", ignoring_low_work_chain_log(announced_h));
+    }
+    for hash in &apply.drop_asks {
+        follow.requested_blocks.remove(hash);
+    }
+    if !apply.want_bodies.is_empty() {
+        queue_block_getdata(
+            hub,
+            out_tx,
+            session,
+            &mut follow.requested_blocks,
+            &apply.want_bodies,
+            getdata_use_compact(hub, follow.cmpct_version),
+        )?;
+    }
+    if let Some(locator) = apply.getheaders {
+        queue_headers_locator(out_tx, session, locator)?;
     }
     Ok(())
+}
+
+/// Send a locator the header job already built. Same in-flight gate as
+/// [`queue_getheaders`].
+fn queue_headers_locator(
+    out: &mpsc::UnboundedSender<PeerOut>,
+    session: Option<&crate::peers::LivePeer>,
+    locator: Vec<BlockHash>,
+) -> Result<(), NetError> {
+    if let Some(s) = session {
+        if s.is_awaiting_headers() {
+            return Ok(());
+        }
+        s.note_awaiting_headers();
+    }
+    let gh = GetHeadersMessage::new(locator, BlockHash::from_byte_array([0u8; 32]));
+    queue_out(out, NetworkMessage::GetHeaders(gh))
+}
+
+#[doc(hidden)]
+pub async fn on_headers(
+    hub: &ChainHub,
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+    headers: &[bitcoin::block::Header],
+) -> Result<(), NetError> {
+    hub.note_headers_reply();
+    let _ = session.is_some_and(|s| s.take_awaiting_headers());
+    let noban = session.is_some_and(|s| s.session_noban());
+    let pending = follow.pending_headers.clone();
+    let requested = follow.requested_blocks.clone();
+    let have_bodies: HashSet<BlockHash> = follow.pending_blocks.keys().copied().collect();
+    let headers = headers.to_vec();
+    let apply = run_header_job(hub, move |hub| {
+        classify_headers(hub, &headers, &pending, &requested, &have_bodies, noban)
+    })
+    .await?;
+    apply_headers(apply, hub, out_tx, follow, session)
 }
 
 pub async fn on_block(
@@ -5826,6 +5980,7 @@ pub fn headers_for_peer(
     query: &Query,
     gh: &bitcoin::p2p::message_blockdata::GetHeadersMessage,
 ) -> Result<Vec<bitcoin::block::Header>, NetError> {
+    crate::reactor::assert_not_reactor("header reply");
     match query.headers_after_locator(&gh.locator_hashes, gh.stop_hash, MAX_HEADERS_RESULTS) {
         Ok(h) if !h.is_empty() || query.tip_height().is_some() => Ok(h),
         Ok(_) => Ok(cache.headers_after_locator(&gh.locator_hashes, gh.stop_hash)),

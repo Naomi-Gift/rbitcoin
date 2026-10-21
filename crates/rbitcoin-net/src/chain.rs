@@ -1646,6 +1646,7 @@ impl ChainHub {
     /// Fail closed: missing parent is the same error as [`Self::ensure_header_fk`].
     /// Output fks align with `headers`.
     pub fn ensure_headers_batch(&self, headers: &[Header]) -> Result<Vec<Fk>, NetError> {
+        crate::reactor::assert_not_reactor("header persist");
         ENSURE_HEADERS_BATCH_N.with(|c| c.set(c.get().saturating_add(1)));
         if headers.is_empty() {
             return Ok(Vec::new());
