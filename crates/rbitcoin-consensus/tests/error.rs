@@ -1,4 +1,5 @@
 use rbitcoin_consensus::error::*;
+use rbitcoin_consensus::{is_warn_and_apply, reason_is_warn_and_apply};
 
 #[test]
 fn block_reject_reason_bip113_and_bip112_needles() {
@@ -103,4 +104,68 @@ fn block_reject_reason_bip113_and_bip112_needles() {
         ),
         "Block validation error: block-script-verify-flag-failed (Non-canonical DER signature)"
     );
+}
+
+/// Every reject string this crate emits is either warn-and-apply or hard.
+/// Proof-of-work and a body that does not match its header stay hard.
+/// `reason_is_warn_and_apply` follows the same split, including Core's names.
+#[test]
+fn trust_reason_class() {
+    let apply = [
+        ConsensusError::Script("x".into()),
+        ConsensusError::BadVersion(2),
+        ConsensusError::BadHeader("timestamp <= median-time-past"),
+        ConsensusError::BadHeader("timestamp too far in future"),
+        ConsensusError::BadHeader("empty median time"),
+        ConsensusError::BadHeader("time-too-old"),
+        ConsensusError::BadHeader("time-too-new"),
+        ConsensusError::BadBlock("bip34 height encoding"),
+        ConsensusError::BadBlock("bip34 coinbase script empty"),
+        ConsensusError::BadBlock("bad-blk-sigops"),
+        ConsensusError::BadBlock("coinbase excess value"),
+        ConsensusError::BadBlock("bad-cb-amount"),
+        ConsensusError::BadBlock("signet solution invalid"),
+        ConsensusError::BadBlock("signet: bad"),
+        ConsensusError::BadTx("not final"),
+        ConsensusError::BadTx("bad-txns-nonfinal"),
+        ConsensusError::BadTx("coinbase immature"),
+        ConsensusError::BadTx("bad-txns-BIP30"),
+        ConsensusError::BadTx("bad-txns-premature-spend-of-coinbase"),
+        ConsensusError::BadTx("non-BIP68-final"),
+    ];
+    let hard = [
+        ConsensusError::InvalidPow,
+        ConsensusError::BadHeader("incorrect proof of work bits"),
+        ConsensusError::BadHeader("target above pow limit"),
+        ConsensusError::BadHeader("bad-diffbits"),
+        ConsensusError::BadBlock("unexpected witness before segwit"),
+        ConsensusError::BadBlock("bad-witness-nonce-size"),
+        ConsensusError::BadBlock("witness commitment mismatch"),
+        ConsensusError::BadBlock("missing witness commitment"),
+        ConsensusError::BadBlock("merkle root mismatch"),
+        ConsensusError::BadPrev,
+        ConsensusError::MissingPrevout,
+        ConsensusError::PrevoutSpent,
+        ConsensusError::Cancelled,
+        ConsensusError::Internal("io"),
+        ConsensusError::BadTx("in < out"),
+        ConsensusError::BadBlock("duplicate txid"),
+        ConsensusError::BadBlock("no transactions"),
+    ];
+    for err in &apply {
+        let reason = block_reject_reason(err);
+        assert!(is_warn_and_apply(err), "apply {err:?} / {reason}");
+        assert!(reason_is_warn_and_apply(&reason), "reason apply {reason}");
+    }
+    for err in &hard {
+        let reason = block_reject_reason(err);
+        assert!(!is_warn_and_apply(err), "hard {err:?} / {reason}");
+        assert!(
+            !reason_is_warn_and_apply(&reason),
+            "reason hard {reason} from {err:?}"
+        );
+    }
+    assert!(!reason_is_warn_and_apply("high-hash"));
+    assert!(!reason_is_warn_and_apply("bad-txnmrklroot"));
+    assert!(!reason_is_warn_and_apply("bad-diffbits"));
 }

@@ -24,6 +24,8 @@ pub mod script_pool;
 pub mod signet;
 pub mod silent_payments;
 #[doc(hidden)]
+pub mod trust;
+#[doc(hidden)]
 pub mod tx_precompute;
 
 pub use block::ScriptCheckJob;
@@ -112,6 +114,10 @@ pub use signet::{
     validate_signet_block_solution,
 };
 pub use silent_payments::{taproot_matches_scan, tweak_from_tx, TaprootOut, TxTweak};
+pub use trust::{
+    collecting, current_block_height, drain_warnings, is_warn_and_apply, note_block_height,
+    reason_is_warn_and_apply, soften, soften_at, TrustCollect,
+};
 pub use tx_precompute::{
     block_wire_len_from_pres, decode_block_precomputes, pres_for_tip, TxPrecompute,
 };

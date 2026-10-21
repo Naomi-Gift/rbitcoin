@@ -61,6 +61,10 @@ pub struct Wave {
     pub in_wave: AtomicUsize,
     pub failed: AtomicBool,
     pub first_err: Mutex<Option<ConsensusError>>,
+    /// When set, warn-and-apply script faults are kept and the rest of the
+    /// wave still runs. Flag-off leaves this false and stops at the first error.
+    pub keep_faults: AtomicBool,
+    pub faults: Mutex<Vec<(usize, ConsensusError)>>,
     pub apply: Apply,
     pub done: Mutex<bool>,
     pub done_cv: Condvar,
@@ -121,6 +125,13 @@ impl Wave {
             // keeps `ctx` live until `is_complete` (then `OwnedWave` drops it).
             let r = unsafe { (self.apply.f)(self.apply.ctx, i) };
             if let Err(e) = r {
+                if self.keep_faults.load(Ordering::Relaxed) && crate::is_warn_and_apply(&e) {
+                    self.faults
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .push((i, e));
+                    continue;
+                }
                 self.failed.store(true, Ordering::Release);
                 let mut g = self.first_err.lock().unwrap_or_else(|p| p.into_inner());
                 if g.is_none() {
@@ -292,6 +303,12 @@ impl<T: Sync> OwnedWave<T> {
         self.wave.is_complete()
     }
 
+    /// Block until every claimed chunk has finished. Call this before
+    /// [`Self::take_faults`]: workers record faults only as they run.
+    pub fn wait(&self) {
+        self.wave.wait_done();
+    }
+
     #[cfg(debug_assertions)]
     pub fn has_unclaimed(&self) -> bool {
         self.wave.has_unclaimed()
@@ -309,6 +326,12 @@ impl<T: Sync> OwnedWave<T> {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Warn-and-apply faults recorded while [`Wave::keep_faults`] is set.
+    /// Indexes match the published job list. Empty when the wave stopped early.
+    pub fn take_faults(&self) -> Vec<(usize, ConsensusError)> {
+        std::mem::take(&mut *self.wave.faults.lock().unwrap_or_else(|p| p.into_inner()))
     }
 }
 
@@ -335,6 +358,15 @@ pub fn start_for_each_owned<T: Sync>(
     start_for_each_owned_chunk(items, f, STEAL_CHUNK)
 }
 
+/// [`start_for_each_owned`] that records every warn-and-apply fault and
+/// finishes the remaining jobs. Stop-class errors still end the wave.
+pub fn start_for_each_owned_keep<T: Sync>(
+    items: Vec<T>,
+    f: fn(&T) -> Result<(), ConsensusError>,
+) -> Result<Option<OwnedWave<T>>, ConsensusError> {
+    start_wave(items, f, STEAL_CHUNK, true, true)
+}
+
 /// Same as [`start_for_each_owned`] with an explicit claim size. `chunk` of 0
 /// is treated as 1. Empty and single-item lists still run inline.
 pub fn start_for_each_owned_chunk<T: Sync>(
@@ -342,7 +374,7 @@ pub fn start_for_each_owned_chunk<T: Sync>(
     f: fn(&T) -> Result<(), ConsensusError>,
     chunk: usize,
 ) -> Result<Option<OwnedWave<T>>, ConsensusError> {
-    start_wave(items, f, chunk, true)
+    start_wave(items, f, chunk, true, false)
 }
 
 /// Like [`start_for_each_owned`], but a single job is still published.
@@ -355,7 +387,7 @@ pub fn start_for_each_pooled<T: Sync>(
     f: fn(&T) -> Result<(), ConsensusError>,
     chunk: usize,
 ) -> Result<Option<OwnedWave<T>>, ConsensusError> {
-    start_wave(items, f, chunk, false)
+    start_wave(items, f, chunk, false, false)
 }
 
 #[doc(hidden)]
@@ -364,6 +396,7 @@ pub fn start_wave<T: Sync>(
     f: fn(&T) -> Result<(), ConsensusError>,
     chunk: usize,
     inline_single: bool,
+    keep_faults: bool,
 ) -> Result<Option<OwnedWave<T>>, ConsensusError> {
     if on_steal_worker() {
         return Err(ConsensusError::BadBlock(
@@ -396,6 +429,8 @@ pub fn start_wave<T: Sync>(
         in_wave: AtomicUsize::new(0),
         failed: AtomicBool::new(false),
         first_err: Mutex::new(None),
+        keep_faults: AtomicBool::new(keep_faults),
+        faults: Mutex::new(Vec::new()),
         apply: Apply {
             f: apply::<T>,
             ctx: (&*ctx as *const ApplyCtx<T>).cast(),

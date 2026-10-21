@@ -16,7 +16,7 @@ pub fn reject_non_final(
     if is_final_tx(tx, block_height, lock_time_cutoff) {
         Ok(())
     } else {
-        Err(ConsensusError::BadTx("bad-txns-nonfinal"))
+        crate::trust::soften(ConsensusError::BadTx("bad-txns-nonfinal"))
     }
 }
 
@@ -62,12 +62,12 @@ pub fn reject_assemble_block_shape(
 }
 
 pub fn add_sigops(cost: u64, legacy: u64, input: u64) -> Result<u64, ConsensusError> {
-    let next = cost
-        .checked_add(legacy)
-        .and_then(|c| c.checked_add(input))
-        .ok_or(ConsensusError::BadBlock("bad-blk-sigops"))?;
+    let Some(next) = cost.checked_add(legacy).and_then(|c| c.checked_add(input)) else {
+        crate::trust::soften(ConsensusError::BadBlock("bad-blk-sigops"))?;
+        return Ok(u64::MAX);
+    };
     if exceeds_sigops_limit(next) {
-        return Err(ConsensusError::BadBlock("bad-blk-sigops"));
+        crate::trust::soften(ConsensusError::BadBlock("bad-blk-sigops"))?;
     }
     Ok(next)
 }
@@ -79,6 +79,52 @@ pub fn fee_from_values(value_in: i64, value_out: i64) -> Result<i64, ConsensusEr
     value_in
         .checked_sub(value_out)
         .ok_or(ConsensusError::BadTx("fee overflow"))
+}
+
+/// Fee when some inputs are a same-block coinbase the caller already waived.
+///
+/// `paid_in` is coins that already exist. `waived_cb` is not a fee: adding
+/// it would let the coinbase fund itself and hide a subsidy mismatch. An
+/// output those waived coins cover contributes nothing. An output above
+/// every input, waived coins included, is still `in < out`. `waived_cb == 0`
+/// is [`fee_from_values`].
+pub fn fee_with_waived_coinbase(
+    paid_in: i64,
+    waived_cb: i64,
+    value_out: i64,
+) -> Result<i64, ConsensusError> {
+    if waived_cb == 0 {
+        return fee_from_values(paid_in, value_out);
+    }
+    let all_in = paid_in
+        .checked_add(waived_cb)
+        .ok_or(ConsensusError::BadTx("value in overflow"))?;
+    if value_out > all_in {
+        return Err(ConsensusError::BadTx("in < out"));
+    }
+    if value_out > paid_in {
+        return Ok(0);
+    }
+    paid_in
+        .checked_sub(value_out)
+        .ok_or(ConsensusError::BadTx("fee overflow"))
+}
+
+/// How much of each output still traces to a waived same-block coinbase.
+///
+/// `clean_in` is input value that was already a coin. `fee` is the result of
+/// [`fee_with_waived_coinbase`]. Outputs are clean from the front until
+/// `clean_in - fee` is used. The rest stays waived for a later spend in this
+/// block, so burning it cannot become a fee and hide a subsidy mismatch.
+pub fn waived_output_residue(clean_in: i64, fee: i64, outputs: &[u64]) -> Vec<u64> {
+    let mut left = u64::try_from(clean_in.saturating_sub(fee).max(0)).unwrap_or(0);
+    let mut residue = Vec::with_capacity(outputs.len());
+    for &value in outputs {
+        let clean = left.min(value);
+        left -= clean;
+        residue.push(value - clean);
+    }
+    residue
 }
 
 pub fn fee_sat(fee: i64) -> Result<u64, ConsensusError> {
@@ -114,17 +160,21 @@ pub fn reject_duplicate_input(inserted: bool) -> Result<(), ConsensusError> {
 
 /// Same-block prevout. A later create is not yet a coin. The coinbase of this
 /// block is immature.
+/// `Ok(true)` is a waived same-block coinbase. The caller must not add that
+/// value into the fee: it is not a coin yet, and counting it hides a subsidy
+/// mismatch. `Ok(false)` is an earlier non-coinbase create in this block.
 pub fn reject_same_block_create(
     prev_index: usize,
     spend_index: usize,
-) -> Result<(), ConsensusError> {
+) -> Result<bool, ConsensusError> {
     if prev_index >= spend_index {
         return Err(ConsensusError::MissingPrevout);
     }
     if prev_index == 0 {
-        return Err(ConsensusError::BadTx("coinbase immature"));
+        crate::trust::soften(ConsensusError::BadTx("coinbase immature"))?;
+        return Ok(true);
     }
-    Ok(())
+    Ok(false)
 }
 
 pub fn reject_unresolved_spend(missing: bool) -> Result<(), ConsensusError> {
@@ -175,7 +225,7 @@ pub fn reject_sequence_locks(
     if sequence_locks_satisfied(tx, prev_heights, coin_mtps, block_height, prev_mtp) {
         Ok(())
     } else {
-        Err(ConsensusError::BadTx("bad-txns-nonfinal"))
+        crate::trust::soften(ConsensusError::BadTx("bad-txns-nonfinal"))
     }
 }
 

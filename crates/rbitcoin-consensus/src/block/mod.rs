@@ -189,9 +189,10 @@ pub fn validate_block_structure_with_pres(
     let txids: Vec<[u8; 32]> = pres.iter().map(|p| p.txid).collect();
     let (merkle, mutated) = rbitcoin_primitives::merkle_root_mutated(&txids);
     if merkle != block.header.merkle_root.to_byte_array() {
+        // Duplicate txids under a root the header does not commit to stay a
+        // merkle miss. That body is not this block.
         return Err(ConsensusError::BadBlock("merkle root mismatch"));
-    }
-    if mutated {
+    } else if mutated {
         return Err(ConsensusError::BadBlock("bad-txns-duplicate"));
     }
     reject_bad_block_tx_layout(block, &pres)?;
@@ -260,7 +261,7 @@ pub fn validate_block_structure_with_pres(
             cost = cost.saturating_add(p.sigops.saturating_mul(WITNESS_SCALE));
         }
         if cost > MAX_BLOCK_SIGOPS_COST {
-            return Err(ConsensusError::BadBlock("bad-blk-sigops"));
+            crate::trust::soften(ConsensusError::BadBlock("bad-blk-sigops"))?;
         }
     }
     let walk_ns = t_walk.elapsed().as_nanos() as u64;
@@ -559,15 +560,13 @@ pub fn check_witness_commitment_with_wtxids(
     leaves.extend_from_slice(precomputed_non_cb);
     let witness_root = merkle_root_bytes(&leaves);
     let wit = &coinbase.input[0].witness;
+    let reserved = wit.nth(0).filter(|item| item.len() == 32);
     if wit.len() != 1 {
         return Err(ConsensusError::BadBlock("bad-witness-nonce-size"));
     }
-    let reserved = wit
-        .nth(0)
-        .ok_or(ConsensusError::BadBlock("bad-witness-nonce-size"))?;
-    if reserved.len() != 32 {
+    let Some(reserved) = reserved else {
         return Err(ConsensusError::BadBlock("bad-witness-nonce-size"));
-    }
+    };
     let mut buf = [0u8; 64];
     buf[0..32].copy_from_slice(&witness_root);
     buf[32..64].copy_from_slice(reserved);
@@ -589,11 +588,11 @@ pub fn check_bip34_coinbase(coinbase: &Transaction, height: u32) -> Result<(), C
     let script = &coinbase.input[0].script_sig;
     let bytes = script.as_bytes();
     if bytes.is_empty() {
-        return Err(ConsensusError::BadBlock("bip34 coinbase script empty"));
+        return crate::trust::soften(ConsensusError::BadBlock("bip34 coinbase script empty"));
     }
     let expected = bip34_height_script(height);
     if bytes.len() < expected.len() || &bytes[..expected.len()] != expected.as_slice() {
-        return Err(ConsensusError::BadBlock("bip34 height encoding"));
+        return crate::trust::soften(ConsensusError::BadBlock("bip34 height encoding"));
     }
     Ok(())
 }
@@ -1142,7 +1141,7 @@ pub fn check_coinbase_subsidy(
         .checked_add(fees)
         .ok_or(ConsensusError::BadBlock("subsidy+fees overflow"))?;
     if coinbase_out > max_cb {
-        return Err(ConsensusError::BadBlock("coinbase excess value"));
+        return crate::trust::soften(ConsensusError::BadBlock("coinbase excess value"));
     }
     Ok(())
 }
@@ -1155,7 +1154,7 @@ pub fn reject_bip30_unspent_prior(
     unspent_spendable: bool,
 ) -> Result<(), ConsensusError> {
     if prior_height != spend_height && unspent_spendable {
-        return Err(ConsensusError::BadTx("bad-txns-BIP30"));
+        return crate::trust::soften(ConsensusError::BadTx("bad-txns-BIP30"));
     }
     Ok(())
 }
@@ -1176,7 +1175,7 @@ pub fn reject_one_create(
         return Err(ConsensusError::MissingPrevout);
     }
     if is_coinbase && spend_height < create_height.saturating_add(maturity) {
-        return Err(ConsensusError::BadTx("coinbase immature"));
+        return crate::trust::soften(ConsensusError::BadTx("coinbase immature"));
     }
     Ok(())
 }
@@ -1321,16 +1320,16 @@ pub fn is_anyone_can_spend(script: &Script) -> bool {
 #[doc(hidden)]
 pub mod facts;
 pub use facts::{
-    add_fee, add_sigops, add_value_in, fee_from_values, fee_sat, header_gap_on_chain,
-    median_or_bad_header, reject_assemble_block_shape, reject_batch_starts_at, reject_bits,
-    reject_carried_header_hash, reject_confirm_batch, reject_csv_create_height,
+    add_fee, add_sigops, add_value_in, fee_from_values, fee_sat, fee_with_waived_coinbase,
+    header_gap_on_chain, median_or_bad_header, reject_assemble_block_shape, reject_batch_starts_at,
+    reject_bits, reject_carried_header_hash, reject_confirm_batch, reject_csv_create_height,
     reject_duplicate_input, reject_empty_confirm_batch, reject_genesis_coinbase_spend,
     reject_non_final, reject_prev_link, reject_prevout_spent, reject_same_block_create,
     reject_sequence_locks, reject_spend_cursor, reject_tx_without_inputs,
     reject_tx_without_outputs, reject_txid_count, reject_unresolved_spend,
     reject_unspendable_prevout, reject_vout_past_n_out, reject_witness_before_segwit,
     require_linked_parent, require_next_work, require_retarget_first, require_same_block_output,
-    unresolved_parent_create,
+    unresolved_parent_create, waived_output_residue,
 };
 
 pub use crate::TxPrecompute;

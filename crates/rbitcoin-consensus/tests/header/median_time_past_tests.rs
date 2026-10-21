@@ -329,6 +329,58 @@ fn check_header_returns_the_median_it_checked() {
     assert_eq!(mtp, parent_time);
 }
 
+/// A waived median check still returns the window. `0` would make a later
+/// locktime look non-final.
+#[test]
+fn waived_median_keeps_the_window() {
+    let params = ChainParams::regtest();
+    let genesis = rbitcoin_consensus::params::genesis_block(&params);
+    let parent_time = genesis.header.time;
+    let mut block = rbitcoin_consensus::regtest_pad::mine_empty_regtest(
+        genesis.block_hash(),
+        parent_time + 1,
+        1,
+    );
+    block.header.time = parent_time;
+    // The timestamp is in the header hash. Meet the target again so the only
+    // fault under the collector is the median comparison.
+    for _ in 0..10_000 {
+        if block.header.validate_pow(block.header.target()).is_ok() {
+            break;
+        }
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+    }
+    assert!(
+        block.header.validate_pow(block.header.target()).is_ok(),
+        "fixture must meet proof-of-work"
+    );
+    let _guard = rbitcoin_consensus::TrustCollect::enter();
+    let mtp = check_header(
+        &params,
+        Height(1),
+        &block.header,
+        block.block_hash().to_byte_array(),
+        Some(ParentHeader {
+            hash: genesis.block_hash().to_byte_array(),
+            time: parent_time,
+            bits: genesis.header.bits,
+        }),
+        &[parent_time],
+        None,
+        |_| None,
+    )
+    .expect("waived median still returns");
+    assert_eq!(mtp, parent_time);
+    let warns = rbitcoin_consensus::drain_warnings();
+    assert!(
+        warns.iter().any(|(_, e)| matches!(
+            e,
+            ConsensusError::BadHeader(s) if *s == "timestamp <= median-time-past"
+        )),
+        "{warns:?}"
+    );
+}
+
 #[test]
 fn check_header_version_and_future_time_regtest() {
     let params = ChainParams::regtest();

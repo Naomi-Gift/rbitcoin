@@ -41,9 +41,14 @@ pub fn check_header(
         }
         let expected = crate::params::genesis_block(params).header.bits;
         if header.bits != expected {
-            return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
+            crate::trust::soften_at(
+                Some(0),
+                ConsensusError::BadHeader("incorrect proof of work bits"),
+            )?;
         }
-        pow_hash_meets_target(hash, header.bits, params.pow_limit)?;
+        if let Err(e) = pow_hash_meets_target(hash, header.bits, params.pow_limit) {
+            crate::trust::soften_at(Some(0), e)?;
+        }
         return Ok(0);
     }
 
@@ -51,12 +56,26 @@ pub fn check_header(
     if parent.hash != header.prev_blockhash.to_byte_array() {
         return Err(ConsensusError::BadPrev);
     }
-    let mtp = median_time_past_times(mtp_times)
-        .map_err(|_| ConsensusError::BadHeader("empty median time"))?;
-    if header.time <= mtp {
-        return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
+    let mtp = match median_time_past_times(mtp_times) {
+        Ok(mtp) => mtp,
+        Err(_) => {
+            crate::trust::soften_at(
+                Some(height.0),
+                ConsensusError::BadHeader("empty median time"),
+            )?;
+            0
+        }
+    };
+    let mtp_failed = header.time <= mtp;
+    if mtp_failed {
+        crate::trust::soften_at(
+            Some(height.0),
+            ConsensusError::BadHeader("timestamp <= median-time-past"),
+        )?;
     }
-    check_header_version_and_future_time(params, height, header)?;
+    if let Err(e) = check_header_version_and_future_time(params, height, header) {
+        crate::trust::soften_at(Some(height.0), e)?;
+    }
 
     let interval = params.difficulty_adjustment_interval();
     if interval > 0
@@ -77,9 +96,16 @@ pub fn check_header(
     )
     .ok_or(ConsensusError::BadPrev)?;
     if header.bits != expected {
-        return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
+        crate::trust::soften_at(
+            Some(height.0),
+            ConsensusError::BadHeader("incorrect proof of work bits"),
+        )?;
     }
-    pow_hash_meets_target(hash, header.bits, params.pow_limit)?;
+    if let Err(e) = pow_hash_meets_target(hash, header.bits, params.pow_limit) {
+        crate::trust::soften_at(Some(height.0), e)?;
+    }
+    // A waived median comparison still returns the window it checked. `0` is
+    // only the empty-window case above. Callers use this as the next cutoff.
     Ok(mtp)
 }
 
@@ -92,17 +118,28 @@ pub fn validate_header_on_parent(
     expected_bits: CompactTarget,
 ) -> Result<(), ConsensusError> {
     if header.time <= parent_mtp {
-        return Err(ConsensusError::BadHeader("timestamp <= median-time-past"));
+        crate::trust::soften_at(
+            Some(height.0),
+            ConsensusError::BadHeader("timestamp <= median-time-past"),
+        )?;
     }
-    check_header_version_and_future_time(params, height, header)?;
+    if let Err(e) = check_header_version_and_future_time(params, height, header) {
+        crate::trust::soften_at(Some(height.0), e)?;
+    }
     if header.bits != expected_bits {
-        return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
+        crate::trust::soften_at(
+            Some(height.0),
+            ConsensusError::BadHeader("incorrect proof of work bits"),
+        )?;
     }
-    pow_hash_meets_target(
+    if let Err(e) = pow_hash_meets_target(
         header.block_hash().to_byte_array(),
         header.bits,
         params.pow_limit,
-    )
+    ) {
+        crate::trust::soften_at(Some(height.0), e)?;
+    }
+    Ok(())
 }
 
 /// POW vs a **caller-computed** header hash (no second SHA256d).

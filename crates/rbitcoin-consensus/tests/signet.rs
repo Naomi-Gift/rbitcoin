@@ -79,6 +79,36 @@ fn genesis_prev_skips_challenge() {
     validate_signet_block_solution(&block, Script::from_bytes(&[0x51])).unwrap();
 }
 
+/// `signet:` parse errors soften only while a collector is active. `signet
+/// encode` is not in that set; a missing commitment is.
+#[test]
+fn review_trust_signet_parse_softens_only_while_collecting() {
+    let challenge = default_signet_challenge();
+    let raw = include_bytes!("../tests/fixtures/signet_block_1.bin");
+    let mut block: Block = deserialize(raw).unwrap();
+    block.txdata[0].output.clear();
+    block.txdata[0].output.push(TxOut {
+        value: Amount::from_sat(1),
+        script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+    });
+    let hard = validate_signet_block_solution(&block, challenge.as_script());
+    assert!(
+        matches!(hard, Err(ConsensusError::BadBlock(s)) if s.contains("signet:")),
+        "{hard:?}"
+    );
+    let guard = rbitcoin_consensus::TrustCollect::enter();
+    let soft = validate_signet_block_solution(&block, challenge.as_script());
+    let warns = rbitcoin_consensus::drain_warnings();
+    drop(guard);
+    assert!(soft.is_ok(), "collected signet parse stayed hard: {soft:?}");
+    assert!(
+        warns
+            .iter()
+            .any(|(_, e)| { matches!(e, ConsensusError::BadBlock(s) if s.starts_with("signet:")) }),
+        "warning missing: {warns:?}"
+    );
+}
+
 #[test]
 fn empty_block_and_missing_commitment_errors() {
     let challenge = default_signet_challenge();

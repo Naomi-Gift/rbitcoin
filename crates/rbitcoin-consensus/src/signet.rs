@@ -48,7 +48,15 @@ pub fn validate_signet_block_solution(
         return Ok(());
     }
 
-    let (to_spend, to_sign) = signet_challenge_transactions(block, challenge)?;
+    let (to_spend, to_sign) = match signet_challenge_transactions(block, challenge) {
+        Ok(pair) => pair,
+        Err(e) => {
+            // Parse faults are warn-and-apply. `soften_at` keeps the hard
+            // errors (`signet encode`) and returns them when no collector is open.
+            crate::trust::soften_at(None, e)?;
+            return Ok(());
+        }
+    };
     verify_challenge_spend(&to_spend, &to_sign, challenge)
 }
 
@@ -361,6 +369,8 @@ pub fn verify_challenge_spend(
     );
     job.null_dummy = true;
     job.witness_active = true;
-    crate::script::verify_job_all_inputs(&job)
-        .map_err(|_| ConsensusError::BadBlock("signet solution invalid"))
+    match crate::script::verify_job_all_inputs(&job) {
+        Ok(()) => Ok(()),
+        Err(_) => crate::trust::soften(ConsensusError::BadBlock("signet solution invalid")),
+    }
 }
