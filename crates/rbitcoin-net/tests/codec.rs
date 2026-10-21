@@ -225,7 +225,17 @@ fn frame_helpers_ping_headers_notfound_and_encode_cost() {
     }
 
     assert!(!encode_is_cpu_heavy(&NetworkMessage::Verack));
-    assert!(encode_is_cpu_heavy(&NetworkMessage::Headers(vec![])));
+    let one = genesis_block(Network::Regtest).header;
+    assert!(!encode_is_cpu_heavy(&NetworkMessage::Headers(vec![])));
+    assert!(!encode_is_cpu_heavy(&NetworkMessage::Headers(vec![one; 8])));
+    assert!(encode_is_cpu_heavy(&NetworkMessage::Headers(vec![one; 9])));
+    assert!(encode_is_cpu_heavy(&NetworkMessage::Headers(vec![
+        one;
+        MAX_HEADERS_RESULTS
+    ])));
+    assert!(encode_is_cpu_heavy(&NetworkMessage::Block(genesis_block(
+        Network::Regtest
+    ))));
     // Small inv is cheap; large is heavy.
     use bitcoin::hashes::Hash as _;
     use bitcoin::p2p::message_blockdata::Inventory;

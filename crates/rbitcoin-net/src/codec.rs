@@ -32,10 +32,14 @@ pub const MAX_HEADERS_RESULTS: usize = 2_000;
 /// Bitcoin Core `MAX_LOCATOR_SZ` — max block locator hashes.
 pub const MAX_LOCATOR_SZ: usize = 101;
 
+/// Header batches at or under this stay on the writer. Not a configuration knob.
+const INLINE_HEADER_BATCH: usize = 8;
+
 /// Whether encoding this payload is heavy enough to keep off async I/O workers.
 #[inline]
 pub fn encode_is_cpu_heavy(payload: &NetworkMessage) -> bool {
     match payload {
+        NetworkMessage::Headers(h) if h.len() <= INLINE_HEADER_BATCH => false,
         NetworkMessage::Block(_) | NetworkMessage::Headers(_) => true,
         NetworkMessage::Inv(v) | NetworkMessage::GetData(v) | NetworkMessage::NotFound(v) => {
             v.len() > 64
