@@ -238,6 +238,107 @@ async fn full_lane_parks_instead_of_spinning() {
     wait_idle();
 }
 
+/// Two senders that both saw a full queue must both enqueue once two slots
+/// are free, even while the lane is still inside a job. `notify_one` before
+/// either waiter registers keeps only one permit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn two_full_senders_both_enqueue() {
+    use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
+    use std::sync::{Condvar, Mutex};
+    use std::time::{Duration, Instant};
+
+    wait_idle();
+    let (holder_tx, holder_rx) = mpsc::sync_channel(1);
+    let release = Arc::new((Mutex::new(false), Condvar::new()));
+    let rel = Arc::clone(&release);
+    let holder = thread::spawn(move || {
+        run_on_tip_accept(move || {
+            holder_tx.send(()).ok();
+            let (lock, cv) = &*rel;
+            let mut g = lock.lock().unwrap();
+            while !*g {
+                g = cv.wait(g).unwrap();
+            }
+        });
+    });
+    holder_rx.recv().expect("holder running");
+
+    let (started_tx, started_rx) = mpsc::sync_channel(QUEUE_CAP);
+    let (release_tx, release_rx) = mpsc::sync_channel(QUEUE_CAP);
+    let filler = thread::spawn(move || {
+        for _ in 0..QUEUE_CAP {
+            let (go_tx, go_rx) = mpsc::sync_channel::<()>(1);
+            let (ran_tx, ran_rx) = mpsc::sync_channel::<()>(1);
+            sender()
+                .send(Box::new(move || {
+                    ran_tx.send(()).ok();
+                    let _ = go_rx.recv();
+                }))
+                .expect("queue the filler");
+            started_tx.send(ran_rx).expect("started watch");
+            release_tx.send(go_tx).expect("release watch");
+        }
+    });
+    filler.join().expect("filler queued");
+    let mut started = Vec::with_capacity(QUEUE_CAP);
+    let mut releases = Vec::with_capacity(QUEUE_CAP);
+    for _ in 0..QUEUE_CAP {
+        started.push(started_rx.recv().expect("started rx"));
+        releases.push(release_rx.recv().expect("release tx"));
+    }
+
+    TIP_PARK_ENTERED.store(0, Ordering::SeqCst);
+    TIP_PARK_GO.store(false, Ordering::SeqCst);
+    TIP_PARK_DELAY.store(true, Ordering::SeqCst);
+    let first = tokio::spawn(async { run_on_tip_accept_async(|| 1u8).await });
+    let second = tokio::spawn(async { run_on_tip_accept_async(|| 2u8).await });
+    let t0 = Instant::now();
+    while TIP_PARK_ENTERED.load(Ordering::SeqCst) < 2 {
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "both senders must see a full queue"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    {
+        let (lock, cv) = &*release;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
+    releases[0].send(()).ok();
+    started[0].recv().expect("first queued job started");
+    started[1].recv().expect("second queued job started");
+
+    TIP_ASYNC_ENQUEUED.store(0, Ordering::SeqCst);
+    TIP_PARK_GO.store(true, Ordering::SeqCst);
+    TIP_PARK_DELAY.store(false, Ordering::SeqCst);
+    tip_park_gate_notify();
+    let t1 = Instant::now();
+    while TIP_ASYNC_ENQUEUED.load(Ordering::SeqCst) < 2 {
+        assert!(
+            t1.elapsed() < Duration::from_millis(500),
+            "one coalesced wake left a free tip-accept slot with a sender still parked"
+        );
+        tokio::task::yield_now().await;
+    }
+
+    for tx in releases.into_iter().skip(1) {
+        tx.send(()).ok();
+    }
+    let (a, b) = tokio::time::timeout(Duration::from_secs(2), async {
+        let a = first.await.expect("first");
+        let b = second.await.expect("second");
+        (a, b)
+    })
+    .await
+    .expect("jobs finish");
+    holder.join().expect("holder");
+    wait_idle();
+    assert_eq!((a, b), (1, 2));
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn owned_job_finishes_after_waiter_abort() {
     use std::sync::atomic::{AtomicU8, Ordering};

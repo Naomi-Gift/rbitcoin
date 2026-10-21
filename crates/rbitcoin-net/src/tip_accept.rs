@@ -7,7 +7,7 @@
 use std::future::Future;
 use std::panic::{self, AssertUnwindSafe};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::task::{Context, Poll, Waker};
@@ -21,6 +21,10 @@ pub const QUEUE_CAP: usize = 8;
 /// Times a full async enqueue yield-looped. A parked wait stays at zero.
 #[doc(hidden)]
 pub static FULL_QUEUE_SPINS: AtomicUsize = AtomicUsize::new(0);
+
+/// Successful `try_send`s from [`run_on_tip_accept_async`].
+#[doc(hidden)]
+pub static TIP_ASYNC_ENQUEUED: AtomicUsize = AtomicUsize::new(0);
 
 #[doc(hidden)]
 pub type Job = Box<dyn FnOnce() + Send>;
@@ -142,6 +146,57 @@ fn slot_freed() -> &'static tokio::sync::Notify {
     N.get_or_init(tokio::sync::Notify::new)
 }
 
+fn note_async_enqueued() {
+    TIP_ASYNC_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+    // The recv that opened this slot may have coalesced with an earlier
+    // `notify_one`. Wake one parked sender so it observes the free slot.
+    slot_freed().notify_one();
+}
+
+/// Test gate between "queue was full" and `Notified::enable`. A burst of
+/// `notify_one` in that window stores one permit. The pin holds senders there
+/// while the lane drains.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub static TIP_PARK_DELAY: AtomicBool = AtomicBool::new(false);
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub static TIP_PARK_ENTERED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub static TIP_PARK_GO: AtomicBool = AtomicBool::new(false);
+
+#[cfg(debug_assertions)]
+fn tip_park_notify() -> &'static tokio::sync::Notify {
+    static N: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    N.get_or_init(tokio::sync::Notify::new)
+}
+
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn tip_park_gate_notify() {
+    tip_park_notify().notify_waiters();
+}
+
+#[cfg(debug_assertions)]
+async fn wait_park_gate() {
+    if !TIP_PARK_DELAY.load(Ordering::SeqCst) || TIP_PARK_GO.load(Ordering::SeqCst) {
+        return;
+    }
+    let notified = tip_park_notify().notified();
+    tokio::pin!(notified);
+    if TIP_PARK_GO.load(Ordering::SeqCst) || !TIP_PARK_DELAY.load(Ordering::SeqCst) {
+        return;
+    }
+    TIP_PARK_ENTERED.fetch_add(1, Ordering::SeqCst);
+    if !notified.as_mut().enable() {
+        if TIP_PARK_GO.load(Ordering::SeqCst) || !TIP_PARK_DELAY.load(Ordering::SeqCst) {
+            return;
+        }
+        notified.await;
+    }
+}
+
 #[doc(hidden)]
 pub fn erase_lifetime(job: Box<dyn FnOnce() + Send + '_>) -> Job {
     // SAFETY: `run_on_tip_accept` blocks on the result channel until `f`
@@ -220,15 +275,33 @@ pub async fn run_on_tip_accept_async<R: Send + 'static>(
     let mut job = job;
     loop {
         match sender().try_send(job) {
-            Ok(()) => break,
+            Ok(()) => {
+                note_async_enqueued();
+                break;
+            }
             Err(TrySendError::Full(j)) => {
                 job = j;
+                #[cfg(debug_assertions)]
+                wait_park_gate().await;
                 let notified = slot_freed().notified();
                 tokio::pin!(notified);
-                // Register before the next try. `enable` consumes a permit
-                // that arrived after the failed send, so that wakeup is not lost.
-                if !notified.as_mut().enable() {
-                    notified.await;
+                // `notify_one` keeps a single permit when no waiter is
+                // registered. `enable` consumes that permit for one sender.
+                // Every other sender that already saw Full must try again
+                // before it sleeps, or a free slot stays empty.
+                if notified.as_mut().enable() {
+                    continue;
+                }
+                match sender().try_send(job) {
+                    Ok(()) => {
+                        note_async_enqueued();
+                        break;
+                    }
+                    Err(TrySendError::Full(j)) => {
+                        job = j;
+                        notified.await;
+                    }
+                    Err(TrySendError::Disconnected(_)) => panic!("tip-accept thread"),
                 }
             }
             Err(TrySendError::Disconnected(_)) => panic!("tip-accept thread"),

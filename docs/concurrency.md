@@ -186,10 +186,14 @@ minimum 4). A private pool would be a second pool. RPC can delay a
 reconstruct until one replacement lane exists.
 
 **Deferred.** `FULL_QUEUE_SPINS` is not incremented. The full tip-accept
-queue parks on `Notify` (`run_on_tip_accept_async`).
-`full_lane_parks_instead_of_spinning` is the pin: the ninth job is still
-pending after 40ms and then finishes. Stack hubs that are not in an
-`Arc` still use the sync wait. The node uses `ChainHub::into_arc`.
+queue parks on `Notify` (`run_on_tip_accept_async`). `notify_one` stores
+one permit when no waiter is registered, so each sender that already saw
+a full queue tries again before it sleeps, and a successful async enqueue
+wakes one more waiter. `full_lane_parks_instead_of_spinning` still parks
+the ninth job at 40ms. `two_full_senders_both_enqueue` holds the lane
+inside a job with two free slots and requires both senders to enqueue.
+Stack hubs that are not in an `Arc` still use the sync wait. The node uses
+`ChainHub::into_arc`.
 
 **Deferred.** `unpark_script_publisher` wakes every registered scripts
 stage. A process has one (IBD or tip). That is not a pool-sized herd.
