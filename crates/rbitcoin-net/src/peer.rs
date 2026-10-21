@@ -2314,13 +2314,23 @@ pub fn mempool_shortid_avail(
     HashMap<bitcoin::bip152::ShortId, Vec<Transaction>>,
     Option<crate::compact::CmpctFillSets>,
 ) {
+    shortid_avail(hub.mempool().map(Arc::as_ref), hsi, version)
+}
+
+fn shortid_avail(
+    mp: Option<&crate::tx_relay::MempoolHub>,
+    hsi: &HeaderAndShortIds,
+    version: u32,
+) -> (
+    HashMap<bitcoin::bip152::ShortId, Vec<Transaction>>,
+    Option<crate::compact::CmpctFillSets>,
+) {
     let pref: Vec<bitcoin::Wtxid> = hsi
         .prefilled_txs
         .iter()
         .map(|p| p.tx.compute_wtxid())
         .collect();
-    match hub
-        .mempool()
+    match mp
         .and_then(|mp| mp.try_cmpct_avail(&hsi.header, hsi.nonce, version, &hsi.short_ids, &pref))
     {
         Some((txs, fill)) => (txs, Some(fill)),
@@ -2346,13 +2356,22 @@ pub fn try_reconstruct_cmpct(
     hsi: &HeaderAndShortIds,
     version: u32,
 ) -> Option<CmpctReconstruct> {
-    let (owned, fill) = mempool_shortid_avail(hub, hsi, version);
+    reconstruct_cmpct_from_mempool(hub.mempool().map(Arc::as_ref), hsi, version)
+}
+
+fn reconstruct_cmpct_from_mempool(
+    mp: Option<&crate::tx_relay::MempoolHub>,
+    hsi: &HeaderAndShortIds,
+    version: u32,
+) -> Option<CmpctReconstruct> {
+    crate::reactor::assert_not_reactor("compact reconstruct");
+    let (owned, fill) = shortid_avail(mp, hsi, version);
     match crate::compact::reconstruct(hsi, &owned, version) {
         crate::compact::Reconstruct::Block(block) => {
             Some(CmpctReconstruct::Block(block, fill.map(Box::new)))
         }
         crate::compact::Reconstruct::Fail => Some(CmpctReconstruct::GetData),
-        crate::compact::Reconstruct::Partial(_) if hub.mempool().is_none() => None,
+        crate::compact::Reconstruct::Partial(_) if mp.is_none() => None,
         crate::compact::Reconstruct::Partial(p) => {
             Some(CmpctReconstruct::NeedTxn(p, fill.map(Box::new)))
         }
@@ -4266,7 +4285,19 @@ pub async fn on_cmpctblock_reconstruct(
     hsi: &HeaderAndShortIds,
     hash: BlockHash,
 ) -> Result<(), NetError> {
-    match try_reconstruct_cmpct(hub, hsi, 2) {
+    // Reconstruct after the message is in hand. The permit is the same
+    // budget as block decode and compact serve. Session state stays here.
+    let permit = block_reconstruct_permit().await?;
+    let mp = hub.mempool().cloned();
+    let owned_hsi = hsi.clone();
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _region = crate::reactor::BlockingRegion::enter();
+        let _permit = permit;
+        reconstruct_cmpct_from_mempool(mp.as_deref(), &owned_hsi, 2)
+    })
+    .await
+    .map_err(|_| NetError::Protocol("compact reconstruct join failed"))?;
+    match outcome {
         Some(CmpctReconstruct::Block(block, fill)) => {
             on_cmpct_got_block(hub, out_tx, follow, session, hsi, hash, block, fill).await
         }

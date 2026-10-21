@@ -4939,6 +4939,39 @@ include!("../peer_header_dos_journey.rs");
 include!("../peer_header_sync_journey.rs");
 include!("../peer_blocksonly_journey.rs");
 
+/// Inbound compact reconstruction must not run on the session worker.
+#[test]
+fn inbound_cmpct_reconstruct_runs_off_the_reactor() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cmpct-recon-off-reactor");
+    hub.ensure_genesis().unwrap();
+    let block = block_for_peer(&hub.cache, &hub.query, &hub.tip_hash().unwrap())
+        .unwrap()
+        .expect("genesis");
+    let hash = block.block_hash();
+    let hsi = HeaderAndShortIds::from_block(&block, 1, 2, &[0]).unwrap();
+    // A live node holds the hub in an `Arc`, so accept awaits the tip lane.
+    let hub = hub.into_arc();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("tokio-rt-worker")
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        tokio::spawn(async move {
+            let (out_tx, _rx) = mpsc::unbounded_channel();
+            let mut follow = PeerFollowState::new();
+            follow.requested_blocks.insert(hash);
+            on_cmpctblock_reconstruct(&hub, &out_tx, &mut follow, None, &hsi, hash)
+                .await
+                .expect("reconstruct");
+        })
+        .await
+        .expect("reactor task")
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Compact getdata and an announced tip wtxid reconstruct off the reactor.
 /// `assert_not_reactor` panics when `block_for_peer` runs on `tokio-rt-worker`.
 #[test]
