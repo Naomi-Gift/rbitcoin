@@ -215,7 +215,9 @@ fn wave_published_before_park_is_not_missed() {
         thread::sleep(Duration::from_millis(1));
     }
     let arm = DelayParkArm::arm();
-    wake_steal_workers();
+    // One empty job pulls the parked worker into the park delay. The wave
+    // is published only after that, so the worker has already missed steal.
+    spawn_detached(|| {});
     let start = Instant::now();
     while DELAY_PARK_ENTERED.load(Ordering::SeqCst) == 0 {
         assert!(
@@ -238,6 +240,145 @@ fn wave_published_before_park_is_not_missed() {
     wave.join().expect("wave thread").expect("wave ok");
     assert_eq!(ALL_HITS.load(Ordering::Relaxed), 64);
     occupy.release();
+}
+
+static HOLD_ENTERED: AtomicUsize = AtomicUsize::new(0);
+static HOLD_GO: AtomicBool = AtomicBool::new(false);
+static HOLD_MU: Mutex<()> = Mutex::new(());
+static HOLD_CV: Condvar = Condvar::new();
+
+fn reset_hold() {
+    HOLD_ENTERED.store(0, Ordering::SeqCst);
+    HOLD_GO.store(false, Ordering::SeqCst);
+}
+
+fn hold_chunk(_: &u32) -> Result<(), ConsensusError> {
+    HOLD_ENTERED.fetch_add(1, Ordering::SeqCst);
+    let mut g = HOLD_MU.lock().unwrap_or_else(|p| p.into_inner());
+    while !HOLD_GO.load(Ordering::SeqCst) {
+        g = HOLD_CV.wait(g).unwrap_or_else(|p| p.into_inner());
+    }
+    Ok(())
+}
+
+fn release_hold() {
+    let _g = HOLD_MU.lock().unwrap_or_else(|p| p.into_inner());
+    HOLD_GO.store(true, Ordering::SeqCst);
+    HOLD_CV.notify_all();
+}
+
+/// Releases the chunk hold before join so a failed assert cannot leave the
+/// workers parked inside `hold_chunk` while `OwnedWave` waits for them.
+struct HeldWave {
+    wave: Option<OwnedWave<u32>>,
+}
+
+impl HeldWave {
+    fn publish(items: Vec<u32>) -> Self {
+        Self {
+            wave: Some(
+                start_for_each_pooled(items, hold_chunk, 1)
+                    .unwrap()
+                    .expect("chunks are published"),
+            ),
+        }
+    }
+
+    fn wave(&self) -> &OwnedWave<u32> {
+        self.wave.as_ref().expect("wave")
+    }
+
+    fn finish(mut self) -> Result<(), ConsensusError> {
+        let wave = self.wave.take().expect("wave");
+        release_hold();
+        wave.finish()
+    }
+}
+
+impl Drop for HeldWave {
+    fn drop(&mut self) {
+        release_hold();
+        drop(self.wave.take());
+    }
+}
+
+fn wait_until(label: &str, pred: impl Fn() -> bool) {
+    let start = Instant::now();
+    while !pred() {
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "{label} idle={} entered={} unparks={}",
+            idle_waiter_count(),
+            HOLD_ENTERED.load(Ordering::SeqCst),
+            STEAL_UNPARKS.load(Ordering::Relaxed)
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn wait_all_idle(n: usize) {
+    wait_until("workers idle", || idle_waiter_count() >= n);
+}
+
+/// One published chunk wakes one idle worker. K chunks wake K workers, capped
+/// at the pool. A larger wave still drains, and a parked worker is not left
+/// beside a queued chunk.
+#[test]
+fn steal_publish_wakes_idle_workers() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let n = worker_spawn_count();
+    assert!(n >= 1);
+    wait_all_idle(n);
+
+    reset_hold();
+    STEAL_UNPARKS.store(0, Ordering::Relaxed);
+    let one = HeldWave::publish(vec![1u32]);
+    wait_until("one chunk claimed", || {
+        HOLD_ENTERED.load(Ordering::SeqCst) >= 1
+    });
+    assert_eq!(
+        STEAL_UNPARKS.load(Ordering::Relaxed),
+        1,
+        "one chunk unparks one worker"
+    );
+    assert_eq!(idle_waiter_count(), n - 1, "the other workers stay parked");
+    one.finish().unwrap();
+    wait_all_idle(n);
+
+    let k = n.min(2);
+    reset_hold();
+    STEAL_UNPARKS.store(0, Ordering::Relaxed);
+    let many = HeldWave::publish((0..k as u32).collect());
+    wait_until("k chunks claimed", || {
+        HOLD_ENTERED.load(Ordering::SeqCst) >= k
+    });
+    assert_eq!(STEAL_UNPARKS.load(Ordering::Relaxed), k);
+    assert_eq!(idle_waiter_count(), n - k);
+    many.finish().unwrap();
+    wait_all_idle(n);
+
+    let chunks = n + 2;
+    reset_hold();
+    STEAL_UNPARKS.store(0, Ordering::Relaxed);
+    let wide = HeldWave::publish((0..chunks as u32).collect());
+    wait_until("pool claimed", || HOLD_ENTERED.load(Ordering::SeqCst) >= n);
+    assert_eq!(
+        STEAL_UNPARKS.load(Ordering::Relaxed),
+        n,
+        "wake is capped at the pool"
+    );
+    assert_eq!(
+        idle_waiter_count(),
+        0,
+        "no parked worker beside a queued chunk"
+    );
+    assert!(
+        wide.wave().has_unclaimed(),
+        "chunks remain after the pool is busy"
+    );
+    wide.finish().unwrap();
+    assert_eq!(HOLD_ENTERED.load(Ordering::SeqCst), chunks);
+    wait_all_idle(n);
 }
 
 static NAMES: Mutex<Vec<String>> = Mutex::new(Vec::new());

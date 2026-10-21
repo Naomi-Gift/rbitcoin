@@ -6,9 +6,10 @@
 //! from the stage thread — steal workers must not `wait_done` on this pool.
 //!
 //! Idle steal workers [`thread::park`]. A new wave or detached job bumps an
-//! epoch and [`thread::Thread::unpark`]s every worker (unpark-before-park leaves a
-//! permit, so a worker cannot miss work by parking after the wake). The jobs
-//! mutex is only the detached-job queue, never the steal wake path.
+//! epoch and unparks one parked worker per queued chunk or detached job
+//! (capped by how many are parked). Unpark-before-park leaves a permit, so a
+//! worker that already decided to park still sees the wave. The jobs mutex is
+//! only the detached-job queue, never the steal wake path.
 //!
 //! No rayon / crossbeam.
 
@@ -134,6 +135,15 @@ impl Wave {
     #[doc(hidden)]
     pub fn has_unclaimed(&self) -> bool {
         !self.failed.load(Ordering::Acquire) && self.next.load(Ordering::Relaxed) < self.n
+    }
+
+    fn unclaimed_chunks(&self) -> usize {
+        if !self.has_unclaimed() {
+            return 0;
+        }
+        let next = self.next.load(Ordering::Relaxed);
+        let chunk = self.chunk.max(1);
+        self.n.saturating_sub(next).div_ceil(chunk)
     }
 
     #[doc(hidden)]
@@ -436,6 +446,9 @@ pub static WORKER_SPAWNS: AtomicUsize = AtomicUsize::new(0);
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub static IDLE_WAITERS: AtomicUsize = AtomicUsize::new(0);
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub static STEAL_UNPARKS: AtomicUsize = AtomicUsize::new(0);
 
 #[doc(hidden)]
 pub fn take_detached_job(pool: &ScriptWorkers) -> Option<Job> {
@@ -466,10 +479,60 @@ pub fn steal_or_job(pool: &ScriptWorkers) -> bool {
 pub fn wake_steal_workers() {
     let pool = workers();
     pool.epoch.fetch_add(1, Ordering::Release);
-    if let Some(threads) = WORKER_THREADS.get() {
-        for t in threads.iter() {
-            t.unpark();
-        }
+    unpark_idle(queued_wake_count(pool));
+}
+
+fn work_pending(pool: &ScriptWorkers) -> bool {
+    if fg_has_unclaimed() {
+        return true;
+    }
+    !pool
+        .jobs
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .is_empty()
+}
+
+fn queued_wake_count(pool: &ScriptWorkers) -> usize {
+    let mut n = 0usize;
+    for wave in waves_snap().load().iter() {
+        n = n.saturating_add(wave.unclaimed_chunks());
+    }
+    let jobs = pool.jobs.lock().unwrap_or_else(|p| p.into_inner()).len();
+    n.saturating_add(jobs)
+}
+
+static IDLE_THREADS: Mutex<Vec<thread::Thread>> = Mutex::new(Vec::new());
+
+fn register_idle_worker() {
+    let current = thread::current();
+    let mut idle = IDLE_THREADS.lock().unwrap_or_else(|p| p.into_inner());
+    if idle.iter().all(|parked| parked.id() != current.id()) {
+        idle.push(current);
+    }
+}
+
+fn unregister_idle_worker() {
+    let id = thread::current().id();
+    IDLE_THREADS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|parked| parked.id() != id);
+}
+
+fn unpark_idle(n: usize) {
+    if n == 0 {
+        return;
+    }
+    let taken = {
+        let mut idle = IDLE_THREADS.lock().unwrap_or_else(|p| p.into_inner());
+        let n = n.min(idle.len());
+        idle.drain(..n).collect::<Vec<_>>()
+    };
+    for thread in taken {
+        thread.unpark();
+        #[cfg(debug_assertions)]
+        STEAL_UNPARKS.fetch_add(1, Ordering::Relaxed);
     }
 }
 
@@ -503,13 +566,30 @@ pub fn workers() -> &'static ScriptWorkers {
                         if pool.epoch.load(Ordering::Acquire) != epoch {
                             continue;
                         }
+                        register_idle_worker();
+                        // Do not run a job while registered. A busy worker on
+                        // the idle list would take a wake meant for one that
+                        // is actually parked.
+                        let missed =
+                            work_pending(pool) || pool.epoch.load(Ordering::Acquire) != epoch;
+                        if missed {
+                            unregister_idle_worker();
+                            continue;
+                        }
                         #[cfg(debug_assertions)]
                         maybe_delay_park();
+                        let missed =
+                            work_pending(pool) || pool.epoch.load(Ordering::Acquire) != epoch;
+                        if missed {
+                            unregister_idle_worker();
+                            continue;
+                        }
                         #[cfg(debug_assertions)]
                         IDLE_WAITERS.fetch_add(1, Ordering::SeqCst);
                         thread::park();
                         #[cfg(debug_assertions)]
                         IDLE_WAITERS.fetch_sub(1, Ordering::SeqCst);
+                        unregister_idle_worker();
                     }
                 })
             else {
