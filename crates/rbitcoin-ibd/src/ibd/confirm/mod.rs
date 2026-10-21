@@ -2072,12 +2072,7 @@ pub fn spawn_confirm_engine(
                 // while the relay-on purge is choosing the tip it stripped.
                 let mp_hold = hub_wb.mempool().cloned();
                 let mut template_hold = mp_hold.as_ref().map(|mp| mp.template_hold());
-                match rbitcoin_query::confirm_write_phase_or_return(
-                    &hub_wb.query,
-                    &hub_wb.params,
-                    hub_wb.milestone,
-                    batch,
-                ) {
+                match write_batch_trusted(&hub_wb, batch) {
                     Ok(_fks) => {
                         if let Err(e) =
                             hub_wb.note_confirmed_tip_while(&meta, &headers, template_hold.as_mut())
@@ -2710,7 +2705,9 @@ pub fn spawn_confirm_engine(
 
                 let pin0 = stats.load_ns.load(std::sync::atomic::Ordering::Relaxed);
                 let asm0 = stats.connect_ns.load(std::sync::atomic::Ordering::Relaxed);
-                let mat_res = hub_load.confirm_wire_load_from_plan(stamped, Some(&pipe));
+                let mat_res = rbitcoin_query::confirm_run::waive_batch(hub_load.query.trust_peer(), || {
+                    hub_load.confirm_wire_load_from_plan(stamped, Some(&pipe))
+                });
                 let pin_d = stats
                     .load_ns
                     .load(std::sync::atomic::Ordering::Relaxed)
@@ -3184,6 +3181,20 @@ pub fn note_confirm_bulk_read() {
     });
 }
 
+/// The write batch's error carries the batch so the caller can offer it back.
+#[allow(clippy::result_large_err)]
+fn write_batch_trusted(
+    hub: &rbitcoin_net::ChainHub,
+    batch: rbitcoin_query::ScriptOkBatch,
+) -> Result<
+    Vec<rbitcoin_primitives::Fk>,
+    (rbitcoin_query::ConfirmError, rbitcoin_query::ScriptOkBatch),
+> {
+    rbitcoin_query::confirm_run::waive_batch(hub.query.trust_peer(), || {
+        rbitcoin_query::confirm_write_phase_or_return(&hub.query, &hub.params, hub.milestone, batch)
+    })
+}
+
 /// One lookup batch: wait out a rotating-media write burst, then identity / `create.loc`.
 pub fn lookup_bulk_wave(
     query: &rbitcoin_query::Query,
@@ -3208,6 +3219,11 @@ pub fn load_bulk_stamp(
     blocks: &[rbitcoin_query::WireBlockIn],
     pipeline: Option<&rbitcoin_query::WireLoadPipeline>,
 ) -> Result<rbitcoin_query::PlanStampOutcome, rbitcoin_query::ConfirmError> {
+    if query.trust_peer() && !rbitcoin_query::confirm_run::confirm_waive(query) {
+        return rbitcoin_query::confirm_run::waive_batch(true, || {
+            load_bulk_stamp(query, params, milestone, blocks, pipeline)
+        });
+    }
     query.store().spindle_wait();
     note_confirm_bulk_read();
     rbitcoin_query::confirm_wire_lookup_stamp(query, params, milestone, blocks, pipeline)

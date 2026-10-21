@@ -49,6 +49,85 @@ fn stale_follow_needs_room_at_max_outbound() {
     assert!(!stale_follow_needs_room(0, 1));
 }
 
+/// `--proxy` or `--onion` with `--trust-peer` must not turn on isolated
+/// broadcast. This node's own txs go out on the standing session.
+#[test]
+fn review_trust_proxy_uses_standing_relay() {
+    let src = include_str!("../src/run.rs");
+    let at = src
+        .find("mempool.set_isolated_broadcast(true)")
+        .expect("isolated broadcast arm");
+    let window = &src[at.saturating_sub(240)..at];
+    assert!(
+        window.contains("trust_peer_set"),
+        "isolated broadcast stays off while --trust-peer is set:\n{window}"
+    );
+}
+
+#[test]
+fn trust_peer_dials_only_that_peer() {
+    use rbitcoin_node::cli::{operator_config_from_args, OperatorArgs};
+    use rbitcoin_node::config::P2pListen;
+    let n = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-trust-dial-{n}"));
+    let addr = "192.0.2.1:8333";
+    let cfg = match operator_config_from_args([
+        "rbitcoin-node",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "--network",
+        "regtest",
+        "--trust-peer",
+        addr,
+    ]) {
+        Ok(OperatorArgs::Ready { config, .. }) => config,
+        other => panic!("expected config, got {other:?}"),
+    };
+    assert!(cfg.trust_peer_set());
+    assert!(matches!(cfg.listen.p2p, P2pListen::Off));
+    assert_eq!(cfg.listen.max_inbound, 0);
+    assert!(!cfg.listen.use_seeds);
+    assert!(!should_resolve_default_seeds(&cfg));
+    assert!(!seednodes_allowed(&cfg.listen));
+    let mut book = AddrMan::new();
+    book.add("198.51.100.9:8333".parse().unwrap());
+    book.add(addr.parse().unwrap());
+    let got = outbound_dial_targets(true, &cfg.listen.connect, &book, 8, &[]);
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].to_string(), addr);
+    let unresolved = outbound_dial_targets(true, &[], &book, 8, &[]);
+    assert!(
+        unresolved.is_empty(),
+        "unresolved trust-peer must not dial the peers file"
+    );
+    let open = follow_dial_targets(&[], &book, 8, &[]);
+    assert!(
+        !open.is_empty(),
+        "the peers file is still a dial target when trust-peer is off"
+    );
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(book));
+    let pinned = rbitcoin_net::NetAddr::Ip(addr.parse().unwrap());
+    let trust_book = rbitcoin_ibd::PeerBookSession::new(ibd_shared_peers(true, &shared), &[pinned]);
+    let trust_cands = trust_book
+        .book()
+        .take_dial_candidates_net(8, &Default::default(), &[]);
+    assert_eq!(trust_cands, vec![pinned], "{trust_cands:?}");
+    let open_book = rbitcoin_ibd::PeerBookSession::new(ibd_shared_peers(false, &shared), &[]);
+    let open_cands = open_book
+        .book()
+        .take_dial_candidates_net(8, &Default::default(), &[]);
+    assert!(
+        open_cands
+            .iter()
+            .any(|a| a.to_string() == "198.51.100.9:8333"),
+        "flag off still dials the peers file: {open_cands:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn follow_dial_targets_connect_bypasses_diversity() {
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -407,7 +486,7 @@ fn follow_targets_refresh_after_catch_up_learns_peers() {
     let shared = Arc::new(std::sync::Mutex::new(AddrMan::new()));
     let mut addrman = AddrMan::new();
     assert!(
-        refresh_follow_targets(&[], &shared, &mut addrman, 2, &[]).is_empty(),
+        refresh_follow_targets(false, &[], &shared, &mut addrman, 2, &[]).is_empty(),
         "empty book has no follow targets"
     );
     shared
@@ -415,9 +494,13 @@ fn follow_targets_refresh_after_catch_up_learns_peers() {
         .unwrap()
         .add_addr(rbitcoin_net::NetAddr::Ip("127.0.0.1:1".parse().unwrap()));
     assert_eq!(
-        refresh_follow_targets(&[], &shared, &mut addrman, 2, &[]).len(),
+        refresh_follow_targets(false, &[], &shared, &mut addrman, 2, &[]).len(),
         1,
         "tip follow must see a peer learned during catch-up"
+    );
+    assert!(
+        refresh_follow_targets(true, &[], &shared, &mut addrman, 2, &[]).is_empty(),
+        "trust-peer does not follow a peer the book learned"
     );
 }
 

@@ -690,3 +690,222 @@ fn cli_omit_preserves_advanced_env() {
     std::env::remove_var("RBITCOIN_P2P_MAX_INBOUND");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--trust-peer ADDR` is the only dial target. Clashing flags fail in the
+/// parser, before `ensure_datadir` creates a store.
+#[test]
+fn trust_peer_addr() {
+    use rbitcoin_node::config::P2pListen;
+    use rbitcoin_node::config::DEFAULT_MAX_INBOUND;
+
+    let h = operator_usage();
+    assert!(
+        h.contains("--trust-peer ADDR"),
+        "help must name --trust-peer with an address"
+    );
+
+    let missing = operator_config_from_args(["rbitcoin-node", "--trust-peer"]);
+    assert!(missing.is_err(), "bare --trust-peer must not start");
+
+    let dir = tmp_datadir();
+    let addr = "192.0.2.1:8333";
+    let cfg = ready_config([
+        "rbitcoin-node",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "--trust-peer",
+        addr,
+    ]);
+    assert_eq!(cfg.trust_peer.map(|a| a.to_string()).as_deref(), Some(addr));
+    assert!(cfg.trust_peer_host.is_none());
+    assert_eq!(cfg.listen.connect.len(), 1);
+    assert_eq!(cfg.listen.connect[0].to_string(), addr);
+    assert!(cfg.listen.connect_dns.is_empty());
+    assert!(!cfg.listen.use_seeds);
+    assert!(matches!(cfg.listen.p2p, P2pListen::Off));
+    assert!(cfg.listen.p2p_extra.is_empty());
+    assert!(!cfg.listen.listen_onion);
+    assert!(cfg.listen.seednodes.is_empty());
+    assert_eq!(cfg.listen.max_inbound, 0);
+    assert!(!dir.exists(), "parser must not create the datadir");
+
+    let plain = ready_config(["rbitcoin-node", "--datadir", dir.to_str().unwrap()]);
+    assert!(plain.trust_peer.is_none());
+    assert!(plain.trust_peer_host.is_none());
+    assert!(plain.listen.connect.is_empty());
+    assert!(plain.listen.use_seeds);
+    assert!(matches!(plain.listen.p2p, P2pListen::Auto));
+    assert_eq!(plain.listen.max_inbound, DEFAULT_MAX_INBOUND);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same address may also be `--connect`. A hostname is the connect-dns row.
+#[test]
+fn trust_peer_same_connect_and_host() {
+    use rbitcoin_node::config::P2pListen;
+    let dir = tmp_datadir();
+    let addr = "192.0.2.1:8333";
+    let same = ready_config([
+        "rbitcoin-node",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "--connect",
+        addr,
+        "--trust-peer",
+        addr,
+        "--no-listen",
+        "--max-inbound",
+        "0",
+    ]);
+    assert_eq!(same.listen.connect.len(), 1);
+    assert_eq!(same.listen.connect[0].to_string(), addr);
+    assert_eq!(same.listen.max_inbound, 0);
+
+    let dns = ready_config([
+        "rbitcoin-node",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "--trust-peer",
+        "seed.example:8333",
+    ]);
+    assert!(dns.trust_peer.is_none());
+    assert_eq!(dns.trust_peer_host.as_deref(), Some("seed.example:8333"));
+    assert!(dns.listen.connect.is_empty());
+    assert_eq!(
+        dns.listen.connect_dns,
+        vec!["seed.example:8333".to_string()]
+    );
+    assert!(!dns.listen.use_seeds);
+    assert!(matches!(dns.listen.p2p, P2pListen::Off));
+
+    let conf = dir.join("trust.conf");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(&conf, "trustpeer=192.0.2.1:8333\n").unwrap();
+    let from_conf = ready_config([
+        "rbitcoin-node",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "--conf",
+        conf.to_str().unwrap(),
+    ]);
+    assert_eq!(
+        from_conf.trust_peer.map(|a| a.to_string()).as_deref(),
+        Some(addr)
+    );
+    assert!(matches!(from_conf.listen.p2p, P2pListen::Off));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A second address, a different connect, seeds, listen, or inbound is a start error.
+#[test]
+fn trust_peer_clashing_flags() {
+    let dir = tmp_datadir();
+    let addr = "192.0.2.1:8333";
+    let clashes: &[&[&str]] = &[
+        &["--trust-peer", addr, "--trust-peer", "192.0.2.2:8333"],
+        &["--trust-peer", addr, "--connect", "192.0.2.2:8333"],
+        &["--trust-peer", addr, "--seed-node", "192.0.2.9:8333"],
+        &["--trust-peer", addr, "--listen", "127.0.0.1:8333"],
+        &["--trust-peer", addr, "--listen-onion"],
+        &["--trust-peer", addr, "--max-inbound", "1"],
+        &["--connect", "seed.example:8333", "--trust-peer", addr],
+    ];
+    for extra in clashes {
+        let mut args = vec!["rbitcoin-node", "--datadir", dir.to_str().unwrap()];
+        args.extend_from_slice(extra);
+        assert!(
+            operator_config_from_args(args).is_err(),
+            "expected start error for {extra:?}"
+        );
+        assert!(!dir.exists(), "clash must not create the datadir");
+    }
+
+    let mut cfg = rbitcoin_node::config::NodeConfig::default();
+    cfg.apply_kv("trust_peer", addr).unwrap();
+    cfg.apply_kv("listen", "127.0.0.1:8333").unwrap();
+    let err = cfg.seal_trust_peer().unwrap_err().to_string();
+    assert!(err.contains("trust-peer"), "{err}");
+    assert!(err.contains("--listen"), "{err}");
+
+    let mut cfg = rbitcoin_node::config::NodeConfig::default();
+    cfg.apply_kv("trustpeer", addr).unwrap();
+    cfg.apply_kv("max_inbound", "8").unwrap();
+    let err = cfg.seal_trust_peer().unwrap_err().to_string();
+    assert!(err.contains("--max-inbound"), "{err}");
+
+    let mut cfg = rbitcoin_node::config::NodeConfig::default();
+    cfg.apply_kv("trust_peer", addr).unwrap();
+    let err = cfg
+        .apply_kv("trustpeer", "192.0.2.2:8333")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("exactly one"), "{err}");
+}
+
+/// `validate` still rejects a trust-peer config that skipped the seal.
+#[test]
+fn trust_peer_validate_rejects_a_broken_seal() {
+    use rbitcoin_node::config::P2pListen;
+
+    let dir = tmp_datadir();
+    let addr = "192.0.2.1:8333";
+    let base = || {
+        ready_config([
+            "rbitcoin-node",
+            "--datadir",
+            dir.to_str().unwrap(),
+            "--trust-peer",
+            addr,
+        ])
+    };
+    base().validate().expect("sealed trust-peer validates");
+
+    let mut cfg = base();
+    cfg.listen.p2p = P2pListen::Auto;
+    assert_trust_err(cfg, "--listen");
+
+    let mut cfg = base();
+    cfg.listen.listen_onion = true;
+    cfg.listen.max_inbound = 1;
+    cfg.tor.control = Some("127.0.0.1:9051".parse().unwrap());
+    assert_trust_err(cfg, "--listen");
+
+    let mut cfg = base();
+    cfg.listen.max_inbound = 4;
+    assert_trust_err(cfg, "--max-inbound");
+
+    let mut cfg = base();
+    cfg.listen.use_seeds = true;
+    assert_trust_err(cfg, "--seed-node");
+
+    let mut cfg = base();
+    cfg.listen.seednodes.push("192.0.2.9:8333".into());
+    assert_trust_err(cfg, "--seed-node");
+
+    let mut cfg = base();
+    cfg.listen.connect.clear();
+    assert_trust_err(cfg, "requires an address");
+
+    let mut cfg = base();
+    cfg.listen.connect.clear();
+    cfg.apply_kv("connect", "192.0.2.2:8333").unwrap();
+    assert_trust_err(cfg, "different --connect");
+
+    let mut host = ready_config([
+        "rbitcoin-node",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "--trust-peer",
+        "seed.example:8333",
+    ]);
+    host.listen.connect_dns.push("other.example:8333".into());
+    assert_trust_err(host, "different --connect");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn assert_trust_err(cfg: NodeConfig, needle: &str) {
+    let err = cfg.validate().unwrap_err().to_string();
+    assert!(err.contains(needle), "{err}");
+}

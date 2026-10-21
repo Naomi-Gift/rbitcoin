@@ -599,6 +599,50 @@ fn mempoolinfo_loaded_and_uacomment() {
 }
 
 #[test]
+fn trust_peer_warning_line() {
+    let (mut ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let no_disagreement = |method: &str, params: Vec<Value>| {
+        let info = dispatch(&ctx, method, params).unwrap();
+        let text = info["warnings"].to_string();
+        assert!(
+            !text.contains("disagreement"),
+            "{method} flag off has no trust warning: {text}"
+        );
+    };
+    no_disagreement("getnetworkinfo", vec![]);
+    no_disagreement("getblockchaininfo", vec![]);
+    no_disagreement("getblocktemplate", vec![json!({"rules": ["segwit"]})]);
+
+    let addr: std::net::SocketAddr = "1.2.3.4:8333".parse().unwrap();
+    let peers = rbitcoin_net::PeerHub::new();
+    peers.set_trust_peer(Some(rbitcoin_net::NetAddr::Ip(addr)), None);
+    ctx.peers = Some(peers);
+    ctx.query.set_trust_peer(true);
+    let needle = "disagreements from trust-peer 1.2.3.4:8333 are warnings";
+    for (method, params) in [
+        ("getnetworkinfo", vec![]),
+        ("getblockchaininfo", vec![]),
+        ("getblocktemplate", vec![json!({"rules": ["segwit"]})]),
+    ] {
+        let info = dispatch(&ctx, method, params).unwrap();
+        assert!(info.get("trustpeer").is_none(), "{method} adds no JSON key");
+        let warnings = info["warnings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{method} warnings is an array: {info}"));
+        let hits = warnings
+            .iter()
+            .filter(|w| w.as_str().unwrap_or("").contains("disagreement"))
+            .count();
+        assert_eq!(hits, 1, "{method} {warnings:?}");
+        assert!(
+            warnings.iter().any(|w| w.as_str() == Some(needle)),
+            "{method} {warnings:?}"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn getnetworkinfo_localrelay_follows_mempool_relay() {
     // `p2p_blocksonly.py`: `-blocksonly` leaves relay off → localrelay false.
     let (ctx, dir) = ctx_empty();

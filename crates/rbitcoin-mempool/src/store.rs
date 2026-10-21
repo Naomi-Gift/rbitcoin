@@ -52,7 +52,10 @@ pub const DEFAULT_SLOT_CAP: u32 = 131_072;
 /// Hard ceiling when doubling the slot table (DoS / RAM bound).
 #[doc(hidden)]
 pub const MAX_SLOT_CAP: u32 = 1_048_576;
-/// Slot record: status(1) + pad(3) + body_off(8) + body_len(4) + txid(32) = 48.
+/// Slot record: status(1) + trust(1) + pad(2) + body_off(8) + body_len(4) + txid(32) = 48.
+///
+/// `trust` is 1 when this live tx was warn-and-applied from the trusted
+/// session. Schema 4 already had these bytes. Older files leave them 0.
 #[doc(hidden)]
 pub const SLOT_REC: usize = 48;
 #[doc(hidden)]
@@ -89,6 +92,8 @@ pub struct MempoolMeta {
 pub struct LiveTx {
     pub slot: u32,
     pub packed: PackedLive,
+    /// Slot trust byte. Set for a warn-and-applied tx from the trusted session.
+    pub trust_kept: bool,
 }
 
 /// Time-based sidecar persist interval (admits). Crash may lose ≤ this window.
@@ -119,6 +124,9 @@ pub struct Mempool {
     pub last_persist_ms: u64,
     /// Tests pin the table at the live count so the next admit evicts.
     pub grow_pinned: bool,
+    /// Next [`Self::append_live_tx`] returns [`MempoolError::Full`] once.
+    #[cfg(debug_assertions)]
+    pub fail_next_append: bool,
     /// A durable DEAD `pwrite` is not yet covered by [`Self::sync_deaths`].
     pub deaths_unsynced: bool,
     /// Successful `meta` `sync_data` calls (tests).
@@ -162,6 +170,8 @@ impl Mempool {
             mock_now_ms: None,
             last_persist_ms: 0,
             grow_pinned: false,
+            #[cfg(debug_assertions)]
+            fail_next_append: false,
             deaths_unsynced: false,
             #[cfg(debug_assertions)]
             meta_syncs: 0,
@@ -355,6 +365,11 @@ impl Mempool {
             accept_secs,
             vins,
         )?;
+        #[cfg(debug_assertions)]
+        if self.fail_next_append {
+            self.fail_next_append = false;
+            return Err(MempoolError::Full);
+        }
         if u32::try_from(payload.len()).is_err() {
             return Err(MempoolError::Corrupt("tx body too large"));
         }
@@ -478,6 +493,7 @@ impl Mempool {
             new_body.extend_from_slice(&self.body[start..start + body_len]);
             let dst = SLOTS_HEADER + (next_slot as usize) * SLOT_REC;
             new_slots[dst] = SLOT_LIVE;
+            new_slots[dst + 1..dst + 4].copy_from_slice(&self.slots[off + 1..off + 4]);
             new_slots[dst + 4..dst + 12].copy_from_slice(&new_off.to_le_bytes());
             new_slots[dst + 12..dst + 16].copy_from_slice(&(body_len as u32).to_le_bytes());
             new_slots[dst + 16..dst + 48].copy_from_slice(&self.slots[off + 16..off + 48]);
@@ -654,7 +670,11 @@ impl Mempool {
             if packed.txid != slot_txid {
                 return Err(MempoolError::Corrupt("live slot txid"));
             }
-            out.push(LiveTx { slot, packed });
+            out.push(LiveTx {
+                slot,
+                packed,
+                trust_kept: self.slots[off + 1] != 0,
+            });
         }
         Ok(out)
     }
@@ -777,6 +797,15 @@ impl Mempool {
         self.slots[off + 12..off + 16].copy_from_slice(&body_len.to_le_bytes());
         self.slots[off + 16..off + 48].copy_from_slice(txid.as_byte_array());
         Ok(())
+    }
+
+    /// Mark a LIVE slot as warn-and-applied from the trusted session.
+    ///
+    /// The byte sits in the schema-4 pad. Compact copies it. A dead slot is
+    /// not reloaded, so clearing it is unnecessary.
+    pub fn set_slot_trust_kept(&mut self, slot: u32, on: bool) {
+        let off = SLOTS_HEADER + (slot as usize) * SLOT_REC + 1;
+        self.slots[off] = u8::from(on);
     }
 
     /// Ensure body has `need` free bytes; return offset of free region. Updates logical len.

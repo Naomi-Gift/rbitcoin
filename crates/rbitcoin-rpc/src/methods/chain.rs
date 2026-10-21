@@ -129,7 +129,8 @@ pub fn signet_challenge_hex(ctx: &RpcContext) -> Option<String> {
 }
 
 pub fn rpc_warnings(ctx: &RpcContext) -> Vec<String> {
-    let w = rbitcoin_net::warning_strings(ctx.query.as_ref(), ctx.network);
+    let who = ctx.peers.as_ref().and_then(|p| p.trust_peer_label());
+    let w = rbitcoin_net::warning_strings(ctx.query.as_ref(), ctx.network, who.as_deref());
     if !w.is_empty()
         && ctx
             .alert_fired

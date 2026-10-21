@@ -553,6 +553,253 @@ fn cidr_noban_is_per_peer_not_hub_wide() {
 }
 
 #[test]
+fn trust_peer_addnode_refused() {
+    let hub = PeerHub::new();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    hub.set_dialer(tx);
+    let trusted: SocketAddr = "192.0.2.1:8333".parse().unwrap();
+    hub.set_trust_peer(Some(rbitcoin_net::NetAddr::Ip(trusted)), None);
+    let other: SocketAddr = "192.0.2.2:8333".parse().unwrap();
+    let err = hub.addnode(other, "add").unwrap_err();
+    assert!(err.contains("trust-peer"), "{err}");
+    assert!(err.contains("192.0.2.1:8333"), "{err}");
+    assert!(take_dials(&mut rx).is_empty());
+    hub.addnode(trusted, "add").unwrap();
+    assert_eq!(take_dials(&mut rx).len(), 1);
+    let err = hub
+        .addconnection(other, PeerConnType::OutboundFullRelay)
+        .unwrap_err();
+    assert!(err.contains("192.0.2.1:8333"), "{err}");
+    let err = hub
+        .addnode_host("192.0.2.9:8333", "onetry", 8333)
+        .unwrap_err();
+    assert!(err.contains("trust-peer"), "{err}");
+    hub.addnode_host("192.0.2.1:8333", "onetry", 8333).unwrap();
+    hub.set_trust_peer(None, Some("seed.example:8333".into()));
+    let err = hub.addnode(other, "remove").unwrap_err();
+    assert!(err.contains("seed.example:8333"), "{err}");
+    hub.addnode_host("seed.example:8333", "add", 8333).unwrap();
+    let err = hub.addnode_host("other.example", "add", 8333).unwrap_err();
+    assert!(err.contains("seed.example:8333"), "{err}");
+}
+
+/// A hostname trust peer allows the socket it resolves to, and no other socket.
+#[test]
+fn trust_peer_resolved_host_is_dialable() {
+    let hub = PeerHub::new();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    hub.set_dialer(tx);
+    hub.set_trust_peer(None, Some("localhost:8333".into()));
+    hub.set_connect_hosts(vec!["localhost:8333".into()], 8333);
+    hub.redial_remembered();
+    let got = take_dials(&mut rx);
+    assert_eq!(got.len(), 1, "resolved trust host must dial: {got:?}");
+    assert!(
+        matches!(got[0].target, DialTarget::Socket(addr) if addr.ip().is_loopback() && addr.port() == 8333),
+        "{got:?}"
+    );
+    let other: SocketAddr = "192.0.2.9:8333".parse().unwrap();
+    let err = hub
+        .dial_manual_target(DialTarget::Socket(other))
+        .unwrap_err();
+    assert!(err.contains("localhost:8333"), "{err}");
+    assert!(take_dials(&mut rx).is_empty());
+}
+
+/// Relay on: the trusted session is not a BIP152 high-bandwidth peer.
+/// The same helper still selects a session when the mode is off.
+#[test]
+fn trust_peer_skips_high_bandwidth() {
+    use rbitcoin_net::chain::AcceptOutcome;
+    use rbitcoin_net::peer::{maybe_select_hb_if_relay, note_accepted_hb};
+
+    let (_dir, chain) = rbitcoin_net::chain::tiny_regtest_hub_labeled("trust-hb");
+    let addr: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let join = |hub: &Arc<PeerHub>| {
+        hub.register(
+            addr,
+            bind,
+            &ver("/rbitcoin:0.1.0/"),
+            false,
+            PeerConnType::OutboundFullRelay,
+        )
+    };
+
+    let trusted_hub = PeerHub::new();
+    trusted_hub.set_trust_peer(Some(rbitcoin_net::NetAddr::Ip(addr)), None);
+    let trusted = join(&trusted_hub);
+    maybe_select_hb_if_relay(&chain, Some(&trusted));
+    note_accepted_hb(
+        &Ok(AcceptOutcome::Accepted { height: 1 }),
+        &Some((Arc::clone(&trusted_hub), trusted.id)),
+    );
+    assert!(
+        !trusted.hb_to.load(Ordering::Relaxed),
+        "trusted session stays low-bandwidth"
+    );
+    assert!(!trusted_hub
+        .hb_selected
+        .lock()
+        .unwrap()
+        .contains(&trusted.id));
+
+    let open = PeerHub::new();
+    let peer = join(&open);
+    maybe_select_hb_if_relay(&chain, Some(&peer));
+    assert!(
+        peer.hb_to.load(Ordering::Relaxed),
+        "flag off still selects high-bandwidth"
+    );
+}
+
+fn hold_session(hub: &Arc<PeerHub>, addr: SocketAddr) -> Arc<LivePeer> {
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    hub.register(
+        addr,
+        bind,
+        &ver("/rbitcoin:0.1.0/"),
+        false,
+        PeerConnType::OutboundFullRelay,
+    )
+}
+
+fn dial_socket(req: &DialRequest) -> SocketAddr {
+    match req.target {
+        DialTarget::Socket(addr) => addr,
+        DialTarget::Domain { ref host, port } => panic!("expected a socket, got {host}:{port}"),
+    }
+}
+
+/// `--trust-peer seed.example` keeps one socket. A later answer disconnects
+/// the previous one and `addnode` of that socket fails.
+#[test]
+fn trust_peer_resolve_replaces_socket() {
+    let hub = PeerHub::new();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    hub.set_dialer(tx);
+    hub.set_trust_peer(None, Some("seed.example:8333".into()));
+    hub.set_connect_hosts(vec!["seed.example:8333".into()], 8333);
+    let first: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+    let second: SocketAddr = "5.6.7.8:8333".parse().unwrap();
+    assert!(
+        !rbitcoin_net::netaddr::clearnet_unroutable(second.ip()),
+        "replacement address must not be an unroutable-gossip address"
+    );
+    let generation = std::cell::Cell::new(0u8);
+    let resolve = |host: &str| {
+        assert!(host.contains("seed.example"), "resolver saw {host}");
+        let addr = if generation.get() == 0 { first } else { second };
+        Ok(DialTarget::Socket(addr))
+    };
+    hub.redial_remembered_with(resolve);
+    let got = take_dials(&mut rx);
+    assert_eq!(got.len(), 1, "first resolution dials once: {got:?}");
+    assert_eq!(dial_socket(&got[0]), first);
+
+    let old = hold_session(&hub, first);
+    generation.set(1);
+    hub.redial_remembered_with(resolve);
+    assert!(
+        hub.get(old.id).is_none(),
+        "previous trust socket is disconnected"
+    );
+    let got = take_dials(&mut rx);
+    assert_eq!(got.len(), 1, "new socket is dialed: {got:?}");
+    assert_eq!(dial_socket(&got[0]), second);
+    let err = hub.addnode(first, "add").unwrap_err();
+    assert!(err.contains("seed.example"), "{err}");
+
+    let live = hold_session(&hub, second);
+    hub.redial_remembered_with(resolve);
+    assert!(hub.get(live.id).is_some(), "same socket stays up");
+    assert!(
+        take_dials(&mut rx).is_empty(),
+        "a live resolution opens no second session"
+    );
+}
+
+/// `--connect` hostnames replace one socket each. A shared socket stays
+/// while any current name still uses it. An IP literal is not re-resolved.
+#[test]
+fn connect_resolve_replaces_socket() {
+    let hub = PeerHub::new();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    hub.set_dialer(tx);
+    hub.set_connect_hosts(vec!["a.example:8333".into(), "b.example:8333".into()], 8333);
+    let literal: SocketAddr = "8.8.8.8:8333".parse().unwrap();
+    hub.set_connect_addrs(vec![rbitcoin_net::NetAddr::Ip(literal)]);
+    let shared: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+    let moved: SocketAddr = "5.6.7.8:8333".parse().unwrap();
+    let phase = std::cell::Cell::new(0u8);
+    let asked = std::cell::RefCell::new(Vec::new());
+    let resolve = |host: &str| {
+        asked.borrow_mut().push(host.to_string());
+        let addr = if host.starts_with("a.") {
+            if phase.get() == 0 {
+                shared
+            } else {
+                moved
+            }
+        } else if host.starts_with("b.") {
+            if phase.get() < 2 {
+                shared
+            } else {
+                moved
+            }
+        } else {
+            panic!("resolved an address that is not a connect hostname: {host}");
+        };
+        Ok(DialTarget::Socket(addr))
+    };
+    hub.redial_remembered_with(resolve);
+    assert!(
+        asked.borrow().iter().all(|h| !h.contains("8.8.8.8")),
+        "an IP literal is not re-resolved: {:?}",
+        asked.borrow()
+    );
+    let got = take_dials(&mut rx);
+    let ips: Vec<SocketAddr> = got.iter().map(dial_socket).collect();
+    assert!(ips.contains(&shared), "{ips:?}");
+    assert!(ips.contains(&literal), "{ips:?}");
+
+    let shared_peer = hold_session(&hub, shared);
+    let literal_peer = hold_session(&hub, literal);
+    phase.set(1);
+    hub.redial_remembered_with(resolve);
+    assert!(
+        hub.get(shared_peer.id).is_some(),
+        "a socket still used by b.example stays connected"
+    );
+    assert!(
+        hub.get(literal_peer.id).is_some(),
+        "the other connect peer stays"
+    );
+    let got = take_dials(&mut rx);
+    assert!(
+        got.iter().any(|d| dial_socket(d) == moved),
+        "a.example dials its new socket: {got:?}"
+    );
+
+    let moved_peer = hold_session(&hub, moved);
+    phase.set(2);
+    hub.redial_remembered_with(resolve);
+    assert!(
+        hub.get(shared_peer.id).is_none(),
+        "the shared socket drops once neither name still uses it"
+    );
+    assert!(hub.get(literal_peer.id).is_some());
+    assert!(
+        hub.get(moved_peer.id).is_some(),
+        "resolving to the live socket opens no second session"
+    );
+    assert!(
+        take_dials(&mut rx).iter().all(|d| dial_socket(d) != moved),
+        "no second dial to the live socket"
+    );
+}
+
+#[test]
 fn addnode_unknown_command() {
     let hub = PeerHub::new();
     let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);

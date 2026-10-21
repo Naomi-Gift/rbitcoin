@@ -4567,3 +4567,354 @@ fn mempool_tx_snapshot_refresh_reuses_tx_arc() {
     assert!(e3b.json.get().is_none());
     let _ = std::fs::remove_dir_all(&mp_dir);
 }
+
+/// A non-final tx from the trusted session stays through hub reorg eviction.
+/// A local submit of the same shape is rejected and stays out of the pool.
+/// The coin is on the chain, so this is `evict_after_reorg`, not a private utxo map.
+#[test]
+fn trust_peer_reorg_evict_keeps_nonfinal() {
+    let (store, q, cbs) = copy_maturity_pad(3);
+    let mp = tmp();
+    let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    q.set_trust_peer(true);
+    let session = 11u64;
+    hub.set_trusted_session(Some(session));
+    let tip = q.tip_height().unwrap().0;
+    let mut tx = spend_true(cbs[0], 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    tx.lock_time = LockTime::from_height(tip + 10).unwrap();
+    tx.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+    hub.accept_tx_from(&tx, Some(session))
+        .expect("non-final from the trusted session");
+    let txid = tx.compute_txid();
+    assert!(hub.try_contains(&txid));
+    hub.evict_after_reorg();
+    assert!(
+        hub.try_contains(&txid),
+        "reorg eviction must keep a session-warned non-final tx"
+    );
+    q.set_trust_peer(false);
+    hub.set_trust_peer(false);
+    hub.evict_after_reorg();
+    assert!(
+        hub.try_contains(&txid),
+        "the keep bit is on the tx, not the process flag"
+    );
+
+    let mut local = spend_true(cbs[1], 1_000, ScriptBuf::from_bytes(vec![0x52]));
+    local.lock_time = LockTime::from_height(tip + 10).unwrap();
+    local.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+    let err = hub.accept_tx(&local).unwrap_err();
+    assert!(
+        matches!(err, AcceptError::NotFinal | AcceptError::Policy(_)),
+        "{err}"
+    );
+    let local_id = local.compute_txid();
+    assert!(!hub.try_contains(&local_id));
+    hub.evict_after_reorg();
+    assert!(
+        !hub.try_contains(&local_id),
+        "a local non-final tx is not in the pool after the sweep"
+    );
+    assert!(hub.try_contains(&txid));
+    let _ = std::fs::remove_dir_all(&mp);
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+/// A script failure with no session is rejected even when the mode is on.
+/// The same failure from the trusted session stays through reorg eviction.
+#[test]
+fn trust_peer_admit_from_peer_only() {
+    use bitcoin::WPubkeyHash;
+
+    let (store, q, cbs) = copy_maturity_pad(3);
+    let mp = tmp();
+    let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    q.set_trust_peer(true);
+    let wpkh = WPubkeyHash::from_byte_array([0x44; 20]);
+    let parent = spend_true(cbs[0], 1_000, ScriptBuf::new_p2wpkh(&wpkh));
+    hub.accept_tx(&parent).expect("fund p2wpkh");
+    let parent_value = parent.output[0].value.to_sat();
+    let child = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(parent_value - 1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let err = hub.accept_tx(&child).unwrap_err();
+    assert!(matches!(err, AcceptError::Script(_)), "{err}");
+    assert!(!hub.try_contains(&child.compute_txid()));
+
+    let session = 7u64;
+    hub.set_trusted_session(Some(session));
+    rbitcoin_log::capture_logs(false);
+    rbitcoin_log::capture_logs(true);
+    let got = hub
+        .accept_tx_from(&child, Some(session))
+        .expect("trusted session admits the script fault");
+    assert_eq!(got.fee_sat, 1_000);
+    let txid = child.compute_txid();
+    assert!(hub.try_contains(&txid));
+    let on = rbitcoin_log::take_logs()
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        on.contains(&format!("trust-peer: applied tx {txid}:")),
+        "{on}"
+    );
+    hub.evict_after_reorg();
+    assert!(
+        hub.try_contains(&txid),
+        "script admit stays through the sweep"
+    );
+
+    let parent2 = spend_true(cbs[1], 1_000, ScriptBuf::new_p2wpkh(&wpkh));
+    hub.accept_tx(&parent2).expect("second fund");
+    let other = Transaction {
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent2.compute_txid(),
+                vout: 0,
+            },
+            ..child.input[0].clone()
+        }],
+        ..child.clone()
+    };
+    let other_err = hub.accept_tx_from(&other, Some(session + 1)).unwrap_err();
+    assert!(matches!(other_err, AcceptError::Script(_)), "{other_err}");
+    assert!(!hub.try_contains(&other.compute_txid()));
+    rbitcoin_log::capture_logs(false);
+    let _ = std::fs::remove_dir_all(&mp);
+    let _ = std::fs::remove_dir_all(&store);
+}
+
+/// Peer relay admit (`accept_with_utxo` → `admit_staged`) warns and stores
+/// a consensus script failure. Flag off rejects with no `trust-peer:` line.
+#[test]
+fn trust_peer_admit_staged_script() {
+    use bitcoin::WPubkeyHash;
+    use rbitcoin_mempool::accept::MapUtxoProvider;
+
+    let store_dir = tmp();
+    let mp_dir = tmp();
+    let q = Query::open_or_create_tiny(&store_dir).unwrap();
+    let q = Arc::new(q);
+    let hub = MempoolHub::open(&mp_dir, Arc::clone(&q)).unwrap();
+    let wpkh = WPubkeyHash::from_byte_array([0x44; 20]);
+    let op = OutPoint {
+        txid: Txid::from_byte_array([0xab; 32]),
+        vout: 0,
+    };
+    let mut map = HashMap::new();
+    map.insert(
+        op,
+        Coin {
+            txout: TxOut {
+                value: Amount::from_sat(100_000),
+                script_pubkey: ScriptBuf::new_p2wpkh(&wpkh),
+            },
+            create_height: 1,
+            create_mtp: 0,
+            is_coinbase: false,
+            create_fk: None,
+        },
+    );
+    let utxos = MapUtxoProvider { map };
+    let tx = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: op,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(99_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    rbitcoin_log::capture_logs(false);
+    rbitcoin_log::capture_logs(true);
+    let off = hub
+        .accept_with_utxo(&tx, &utxos, None, false, &[])
+        .unwrap_err();
+    assert!(matches!(off, AcceptError::Script(_)), "{off}");
+    let off_log = rbitcoin_log::take_logs()
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!off_log.contains("trust-peer:"), "{off_log}");
+    assert!(!hub.try_contains(&tx.compute_txid()));
+
+    q.set_trust_peer(true);
+    let session = 4u64;
+    hub.set_trusted_session(Some(session));
+    rbitcoin_log::capture_logs(true);
+    let got = hub
+        .accept_with_utxo(&tx, &utxos, Some(session), false, &[])
+        .expect("peer admit");
+    assert_eq!(got.fee_sat, 1_000);
+    let txid = tx.compute_txid();
+    assert!(hub.try_contains(&txid));
+    let on = rbitcoin_log::take_logs()
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        on.contains(&format!("trust-peer: applied tx {txid}:")),
+        "{on}"
+    );
+    assert!(on.contains("script verification"), "{on}");
+    rbitcoin_log::capture_logs(false);
+    let _ = std::fs::remove_dir_all(&mp_dir);
+    let _ = std::fs::remove_dir_all(&store_dir);
+}
+
+/// A script reject already in recent-reject is admitted again from the
+/// trusted session. Another peer is still dropped. Dust stays out and
+/// does not log `trust-peer:`.
+#[test]
+fn review_trust_recent_reject_does_not_drop_session_tx() {
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use bitcoin::WPubkeyHash;
+    use rbitcoin_consensus::{ChainParams, Milestone};
+    use rbitcoin_net::chain::ChainHub;
+    use rbitcoin_net::peer::{on_tx, PeerFollowState};
+    use rbitcoin_net::peers::{PeerConnType, PeerHub};
+    use rbitcoin_net::NetAddr;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let (store, q, cbs) = copy_maturity_pad(3);
+    let q = match std::sync::Arc::try_unwrap(q) {
+        Ok(q) => q,
+        Err(_) => panic!("pad query is not shared"),
+    };
+    let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
+    hub.finished_ibd.store(true, Ordering::Release);
+    let mp_dir = tmp();
+    let mp =
+        std::sync::Arc::new(MempoolHub::open(&mp_dir, std::sync::Arc::clone(&hub.query)).unwrap());
+    mp.set_relay_enabled(true);
+    if hub.attach_mempool(std::sync::Arc::clone(&mp)).is_err() {
+        panic!("mempool already attached");
+    }
+    hub.query.set_trust_peer(true);
+
+    let wpkh = WPubkeyHash::from_byte_array([0x44; 20]);
+    let parent = spend_true(cbs[0], 1_000, ScriptBuf::new_p2wpkh(&wpkh));
+    mp.accept_tx(&parent).expect("fund p2wpkh");
+    let parent_value = parent.output[0].value.to_sat();
+    let child = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: parent.compute_txid(),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::from_slice(&[vec![0x01]]),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(parent_value - 1_000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let err = mp.accept_tx(&child).unwrap_err();
+    assert!(matches!(err, AcceptError::Script(_)), "{err}");
+    let txid = child.compute_txid();
+    assert!(!mp.try_contains(&txid));
+    assert!(
+        mp.try_recent_reject(&child.compute_wtxid()),
+        "local script reject must sit in recent-reject"
+    );
+
+    let trusted_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 18444);
+    let other_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)), 18444);
+    let peers = PeerHub::new();
+    peers.set_trust_peer(Some(NetAddr::from_socket(trusted_addr)), None);
+    let ver = |addr: SocketAddr| VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let other = peers.register(
+        other_addr,
+        other_addr,
+        &ver(other_addr),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let trusted = peers.register(
+        trusted_addr,
+        trusted_addr,
+        &ver(trusted_addr),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let mut follow = PeerFollowState::new();
+        on_tx(&hub, &out_tx, &mut follow, Some(&other), &child)
+            .await
+            .unwrap();
+    });
+    assert!(
+        !mp.try_contains(&txid),
+        "a non-trusted peer must not clear recent-reject"
+    );
+
+    rt.block_on(async {
+        let mut follow = PeerFollowState::new();
+        on_tx(&hub, &out_tx, &mut follow, Some(&trusted), &child)
+            .await
+            .unwrap();
+    });
+    assert!(mp.try_contains(&txid), "trusted session re-admits");
+
+    // `on_tx` commits on the blocking pool, so this thread's log buffer
+    // cannot see the applied line. The mempool test pins that log.
+    let dust = spend_true(cbs[1], 50_0000_0000, ScriptBuf::from_bytes(vec![0x51]));
+    rt.block_on(async {
+        let mut follow = PeerFollowState::new();
+        on_tx(&hub, &out_tx, &mut follow, Some(&trusted), &dust)
+            .await
+            .unwrap();
+    });
+    assert!(
+        !mp.try_contains(&dust.compute_txid()),
+        "a policy reject from the trusted session stays out"
+    );
+    let _ = std::fs::remove_dir_all(&mp_dir);
+    let _ = std::fs::remove_dir_all(&store);
+}

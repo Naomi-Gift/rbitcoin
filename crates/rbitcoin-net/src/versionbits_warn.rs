@@ -143,12 +143,22 @@ pub fn signals_unknown(version: &i32, bit: i32) -> bool {
 }
 
 /// Warning strings for RPC `warnings` arrays.
-pub fn warning_strings(query: &Query, network: Network) -> Vec<String> {
+///
+/// `trust_who` is the trusted peer's address when the mode is on. The line
+/// is absent when the mode is off, including when a label is passed.
+pub fn warning_strings(query: &Query, network: Network, trust_who: Option<&str>) -> Vec<String> {
     static SCAN: Mutex<UnknownBitsScan> = Mutex::new(UnknownBitsScan::new());
-    SCAN.lock()
+    let mut lines: Vec<String> = SCAN
+        .lock()
         .unwrap_or_else(|e| e.into_inner())
         .active_bits(query, network)
         .into_iter()
         .map(unknown_rules_warning)
-        .collect()
+        .collect();
+    if query.trust_peer() {
+        if let Some(who) = trust_who {
+            lines.push(format!("disagreements from trust-peer {who} are warnings"));
+        }
+    }
+    lines
 }

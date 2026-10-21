@@ -478,7 +478,13 @@ pub fn apply_peer_event(
         }
         PeerEvent::Addrs { peer, addrs } => {
             let allow = take_addr_tokens(st, peer, addrs.len());
-            inject_learned_addrs(peer_book, &addrs[..allow], local_addr, peer);
+            learn_peer_addrs(
+                hub.query.trust_peer(),
+                peer_book,
+                &addrs[..allow],
+                local_addr,
+                peer,
+            );
         }
         PeerEvent::Dead { peer, reason } => apply_peer_dead(st, peer_book, peer, reason),
     }
@@ -1090,6 +1096,22 @@ pub fn apply_peer_dead(
     }
     let freed = release_peer_block_work(&mut st.slots, &mut st.inflight, &mut st.body, peer);
     st.reopen_for_densify(&freed);
+}
+
+/// Grow the IBD dial book from peer-advertised addresses.
+///
+/// `--trust-peer` keeps the book at the pinned target: gossip is not a dial candidate.
+pub fn learn_peer_addrs(
+    trust_peer: bool,
+    book: &mut AddrMan,
+    addrs: &[rbitcoin_net::NetAddr],
+    local_addr: SocketAddr,
+    from_peer: usize,
+) {
+    if trust_peer {
+        return;
+    }
+    inject_learned_addrs(book, addrs, local_addr, from_peer);
 }
 
 /// Grow the IBD dial book from peer-advertised addresses (getaddr responses).

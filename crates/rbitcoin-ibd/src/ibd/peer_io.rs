@@ -955,6 +955,11 @@ pub async fn spawn_peer(
     if perms.as_ref().is_some_and(|p| p.net_discouraged(addr)) {
         return Err(NetError::Protocol("discouraged"));
     }
+    if let Some(p) = perms.as_ref() {
+        if let Err(msg) = p.trust_allows_net(addr) {
+            return Err(NetError::Consensus(msg));
+        }
+    }
     let stream = dialer.connect_net(addr).await?;
     let version_socket = addr
         .socket_addr()

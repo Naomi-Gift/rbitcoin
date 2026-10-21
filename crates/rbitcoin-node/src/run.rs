@@ -350,6 +350,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         std::env::var("RBITCOIN_IO").unwrap_or_else(|_| "default".into()),
     );
 
+    handle.query.set_trust_peer(config.trust_peer_set());
     let query = handle.query;
     let p2p_ua =
         rbitcoin_primitives::rbitcoin_subversion(env!("CARGO_PKG_VERSION"), &config.uacomments)
@@ -382,6 +383,16 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         }
     }
     .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
+    node.peers
+        .set_trust_peer(config.trust_peer, config.trust_peer_host.clone());
+    if config.trust_peer_set() {
+        let who = config
+            .trust_peer
+            .map(|a| a.to_string())
+            .or_else(|| config.trust_peer_host.clone())
+            .unwrap_or_default();
+        info!("node: trust-peer {who} is the only dial target");
+    }
     publish_listener_addr(config.datadir.path(), "p2p", node.local_addr);
     let spend_sync = SpendSync::spawn(std::sync::Arc::clone(&node.hub.query));
     status.attach_p2p(&node.hub, &node.peers);
@@ -454,6 +465,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             persist,
             block_reserved_sigops,
         )?;
+        mp.set_trust_peer(mp.query.trust_peer());
         mp.set_cluster_limits(cluster_count, cluster_kvb);
         if let Some(b) = bytes_per_sigop {
             mp.set_bytes_per_sigop(b);
@@ -478,7 +490,10 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     .map_err(NodeError::Config)?;
     node.peers.attach_mempool(&mempool);
     status.attach_mempool(&mempool);
-    if config.listen.proxy.is_some() || config.listen.onion.is_some() {
+    // Proxy and onion are how the one trusted peer is reached. This node's
+    // own txs stay on that session. Isolated broadcast dials other nodes.
+    if (config.listen.proxy.is_some() || config.listen.onion.is_some()) && !config.trust_peer_set()
+    {
         mempool.set_isolated_broadcast(true);
     }
     node.peers.set_net_perms(table.clone());
@@ -644,6 +659,13 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         config.network.default_p2p_port(),
     );
     let dns_resolved = resolve_connect_dns(&config.listen.connect_dns, config.network).await;
+    if config.trust_peer_host.is_some() {
+        for addr in &dns_resolved {
+            if let rbitcoin_net::NetAddr::Ip(sock) = addr {
+                node.peers.note_trust_resolved(*sock);
+            }
+        }
+    }
     for c in &config.listen.connect {
         addrman.add_addr(*c);
     }
@@ -663,7 +685,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             addrman.len().saturating_sub(n_before),
             addrman.len()
         );
-    } else if config.listen.proxy.is_some() && config.listen.use_seeds {
+    } else if !config.trust_peer_set() && config.listen.proxy.is_some() && config.listen.use_seeds {
         proxy_seeds_queued = true;
         let n = queue_proxy_seed_addrfetch(&node.peers, config.network);
         info!("ibd: SOCKS proxy set — queued {n} seed hostnames via SOCKS addrfetch");
@@ -675,7 +697,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
     let shared_peers = std::sync::Arc::new(std::sync::Mutex::new(addrman.clone()));
     node.peers.set_addrman(std::sync::Arc::clone(&shared_peers));
-    if mempool.isolated_broadcast() {
+    if mempool.isolated_broadcast() && !config.trust_peer_set() {
         let _iso = rbitcoin_net::spawn_isolated_broadcast_loop(
             Arc::clone(&mempool),
             config.listen.isolated_dialer(),
@@ -710,8 +732,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let occupied = node.peers.live_outbound_full_relay_nets();
     let mut pinned = config.listen.connect.clone();
     pinned.extend(dns_resolved);
+    let trust_peer = config.trust_peer_set();
     let follow_type = follow_dial_type(&pinned);
-    let ibd_targets = follow_dial_targets(&pinned, &addrman, candidate_n, &occupied);
+    let ibd_targets = outbound_dial_targets(trust_peer, &pinned, &addrman, candidate_n, &occupied);
     let awaiting_dialable = addrman.is_empty() && (reachability_removed_rows || proxy_seeds_queued);
     let mut rpc_handle: Option<RpcHandle> = None;
     status.enter(Phase::CatchUp);
@@ -758,8 +781,14 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     // was read. Refresh the follow dial list before tip mode; IBD disconnects
     // its own peers on the way out.
     let occupied_now = node.peers.live_outbound_full_relay_nets();
-    let targets =
-        refresh_follow_targets(&pinned, &shared_peers, &mut addrman, max_out, &occupied_now);
+    let targets = refresh_follow_targets(
+        trust_peer,
+        &pinned,
+        &shared_peers,
+        &mut addrman,
+        max_out,
+        &occupied_now,
+    );
 
     let catch_up = catch_up_with_connect(
         catch_up,
@@ -1465,8 +1494,11 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                     }
                 } else {
                     info!("ibd: retry catch-up from {peer} (tip stagnant, catch-up incomplete)");
-                    let retry_cfg =
+                    let mut retry_cfg =
                         catch_up_retry_config(std::sync::Arc::clone(&shared_peers), node.dialer());
+                    if node.hub.query.trust_peer() {
+                        retry_cfg.peers = None;
+                    }
                     let cancel = Some(Arc::clone(&shutdown.flag));
                     let retry_peers = [rbitcoin_net::NetAddr::Ip(peer)];
                     tokio::select! {
@@ -1804,19 +1836,20 @@ pub async fn wait_for_dialable_targets(
 /// can be stale (or empty) even when the shared book now has rows.
 #[doc(hidden)]
 pub fn refresh_follow_targets(
+    trust_peer: bool,
     pinned: &[rbitcoin_net::NetAddr],
     shared_peers: &std::sync::Arc<std::sync::Mutex<AddrMan>>,
     addrman: &mut AddrMan,
     max_out: usize,
     occupied: &[rbitcoin_net::NetAddr],
 ) -> Vec<rbitcoin_net::NetAddr> {
-    {
+    if !trust_peer {
         let g = shared_peers.lock().unwrap_or_else(|e| e.into_inner());
         if !g.is_empty() {
             *addrman = g.clone();
         }
     }
-    follow_dial_targets(pinned, addrman, max_out, occupied)
+    outbound_dial_targets(trust_peer, pinned, addrman, max_out, occupied)
 }
 
 pub fn catch_up_after_ok(accepted: u32, tip: u32, shutdown: bool) -> CatchUp {
@@ -1973,8 +2006,13 @@ pub async fn run_ibd_or_skip(
     network: Network,
 ) -> CatchUp {
     let mut targets = ibd_targets.to_vec();
+    // `--trust-peer` has one pinned dial. An empty list is a failed resolve,
+    // not a reason to wait for the peers file.
+    let wait_for_discovery = !node.hub.query.trust_peer()
+        && awaiting_dialable
+        && matches!(peerless, Peerless::Redial { .. });
     if targets.is_empty() {
-        if awaiting_dialable && matches!(peerless, Peerless::Redial { .. }) {
+        if wait_for_discovery {
             info!("ibd: no dialable address yet — keeping catch-up open while discovery continues");
             let occupied = node.peers.live_outbound_full_relay_nets();
             let Some(found) = wait_for_dialable_targets(
@@ -2024,7 +2062,7 @@ pub async fn run_ibd_or_skip(
     let ibd_cfg = IbdConfig {
         target_peers,
         peerless,
-        peers: Some(std::sync::Arc::clone(shared_peers)),
+        peers: ibd_shared_peers(node.hub.query.trust_peer(), shared_peers),
         dialer: node.dialer(),
         ..IbdConfig::default()
     };
@@ -2571,6 +2609,20 @@ pub fn main_catch_up_peerless(tip_indexes: bool, max_run_secs: Option<u64>) -> P
     }
 }
 
+/// Peers-file book for catch-up. `--trust-peer` starts empty so only the
+/// pinned targets seeded by the caller are dial candidates.
+#[doc(hidden)]
+pub fn ibd_shared_peers(
+    trust_peer: bool,
+    shared: &std::sync::Arc<std::sync::Mutex<AddrMan>>,
+) -> Option<std::sync::Arc<std::sync::Mutex<AddrMan>>> {
+    if trust_peer {
+        None
+    } else {
+        Some(std::sync::Arc::clone(shared))
+    }
+}
+
 /// Production IBD knobs for a single-peer catch-up retry (stale tip, incomplete catch-up).
 ///
 /// Uses [`IbdConfig::default`] (window 1024, stall 30s, connect 8s, …) — not
@@ -2668,6 +2720,24 @@ pub fn load_asmap(datadir: &Path, configured: Option<&Path>) -> Option<Arc<AsMap
             );
             None
         }
+    }
+}
+
+/// Dial targets for catch-up and tip-follow.
+///
+/// `--trust-peer` never falls through to the peers file when DNS resolution
+/// produced no address. `--connect` still bypasses the netgroup filter.
+pub fn outbound_dial_targets(
+    trust_peer: bool,
+    pinned: &[rbitcoin_net::NetAddr],
+    book: &AddrMan,
+    max: usize,
+    occupied: &[rbitcoin_net::NetAddr],
+) -> Vec<rbitcoin_net::NetAddr> {
+    if trust_peer {
+        pinned.to_vec()
+    } else {
+        follow_dial_targets(pinned, book, max, occupied)
     }
 }
 

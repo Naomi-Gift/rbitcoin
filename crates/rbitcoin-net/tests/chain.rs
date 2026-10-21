@@ -3795,6 +3795,31 @@ fn check_block_proposal_prices_fees_and_rejects_on_one_chain() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn trust_log_text() -> String {
+    rbitcoin_log::take_logs()
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn spend_coinbase(txid: bitcoin::Txid, sats: u64, spk: ScriptBuf) -> Transaction {
+    Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: OutPoint { txid, vout: 0 },
+            script_sig: ScriptBuf::new(),
+            sequence: bitcoin::Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: bitcoin::Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(sats),
+            script_pubkey: spk,
+        }],
+    }
+}
+
 /// A side block whose parent header read is cancelled is not `BLOCK_FAILED`.
 #[test]
 fn cancelled_header_read_on_a_side_block_is_not_cached_invalid() {
@@ -4171,4 +4196,525 @@ fn reconsider_skips_a_branch_that_fails() {
     assert!(err.is_local_fault(), "{err}");
     assert!(hub.fork_tips.read().unwrap().iter().any(|h| h == tip));
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A block that extends the tip, claims difficulty 1, and has no matching
+/// proof of work must not connect and must not add that claimed work.
+#[test]
+fn review_trust_no_pow_block_credits_claimed_work() {
+    fn forged_block(hub: &ChainHub) -> bitcoin::Block {
+        let op_true = ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+        let mut forged = hub.assemble_block_to_script(op_true, vec![]).unwrap();
+        forged.header.bits = bitcoin::CompactTarget::from_consensus(0x1d00_ffff);
+        forged.header.merkle_root = forged.compute_merkle_root().unwrap();
+        while forged.header.validate_pow(forged.header.target()).is_ok() {
+            forged.header.nonce = forged.header.nonce.wrapping_add(1);
+        }
+        forged
+    }
+    let (_d_off, off_hub) = tiny_regtest_hub_labeled("review-pow-off");
+    let r_off = off_hub.accept_received_block(forged_block(&off_hub));
+    assert!(r_off.is_err(), "flag off rejects: {r_off:?}");
+
+    let (_d_on, hub) = tiny_regtest_hub_labeled("review-pow-on");
+    let forged = forged_block(&hub);
+    let hash = forged.block_hash();
+    let before = hub.chain_work().unwrap();
+    hub.query.set_trust_peer(true);
+    let r = hub.accept_received_block(forged);
+    let after = hub.chain_work().unwrap();
+    assert!(r.is_err(), "no-PoW block applied: {r:?}");
+    assert_eq!(
+        after, before,
+        "claimed work moved\nbefore {before:?}\nafter {after:?}"
+    );
+    assert!(
+        hub.header_of(&hash).is_none(),
+        "high-hash header was stored"
+    );
+    // `capture_logs` is thread-local. Tip-accept emits the not-applied line
+    // on its own thread; the same-thread header and confirm tests pin that text.
+    assert!(r.as_ref().err().is_some_and(|e| !e.is_mutated()));
+}
+
+/// Local `submitblock` of a heavier side chain stays strict while the mode is
+/// on. An equal-work sibling is parked, then a child makes that branch win.
+/// The parked body's own bit is what connect reads. The process bit does not.
+#[test]
+fn review_trust_local_side_subsidy_is_not_applied() {
+    let (_dir, hub) = tiny_regtest_hub_labeled("review-local-side");
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    hub.generate_to_script(1, op_true, vec![]).unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let tip_h = hub.tip_height().unwrap();
+    let tip_block = hub.block_at_height(tip_h).unwrap().unwrap();
+    let sibling = mine_distinct(
+        tip_block.header.prev_blockhash,
+        tip_block.header.time,
+        tip_h,
+        &[tip],
+    );
+    let sibling_hash = sibling.block_hash();
+    hub.query.set_trust_peer(true);
+    let parked = hub.accept_received_block(sibling).unwrap();
+    assert_eq!(parked, AcceptOutcome::IgnoredWeaker);
+    assert_eq!(hub.tip_hash(), Some(tip));
+    assert!(hub.held_body(&sibling_hash).is_some());
+    let mut child = mine(
+        sibling_hash,
+        tip_block.header.time.saturating_add(1),
+        tip_h + 1,
+    );
+    let bumped = child.txdata[0].output[0].value.to_sat() + 1;
+    child.txdata[0].output[0].value = Amount::from_sat(bumped);
+    child.header.merkle_root = child.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut child.header);
+    assert!(child.header.validate_pow(child.header.target()).is_ok());
+    let r = hub.accept_received_block(child);
+    assert!(r.is_err(), "local side-chain subsidy applied: {r:?}");
+    assert_eq!(
+        hub.tip_hash(),
+        Some(tip),
+        "tip moved onto the local side chain"
+    );
+    assert_eq!(hub.tip_height(), Some(tip_h));
+}
+
+/// The mode is on. A side chain the trusted session held still applies an
+/// excess coinbase. The process flag alone does not.
+#[test]
+fn review_trust_session_side_subsidy_is_applied() {
+    let (_dir, hub) = tiny_regtest_hub_labeled("review-session-side");
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    hub.generate_to_script(1, op_true, vec![]).unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let tip_h = hub.tip_height().unwrap();
+    let tip_block = hub.block_at_height(tip_h).unwrap().unwrap();
+    let sibling = mine_distinct(
+        tip_block.header.prev_blockhash,
+        tip_block.header.time,
+        tip_h,
+        &[tip],
+    );
+    let sibling_hash = sibling.block_hash();
+    hub.query.set_trust_peer(true);
+    let parked =
+        rbitcoin_net::tip_accept::run_on_tip_accept(|| hub.accept_received_on_lane(sibling, true))
+            .unwrap();
+    assert_eq!(parked, AcceptOutcome::IgnoredWeaker);
+    assert_eq!(hub.tip_hash(), Some(tip));
+    let mut child = mine(
+        sibling_hash,
+        tip_block.header.time.saturating_add(1),
+        tip_h + 1,
+    );
+    let bumped = child.txdata[0].output[0].value.to_sat() + 1;
+    child.txdata[0].output[0].value = Amount::from_sat(bumped);
+    child.header.merkle_root = child.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut child.header);
+    let r =
+        rbitcoin_net::tip_accept::run_on_tip_accept(|| hub.accept_received_on_lane(child, true));
+    assert!(
+        matches!(r, Ok(AcceptOutcome::Accepted { .. })),
+        "session side-chain subsidy was not applied: {r:?}"
+    );
+    assert_eq!(hub.tip_height(), Some(tip_h + 1));
+    assert_ne!(hub.tip_hash(), Some(tip));
+}
+
+/// A tip that connected under the session bit must come back if a later local
+/// branch fails. Restore does not read the process flag.
+#[test]
+fn review_trust_restore_keeps_a_waived_tip() {
+    let (_dir, hub) = tiny_regtest_hub_labeled("review-restore-waive");
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+    let parent_h = hub.tip_height().unwrap();
+    let parent = hub.tip_hash().unwrap();
+    let mut bad = hub.assemble_block_to_script(op_true, vec![]).unwrap();
+    let bumped = bad.txdata[0].output[0].value.to_sat() + 1;
+    bad.txdata[0].output[0].value = Amount::from_sat(bumped);
+    bad.header.merkle_root = bad.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut bad.header);
+    let bad_hash = bad.block_hash();
+    hub.query.set_trust_peer(true);
+    let applied =
+        rbitcoin_net::tip_accept::run_on_tip_accept(|| hub.accept_received_on_lane(bad, true))
+            .unwrap();
+    assert_eq!(
+        applied,
+        AcceptOutcome::Accepted {
+            height: parent_h + 1
+        }
+    );
+    let bad_time = hub.tip_header().unwrap().time;
+    let sibling = mine_distinct(parent, bad_time, parent_h + 1, &[bad_hash]);
+    let sibling_hash = sibling.block_hash();
+    assert_eq!(
+        hub.accept_received_block(sibling).unwrap(),
+        AcceptOutcome::IgnoredWeaker
+    );
+    let mut child = mine(sibling_hash, bad_time.saturating_add(1), parent_h + 2);
+    let bumped = child.txdata[0].output[0].value.to_sat() + 1;
+    child.txdata[0].output[0].value = Amount::from_sat(bumped);
+    child.header.merkle_root = child.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut child.header);
+    let r = hub.accept_received_block(child);
+    assert!(r.is_err(), "local child of a waived tip applied: {r:?}");
+    let msg = r.unwrap_err().to_string();
+    assert!(
+        !msg.contains("tip restore failed"),
+        "waived tip tore on restore: {msg}"
+    );
+    assert_eq!(hub.tip_hash(), Some(bad_hash));
+    assert_eq!(hub.tip_height(), Some(parent_h + 1));
+}
+
+/// `accept_received_block` is local submit and generate. The process bit does
+/// not waive an excess coinbase.
+#[test]
+fn review_trust_local_excess_subsidy_is_not_applied() {
+    let (_dir, hub) = tiny_regtest_hub_labeled("review-local-subsidy");
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+    let mut block = hub.assemble_block_to_script(op_true, vec![]).unwrap();
+    let bumped = block.txdata[0].output[0].value.to_sat() + 1;
+    block.txdata[0].output[0].value = Amount::from_sat(bumped);
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    for _ in 0..10_000 {
+        if block.header.validate_pow(block.header.target()).is_ok() {
+            break;
+        }
+        block.header.nonce = block.header.nonce.wrapping_add(1);
+    }
+    assert!(block.header.validate_pow(block.header.target()).is_ok());
+    let before = hub.tip_height();
+    hub.query.set_trust_peer(true);
+    let r = hub.accept_received_block(block);
+    assert!(r.is_err(), "local excess subsidy applied: {r:?}");
+    assert_eq!(hub.tip_height(), before);
+}
+
+fn excess_on(prev: BlockHash, time: u32, height: u32) -> Block {
+    let mut block = mine(prev, time, height);
+    let bumped = block.txdata[0].output[0].value.to_sat() + 1;
+    block.txdata[0].output[0].value = Amount::from_sat(bumped);
+    block.header.merkle_root = block.compute_merkle_root().unwrap();
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
+    block
+}
+
+/// A local warn-and-apply reject does not stick. The trusted session can
+/// still connect that block. A high-hash reject still sticks.
+#[test]
+fn review_trust_local_reject_does_not_stick() {
+    let (_dir, hub) = tiny_regtest_hub_labeled("review-reject-stick");
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+    let before = hub.tip_height();
+    let tip = hub.tip_hash().unwrap();
+    let tip_block = hub.block_at_height(before.unwrap()).unwrap().unwrap();
+    let bad = excess_on(
+        tip,
+        tip_block.header.time.saturating_add(1),
+        before.unwrap() + 1,
+    );
+    let hash = bad.block_hash();
+    hub.query.set_trust_peer(true);
+    let r = hub.accept_received_block(bad.clone());
+    assert!(r.is_err(), "local excess applied: {r:?}");
+    assert_eq!(hub.tip_height(), before);
+    assert!(
+        !hub.is_block_invalid(&hash),
+        "warn-and-apply reject stuck: {r:?}"
+    );
+    let applied =
+        rbitcoin_net::tip_accept::run_on_tip_accept(|| hub.accept_received_on_lane(bad, true));
+    assert!(
+        matches!(applied, Ok(AcceptOutcome::Accepted { .. })),
+        "trusted session was blocked: {applied:?}"
+    );
+    assert_eq!(hub.tip_hash(), Some(hash));
+
+    let mut forged = hub.assemble_block_to_script(op_true, vec![]).unwrap();
+    forged.header.bits = CompactTarget::from_consensus(0x1d00_ffff);
+    forged.header.merkle_root = forged.compute_merkle_root().unwrap();
+    while forged.header.validate_pow(forged.header.target()).is_ok() {
+        forged.header.nonce = forged.header.nonce.wrapping_add(1);
+    }
+    let forged_hash = forged.block_hash();
+    let work = hub.chain_work().unwrap();
+    let pow = hub.accept_received_block(forged);
+    assert!(pow.is_err(), "no-PoW block applied: {pow:?}");
+    assert_eq!(hub.chain_work().unwrap(), work);
+    assert!(
+        hub.is_block_invalid(&forged_hash),
+        "high-hash reject did not stick"
+    );
+}
+
+/// A strict hold is upgraded when the trusted session delivers the same body.
+/// Until then a local child cannot connect the excess subsidy.
+#[test]
+fn review_trust_session_upgrades_held_waive() {
+    let (_dir, hub) = tiny_regtest_hub_labeled("review-hold-upgrade");
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    hub.generate_to_script(2, op_true, vec![]).unwrap();
+    let tip = hub.tip_hash().unwrap();
+    let tip_h = hub.tip_height().unwrap();
+    let genesis = hub.block_at_height(0).unwrap().unwrap();
+    let excess = excess_on(
+        genesis.block_hash(),
+        genesis.header.time.saturating_add(1),
+        1,
+    );
+    let excess_hash = excess.block_hash();
+    hub.query.set_trust_peer(true);
+    let parked = hub.accept_received_block(excess.clone()).unwrap();
+    assert_eq!(parked, AcceptOutcome::IgnoredWeaker);
+    assert_eq!(hub.tip_hash(), Some(tip));
+    assert!(hub.held_body(&excess_hash).is_some());
+    assert!(!hub.is_block_invalid(&excess_hash));
+
+    let child = mine(excess_hash, genesis.header.time.saturating_add(2), 2);
+    let child_hash = child.block_hash();
+    let local = hub.accept_received_block(child);
+    assert!(
+        local.is_err() || matches!(local, Ok(AcceptOutcome::IgnoredWeaker)),
+        "local child connected the strict hold: {local:?}"
+    );
+    assert_eq!(hub.tip_hash(), Some(tip));
+
+    rbitcoin_net::tip_accept::run_on_tip_accept(|| hub.accept_received_on_lane(excess, true))
+        .unwrap();
+    let child = mine(excess_hash, genesis.header.time.saturating_add(2), 2);
+    let grand = mine(child_hash, genesis.header.time.saturating_add(3), 3);
+    let session = rbitcoin_net::tip_accept::run_on_tip_accept(|| {
+        let _ = hub.accept_received_on_lane(child, true)?;
+        hub.accept_received_on_lane(grand, true)
+    });
+    assert!(
+        matches!(session, Ok(AcceptOutcome::Accepted { .. })),
+        "session did not connect the upgraded hold: {session:?}"
+    );
+    assert_ne!(hub.tip_hash(), Some(tip));
+    assert!(hub.tip_height().unwrap() > tip_h);
+}
+
+/// Median time on the second block of a reorg is warn-and-apply only for the
+/// session that held the branch. A local submit of the same blocks stays put.
+#[test]
+fn review_trust_reorg_mtp_on_second_block() {
+    fn branch(hub: &ChainHub, waive: bool) -> Result<AcceptOutcome, NetError> {
+        let tip = hub.tip_hash().unwrap();
+        let tip_h = hub.tip_height().unwrap();
+        let tip_block = hub.block_at_height(tip_h).unwrap().unwrap();
+        let sibling = mine_distinct(
+            tip_block.header.prev_blockhash,
+            tip_block.header.time,
+            tip_h,
+            &[tip],
+        );
+        let sibling_hash = sibling.block_hash();
+        let child = mine(sibling_hash, sibling.header.time, tip_h + 1);
+        let run = |block: Block| {
+            rbitcoin_net::tip_accept::run_on_tip_accept(|| {
+                hub.accept_received_on_lane(block, waive)
+            })
+        };
+        let parked = if waive {
+            run(sibling).unwrap()
+        } else {
+            hub.accept_received_block(sibling).unwrap()
+        };
+        assert_eq!(parked, AcceptOutcome::IgnoredWeaker);
+        if waive {
+            run(child)
+        } else {
+            hub.accept_received_block(child)
+        }
+    }
+
+    let (_dir, local) = tiny_regtest_hub_labeled("review-reorg-mtp-local");
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    local
+        .generate_to_script(1, op_true.clone(), vec![])
+        .unwrap();
+    let tip = local.tip_hash().unwrap();
+    local.query.set_trust_peer(true);
+    rbitcoin_log::capture_logs(false);
+    rbitcoin_log::capture_logs(true);
+    let local_r = branch(&local, false);
+    assert!(local_r.is_err(), "local mtp reorg applied: {local_r:?}");
+    assert_eq!(local.tip_hash(), Some(tip));
+
+    let (_dir, session) = tiny_regtest_hub_labeled("review-reorg-mtp-session");
+    session.generate_to_script(1, op_true, vec![]).unwrap();
+    session.query.set_trust_peer(true);
+    let session_tip = session.tip_hash().unwrap();
+    let session_r = branch(&session, true);
+    assert!(
+        matches!(session_r, Ok(AcceptOutcome::Accepted { .. })),
+        "session mtp reorg rejected: {session_r:?}"
+    );
+    assert_ne!(session.tip_hash(), Some(session_tip));
+}
+
+/// A clean connect must not keep a second waive set.
+#[test]
+fn review_trust_clean_connect_takes_no_waive_set() {
+    let src = include_str!("../src/chain.rs");
+    assert!(
+        !src.contains("connected_waived"),
+        "the second waive set must stay deleted"
+    );
+    assert!(!src.contains("fn note_connected_waived"));
+}
+
+/// A proposal error is the error. The mode does not log it.
+///
+/// Covers a wrong prev, unexpected nBits (even with an excess coinbase),
+/// an excess coinbase, a same-block coinbase spend, and a bad script.
+#[test]
+fn review_trust_proposal_is_silent() {
+    let (dir, hub) = tmp_hub();
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+    let template = hub
+        .assemble_block_to_script(op_true.clone(), vec![])
+        .unwrap();
+    hub.query.set_trust_peer(true);
+    rbitcoin_log::capture_logs(false);
+
+    let mut wrong_prev = template.clone();
+    wrong_prev.header.prev_blockhash = BlockHash::from_byte_array([0xab; 32]);
+    rbitcoin_log::capture_logs(true);
+    assert_eq!(
+        hub.check_block_proposal(&wrong_prev).unwrap_err(),
+        "inconclusive-not-best-prevblk"
+    );
+    assert_proposal_silent();
+
+    let mut bits = template.clone();
+    bits.header.bits = CompactTarget::from_consensus(0x0100_0000);
+    bits.txdata[0].output[0].value = Amount::from_sat(bits.txdata[0].output[0].value.to_sat() + 1);
+    bits.header.merkle_root = bits.compute_merkle_root().unwrap();
+    hub.query.set_trust_peer(false);
+    rbitcoin_log::capture_logs(true);
+    assert_eq!(hub.check_block_proposal(&bits).unwrap_err(), "bad-diffbits");
+    assert_proposal_silent();
+    hub.query.set_trust_peer(true);
+    rbitcoin_log::capture_logs(true);
+    assert_eq!(hub.check_block_proposal(&bits).unwrap_err(), "bad-diffbits");
+    assert_proposal_silent();
+
+    let mut excess = template.clone();
+    let bumped = excess.txdata[0].output[0].value.to_sat() + 1;
+    excess.txdata[0].output[0].value = Amount::from_sat(bumped);
+    excess.header.merkle_root = excess.compute_merkle_root().unwrap();
+    rbitcoin_log::capture_logs(true);
+    assert_eq!(
+        hub.check_block_proposal(&excess).unwrap_err(),
+        "bad-cb-amount"
+    );
+    assert_proposal_silent();
+
+    let mut early = template;
+    let cb_txid = early.txdata[0].compute_txid();
+    let cb_sats = early.txdata[0].output[0].value.to_sat();
+    early
+        .txdata
+        .push(spend_coinbase(cb_txid, cb_sats, op_true.clone()));
+    early.header.merkle_root = early.compute_merkle_root().unwrap();
+    rbitcoin_log::capture_logs(true);
+    let early_err = hub.check_block_proposal(&early).unwrap_err();
+    assert!(
+        early_err.contains("premature") || early_err.contains("coinbase"),
+        "{early_err}"
+    );
+    assert_proposal_silent();
+
+    hub.generate_to_script(100, op_true.clone(), vec![])
+        .unwrap();
+    let mut spend = mature_spend_tx(&hub, 1);
+    spend.input[0].script_sig = ScriptBuf::from_bytes(vec![0x6a]);
+    let script_block = hub.assemble_block_to_script(op_true, vec![spend]).unwrap();
+    rbitcoin_log::capture_logs(true);
+    let script_err = hub.check_block_proposal(&script_block).unwrap_err();
+    assert!(
+        script_err.contains("script") || script_err.contains("block-script-verify"),
+        "{script_err}"
+    );
+    assert_proposal_silent();
+    rbitcoin_log::capture_logs(false);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn assert_proposal_silent() {
+    let logs = trust_log_text();
+    assert!(!logs.contains("trust-peer:"), "{logs}");
+}
+
+/// `submitheader` stays strict while the mode is on. A future timestamp is
+/// not stored and is not logged as applied.
+#[test]
+fn review_trust_submitheader_stays_strict() {
+    let (_dir, hub) = tiny_regtest_hub_labeled("review-submitheader");
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+    let mut block = hub.assemble_block_to_script(op_true, vec![]).unwrap();
+    block.header.time = block.header.time.saturating_add(3 * 60 * 60);
+    rbitcoin_consensus::grind_regtest_pow(&mut block.header);
+    let hash = block.header.block_hash();
+    hub.query.set_trust_peer(true);
+    rbitcoin_log::capture_logs(false);
+    rbitcoin_log::capture_logs(true);
+    let r = hub.process_submitted_header(&block.header);
+    let logs = trust_log_text();
+    assert!(r.is_err(), "future submitheader stored: {r:?}");
+    assert!(
+        hub.header_of(&hash).is_none(),
+        "future header row was stored"
+    );
+    assert!(
+        !logs.contains("trust-peer: applied"),
+        "submitheader logged applied:\n{logs}"
+    );
+}
+
+/// A body that does not match its header is not this block. The hash stays
+/// refetchable: it is not marked permanently failed.
+#[test]
+fn review_trust_merkle_mismatch_stays_refetchable() {
+    fn mismatched(hub: &ChainHub) -> bitcoin::Block {
+        let op_true = ScriptBuf::from_bytes(vec![0x51]);
+        hub.generate_to_script(1, op_true.clone(), vec![]).unwrap();
+        let mut block = hub.assemble_block_to_script(op_true, vec![]).unwrap();
+        block.header.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x11; 32]);
+        for _ in 0..10_000 {
+            block.header.nonce = block.header.nonce.wrapping_add(1);
+            if block.header.validate_pow(block.header.target()).is_ok() {
+                return block;
+            }
+        }
+        panic!("regtest target accepted no nonce");
+    }
+    let (_d_on, hub) = tiny_regtest_hub_labeled("review-merkle-on");
+    let block = mismatched(&hub);
+    let hash = block.block_hash();
+    let before = hub.chain_work().unwrap();
+    hub.query.set_trust_peer(true);
+    let r = hub.accept_received_block(block);
+    let after = hub.chain_work().unwrap();
+    assert!(r.is_err(), "merkle mismatch applied: {r:?}");
+    assert_eq!(after, before, "claimed work moved");
+    assert!(
+        r.as_ref().err().is_some_and(|e| e.is_mutated()),
+        "merkle miss must stay refetchable: {r:?}"
+    );
+    assert!(
+        !hub.is_block_invalid(&hash),
+        "hash was marked permanently failed"
+    );
 }

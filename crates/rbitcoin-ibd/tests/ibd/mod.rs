@@ -19,3 +19,4 @@ mod rate;
 mod reorg;
 mod state;
 mod status;
+mod trust_peer;

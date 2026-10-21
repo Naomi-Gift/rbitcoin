@@ -194,6 +194,10 @@ pub fn finish_operator_config(
     config.smoke = smoke;
     config.absorb_inbound_env();
     config.resolve_listen_defaults();
+    if let Err(e) = config.seal_trust_peer() {
+        eprintln!("error: {e}");
+        return Err(ExitCode::from(2));
+    }
     Ok(OperatorArgs::Ready {
         config,
         log_level_cli,
@@ -315,7 +319,7 @@ pub fn operator_usage() -> String {
         "rbitcoin-node {} — usage:\n\
   rbitcoin-node [--conf FILE] [--datadir PATH] [--datadir-cold PATH] [--network NET] \\\n\
     [--signet-challenge HEX] [--signet-block-time SECS] \\\n\
-    [--listen ADDR] [--no-listen] [--connect ADDR]... [--seed-node HOST]... [--proxy HOST:PORT] [--onion HOST:PORT] [--proxy-randomize[=0|1]] [--only-net NET]... \\\n\
+    [--listen ADDR] [--no-listen] [--connect ADDR]... [--trust-peer ADDR] [--seed-node HOST]... [--proxy HOST:PORT] [--onion HOST:PORT] [--proxy-randomize[=0|1]] [--only-net NET]... \\\n\
     [--tor-control [HOST:PORT]] [--tor-control-cookie PATH] [--tor-control-password PASS] \\\n\
     [--i2p-sam [HOST:PORT]] [--i2p-accept-incoming] \\\n\
     [--electrum-listen ADDR] [--esplora-listen ADDR] [--esplora-onion[=0|1]] [--health-listen [ADDR]] [--metrics] \\\n\
@@ -347,6 +351,12 @@ Milestone: skip script/sig checks at/below HEIGHT.\n\
 Check-blocks: --check-blocks N revalidates the last N confirmed heights on open (default 6; 0 = all).\n\
 Mempool: --mempool-size-mb (default 300 → 300e6 WU; N × 1_000_000 weight, not MiB).\n\
 Peers: --max-outbound (default 16 live download), --max-inbound (default 125).\n\
+Trust-peer: --trust-peer ADDR (conf trustpeer=) dials only that address, the same grammar as --connect.\n\
+  It turns listening off and sets max-inbound to 0. A second address, a different --connect,\n\
+  --seed-node, --listen, --listen-onion, or --max-inbound greater than 0 is a start error.\n\
+  Consensus checks still run. A warn-and-apply fault from that peer is logged\n\
+  trust-peer: and kept; other blocks and transactions stay strict (COMPAT.md).\n\
+  Policy stays a hard error.\n\
   --proxy HOST:PORT SOCKS5 for all P2P outbound; --onion HOST:PORT SOCKS for onion (02).\n\
   --proxy-randomize (default on) uses a fresh SOCKS username per peer (Tor circuit isolation).\n\
   --tor-control [HOST:PORT] talks to system tor (default 127.0.0.1:9051). Cookie or password AUTH;\n\

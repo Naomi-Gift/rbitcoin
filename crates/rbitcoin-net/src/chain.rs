@@ -1,7 +1,8 @@
 //! Shared chain accept path for P2P: tip extension and most-work reorg.
 //!
-//! Lock order: `connect_lock` then inner maps (`held_bodies`, `invalidated`,
-//! `header_tips`, …). Never acquire `connect_lock` while holding an inner guard.
+//! Lock order: `connect_lock` then inner maps (`held_bodies`, `confirmed`,
+//! `invalidated`, `header_tips`, …). Never acquire `connect_lock` while holding
+//! an inner guard.
 
 use crate::cache::BlockCache;
 use crate::error::NetError;
@@ -82,10 +83,19 @@ pub struct HeaderSyncNode {
     pub height: Option<u32>,
 }
 
+/// One parked body. `waive` is the session bit from the accept that first
+/// held it. A later hold of the same hash does not change it.
+#[doc(hidden)]
+pub struct HeldRow {
+    pub block: Arc<Block>,
+    pub seq: u64,
+    pub waive: bool,
+}
+
 /// Never-confirmed side-branch bodies plus first-seen seq (equal-work FIFO).
 #[doc(hidden)]
 pub struct HeldBodies {
-    pub by_hash: HashMap<BlockHash, (Arc<Block>, u64)>,
+    pub by_hash: HashMap<BlockHash, HeldRow>,
     pub next_seq: u64,
 }
 
@@ -113,7 +123,19 @@ impl HeldBodies {
 
     #[doc(hidden)]
     pub fn get(&self, hash: &BlockHash) -> Option<&Block> {
-        self.by_hash.get(hash).map(|(b, _)| b.as_ref())
+        self.by_hash.get(hash).map(|row| row.block.as_ref())
+    }
+
+    /// Session waive bit recorded with the first hold. Absent is strict.
+    #[doc(hidden)]
+    pub fn waive(&self, hash: &BlockHash) -> bool {
+        self.hold_waive(hash).unwrap_or(false)
+    }
+
+    /// `Some` when this hash is held. The bool is that hold's waive bit.
+    #[doc(hidden)]
+    pub fn hold_waive(&self, hash: &BlockHash) -> Option<bool> {
+        self.by_hash.get(hash).map(|row| row.waive)
     }
 
     #[doc(hidden)]
@@ -138,23 +160,30 @@ impl HeldBodies {
 
     #[doc(hidden)]
     pub fn blocks(&self) -> impl Iterator<Item = &Block> + '_ {
-        self.by_hash.values().map(|(b, _)| b.as_ref())
+        self.by_hash.values().map(|row| row.block.as_ref())
     }
 
     #[doc(hidden)]
     pub fn entries(&self) -> impl Iterator<Item = (BlockHash, &Block)> + '_ {
-        self.by_hash.iter().map(|(h, (b, _))| (*h, b.as_ref()))
+        self.by_hash.iter().map(|(h, row)| (*h, row.block.as_ref()))
     }
 
     #[doc(hidden)]
     pub fn seq(&self, hash: BlockHash) -> u64 {
-        self.by_hash.get(&hash).map(|(_, s)| *s).unwrap_or(u64::MAX)
+        self.by_hash
+            .get(&hash)
+            .map(|row| row.seq)
+            .unwrap_or(u64::MAX)
     }
 
     #[doc(hidden)]
-    pub fn insert(&mut self, block: Arc<Block>, keep: &HashSet<BlockHash>) {
+    pub fn insert(&mut self, block: Arc<Block>, keep: &HashSet<BlockHash>, waive: bool) {
         let hash = block.block_hash();
-        if self.by_hash.contains_key(&hash) {
+        if let Some(row) = self.by_hash.get_mut(&hash) {
+            // A later trusted-session hold may waive. A local hold does not clear it.
+            if waive {
+                row.waive = true;
+            }
             return;
         }
         let nbytes = Self::wire_len(&block);
@@ -166,12 +195,12 @@ impl HeldBodies {
                 .by_hash
                 .iter()
                 .filter(|(h, _)| !keep.contains(*h))
-                .min_by_key(|(_, (_, s))| *s)
+                .min_by_key(|(_, row)| row.seq)
                 .map(|(h, _)| *h)
                 .or_else(|| {
                     self.by_hash
                         .iter()
-                        .min_by_key(|(_, (_, s))| *s)
+                        .min_by_key(|(_, row)| row.seq)
                         .map(|(h, _)| *h)
                 });
             if let Some(k) = victim {
@@ -182,7 +211,7 @@ impl HeldBodies {
         }
         let seq = self.next_seq;
         self.next_seq = self.next_seq.saturating_add(1);
-        self.by_hash.insert(hash, (block, seq));
+        self.by_hash.insert(hash, HeldRow { block, seq, waive });
     }
 
     #[doc(hidden)]
@@ -511,6 +540,28 @@ pub fn spent_outpoints(txdata: &[Transaction]) -> Vec<OutPoint> {
         .collect()
 }
 
+/// Run a header check that does not open its own collector. The waive bit is
+/// the thread cell. The caller set it for this batch, or left it off.
+fn soften_parent_header(
+    query: &rbitcoin_query::Query,
+    header: &Header,
+    height: u32,
+    check: impl FnOnce() -> Result<(), rbitcoin_consensus::ConsensusError>,
+) -> Result<(), rbitcoin_consensus::ConsensusError> {
+    let own =
+        rbitcoin_query::confirm_run::confirm_waive(query) && !rbitcoin_consensus::collecting();
+    let guard = own.then(rbitcoin_consensus::TrustCollect::enter);
+    let result = check();
+    if own {
+        let hash = header.block_hash().to_byte_array();
+        let applied = result.is_ok();
+        let stopped = result.as_ref().err();
+        rbitcoin_query::confirm_run::log_collected_header(hash, height, applied, stopped);
+        drop(guard);
+    }
+    result
+}
+
 pub fn accept_err_is_temporary_time(e: &NetError) -> bool {
     match e {
         NetError::Consensus(s) | NetError::ConnectFailed { msg: s, .. } => {
@@ -522,6 +573,20 @@ pub fn accept_err_is_temporary_time(e: &NetError) -> bool {
         }
         _ => false,
     }
+}
+
+/// Warn-and-apply faults stay retryable so the trusted session can deliver
+/// the same block. Hard rejects still stick.
+pub fn accept_err_is_warn_and_apply(e: &NetError) -> bool {
+    let Some(reason) = (match e {
+        NetError::Consensus(s) | NetError::Mutated(s) | NetError::ConnectFailed { msg: s, .. } => {
+            Some(s.as_str())
+        }
+        _ => None,
+    }) else {
+        return false;
+    };
+    rbitcoin_consensus::reason_is_warn_and_apply(reason)
 }
 
 /// Default tip recency window (24h).
@@ -1088,7 +1153,7 @@ impl ChainHub {
         if genesis.block_hash() != self.params.genesis_hash {
             return Err(NetError::Protocol("genesis hash mismatch with params"));
         }
-        self.connect_at(0, Arc::new(genesis))?;
+        self.connect_at(0, Arc::new(genesis), false)?;
         Ok(())
     }
 
@@ -1493,7 +1558,10 @@ impl ChainHub {
             .failing_block_hash()
             .map(BlockHash::from_byte_array)
             .unwrap_or(offered);
-        if e.is_mutated() || accept_err_is_temporary_time(e) {
+        if e.is_mutated()
+            || accept_err_is_temporary_time(e)
+            || (self.query.trust_peer() && accept_err_is_warn_and_apply(e))
+        {
             self.drop_held(hash);
             self.forget_asked_block(&hash);
             return;
@@ -1628,6 +1696,7 @@ impl ChainHub {
                 }
             }
         }
+        // A submitted header is local. The cell stays off, so the mode does not soften it.
         self.ensure_header(header).map_err(|e| e.to_string())
     }
 
@@ -1651,6 +1720,15 @@ impl ChainHub {
     /// Fail closed: missing parent is the same error as [`Self::ensure_header_fk`].
     /// Output fks align with `headers`.
     pub fn ensure_headers_batch(&self, headers: &[Header]) -> Result<Vec<Fk>, NetError> {
+        // Headers from the network. Flag-off does not write the cell.
+        // A caller that already opted in (the recursive call) falls through.
+        if self.query.trust_peer()
+            && !rbitcoin_query::confirm_run::confirm_waive(self.query.as_ref())
+        {
+            return rbitcoin_query::confirm_run::waive_batch(true, || {
+                self.ensure_headers_batch(headers)
+            });
+        }
         ENSURE_HEADERS_BATCH_N.with(|c| c.set(c.get().saturating_add(1)));
         if headers.is_empty() {
             return Ok(Vec::new());
@@ -1745,6 +1823,22 @@ impl ChainHub {
         Ok(prev_fk)
     }
 
+    /// Off-tip header checks. `validate_header` is only for a confirmed parent,
+    /// and that is the call which opens [`rbitcoin_consensus::TrustCollect`].
+    fn apply_off_tip_header(
+        query: &rbitcoin_query::Query,
+        params: &ChainParams,
+        header: &Header,
+        height: u32,
+        mtp: u32,
+        expected: CompactTarget,
+    ) -> Result<(), NetError> {
+        soften_parent_header(query, header, height, || {
+            validate_header_on_parent(params, Height(height), header, mtp, expected)
+        })
+        .map_err(|e| header_reject(header, &rbitcoin_query::ConfirmError::from(e)))
+    }
+
     #[doc(hidden)]
     pub fn header_sync_contextual(
         &self,
@@ -1775,14 +1869,15 @@ impl ChainHub {
             .ok_or_else(|| NetError::Consensus("header parent height unknown".into()))?;
         let mtp = self.mtp_off_tip(&parent, in_batch);
         let expected = self.expected_bits_off_tip(header, &parent, parent_height, in_batch)?;
-        validate_header_on_parent(
+        // `validate_header` opens the collector, and it only runs for a confirmed parent.
+        Self::apply_off_tip_header(
+            self.query.as_ref(),
             &self.params,
-            Height(parent_height.saturating_add(1)),
             header,
+            parent_height.saturating_add(1),
             mtp,
             expected,
         )
-        .map_err(|e| header_reject(header, &rbitcoin_query::ConfirmError::from(e)))
     }
 
     #[doc(hidden)]
@@ -2718,12 +2813,12 @@ impl ChainHub {
 
     /// Accept a block that extends the tip, or reorg to a stronger competing tip / branch.
     pub fn accept_block(&self, block: Block) -> Result<AcceptOutcome, NetError> {
-        crate::tip_accept::run_on_tip_accept(|| self.accept_incoming(Arc::new(block), false))
+        crate::tip_accept::run_on_tip_accept(|| self.accept_incoming(Arc::new(block), false, false))
     }
 
     #[doc(hidden)]
     pub fn accept_block_inner(&self, block: Arc<Block>) -> Result<AcceptOutcome, NetError> {
-        self.accept_incoming(block, false)
+        self.accept_incoming(block, false, false)
     }
 
     #[doc(hidden)]
@@ -2731,6 +2826,7 @@ impl ChainHub {
         &self,
         block: Arc<Block>,
         hold_unconnected: bool,
+        waive: bool,
     ) -> Result<AcceptOutcome, NetError> {
         let hash = block.block_hash();
         if self.already_have(hash) {
@@ -2758,7 +2854,7 @@ impl ChainHub {
                 if prev.to_byte_array() != [0u8; 32] {
                     return Err(NetError::Protocol("non-genesis without tip"));
                 }
-                self.connect_at(0, block)?;
+                self.connect_at(0, block, waive)?;
                 Ok(AcceptOutcome::Accepted { height: 0 })
             }
             Some(tip_h) => {
@@ -2771,7 +2867,7 @@ impl ChainHub {
                 if prev == tip_hash {
                     let height = tip_h.saturating_add(1);
                     self.remember_cmpct_prefill_from_block(block.as_ref());
-                    self.connect_at(height, block)?;
+                    self.connect_at(height, block, waive)?;
                     return Ok(AcceptOutcome::Accepted { height });
                 }
 
@@ -2781,7 +2877,7 @@ impl ChainHub {
                     .map_err(NetError::store)?
                 else {
                     if hold_unconnected {
-                        self.hold_body(block);
+                        self.hold_body(block, waive);
                     }
                     return Err(NetError::UnknownParent);
                 };
@@ -2796,15 +2892,27 @@ impl ChainHub {
                 .map_err(|e| header_reject(&block.header, &e))?;
 
                 if new_height == tip_h {
-                    let out = self.accept_branch_locked(std::slice::from_ref(block.as_ref()))?;
-                    if matches!(out, AcceptOutcome::IgnoredWeaker) && hold_unconnected {
-                        self.hold_body(block);
+                    // Park before the branch attempt so connect reads this
+                    // session bit. Only an equal-work loser stays parked.
+                    let hash = block.block_hash();
+                    let already =
+                        hold_unconnected && self.held_bodies.read().unwrap().contains(&hash);
+                    if hold_unconnected {
+                        // Re-hold so a trusted session can set the waive bit.
+                        self.hold_body(Arc::clone(&block), waive);
                     }
-                    return Ok(out);
+                    let out = self.accept_branch_locked(std::slice::from_ref(block.as_ref()));
+                    if hold_unconnected
+                        && !already
+                        && !matches!(out, Ok(AcceptOutcome::IgnoredWeaker))
+                    {
+                        self.drop_held(hash);
+                    }
+                    return out;
                 }
 
                 if hold_unconnected {
-                    self.hold_body(block);
+                    self.hold_body(block, waive);
                 }
                 Err(NetError::SideBlock)
             }
@@ -2994,21 +3102,40 @@ impl ChainHub {
         let mut batch = HashMap::with_capacity(blocks.len());
         for (i, b) in blocks.iter().enumerate() {
             let height = fork_h.saturating_add(1).saturating_add(i as u32);
-            let checked = if i == 0 {
-                validate_header(self.query.as_ref(), &self.params, Height(height), &b.header)
-                    .map_err(|e| header_reject(&b.header, &e))
-            } else {
-                let parent = &blocks[i - 1].header;
-                let mtp = self.mtp_off_tip(parent, &batch);
-                let expected = self.expected_bits_off_tip(
-                    &b.header,
-                    parent,
-                    height.saturating_sub(1),
-                    &batch,
-                )?;
-                validate_header_on_parent(&self.params, Height(height), &b.header, mtp, expected)
-                    .map_err(|e| header_reject(&b.header, &rbitcoin_query::ConfirmError::from(e)))
-            };
+            let hash = b.block_hash();
+            let checked =
+                rbitcoin_query::confirm_run::waive_batch(self.waive_for_connect(&hash), || {
+                    if i == 0 {
+                        validate_header(
+                            self.query.as_ref(),
+                            &self.params,
+                            Height(height),
+                            &b.header,
+                        )
+                        .map_err(|e| header_reject(&b.header, &e))
+                    } else {
+                        let parent = &blocks[i - 1].header;
+                        let mtp = self.mtp_off_tip(parent, &batch);
+                        let expected = self.expected_bits_off_tip(
+                            &b.header,
+                            parent,
+                            height.saturating_sub(1),
+                            &batch,
+                        )?;
+                        soften_parent_header(self.query.as_ref(), &b.header, height, || {
+                            validate_header_on_parent(
+                                &self.params,
+                                Height(height),
+                                &b.header,
+                                mtp,
+                                expected,
+                            )
+                        })
+                        .map_err(|e| {
+                            header_reject(&b.header, &rbitcoin_query::ConfirmError::from(e))
+                        })
+                    }
+                });
             if let Err(e) = checked {
                 return Err(connect_failed_for_header(b.block_hash().to_byte_array(), e));
             }
@@ -3068,7 +3195,11 @@ impl ChainHub {
         for (i, b) in blocks.iter().enumerate() {
             self.announce_reorg_len
                 .store(i as u32 + 1, Ordering::Relaxed);
-            let Err(e) = self.connect_at(base + i as u32, Arc::new(b.clone())) else {
+            let Err(e) = self.connect_at(
+                base + i as u32,
+                Arc::new(b.clone()),
+                self.waive_for_connect(&b.block_hash()),
+            ) else {
                 continue;
             };
             self.announce_reorg_len.store(0, Ordering::Relaxed);
@@ -3115,7 +3246,14 @@ impl ChainHub {
             )));
         }
         for (j, ob) in old_path.iter().enumerate() {
-            if let Err(re) = self.connect_at(fh + 1 + j as u32, Arc::new(ob.clone())) {
+            // These blocks were our chain. Disconnect already dropped them
+            // from `confirmed`, so the mode bit is the restore waive.
+            // Flag-off stays strict. No second set.
+            if let Err(re) = self.connect_at(
+                fh + 1 + j as u32,
+                Arc::new(ob.clone()),
+                self.query.trust_peer(),
+            ) {
                 return Err(NetError::Store(format!(
                     "reorg connect failed ({e}); tip restore failed: {re}"
                 )));
@@ -3179,14 +3317,18 @@ impl ChainHub {
     /// and [`Self::accept_branch`] when a held (or archived) path has more
     /// work — or is precious at equal work. Not the IBD body-queue pipeline.
     pub fn accept_received_block(&self, block: Block) -> Result<AcceptOutcome, NetError> {
-        crate::tip_accept::run_on_tip_accept(|| self.accept_received_block_inner(block))
+        crate::tip_accept::run_on_tip_accept(|| self.accept_received_block_inner(block, false))
     }
 
     #[doc(hidden)]
-    pub fn accept_received_block_inner(&self, block: Block) -> Result<AcceptOutcome, NetError> {
+    pub fn accept_received_block_inner(
+        &self,
+        block: Block,
+        waive: bool,
+    ) -> Result<AcceptOutcome, NetError> {
         let hash = block.block_hash();
         let block = Arc::new(block);
-        match self.accept_incoming(block, true) {
+        match self.accept_incoming(block, true, waive) {
             Ok(AcceptOutcome::Accepted { height }) => {
                 self.held_bodies.write().unwrap().remove(&hash);
                 match self.apply_held_for(hash)? {
@@ -3252,12 +3394,18 @@ impl ChainHub {
         block: Block,
     ) -> Result<AcceptOutcome, NetError> {
         let hub = Arc::clone(self);
-        crate::tip_accept::run_on_tip_accept_async(move || hub.accept_received_block_inner(block))
-            .await
+        crate::tip_accept::run_on_tip_accept_async(move || {
+            hub.accept_received_block_inner(block, false)
+        })
+        .await
     }
 
-    pub fn accept_received_on_lane(&self, block: Block) -> Result<AcceptOutcome, NetError> {
-        self.accept_received_block_inner(block)
+    pub fn accept_received_on_lane(
+        &self,
+        block: Block,
+        waive: bool,
+    ) -> Result<AcceptOutcome, NetError> {
+        self.accept_received_block_inner(block, waive)
     }
 
     /// Wait until the current tip-accept job finishes (including BIP152 HB select).
@@ -3316,12 +3464,13 @@ impl ChainHub {
     }
 
     /// Park a disconnected body without running [`Self::try_apply_held`].
+    /// Reorg and reconsider callers revalidate strictly.
     pub fn hold_unconnected_body(&self, block: Block) {
-        self.hold_body(Arc::new(block));
+        self.hold_body(Arc::new(block), false);
     }
 
     #[doc(hidden)]
-    pub fn hold_body(&self, block: Arc<Block>) {
+    pub fn hold_body(&self, block: Arc<Block>, waive: bool) {
         let hash = block.block_hash();
         if self.is_connected(&hash) {
             return;
@@ -3334,7 +3483,20 @@ impl ChainHub {
             }
         }
         let keep = self.asked_blocks.read().unwrap().clone();
-        self.held_bodies.write().unwrap().insert(block, &keep);
+        self.held_bodies
+            .write()
+            .unwrap()
+            .insert(block, &keep, waive);
+    }
+
+    /// Waive only a body this session held. Flag-off returns before any lock.
+    /// Restoring our own chain uses the mode bit at the restore call.
+    #[doc(hidden)]
+    pub fn waive_for_connect(&self, hash: &BlockHash) -> bool {
+        if !self.query.trust_peer() {
+            return false;
+        }
+        self.held_bodies.read().unwrap().waive(hash)
     }
 
     /// Never-confirmed side-branch body in RAM. Once-confirmed disconnected
@@ -3531,7 +3693,7 @@ impl ChainHub {
     }
 
     #[doc(hidden)]
-    pub fn connect_at(&self, height: u32, block: Arc<Block>) -> Result<(), NetError> {
+    pub fn connect_at(&self, height: u32, block: Arc<Block>, waive: bool) -> Result<(), NetError> {
         debug_assert!(
             crate::tip_accept::on_tip_accept_thread(),
             "connect_at must run on tip-accept"
@@ -3554,15 +3716,17 @@ impl ChainHub {
         let _ = self
             .clock
             .with_frozen(|| loop {
-                match accept_and_connect_block_preverified(
-                    &self.query,
-                    &self.params,
-                    Height(height),
-                    Arc::clone(&block),
-                    self.milestone,
-                    &preverified,
-                    Some(std::sync::Arc::clone(&pres)),
-                ) {
+                match rbitcoin_query::confirm_run::waive_batch(waive, || {
+                    accept_and_connect_block_preverified(
+                        &self.query,
+                        &self.params,
+                        Height(height),
+                        Arc::clone(&block),
+                        self.milestone,
+                        &preverified,
+                        Some(std::sync::Arc::clone(&pres)),
+                    )
+                }) {
                     Ok(fk) => return Ok(fk),
                     Err(e) if e.is_uring_session_fault() => {
                         self.query.uring_recover_or_abort("tip-connect");
@@ -3908,24 +4072,15 @@ pub fn check_block_proposal_with(
         rbitcoin_query::expected_next_bits(query, params, Height(height), block.header.time)
             .map(|c| c.to_consensus())
             .unwrap_or(tip_rec.bits);
-    if block.header.bits.to_consensus() != expected {
-        return Err("bad-diffbits".into());
-    }
     let mtp = rbitcoin_query::median_time_past_store(query, tip_h).map_err(|e| e.to_string())?;
-    // Core is `<=` MTP. Proposal uses `<` so a template stamped at the
-    // parent's mediantime+1 still validates after that parent is submitted
-    // (new MTP often equals that stamp on an incrementing cache).
-    if block.header.time < mtp {
-        return Err("time-too-old".into());
-    }
-    rbitcoin_consensus::with_now(u64::from(now), || {
-        rbitcoin_consensus::header::check_header_version_and_future_time(
-            params,
-            Height(height),
-            &block.header,
-        )
-    })
-    .map_err(|e| rbitcoin_consensus::block_reject_reason(&e))?;
+    let header = ProposalHeader {
+        block,
+        height,
+        expected_bits: expected,
+        mtp,
+        now,
+    };
+    proposal_header_checks(params, header)?;
     let vctx = rbitcoin_consensus::ValidationContext::at(params, Height(height), milestone);
     if let Err(e) = rbitcoin_consensus::validate_block_structure(block, &vctx) {
         return Err(rbitcoin_consensus::block_reject_reason(&e));
@@ -3969,10 +4124,48 @@ pub fn check_block_proposal_with(
         if sigops > MAX_BLOCK_SIGOPS_COST {
             return Err("bad-blk-sigops".into());
         }
-        rbitcoin_consensus::verify_tx_scripts_with_flags(ins, tx.clone(), flags)
-            .map_err(|e| rbitcoin_consensus::block_reject_reason(&e))?;
+        if let Err(e) = rbitcoin_consensus::verify_tx_scripts_with_flags(ins, tx.clone(), flags) {
+            return Err(rbitcoin_consensus::block_reject_reason(&e));
+        }
     }
     Ok(fees)
+}
+
+struct ProposalHeader<'a> {
+    block: &'a Block,
+    height: u32,
+    expected_bits: u32,
+    mtp: u32,
+    now: u32,
+}
+
+fn proposal_header_checks(params: &ChainParams, header: ProposalHeader<'_>) -> Result<(), String> {
+    let ProposalHeader {
+        block,
+        height,
+        expected_bits,
+        mtp,
+        now,
+    } = header;
+    if block.header.bits.to_consensus() != expected_bits {
+        return Err("bad-diffbits".into());
+    }
+    // Core is `<=` MTP. Proposal uses `<` so a template stamped at the
+    // parent's mediantime+1 still validates after that parent is submitted
+    // (new MTP often equals that stamp on an incrementing cache).
+    if block.header.time < mtp {
+        return Err("time-too-old".into());
+    }
+    if let Err(e) = rbitcoin_consensus::with_now(u64::from(now), || {
+        rbitcoin_consensus::header::check_header_version_and_future_time(
+            params,
+            Height(height),
+            &block.header,
+        )
+    }) {
+        return Err(rbitcoin_consensus::block_reject_reason(&e));
+    }
+    Ok(())
 }
 
 /// Resolves every spend against the block and the confirmed chain. `Ok` is
@@ -4031,43 +4224,26 @@ pub fn proposal_connect(
         let mut in_val = 0u64;
         let mut tx_prevouts = Vec::with_capacity(tx.input.len());
         let mut coin_heights = Vec::with_capacity(tx.input.len());
+        let coins = ProposalCoins {
+            cb_txid,
+            created: &created,
+            parents: &parents,
+        };
         for inp in &tx.input {
-            let op = inp.previous_output;
-            if !spent.insert(op) {
-                return Err("bad-txns-inputs-missingorspent".into());
-            }
-            // Same-block coinbase outputs are not spendable yet. Counting
-            // them would inflate `fees` and hide `bad-cb-amount`.
-            if op.txid == cb_txid && created.contains_key(&op) {
-                return Err("bad-txns-premature-spend-of-coinbase".into());
-            }
-            let txout = if let Some(o) = created.get(&op) {
-                coin_heights.push(height);
-                o.clone()
-            } else if let Some((fk, created_h, o)) = chain_txout(query, &parents, &op) {
-                if coinbase_spend_is_immature(
-                    query,
-                    *fk,
-                    *created_h,
-                    height,
-                    params.coinbase_maturity(),
-                )? {
-                    return Err("bad-txns-premature-spend-of-coinbase".into());
-                }
-                coin_heights.push(*created_h);
-                o.clone()
-            } else {
-                return Err("bad-txns-inputs-missingorspent".into());
+            let mut acc = ProposalInAccum {
+                spent: &mut spent,
+                in_val: &mut in_val,
             };
-            // Core never stores this script as a coin. Reject before fee
-            // math, ahead of the script check.
-            if rbitcoin_consensus::policy::is_unspendable(txout.script_pubkey.as_bytes()) {
-                return Err("bad-txns-inputs-missingorspent".into());
-            }
-            in_val = in_val
-                .checked_add(txout.value.to_sat())
-                .ok_or("bad-txns-inputvalues-outofrange")?;
+            let (txout, coin_h) = proposal_one_input(
+                query,
+                params,
+                height,
+                &coins,
+                &mut acc,
+                &inp.previous_output,
+            )?;
             tx_prevouts.push(txout);
+            coin_heights.push(coin_h);
         }
         let mut out_val = 0u64;
         for o in &tx.output {
@@ -4075,12 +4251,8 @@ pub fn proposal_connect(
                 .checked_add(o.value.to_sat())
                 .ok_or("bad-txns-txouttotal-toolarge")?;
         }
-        if out_val > in_val {
-            return Err("bad-txns-in-belowout".into());
-        }
-        fees = fees
-            .checked_add(in_val - out_val)
-            .ok_or("bad-txns-fee-outofrange")?;
+        let fee = proposal_tx_fee(in_val, out_val)?;
+        fees = fees.checked_add(fee).ok_or("bad-txns-fee-outofrange")?;
         if params.csv_active_at(height) {
             proposal_sequence_locks(query, tx, &coin_heights, height, mtp)?;
         }
@@ -4096,6 +4268,70 @@ pub fn proposal_connect(
         }
     }
     Ok((fees, prevouts))
+}
+
+struct ProposalCoins<'a> {
+    cb_txid: Txid,
+    created: &'a HashMap<OutPoint, TxOut>,
+    parents: &'a HashMap<OutPoint, (Fk, u32, TxOut)>,
+}
+
+struct ProposalInAccum<'a> {
+    spent: &'a mut HashSet<OutPoint>,
+    in_val: &'a mut u64,
+}
+
+/// One proposal input. Duplicate, missing, unspendable, same-block
+/// coinbase, and immature coinbase spends are errors.
+fn proposal_one_input(
+    query: &Query,
+    params: &ChainParams,
+    height: u32,
+    coins: &ProposalCoins<'_>,
+    acc: &mut ProposalInAccum<'_>,
+    op: &OutPoint,
+) -> Result<(TxOut, u32), String> {
+    if !acc.spent.insert(*op) {
+        return Err("bad-txns-inputs-missingorspent".into());
+    }
+    // Same-block coinbase outputs are not spendable yet.
+    if op.txid == coins.cb_txid && coins.created.contains_key(op) {
+        return Err("bad-txns-premature-spend-of-coinbase".into());
+    }
+    let (txout, coin_h) = if let Some(o) = coins.created.get(op) {
+        (o.clone(), height)
+    } else if let Some((fk, created_h, o)) = chain_txout(query, coins.parents, op) {
+        if coinbase_spend_is_immature(query, *fk, *created_h, height, params.coinbase_maturity())? {
+            return Err("bad-txns-premature-spend-of-coinbase".into());
+        }
+        (o.clone(), *created_h)
+    } else {
+        return Err("bad-txns-inputs-missingorspent".into());
+    };
+    // Core never stores this script as a coin. Reject before fee math,
+    // ahead of the script check.
+    if rbitcoin_consensus::policy::is_unspendable(txout.script_pubkey.as_bytes()) {
+        return Err("bad-txns-inputs-missingorspent".into());
+    }
+    *acc.in_val = acc
+        .in_val
+        .checked_add(txout.value.to_sat())
+        .ok_or("bad-txns-inputvalues-outofrange")?;
+    Ok((txout, coin_h))
+}
+
+fn proposal_tx_fee(paid: u64, out_val: u64) -> Result<u64, String> {
+    let paid_i = i64::try_from(paid).map_err(|_| "bad-txns-inputvalues-outofrange".to_string())?;
+    let out_i = i64::try_from(out_val).map_err(|_| "bad-txns-txouttotal-toolarge".to_string())?;
+    let fee = rbitcoin_consensus::block::fee_with_waived_coinbase(paid_i, 0, out_i).map_err(
+        |e| match e {
+            rbitcoin_consensus::ConsensusError::BadTx("in < out") => {
+                "bad-txns-in-belowout".to_string()
+            }
+            _ => "bad-txns-fee-outofrange".to_string(),
+        },
+    )?;
+    u64::try_from(fee).map_err(|_| "bad-txns-fee-outofrange".to_string())
 }
 
 /// BIP68 on a proposal, as at connect: a coin's time is the median time of

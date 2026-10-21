@@ -303,9 +303,49 @@ assert builtins.match ".*--listen 127.0.0.1:18444.*" execStart != null;
 assert builtins.match ".*--rpc-listen 127.0.0.1:18443.*" execStart != null;
 assert builtins.match ".*--rest.*" execStart == null;
 assert builtins.match ".*--rest.*" restOnExec != null;
-assert builtins.match ".*--milestone.*" (
+assert builtins.match ".*--trust-peer.*" (
   defaultSystem.config.systemd.services.rbitcoin.serviceConfig.ExecStart
 ) == null;
+assert builtins.match ".*--listen.*" (
+  defaultSystem.config.systemd.services.rbitcoin.serviceConfig.ExecStart
+) != null;
+let
+  trustPeerSystem = nixpkgs.lib.nixosSystem {
+    inherit (pkgs.stdenv.hostPlatform) system;
+    modules = [
+      module
+      {
+        services.rbitcoin = {
+          enable = true;
+          package = fakePackage;
+          trustPeer = "192.0.2.1:8333";
+        };
+      }
+    ];
+  };
+  trustPeerExec = trustPeerSystem.config.systemd.services.rbitcoin.serviceConfig.ExecStart;
+  trustPeerListen = nixpkgs.lib.nixosSystem {
+    inherit (pkgs.stdenv.hostPlatform) system;
+    modules = [
+      module
+      {
+        services.rbitcoin = {
+          enable = true;
+          package = fakePackage;
+          trustPeer = "192.0.2.1:8333";
+          p2p.listen = true;
+        };
+      }
+    ];
+  };
+in
+assert builtins.match ".*--trust-peer 192.0.2.1:8333.*" trustPeerExec != null;
+assert builtins.match ".*--no-listen.*" trustPeerExec != null;
+assert builtins.match ".*--max-inbound 0.*" trustPeerExec != null;
+assert builtins.match ".*--listen .*" trustPeerExec == null;
+assert builtins.any (m: builtins.match ".*trustPeer.*" m != null) (
+  failedAssertions trustPeerListen
+);
 assert builtins.match ".*--milestone 100.*" (
   (nixpkgs.lib.nixosSystem {
     inherit (pkgs.stdenv.hostPlatform) system;

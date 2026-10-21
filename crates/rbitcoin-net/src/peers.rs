@@ -1463,6 +1463,12 @@ pub struct PeerHub {
     pub connect_hosts: Mutex<Vec<String>>,
     /// `--connect` targets given as a [`crate::NetAddr`] (IP, onion, I2P, CJDNS).
     pub connect_addrs: Mutex<Vec<crate::NetAddr>>,
+    /// `--trust-peer` address. `addnode` of anyone else fails.
+    trust_addr: Mutex<Option<crate::NetAddr>>,
+    /// `--trust-peer` DNS host (`host:port`).
+    trust_host: Mutex<Option<String>>,
+    /// One current socket per hostname, for `--trust-peer` and `--connect`.
+    host_sockets: Mutex<HashMap<String, SocketAddr>>,
     /// Outbound dials still before session registration, by target. The
     /// redial pass skips these, so a slow connect is not stacked every 2 s.
     pub dials_in_flight: Arc<Mutex<HashMap<String, usize>>>,
@@ -1590,6 +1596,9 @@ impl PeerHub {
             manual_hosts: Mutex::new(HashSet::new()),
             connect_hosts: Mutex::new(Vec::new()),
             connect_addrs: Mutex::new(Vec::new()),
+            trust_addr: Mutex::new(None),
+            trust_host: Mutex::new(None),
+            host_sockets: Mutex::new(HashMap::new()),
             dials_in_flight: Arc::new(Mutex::new(HashMap::new())),
             addrfetch_replies: AtomicU64::new(0),
             connect_default_port: AtomicU16::new(0),
@@ -2625,6 +2634,7 @@ impl PeerHub {
     /// that is connected or still dialling, and the RPC still succeeds.
     #[doc(hidden)]
     pub fn dial_manual_target(&self, target: DialTarget) -> Result<(), String> {
+        self.trust_allows_target(&target)?;
         // Claim before the live check: a dial registers its session before
         // it drops its claim, so no window shows the endpoint as neither.
         let Some(claim) = self.claim_dial(&target) else {
@@ -2637,6 +2647,7 @@ impl PeerHub {
     }
 
     pub fn addnode_net(&self, addr: crate::NetAddr, cmd: &str) -> Result<(), String> {
+        self.trust_allows_spec(&addr.to_string())?;
         match cmd {
             "onetry" => self.dial_manual_net(&addr),
             "add" => {
@@ -2665,6 +2676,7 @@ impl PeerHub {
     /// `onetry` fails if the name does not resolve now.
     pub fn addnode_host(&self, node: &str, cmd: &str, default_port: u16) -> Result<(), String> {
         self.note_default_port(default_port);
+        self.trust_allows_spec(node)?;
         match cmd {
             "onetry" => self.dial_resolved(node),
             "add" => {
@@ -2701,6 +2713,165 @@ impl PeerHub {
         *self.connect_addrs.lock().unwrap_or_else(|e| e.into_inner()) = addrs;
     }
 
+    /// Pin the sole peer. Further dials and `addnode` of any other address fail.
+    pub fn set_trust_peer(&self, addr: Option<crate::NetAddr>, host: Option<String>) {
+        if let Some(prev) = self
+            .trust_host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
+            if let Some(key) = self.host_key(&prev) {
+                self.host_sockets
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&key);
+            }
+        }
+        *self.trust_addr.lock().unwrap_or_else(|e| e.into_inner()) = addr;
+        *self.trust_host.lock().unwrap_or_else(|e| e.into_inner()) = host;
+    }
+
+    /// Remember the socket the trusted hostname resolved to. A later answer
+    /// replaces that socket.
+    pub fn note_trust_resolved(&self, addr: SocketAddr) {
+        let Some(host) = self
+            .trust_host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
+            return;
+        };
+        self.note_host_resolved(&host, addr);
+    }
+
+    fn host_key(&self, node: &str) -> Option<String> {
+        ensure_host_port(node, self.default_port_opt())
+            .ok()
+            .map(|key| key.to_ascii_lowercase())
+    }
+
+    /// Store `addr` as the current socket for `host`. Disconnect the previous
+    /// socket when no remaining target still uses it.
+    fn note_host_resolved(&self, host: &str, addr: SocketAddr) {
+        let Some(key) = self.host_key(host) else {
+            return;
+        };
+        let prev = {
+            let mut map = self.host_sockets.lock().unwrap_or_else(|e| e.into_inner());
+            map.insert(key, addr)
+        };
+        let Some(prev) = prev.filter(|prev| *prev != addr) else {
+            return;
+        };
+        if self.socket_still_current(prev) {
+            return;
+        }
+        self.disconnect_addr(prev);
+    }
+
+    fn socket_still_current(&self, addr: SocketAddr) -> bool {
+        if self
+            .host_sockets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .any(|kept| *kept == addr)
+        {
+            return true;
+        }
+        let pinned = *self.trust_addr.lock().unwrap_or_else(|e| e.into_inner());
+        if pinned.is_some_and(|a| a == crate::NetAddr::Ip(addr)) {
+            return true;
+        }
+        self.connect_addrs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&crate::NetAddr::Ip(addr))
+    }
+
+    fn trust_current_socket(&self) -> Option<SocketAddr> {
+        let host = self
+            .trust_host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()?;
+        let key = self.host_key(&host)?;
+        self.host_sockets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .copied()
+    }
+
+    /// True when `--trust-peer` is set and this live session is that peer.
+    pub fn session_is_trusted_peer(&self, session: &LivePeer) -> bool {
+        self.trust_label().is_some() && self.trust_allows_net(session.net).is_ok()
+    }
+
+    /// Same allow check as `addnode`, for a dial target that is already a [`crate::NetAddr`].
+    pub fn trust_allows_net(&self, addr: crate::NetAddr) -> Result<(), String> {
+        self.trust_allows_target(&DialTarget::from_net(addr))
+    }
+
+    /// Address or hostname named by `--trust-peer`, when the mode is on.
+    pub fn trust_peer_label(&self) -> Option<String> {
+        self.trust_label()
+    }
+
+    fn trust_label(&self) -> Option<String> {
+        let addr = *self.trust_addr.lock().unwrap_or_else(|e| e.into_inner());
+        let host = self
+            .trust_host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        if addr.is_none() && host.is_none() {
+            return None;
+        }
+        Some(addr.map(|a| a.to_string()).or(host).unwrap_or_default())
+    }
+
+    fn trust_allows_spec(&self, spec: &str) -> Result<(), String> {
+        let Some(label) = self.trust_label() else {
+            return Ok(());
+        };
+        if spec.eq_ignore_ascii_case(&label) {
+            return Ok(());
+        }
+        let pinned = *self.trust_addr.lock().unwrap_or_else(|e| e.into_inner());
+        if pinned.is_some_and(|addr| spec.parse::<crate::NetAddr>().ok() == Some(addr)) {
+            return Ok(());
+        }
+        Err(format!("trust-peer allows only {label}"))
+    }
+
+    fn trust_allows_target(&self, target: &DialTarget) -> Result<(), String> {
+        if self.trust_label().is_none() {
+            return Ok(());
+        }
+        match target {
+            DialTarget::Socket(addr) => {
+                if self.trust_allows_spec(&addr.to_string()).is_ok() {
+                    return Ok(());
+                }
+                if self.trust_current_socket() == Some(*addr) {
+                    return Ok(());
+                }
+                self.trust_allows_spec(&addr.to_string())
+            }
+            DialTarget::Domain { host, port } => {
+                let spec = format!("{host}:{port}");
+                if self.trust_allows_spec(&spec).is_ok() || self.trust_allows_spec(host).is_ok() {
+                    Ok(())
+                } else {
+                    self.trust_allows_spec(&spec)
+                }
+            }
+        }
+    }
+
     #[doc(hidden)]
     pub fn note_default_port(&self, default_port: u16) {
         if default_port != 0 && self.connect_default_port.load(Ordering::Relaxed) == 0 {
@@ -2723,7 +2894,28 @@ impl PeerHub {
         }
         let addr =
             parse_peer_addr_with_port(node, self.default_port_opt()).map_err(|e| e.to_string())?;
+        if self.trust_host_matches(node) {
+            self.note_trust_resolved(addr);
+        }
         Ok(DialTarget::Socket(addr))
+    }
+
+    fn trust_host_matches(&self, node: &str) -> bool {
+        let Some(host) = self
+            .trust_host
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
+            return false;
+        };
+        if node.eq_ignore_ascii_case(&host) {
+            return true;
+        }
+        let Ok(with_port) = ensure_host_port(node, self.default_port_opt()) else {
+            return false;
+        };
+        with_port.eq_ignore_ascii_case(&host)
     }
 
     #[doc(hidden)]
@@ -2847,11 +3039,17 @@ impl PeerHub {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let targets = self
-            .remembered_redials()
-            .into_iter()
-            .filter_map(|host| resolve(&host).ok())
-            .chain(addrs.into_iter().map(DialTarget::from_net));
+        let mut targets = Vec::new();
+        for host in self.remembered_redials() {
+            let Ok(target) = resolve(&host) else {
+                continue;
+            };
+            if let DialTarget::Socket(addr) = target {
+                self.note_host_resolved(&host, addr);
+            }
+            targets.push(target);
+        }
+        targets.extend(addrs.into_iter().map(DialTarget::from_net));
         for target in targets {
             if !seen.insert(target.to_string()) {
                 continue;
@@ -2953,6 +3151,7 @@ impl PeerHub {
     /// stuck one would block the redial pass for that endpoint.
     #[doc(hidden)]
     pub fn queue_dial(&self, target: DialTarget, typ: PeerConnType) -> Result<(), String> {
+        self.trust_allows_target(&target)?;
         let in_flight = (typ != PeerConnType::Feeler).then(|| self.dial_in_flight(&target));
         self.send_dial(target, typ, in_flight)
     }
@@ -2966,6 +3165,7 @@ impl PeerHub {
         typ: PeerConnType,
         in_flight: Option<DialInFlight>,
     ) -> Result<(), String> {
+        self.trust_allows_target(&target)?;
         let g = self.dial_tx.lock().unwrap_or_else(|e| e.into_inner());
         let tx = g.as_ref().ok_or("no dialer attached")?;
         tx.send(DialRequest {

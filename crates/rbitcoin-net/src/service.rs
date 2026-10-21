@@ -367,6 +367,9 @@ impl P2PNode {
         peer: crate::NetAddr,
         typ: PeerConnType,
     ) -> Result<(), NetError> {
+        if let Err(msg) = self.peers.trust_allows_net(peer) {
+            return Err(NetError::Consensus(msg));
+        }
         let target = DialTarget::from_net(peer);
         let prepared = prepare_outbound_session(
             target,

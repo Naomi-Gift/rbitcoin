@@ -109,9 +109,15 @@ pub fn maybe_select_hb_if_relay(hub: &ChainHub, session: Option<&crate::peers::L
     if hub.mempool().is_some_and(|m| !m.relay_enabled()) {
         return;
     }
-    if let Some(s) = session {
-        s.maybe_select_as_hb();
+    let Some(s) = session else {
+        return;
+    };
+    // Compact-block reconstruction stays. The trusted session is not asked
+    // for high-bandwidth announcements.
+    if s.peer_hub().is_some_and(|ph| ph.session_is_trusted_peer(s)) {
+        return;
     }
+    s.maybe_select_as_hb();
 }
 
 #[doc(hidden)]
@@ -121,6 +127,9 @@ pub fn note_accepted_hb(
 ) {
     if matches!(r, Ok(AcceptOutcome::Accepted { .. })) {
         if let Some((ph, id)) = hb {
+            if ph.get(*id).is_some_and(|s| ph.session_is_trusted_peer(&s)) {
+                return;
+            }
             ph.maybe_select_hb(*id);
         }
     }
@@ -131,6 +140,8 @@ pub async fn accept_received_from_peer(
     block: Block,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<AcceptOutcome, NetError> {
+    let waive =
+        session.is_some_and(|s| s.peer_hub().is_some_and(|ph| ph.session_is_trusted_peer(s)));
     let relay_ok = hub.mempool().is_none_or(|m| m.relay_enabled());
     let hb = if relay_ok {
         session.and_then(|s| s.peer_hub().map(|ph| (ph, s.id)))
@@ -139,7 +150,7 @@ pub async fn accept_received_from_peer(
     };
     if let Some(hub) = hub.shared_arc() {
         return crate::tip_accept::run_on_tip_accept_async(move || {
-            let r = hub.accept_received_on_lane(block);
+            let r = hub.accept_received_on_lane(block, waive);
             note_accepted_hb(&r, &hb);
             r
         })
@@ -148,7 +159,7 @@ pub async fn accept_received_from_peer(
     // A stack hub (unit tests) has no `Arc`. Join before return so the
     // borrow outlives the job.
     crate::tip_accept::run_on_tip_accept(|| {
-        let r = hub.accept_received_on_lane(block);
+        let r = hub.accept_received_on_lane(block, waive);
         note_accepted_hb(&r, &hb);
         r
     })
@@ -3951,7 +3962,7 @@ pub async fn on_block(
     if on_block_unrequested_skip(hub, follow, session, block, hash)? {
         return Ok(());
     }
-    if let Err(e) = hub.ensure_header(&block.header) {
+    if let Err(e) = ensure_peer_header(hub, &block.header) {
         if !crate::chain::accept_err_is_temporary_time(&e) {
             misbehaving(&mut follow.ban_score, session);
         }
@@ -3988,7 +3999,7 @@ pub fn on_block_unrequested_skip(
         misbehaving(&mut follow.ban_score, session);
         return Ok(true);
     }
-    if let Err(e) = hub.ensure_header(&block.header) {
+    if let Err(e) = ensure_peer_header(hub, &block.header) {
         if !crate::chain::accept_err_is_temporary_time(&e) {
             misbehaving(&mut follow.ban_score, session);
         }
@@ -4603,15 +4614,20 @@ pub async fn on_tx(
             let txid = tx.compute_txid();
             let wtxid = tx.compute_wtxid();
             follow.from_this_peer.insert(txid, FROM_THIS_PEER_CAP);
-            if mp.try_recent_reject(&wtxid) {
+            let from = session.map(|s| s.id);
+            let trusted = session
+                .is_some_and(|s| s.peer_hub().is_some_and(|ph| ph.session_is_trusted_peer(s)));
+            // A recent reject is final for every peer except the trusted one.
+            // That session already accepted the tx, so judge it again.
+            if mp.try_recent_reject(&wtxid) && !trusted {
                 mp.resolve_tx_request(&txid, &wtxid, false);
                 maybe_force_relay_recent_reject(hub, session, mp, txid, wtxid);
                 return Ok(());
             }
-            match mp
-                .accept_tx_from_async(tx.clone(), session.map(|s| s.id))
-                .await
-            {
+            if trusted {
+                mp.set_trusted_session(from);
+            }
+            match mp.accept_tx_from_async(tx.clone(), from).await {
                 Ok(r) => {
                     mp.resolve_tx_request(&txid, &wtxid, true);
                     if let Some(s) = session {
@@ -4867,6 +4883,12 @@ pub fn cmpct_announce_msg(
     cmpct_announce_from_block(hub, &block, cmpct_version)
 }
 
+/// A header from the current peer. While the mode is on that peer is the trusted one.
+/// Flag-off does not write the waive cell.
+fn ensure_peer_header(hub: &ChainHub, header: &bitcoin::block::Header) -> Result<(), NetError> {
+    rbitcoin_query::confirm_run::waive_batch(hub.query.trust_peer(), || hub.ensure_header(header))
+}
+
 /// Send `cmpctblock` to peers who asked for high-bandwidth announcements
 /// (`hb_from`: they sent `sendcmpct` announce=1) as soon as a reconstructed
 /// or received body has a PoW-valid header that extends our tip, **before**
@@ -4897,7 +4919,7 @@ pub fn relay_new_pow_valid_block(
     if block.header.prev_blockhash != tip {
         return;
     }
-    if hub.ensure_header(&block.header).is_err() {
+    if ensure_peer_header(hub, &block.header).is_err() {
         return;
     }
     hub.remember_cmpct_prefill_from_block(block);

@@ -9,6 +9,7 @@ let
   inherit (lib)
     concatStringsSep
     escapeShellArg
+    mkDefault
     mkEnableOption
     mkIf
     mkOption
@@ -117,6 +118,8 @@ let
   ++ optional cfg.datadirHdd "--datadir-hdd"
   ++ optional (cfg.milestone != null) "--milestone"
   ++ optional (cfg.milestone != null) (toString cfg.milestone)
+  ++ optional (cfg.trustPeer != null) "--trust-peer"
+  ++ optional (cfg.trustPeer != null) cfg.trustPeer
   ++ lib.optionals cfg.sv2.tp.enable [
     "--sv2-tp-listen"
     (socket cfg.sv2.tp.address cfg.sv2.tp.port)
@@ -152,6 +155,20 @@ in
       type = types.path;
       default = "/var/lib/rbitcoin";
       description = "Directory for the node store, mempool, peers, logs, and RPC cookie.";
+    };
+
+    trustPeer = mkOption {
+      type = types.nullOr types.str;
+      default = null;
+      example = "192.0.2.1:8333";
+      description = ''
+        Pass `--trust-peer ADDR`. Null omits the flag and leaves P2P listen on.
+        The address uses the same grammar as `--connect` (host:port, and `[IPv6]:port`).
+        Exactly one peer: the module also passes `--no-listen` and `--max-inbound 0`.
+        Do not combine it with `p2p.listen`, `p2p.listenOnion`, or `p2p.maxInbound` above 0.
+        Flag syntax and start errors: docs/operator/operations.md.
+        Which faults warn: COMPAT.md.
+      '';
     };
 
     milestone = mkOption {
@@ -576,7 +593,21 @@ in
   };
 
   config = mkIf cfg.enable {
+    services.rbitcoin.p2p.listen = mkIf (cfg.trustPeer != null) (mkDefault false);
+    services.rbitcoin.p2p.maxInbound = mkIf (cfg.trustPeer != null) (mkDefault 0);
     assertions = [
+      {
+        assertion = cfg.trustPeer == null || !cfg.p2p.listen;
+        message = "services.rbitcoin.trustPeer cannot be combined with p2p.listen";
+      }
+      {
+        assertion = cfg.trustPeer == null || !cfg.p2p.listenOnion;
+        message = "services.rbitcoin.trustPeer cannot be combined with p2p.listenOnion";
+      }
+      {
+        assertion = cfg.trustPeer == null || cfg.p2p.maxInbound == 0;
+        message = "services.rbitcoin.trustPeer cannot be combined with p2p.maxInbound greater than 0";
+      }
       {
         assertion = cfg.coldDataDir == null || cfg.coldDataDir != cfg.dataDir;
         message = "services.rbitcoin.coldDataDir must differ from dataDir";

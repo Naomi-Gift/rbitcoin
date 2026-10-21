@@ -177,7 +177,17 @@ fn orphan_parks_then_promotes(life: &mut Life) {
     let dry = spend_tx(out(pid, 0), 97_000);
     let err = life
         .mp
-        .prepare_admit(&dry, &life.chain, life.tip, 0, false, None)
+        .prepare_admit(
+            &dry,
+            &life.chain,
+            life.tip,
+            PrepareOpts {
+                fee_delta: 0,
+                report_orphans: false,
+                min_relay: None,
+                waive: false,
+            },
+        )
         .unwrap_err();
     assert!(matches!(err, AcceptError::MissingPrevout(_)), "{err}");
     assert_eq!(life.mp.orphan_count(), 1);
@@ -237,7 +247,17 @@ fn full_rbf_and_staged_commit(life: &mut Life) -> (OutPoint, Txid) {
     let second = spend_tx(e, 99_000);
     let prep = life
         .mp
-        .prepare_admit(&second, &life.chain, life.tip, 0, false, None)
+        .prepare_admit(
+            &second,
+            &life.chain,
+            life.tip,
+            PrepareOpts {
+                fee_delta: 0,
+                report_orphans: false,
+                min_relay: None,
+                waive: false,
+            },
+        )
         .expect("prevout free at prepare");
     life.accept(&first).unwrap();
     let err = life.mp.commit_after_script(&second, prep).unwrap_err();

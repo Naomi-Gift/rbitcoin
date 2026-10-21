@@ -117,6 +117,8 @@ pub struct ListenOpts {
     pub i2p_accept_incoming: bool,
     /// Loopback P2P accept + Tor `ADD_ONION` (`--listen-onion`).
     pub listen_onion: bool,
+    /// `--listen` or `--no-listen` was set. Default auto-listen is not explicit.
+    pub p2p_explicit: bool,
     /// Kernel CJDNS overlay (`fc00::/8`) is routable (`--cjdns-reachable`).
     pub cjdns_reachable: bool,
 }
@@ -146,6 +148,7 @@ impl Default for ListenOpts {
             i2p_sam: None,
             i2p_accept_incoming: false,
             listen_onion: false,
+            p2p_explicit: false,
             cjdns_reachable: false,
         }
     }
@@ -411,6 +414,10 @@ pub struct NodeConfig {
     /// Default [`rbitcoin_net::REDIAL_INTERVAL`]. Not a conf key; a test that
     /// waits for the redial sets [`rbitcoin_net::REDIAL_INTERVAL_TEST`].
     pub connect_redial: Duration,
+    /// `--trust-peer` as a [`rbitcoin_net::NetAddr`] (IP, onion, I2P, CJDNS).
+    pub trust_peer: Option<rbitcoin_net::NetAddr>,
+    /// `--trust-peer` clearnet DNS name. Mutually exclusive with [`Self::trust_peer`].
+    pub trust_peer_host: Option<String>,
 }
 
 impl Default for NodeConfig {
@@ -474,6 +481,8 @@ impl Default for NodeConfig {
             prefill_compact: true,
             check_blocks: None,
             connect_redial: rbitcoin_net::REDIAL_INTERVAL,
+            trust_peer: None,
+            trust_peer_host: None,
         }
     }
 }
@@ -684,7 +693,143 @@ impl NodeConfig {
         }
         self.validate_only_net()?;
         self.validate_hidden_inbound()?;
+        self.validate_trust_peer()?;
         self.validate_rpc_cookie()
+    }
+
+    /// True when `--trust-peer` named the sole dial target.
+    pub fn trust_peer_set(&self) -> bool {
+        self.trust_peer.is_some() || self.trust_peer_host.is_some()
+    }
+
+    /// Pin `--trust-peer` as the only dial target and refuse clashing flags.
+    ///
+    /// Runs from CLI assembly, before [`Self::ensure_datadir`] opens a store.
+    pub fn seal_trust_peer(&mut self) -> Result<(), NodeError> {
+        self.trust_peer_conflict()?;
+        if !self.trust_peer_set() {
+            return Ok(());
+        }
+        match (&self.trust_peer, &self.trust_peer_host) {
+            (Some(addr), None) => {
+                if self.listen.connect.is_empty() {
+                    self.listen.connect.push(*addr);
+                }
+            }
+            (None, Some(host)) => {
+                if self.listen.connect_dns.is_empty() {
+                    self.listen.connect_dns.push(host.clone());
+                }
+            }
+            _ => {
+                return Err(NodeError::Config(
+                    "trust-peer accepts exactly one address".into(),
+                ));
+            }
+        }
+        self.listen.p2p = P2pListen::Off;
+        self.listen.p2p_extra.clear();
+        self.listen.listen_onion = false;
+        self.listen.use_seeds = false;
+        self.listen.max_inbound = 0;
+        self.listen.seednodes.clear();
+        Ok(())
+    }
+
+    fn trust_peer_conflict(&self) -> Result<(), NodeError> {
+        if self.trust_peer.is_some() && self.trust_peer_host.is_some() {
+            return Err(NodeError::Config(
+                "trust-peer accepts exactly one address".into(),
+            ));
+        }
+        if !self.trust_peer_set() {
+            return Ok(());
+        }
+        if self.listen.listen_onion {
+            return Err(NodeError::Config(
+                "trust-peer cannot be combined with --listen-onion".into(),
+            ));
+        }
+        if self.listen.p2p_explicit && !matches!(self.listen.p2p, P2pListen::Off) {
+            return Err(NodeError::Config(
+                "trust-peer cannot be combined with --listen".into(),
+            ));
+        }
+        if self.listen.max_inbound_explicit && self.listen.max_inbound > 0 {
+            return Err(NodeError::Config(
+                "trust-peer cannot be combined with --max-inbound greater than 0".into(),
+            ));
+        }
+        if !self.listen.seednodes.is_empty() {
+            return Err(NodeError::Config(
+                "trust-peer cannot be combined with --seed-node".into(),
+            ));
+        }
+        self.connect_matches_trust_peer()
+    }
+
+    fn connect_matches_trust_peer(&self) -> Result<(), NodeError> {
+        let clash =
+            NodeError::Config("trust-peer cannot be combined with a different --connect".into());
+        match (&self.trust_peer, &self.trust_peer_host) {
+            (Some(addr), None)
+                if !self.listen.connect_dns.is_empty()
+                    || self.listen.connect.len() > 1
+                    || self.listen.connect.iter().any(|a| a != addr) =>
+            {
+                return Err(clash);
+            }
+            (None, Some(host))
+                if !self.listen.connect.is_empty()
+                    || self.listen.connect_dns.len() > 1
+                    || self
+                        .listen
+                        .connect_dns
+                        .iter()
+                        .any(|h| !h.eq_ignore_ascii_case(host)) =>
+            {
+                return Err(clash);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// Sealed `--trust-peer` state: one dial target, no listen, no seeds.
+    fn validate_trust_peer(&self) -> Result<(), NodeError> {
+        if !self.trust_peer_set() {
+            return Ok(());
+        }
+        self.reject_trust_listen()?;
+        self.reject_trust_seeds()?;
+        self.connect_matches_trust_peer()?;
+        if self.listen.connect.is_empty() && self.listen.connect_dns.is_empty() {
+            return Err(NodeError::Config("trust-peer requires an address".into()));
+        }
+        Ok(())
+    }
+
+    fn reject_trust_listen(&self) -> Result<(), NodeError> {
+        if !matches!(self.listen.p2p, P2pListen::Off) || self.listen.listen_onion {
+            return Err(NodeError::Config(
+                "trust-peer cannot be combined with --listen".into(),
+            ));
+        }
+        if self.listen.max_inbound > 0 {
+            return Err(NodeError::Config(
+                "trust-peer cannot be combined with --max-inbound greater than 0".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn reject_trust_seeds(&self) -> Result<(), NodeError> {
+        if self.listen.use_seeds || !self.listen.seednodes.is_empty() {
+            return Err(NodeError::Config(
+                "trust-peer cannot be combined with --seed-node".into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Check `--rpc-cookie-file` at startup. RPC itself only binds after
@@ -988,6 +1133,7 @@ impl NodeConfig {
                 );
             }
             "listen" => {
+                self.listen.p2p_explicit = true;
                 if is_listen_off(val) {
                     self.listen.p2p = P2pListen::Off;
                     self.listen.p2p_extra.clear();
@@ -1002,6 +1148,7 @@ impl NodeConfig {
                 if parse_conf_bool(val)
                     .map_err(|e| NodeError::Config(format!("conf no_listen: {e}")))?
                 {
+                    self.listen.p2p_explicit = true;
                     self.listen.p2p = P2pListen::Off;
                     self.listen.p2p_extra.clear();
                 }
@@ -1017,6 +1164,17 @@ impl NodeConfig {
             }
             "connect" => {
                 push_connect(&mut self.listen, val)?;
+            }
+            "trust_peer" | "trustpeer" => {
+                if self.trust_peer.is_some() || self.trust_peer_host.is_some() {
+                    return Err(NodeError::Config(
+                        "trust-peer accepts exactly one address".into(),
+                    ));
+                }
+                match parse_connect_target("trust-peer", val)? {
+                    ParsedConnect::Addr(addr) => self.trust_peer = Some(addr),
+                    ParsedConnect::Dns(host) => self.trust_peer_host = Some(host),
+                }
             }
             "head_scale" => {
                 self.head_scale = match val {
@@ -1627,16 +1785,22 @@ pub fn parse_minimum_chain_work(spec: &str) -> Result<[u8; 32], String> {
 }
 
 #[doc(hidden)]
-pub fn push_connect(listen: &mut ListenOpts, val: &str) -> Result<(), NodeError> {
+pub enum ParsedConnect {
+    Addr(rbitcoin_net::NetAddr),
+    Dns(String),
+}
+
+/// `--connect` / `--trust-peer` address grammar.
+#[doc(hidden)]
+pub fn parse_connect_target(key: &str, val: &str) -> Result<ParsedConnect, NodeError> {
     let val = val.trim();
     if val.is_empty() {
-        return Err(NodeError::Config(
-            "conf connect requires host[:port]".into(),
-        ));
+        return Err(NodeError::Config(format!(
+            "conf {key} requires host[:port]"
+        )));
     }
     if let Ok(addr) = val.parse::<rbitcoin_net::NetAddr>() {
-        listen.connect.push(addr);
-        return Ok(());
+        return Ok(ParsedConnect::Addr(addr));
     }
     let host = match val.rsplit_once(':') {
         Some((host, port)) if port.parse::<u16>().is_ok() => host,
@@ -1649,10 +1813,18 @@ pub fn push_connect(listen: &mut ListenOpts, val: &str) -> Result<(), NodeError>
         || val.contains('/')
     {
         return Err(NodeError::Config(format!(
-            "conf connect: bad peer address {val}"
+            "conf {key}: bad peer address {val}"
         )));
     }
-    listen.connect_dns.push(val.to_string());
+    Ok(ParsedConnect::Dns(val.to_string()))
+}
+
+#[doc(hidden)]
+pub fn push_connect(listen: &mut ListenOpts, val: &str) -> Result<(), NodeError> {
+    match parse_connect_target("connect", val)? {
+        ParsedConnect::Addr(addr) => listen.connect.push(addr),
+        ParsedConnect::Dns(host) => listen.connect_dns.push(host),
+    }
     Ok(())
 }
 

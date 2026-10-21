@@ -2861,6 +2861,13 @@ pub fn batch_context_ok(
     if headers.is_empty() {
         return false;
     }
+    // The header batch opts in while the mode is on. Flag-off does not write the cell.
+    // The recursive call already holds the cell, so it does not opt in again.
+    if hub.query.trust_peer() && !rbitcoin_query::confirm_run::confirm_waive(hub.query.as_ref()) {
+        return rbitcoin_query::confirm_run::waive_batch(true, || {
+            batch_context_ok(st, hub, headers, diff)
+        });
+    }
     let Some(mut parent) = parent_header(st, hub, headers[0].prev_blockhash) else {
         return false;
     };
@@ -2872,34 +2879,61 @@ pub fn batch_context_ok(
     // The min-difficulty walk-back can land on a header earlier in this
     // reply, so the snapshot advances with the batch.
     let mut diff = *diff;
+    let own_guard = rbitcoin_query::confirm_run::confirm_waive(hub.query.as_ref())
+        && !rbitcoin_consensus::collecting();
+    let guard = own_guard.then(rbitcoin_consensus::TrustCollect::enter);
+    let mut stopped: Option<(u32, [u8; 32], rbitcoin_consensus::ConsensusError)> = None;
+    let mut seen: Vec<(u32, [u8; 32])> = Vec::with_capacity(headers.len());
+    let mut accepted = true;
     for hdr in headers {
         let hash = hdr.block_hash();
         if hdr.prev_blockhash != parent_hash {
-            return false;
+            stopped = Some((
+                height.saturating_add(1),
+                hash.to_byte_array(),
+                rbitcoin_consensus::ConsensusError::BadPrev,
+            ));
+            accepted = false;
+            break;
         }
         height = height.saturating_add(1);
+        seen.push((height, hash.to_byte_array()));
         let mtp = if times.len() < 11 {
             0
         } else {
             match rbitcoin_primitives::median_time_past_times(&times) {
                 Ok(mtp) => mtp,
-                Err(_) => return false,
+                Err(_) => {
+                    stopped = Some((
+                        height,
+                        hash.to_byte_array(),
+                        rbitcoin_consensus::ConsensusError::BadHeader("empty median time"),
+                    ));
+                    accepted = false;
+                    break;
+                }
             }
         };
         parent_hash = hash;
         let Some(bits) = expected_lookahead_bits(hub, height, &parent, hdr.time, st, &diff) else {
-            return false;
+            stopped = Some((
+                height,
+                hash.to_byte_array(),
+                rbitcoin_consensus::ConsensusError::BadHeader("missing retarget first header"),
+            ));
+            accepted = false;
+            break;
         };
-        if rbitcoin_consensus::validate_header_on_parent(
+        if let Err(e) = rbitcoin_consensus::validate_header_on_parent(
             &hub.params,
             rbitcoin_primitives::Height(height),
             hdr,
             mtp,
             bits,
-        )
-        .is_err()
-        {
-            return false;
+        ) {
+            stopped = Some((height, hash.to_byte_array(), e));
+            accepted = false;
+            break;
         }
         if times.len() == 11 {
             times.remove(0);
@@ -2909,7 +2943,27 @@ pub fn batch_context_ok(
         note_full_diff_snap(&mut diff, hub, hdr, height);
         parent = *hdr;
     }
-    true
+    let warns = if own_guard {
+        rbitcoin_consensus::drain_warnings()
+    } else {
+        Vec::new()
+    };
+    drop(guard);
+    if own_guard {
+        for (h, err) in warns {
+            let hh = h.unwrap_or(height);
+            let hash = seen
+                .iter()
+                .find(|(y, _)| *y == hh)
+                .map(|(_, hash)| *hash)
+                .unwrap_or([0; 32]);
+            rbitcoin_query::confirm_run::warn_trust_block(accepted, hash, hh, &err);
+        }
+        if let Some((h, hash, err)) = stopped {
+            rbitcoin_query::confirm_run::warn_trust_block(false, hash, h, &err);
+        }
+    }
+    accepted
 }
 
 #[doc(hidden)]

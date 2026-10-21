@@ -60,9 +60,10 @@ pub mod store;
 pub mod testutil;
 
 pub use accept::{
-    check_mempool_structural, AcceptError, AcceptFailureRecord, AcceptResult, AcceptStageUs,
-    ActiveMempool, ChainPrevout, ChainTipCtx, Coin, LiftedOrphan, PreparedAdmit, UtxoProvider,
-    DEFAULT_MAX_MEMPOOL_WEIGHT, MAX_PACKAGE_COUNT, MAX_PACKAGE_WEIGHT,
+    check_mempool_structural, trust_keeps_structural, AcceptError, AcceptFailureRecord,
+    AcceptResult, AcceptStageUs, ActiveMempool, ChainPrevout, ChainTipCtx, Coin, LiftedOrphan,
+    PrepareOpts, PreparedAdmit, UtxoProvider, DEFAULT_MAX_MEMPOOL_WEIGHT, MAX_PACKAGE_COUNT,
+    MAX_PACKAGE_WEIGHT,
 };
 pub use error::MempoolError;
 pub use fee_analog::{AnalogHistory, HISTORICAL_CONFIDENCE_FAR};
