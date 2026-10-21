@@ -119,6 +119,7 @@ fn empty_and_single_run_inline() {
 
 #[test]
 fn spawn_detached_runs_work() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
     use std::sync::mpsc;
     let (tx, rx) = mpsc::sync_channel(1);
     spawn_detached(move || {
@@ -132,6 +133,7 @@ fn spawn_detached_runs_work() {
 
 #[test]
 fn join_many_does_not_spawn_per_job() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
     let before = worker_spawn_count();
     assert!(before >= 1);
     for i in 0..32u32 {
@@ -149,6 +151,7 @@ fn join_many_does_not_spawn_per_job() {
 /// once (no jobs-mutex held across the idle wait).
 #[test]
 fn pool_waiters_run_concurrently() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
     let n = worker_spawn_count();
     assert!(n >= 1);
     let start = Instant::now();
@@ -538,6 +541,7 @@ fn help_steal_runs_the_chunk_the_workers_cannot() {
 
 #[test]
 fn owned_wave_from_script_worker_is_refused() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
     let got =
         run_detached_join(|| start_for_each_owned(vec![1u32, 2], ok_u32).map(|w| w.is_some()))
             .expect("join");
@@ -550,6 +554,7 @@ fn owned_wave_from_script_worker_is_refused() {
 
 #[test]
 fn panic_while_workers_occupied_does_not_deadlock_pool() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
     let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
