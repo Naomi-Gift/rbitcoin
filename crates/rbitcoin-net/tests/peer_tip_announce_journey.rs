@@ -225,16 +225,26 @@ fn tip_announce_ibd_feefilter_and_empty_inv() {
         "IBD feefilter is sent even when relay is off"
     );
     let tip = hub.tip_hash().unwrap();
+    let gb = GetBlocksMessage::new(vec![tip], tip);
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let mut follow = PeerFollowState::new();
-    handle_peer_inventory_msg(
-        &NetworkMessage::GetBlocks(GetBlocksMessage::new(vec![tip], tip)),
+    let sync = handle_peer_inventory_msg(
+        &NetworkMessage::GetBlocks(gb.clone()),
         hub,
         &out_tx,
         &mut follow,
         None,
-    )
-    .unwrap();
+    );
+    assert!(
+        sync.is_err(),
+        "header work is not on the sync inventory path"
+    );
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("getblocks runtime")
+        .block_on(on_getblocks(hub, &out_tx, &mut follow, None, &gb))
+        .expect("getblocks");
     assert!(out_rx.try_recv().is_err(), "no headers means no inv");
 }
 

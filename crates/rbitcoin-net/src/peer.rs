@@ -3019,6 +3019,13 @@ pub fn handle_peer_inventory_msg(
         | NetworkMessage::CmpctBlock(_)
         | NetworkMessage::BlockTxn(_)
         | NetworkMessage::Tx(_) => {}
+        NetworkMessage::Headers(_)
+        | NetworkMessage::GetHeaders(_)
+        | NetworkMessage::GetBlocks(_) => {
+            return Err(NetError::Protocol(
+                "header work is not on the sync inventory path",
+            ));
+        }
         _ => {}
     }
     Ok(())
