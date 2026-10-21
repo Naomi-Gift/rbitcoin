@@ -3381,11 +3381,10 @@ pub async fn serve_getdata_tail(
         match &item {
             // Unknown hash: Core ProcessGetData answers notfound. Silence
             // holds the requester's getdata until the stall floor.
-            // `knows_header` is the index check. Body reconstruct runs on
-            // the blocking pool. A missing body is `false` from that encode.
+            // The header check and the body reconstruct both run on the
+            // blocking pool. A missing header or body is `false`.
             Inventory::Block(h) | Inventory::WitnessBlock(h)
-                if !hub.knows_header(h)
-                    || !serve_getdata_full_block(hub, out_tx, session, h).await? =>
+                if !serve_getdata_full_block(hub, out_tx, session, h).await? =>
             {
                 notfound.push(item);
             }

@@ -5022,6 +5022,58 @@ fn inbound_cmpct_reconstruct_runs_off_the_reactor() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A block `getdata` must not look up headers on the session worker. The
+/// missing hash and the genesis body both resolve on the blocking pool.
+#[test]
+fn getdata_block_lookup_stays_off_the_reactor() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getdata-lookup-off-reactor");
+    hub.ensure_genesis().unwrap();
+    let hash = hub.tip_hash().unwrap();
+    let missing = bitcoin::BlockHash::from_byte_array([9u8; 32]);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("tokio-rt-worker")
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        tokio::spawn(async move {
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let mut follow = PeerFollowState::new();
+            let before = rbitcoin_query::header_lookup_count();
+            serve_getdata(
+                &hub,
+                &out_tx,
+                &mut follow,
+                None,
+                vec![
+                    Inventory::WitnessBlock(missing),
+                    Inventory::WitnessBlock(hash),
+                ],
+            )
+            .await
+            .expect("getdata");
+            assert_eq!(
+                rbitcoin_query::header_lookup_count(),
+                before,
+                "block getdata looked up a header on the session worker"
+            );
+            let block = out_rx.try_recv().expect("genesis body");
+            let served = served_block(block);
+            assert_eq!(served.block_hash(), hash);
+            match out_rx.try_recv().map(PeerOut::expect_msg) {
+                Ok(NetworkMessage::NotFound(v)) => {
+                    assert!(v.contains(&Inventory::WitnessBlock(missing)));
+                }
+                other => panic!("missing hash is notfound, got {other:?}"),
+            }
+        })
+        .await
+        .expect("reactor task")
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Compact getdata and an announced tip wtxid reconstruct off the reactor.
 /// `assert_not_reactor` panics when `block_for_peer` runs on `tokio-rt-worker`.
 #[test]
