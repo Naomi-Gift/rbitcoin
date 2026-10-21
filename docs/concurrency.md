@@ -122,6 +122,72 @@ cannot pin bitcoind RPC — we can).
 
 API tokens: [`COMPAT.md`](../COMPAT.md) (Esplora headers, Electrum JSON-RPC extra members, status preimage).
 
+## Wakeups and handoffs
+
+What was checked against lock contention, wasted wakeups, and extra
+handoffs. Each line is fixed or deferred. Tokio's eager driver handoff
+stays off (`tokio_unstable` is not set). There is no second thread pool
+and no environment knob for these choices.
+
+**Fixed.** `wake_steal_workers` (`script_pool.rs`) unparks one parked
+`rbtc-scripts-*` worker per unclaimed steal chunk and per detached job,
+capped by how many workers are parked. A worker is on that idle list only
+while it is not holding a job. The epoch check still runs after the debug
+park delay, so a wave published after the steal check is not missed.
+`steal_publish_wakes_idle_workers` is the pin.
+
+**Fixed.** `serve_getdata_tail` used to call `ChainHub::knows_header` on
+the session worker for every block `getdata`. An unknown hash took
+`get_header_by_hash` there. `serve_getdata_full_block` already
+reconstructs on the blocking pool and returns false when the header or
+the body is missing, so the session check is gone.
+`getdata_block_lookup_stays_off_the_reactor` is the pin.
+
+**Fixed, already zero.** The IBD coordinator holds `shared`
+(`ibd_cancellable`) across the turn, the redial apply, and the event
+drains. A seeded two-block catch-up does no header lookup and no
+`handle_pread_all` on that task. `tip_height`, `has_block`, and
+`block_queue_*` under the lock are RAM. The header thread still reads
+the store (`load_origin`, resume) with the lock dropped around that IO.
+`coord_shared_lock_skips_header_and_store_io` is the pin. Nothing in the
+turn was moved.
+
+**Deferred.** Headers decode and classify are still two blocking joins.
+`decode_framed_offload` drops its permit inside the decode job.
+`on_headers` then takes the header-decode permit in `run_header_job`.
+Fusing them would hold one permit across classify and tie the frame's
+lifetime to `HeadersApply`. The session runs neither piece. One extra
+join is not the stall.
+
+**Deferred.** `queue_getheaders` still builds the locator on the caller
+(`headers_sync_locator` / `locator_from_height`, about ten
+`header_at_height` calls). Callers are the handshake, inv, and a missing
+block parent. The headers-apply path already queues the locator
+`classify_headers` built inside the header job (`queue_headers_locator`).
+A second builder for that short walk is not the fix.
+
+**Deferred.** These session checks are still one hash, not a batch:
+`on_inv_block_needs_headers`, the `on_block` parent check, compact parent
+checks, `header_announcement_connects`, and `stale_relay_allowed` after a
+body was found. `is_connected` is the published height index and does not
+read the header file. The per-item getdata loop was the batch, and that
+moved.
+
+**Deferred.** Mempool accept, Electrum, Esplora, RPC, block decode,
+compact reconstruct, and header jobs share Tokio's blocking pool (nCPU,
+minimum 4). A private pool would be a second pool. RPC can delay a
+reconstruct until one replacement lane exists.
+
+**Deferred.** `FULL_QUEUE_SPINS` is not incremented. The full tip-accept
+queue parks on `Notify` (`run_on_tip_accept_async`).
+`full_lane_parks_instead_of_spinning` is the pin: the ninth job is still
+pending after 40ms and then finishes. Stack hubs that are not in an
+`Arc` still use the sync wait. The node uses `ChainHub::into_arc`.
+
+**Deferred.** `unpark_script_publisher` wakes every registered scripts
+stage. A process has one (IBD or tip). That is not a pool-sized herd.
+`Wave::notify_if_complete` is the caller.
+
 ## Practical rules
 
 1. Do **not** spawn a second Class A writer while IBD confirm write is running.
