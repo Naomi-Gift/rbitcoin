@@ -1,8 +1,8 @@
 {
   "new_base": "cdfdaa0ef2b1fea88a1580adce5e42b6213aebac",
   "new_skip": 5254,
-  "old_index": 9392,
+  "old_index": 9852,
   "new_cap_used": true,
   "run_id": "39549148028",
-  "old_name": "crates/rbitcoin-query/src/archive.rs:1157:35: replace != with == in Query::archive_plan_batch_from_wire"
+  "old_name": "crates/rbitcoin-query/src/connect.rs:609:51: replace <= with > in Query::sh_job_released"
 }
