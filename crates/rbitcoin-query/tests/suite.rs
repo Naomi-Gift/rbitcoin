@@ -29,5 +29,6 @@ mod sp_tweaks;
 mod spend_sync;
 mod stamp;
 mod structure_rule_tests;
+mod trust_peer;
 mod wire_agree_tests;
 mod write_create_loc;

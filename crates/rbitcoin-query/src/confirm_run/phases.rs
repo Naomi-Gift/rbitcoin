@@ -158,6 +158,7 @@ pub fn assemble_run(
     for (i, meta) in metas.into_iter().enumerate() {
         let block = &wire_blocks[i];
         let height = meta.height;
+        rbitcoin_consensus::note_block_height(height.0);
         // Once-computed at plan/structure — never rehash `block_hash()` here.
         let block_hash = meta.hash;
         let ctx = ValidationContext::at(params, height, milestone);
@@ -370,6 +371,7 @@ pub fn structural_run(
     let mut tot = StructuralPhaseNs::default();
     let bip34_ancestor = bip34_ancestor_for_write(query, params, prepared);
     for (i, p) in prepared.iter().enumerate() {
+        rbitcoin_consensus::note_block_height(p.height.0);
         let ctx = ValidationContext::at(params, p.height, milestone);
         let ph = structural_validate_spends(
             query,

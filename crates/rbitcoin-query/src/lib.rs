@@ -432,6 +432,8 @@ pub struct Query {
     /// Cooperative cancel for in-flight confirm load. Set on IBD SIGINT
     /// teardown so the confirm load thread aborts before process exit.
     pub confirm_cancel: std::sync::atomic::AtomicBool,
+    /// `--trust-peer`: consensus faults warn and the plan's apply-class still connects.
+    pub trust_peer: std::sync::atomic::AtomicBool,
     /// One header read returns [`StoreError::Cancelled`]. Tests only.
     #[cfg(debug_assertions)]
     pub header_read_cancel: std::sync::atomic::AtomicBool,
@@ -610,6 +612,7 @@ impl Query {
             sptweaks_origin: AtomicU32::new(sptweaks_origin),
             index_mode_cell: std::sync::atomic::AtomicU8::new(IndexMode::Tip as u8),
             confirm_cancel: std::sync::atomic::AtomicBool::new(false),
+            trust_peer: std::sync::atomic::AtomicBool::new(false),
             #[cfg(debug_assertions)]
             header_read_cancel: std::sync::atomic::AtomicBool::new(false),
             height_by_hash: Mutex::new(HeightByHashIndex::default()),
@@ -1447,6 +1450,16 @@ impl Query {
 
     pub fn confirm_parent_cache(&self) -> &confirm_parent_cache::ConfirmParentCache {
         &self.confirm_parents
+    }
+
+    /// `--trust-peer`: warn-and-apply consensus faults still connect.
+    pub fn set_trust_peer(&self, on: bool) {
+        self.trust_peer
+            .store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn trust_peer(&self) -> bool {
+        self.trust_peer.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Enable/disable durable spend-annotation writes on confirm

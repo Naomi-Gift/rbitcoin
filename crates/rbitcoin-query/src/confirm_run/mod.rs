@@ -37,6 +37,7 @@ use rbitcoin_consensus::header::pow_hash_meets_target;
 use rbitcoin_consensus::{ChainParams, ConsensusError, Milestone};
 use rbitcoin_primitives::Height;
 use rbitcoin_store::{StoreError, WriteIoBackend};
+use std::cell::Cell;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
@@ -190,6 +191,9 @@ pub struct LoadedBatch {
     /// Indexes to assemble. Copied from `index_live` at load.
     pub index_want: index::IndexWant,
     pub stats: Arc<crate::ConfirmStats>,
+    /// Waive bit from [`confirm_waive`] at load. The script wave keeps every
+    /// warn-and-apply fault only when this is set. Flag-off stays false.
+    pub trust_peer: bool,
 }
 
 /// Script-verified batch ready for ordered commit (Class A + structural + C).
@@ -313,10 +317,200 @@ pub fn confirm_wire_run_preverified(
     preverified: &ScriptPreverified,
 ) -> Result<Vec<rbitcoin_primitives::Fk>, ConfirmError> {
     rbitcoin_consensus::block::reject_empty_confirm_batch(blocks.is_empty())?;
-    let stamped = confirm_wire_lookup_stamp(query, params, milestone, blocks, None)?;
-    let mat = confirm_wire_load_from_plan(query, params, milestone, stamped, None, preverified)?;
-    let ok = confirm_scripts_phase(mat.batch)?;
-    confirm_write_phase(query, params, milestone, ok.batch)
+    let trust = confirm_waive(query);
+    let guard = trust.then(rbitcoin_consensus::TrustCollect::enter);
+    let result = (|| {
+        let stamped = confirm_wire_lookup_stamp(query, params, milestone, blocks, None)?;
+        let mat =
+            confirm_wire_load_from_plan(query, params, milestone, stamped, None, preverified)?;
+        let ok = confirm_scripts_phase(mat.batch)?;
+        confirm_write_phase(query, params, milestone, ok.batch)
+    })();
+    // Flag-off never drains: that allocates on the valid-block path.
+    if trust {
+        let warns = rbitcoin_consensus::drain_warnings();
+        let stop_at = rbitcoin_consensus::current_block_height();
+        drop(guard);
+        log_trust_block_faults(blocks, &warns, result.as_ref().err(), stop_at);
+    }
+    result
+}
+
+thread_local! {
+    /// This thread opted into warn-and-apply for the batch it is confirming.
+    /// Default is off. [`Query::trust_peer`] does not set it.
+    static WAIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Waiver for this confirm. One cell read. The mode bit is not consulted.
+pub fn confirm_waive(_query: &Query) -> bool {
+    WAIVE.with(|c| c.get())
+}
+
+/// Set the waive bit for `f` on this thread, then restore the previous value.
+/// A panic inside `f` restores the bit too, so the next caller on this thread
+/// is not waived just because a connect aborted.
+pub fn with_confirm_waive<R>(waive: bool, f: impl FnOnce() -> R) -> R {
+    let prev = WAIVE.with(|c| c.replace(waive));
+    let _restore = WaiveRestore(prev);
+    f()
+}
+
+/// Set the cell for `body` only when `waive` is true. False does not write it,
+/// so a flag-off confirm does not touch the cell.
+pub fn waive_batch<R>(waive: bool, body: impl FnOnce() -> R) -> R {
+    if waive {
+        with_confirm_waive(true, body)
+    } else {
+        body()
+    }
+}
+
+struct WaiveRestore(bool);
+
+impl Drop for WaiveRestore {
+    fn drop(&mut self) {
+        WAIVE.with(|c| c.set(self.0));
+    }
+}
+
+/// Collector owned by one confirm stage. Nested calls (the unified wire run
+/// already entered) leave this empty so the outer drain logs once.
+struct TrustScope {
+    guard: Option<rbitcoin_consensus::TrustCollect>,
+}
+
+impl TrustScope {
+    fn enter(query: &Query) -> Self {
+        let guard = (confirm_waive(query) && !rbitcoin_consensus::collecting())
+            .then(rbitcoin_consensus::TrustCollect::enter);
+        Self { guard }
+    }
+
+    fn finish(self, ids: &[(u32, [u8; 32])], stopped: Option<&ConfirmError>) {
+        if self.guard.is_none() {
+            return;
+        }
+        let warns = rbitcoin_consensus::drain_warnings();
+        let stop_at = rbitcoin_consensus::current_block_height();
+        drop(self.guard);
+        log_trust_ids(ids, &warns, stopped, stop_at);
+    }
+}
+
+pub(crate) fn trust_ids_from_wire(blocks: &[WireBlockIn]) -> Vec<(u32, [u8; 32])> {
+    blocks
+        .iter()
+        .map(|(h, b, _)| (h.0, b.block_hash().to_byte_array()))
+        .collect()
+}
+
+fn log_trust_block_faults(
+    blocks: &[WireBlockIn],
+    warns: &[(Option<u32>, rbitcoin_consensus::ConsensusError)],
+    stopped: Option<&ConfirmError>,
+    stop_at: Option<u32>,
+) {
+    log_trust_ids(&trust_ids_from_wire(blocks), warns, stopped, stop_at);
+}
+
+fn log_trust_ids(
+    blocks: &[(u32, [u8; 32])],
+    warns: &[(Option<u32>, rbitcoin_consensus::ConsensusError)],
+    stopped: Option<&ConfirmError>,
+    stop_at: Option<u32>,
+) {
+    let applied = stopped.is_none();
+    let fallback = blocks.first().copied();
+    let hash_at = |height: u32| -> Option<[u8; 32]> {
+        blocks
+            .iter()
+            .find(|(h, _)| *h == height)
+            .map(|(_, hash)| *hash)
+    };
+    for (height, err) in warns {
+        let (h, hash) = match (height, fallback) {
+            (Some(h), _) => (
+                *h,
+                hash_at(*h)
+                    .or_else(|| fallback.map(|(_, hash)| hash))
+                    .unwrap_or([0; 32]),
+            ),
+            (None, Some((h, hash))) => (h, hash),
+            (None, None) => (0, [0; 32]),
+        };
+        warn_trust_block(applied, hash, h, err);
+    }
+    if let Some(ConfirmError::Rules(err)) = stopped {
+        let hinted = stop_at.and_then(|h| hash_at(h).map(|hash| (h, hash)));
+        let (h, hash) = hinted.or(fallback).unwrap_or((0, [0; 32]));
+        warn_trust_block(false, hash, h, err);
+    }
+}
+
+/// Drain the collector and log one line per fault. Caller drops the guard
+/// after this returns so a nested check does not see a stale depth.
+pub fn log_collected_header(
+    hash: [u8; 32],
+    height: u32,
+    applied: bool,
+    stopped: Option<&rbitcoin_consensus::ConsensusError>,
+) {
+    let warns = rbitcoin_consensus::drain_warnings();
+    for (h, err) in warns {
+        warn_trust_block(applied, hash, h.unwrap_or(height), &err);
+    }
+    if let Some(err) = stopped {
+        warn_trust_block(false, hash, height, err);
+    }
+}
+
+pub fn warn_trust_block(
+    applied: bool,
+    hash: [u8; 32],
+    height: u32,
+    err: &rbitcoin_consensus::ConsensusError,
+) {
+    warn_trust_reason(
+        applied,
+        hash,
+        height,
+        &rbitcoin_consensus::block_reject_reason(err),
+    );
+}
+
+pub fn warn_trust_reason(applied: bool, hash: [u8; 32], height: u32, reason: &str) {
+    // Header store and the header walk both check one header. Keep one line
+    // per verb: a later apply must not be hidden by an earlier reject.
+    if !trust_log_fresh(applied, hash, height, reason) {
+        return;
+    }
+    let verb = if applied { "applied" } else { "not applied" };
+    let hash = bitcoin::BlockHash::from_byte_array(hash);
+    rbitcoin_log::warn!("trust-peer: {verb} block {hash} height {height}: {reason}");
+}
+
+fn trust_log_fresh(applied: bool, hash: [u8; 32], height: u32, reason: &str) -> bool {
+    use std::cell::RefCell;
+    const CAP: usize = 64;
+    type Seen = ([u8; 32], u32, bool, String);
+    thread_local! {
+        static SEEN: RefCell<Vec<Seen>> = const { RefCell::new(Vec::new()) };
+    }
+    SEEN.with(|seen| {
+        let mut seen = seen.borrow_mut();
+        if seen
+            .iter()
+            .any(|(h, y, verb, r)| *h == hash && *y == height && *verb == applied && r == reason)
+        {
+            return false;
+        }
+        if seen.len() == CAP {
+            seen.drain(..CAP / 2);
+        }
+        seen.push((hash, height, applied, reason.to_string()));
+        true
+    })
 }
 
 impl LoadedBatch {

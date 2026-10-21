@@ -399,6 +399,7 @@ fn two_block_index_batch(
             tweak_origin: Some(0),
         },
         stats: Arc::new(rbitcoin_query::ConfirmStats::default()),
+        trust_peer: false,
     }
 }
 

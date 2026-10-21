@@ -54,7 +54,9 @@ pub fn validate_header_hashed(
     } else {
         None
     };
-    check_header(
+    let own_guard = crate::confirm_run::confirm_waive(query) && !rbitcoin_consensus::collecting();
+    let guard = own_guard.then(rbitcoin_consensus::TrustCollect::enter);
+    let result = check_header(
         params,
         height,
         header,
@@ -69,7 +71,17 @@ pub fn validate_header_hashed(
         },
     )
     .map(|_| ())
-    .map_err(ConfirmError::from)
+    .map_err(ConfirmError::from);
+    if own_guard {
+        let applied = result.is_ok();
+        let stopped = match &result {
+            Err(ConfirmError::Rules(err)) => Some(err),
+            _ => None,
+        };
+        crate::confirm_run::log_collected_header(hash, height.0, applied, stopped);
+        drop(guard);
+    }
+    result
 }
 
 /// Contextual checks when the parent is a known header, not necessarily on the

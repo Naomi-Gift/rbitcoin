@@ -132,6 +132,19 @@ pub fn confirm_wire_lookup_stamp(
     blocks: &[WireBlockIn],
     pipeline: Option<&WireLoadPipeline>,
 ) -> Result<PlanStampOutcome, ConfirmError> {
+    let scope = super::TrustScope::enter(query);
+    let result = lookup_stamp_work(query, params, milestone, blocks, pipeline);
+    scope.finish(&super::trust_ids_from_wire(blocks), result.as_ref().err());
+    result
+}
+
+fn lookup_stamp_work(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    blocks: &[WireBlockIn],
+    pipeline: Option<&WireLoadPipeline>,
+) -> Result<PlanStampOutcome, ConfirmError> {
     let t0 = Instant::now();
     query.on_load_pack().map_err(ConfirmError::from)?;
     let (mut plan, metas, wire_blocks, plan_ns) =
@@ -458,6 +471,21 @@ pub fn confirm_wire_load_from_plan(
     pipeline: Option<&WireLoadPipeline>,
     preverified: &ScriptPreverified,
 ) -> Result<ConfirmLoadOutcome, ConfirmError> {
+    let ids: Vec<(u32, [u8; 32])> = stamped.metas.iter().map(|m| (m.height.0, m.hash)).collect();
+    let scope = super::TrustScope::enter(query);
+    let result = load_from_plan_inner(query, params, milestone, stamped, pipeline, preverified);
+    scope.finish(&ids, result.as_ref().err());
+    result
+}
+
+fn load_from_plan_inner(
+    query: &Query,
+    params: &ChainParams,
+    milestone: Milestone,
+    stamped: PlanStampOutcome,
+    pipeline: Option<&WireLoadPipeline>,
+    preverified: &ScriptPreverified,
+) -> Result<ConfirmLoadOutcome, ConfirmError> {
     let t_work = Instant::now();
     let t_load = Instant::now();
     let PlanStampOutcome {
@@ -527,6 +555,7 @@ pub fn confirm_wire_load_from_plan(
             archive_plan: plan,
             index_want: super::index::index_want(query),
             stats: query.confirm_stats_arc(),
+            trust_peer: super::confirm_waive(query),
         },
         work_ns,
     })
@@ -561,6 +590,7 @@ pub fn wire_lookup_phase(
         let block = Arc::clone(block);
         let hash = block.block_hash().to_byte_array();
         let ctx = ValidationContext::at(params, *height, milestone);
+        rbitcoin_consensus::note_block_height(height.0);
         let t_struct = Instant::now();
         let stats = query.confirm_stats();
         let mut note = |txid_ns, wtxid_ns, walk_ns| {
@@ -704,12 +734,16 @@ pub fn stamp_check_header_link(
         } else {
             let expect_prev = pipeline.and_then(|p| p.parent_hash).unwrap_or([0u8; 32]);
             rbitcoin_consensus::block::reject_prev_link(&prev_bytes, &expect_prev)?;
-            pow_hash_meets_target(hash, header.bits, params.pow_limit)?;
+            if let Err(e) = pow_hash_meets_target(hash, header.bits, params.pow_limit) {
+                rbitcoin_consensus::soften_at(Some(height.0), e)?;
+            }
         }
         return Ok(());
     }
     rbitcoin_consensus::block::reject_prev_link(&prev_bytes, &prev_meta_hash.unwrap_or([0u8; 32]))?;
-    pow_hash_meets_target(hash, header.bits, params.pow_limit)?;
+    if let Err(e) = pow_hash_meets_target(hash, header.bits, params.pow_limit) {
+        rbitcoin_consensus::soften_at(Some(height.0), e)?;
+    }
     Ok(())
 }
 

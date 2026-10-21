@@ -194,6 +194,8 @@ pub fn assemble_block_prevouts(
     let t_loop = Instant::now();
 
     let lock_time_cutoff = assemble_lock_time_cutoff(ctx, block, prev_mtp);
+    // Empty until a same-block coinbase is waived. Honest blocks do not allocate.
+    let mut waived_out: Option<WaivedOut> = None;
 
     for (ti, tx) in block.txdata.iter().enumerate() {
         let spend_fk = archived_tx_fks.map(|fks| fks[ti]);
@@ -225,6 +227,7 @@ pub fn assemble_block_prevouts(
                 &mut block_sigops_cost,
                 build_script_jobs,
                 &mut clk_job,
+                &mut waived_out,
             )?;
         }
 
@@ -309,9 +312,10 @@ pub fn assemble_non_cb_tx(
     block_sigops_cost: &mut u64,
     build_script_jobs: bool,
     clk_job: &mut u64,
+    waived_out: &mut Option<WaivedOut>,
 ) -> Result<u64, ConfirmError> {
     rbitcoin_consensus::block::reject_tx_without_inputs(tx)?;
-    let (value_in, prevouts, tx_in_sigops) = assemble_non_cb_inputs(
+    let (value_in, waived_cb, prevouts, tx_in_sigops) = assemble_non_cb_inputs(
         params,
         block,
         tx,
@@ -328,6 +332,7 @@ pub fn assemble_non_cb_tx(
         acc,
         spends,
         build_script_jobs,
+        waived_out,
     )?;
     let tx_legacy_sigops = match pres.and_then(|p| p.get(ti)) {
         Some(p) => p.sigops.saturating_mul(4),
@@ -336,7 +341,10 @@ pub fn assemble_non_cb_tx(
     *block_sigops_cost =
         rbitcoin_consensus::block::add_sigops(*block_sigops_cost, tx_legacy_sigops, tx_in_sigops)?;
     let value_out = rbitcoin_consensus::block::assemble_tx_value_out(tx, ti, pres)?;
-    let fee = rbitcoin_consensus::block::fee_from_values(value_in, value_out)?;
+    let fee = rbitcoin_consensus::block::fee_with_waived_coinbase(value_in, waived_cb, value_out)?;
+    if waived_cb > 0 {
+        stamp_waived_outputs(waived_out, txid, value_in, fee, tx);
+    }
     let fee_sat = rbitcoin_consensus::block::fee_sat(fee)?;
     *fees = rbitcoin_consensus::block::add_fee(*fees, fee)?;
     if build_script_jobs {
@@ -395,8 +403,10 @@ pub fn assemble_non_cb_inputs(
         u32,
     )>,
     build_script_jobs: bool,
-) -> Result<(i64, JobPrevouts, u64), ConfirmError> {
+    waived_out: &Option<WaivedOut>,
+) -> Result<(i64, i64, JobPrevouts, u64), ConfirmError> {
     let mut value_in = 0i64;
+    let mut waived_cb = 0i64;
     let mut prevouts =
         if build_script_jobs && wire.is_some() {
             rbitcoin_consensus::block::JobPrevouts::Shared(Vec::with_capacity(tx.input.len()))
@@ -416,9 +426,17 @@ pub fn assemble_non_cb_inputs(
             params.is_genesis_coinbase(&key.0),
         )?;
         rbitcoin_consensus::block::reject_duplicate_input(pending_spent.insert(key))?;
-        if let Some(&pj) = txid_index.get(&key.0) {
-            rbitcoin_consensus::block::reject_same_block_create(pj, ti)?;
-        }
+        let (skip_fee, residue) = if let Some(&pj) = txid_index.get(&key.0) {
+            let skip_fee = rbitcoin_consensus::block::reject_same_block_create(pj, ti)?;
+            let residue = if skip_fee {
+                0
+            } else {
+                same_block_residue(waived_out, key)
+            };
+            (skip_fee, residue)
+        } else {
+            (false, 0)
+        };
         let prev_fk = edges
             .as_ref()
             .and_then(|t| t.get(ii))
@@ -447,8 +465,13 @@ pub fn assemble_non_cb_inputs(
             create_fk,
             ii as u32,
         ));
-        value_in =
-            rbitcoin_consensus::block::add_value_in(value_in, prev_out.txout.value.to_sat())?;
+        add_spent_value(
+            skip_fee,
+            residue,
+            &mut value_in,
+            &mut waived_cb,
+            prev_out.txout.value.to_sat(),
+        )?;
         if build_script_jobs {
             match &mut prevouts {
                 rbitcoin_consensus::block::JobPrevouts::Shared(v) => {
@@ -463,7 +486,57 @@ pub fn assemble_non_cb_inputs(
             }
         }
     }
-    Ok((value_in, prevouts, tx_in_sigops))
+    Ok((value_in, waived_cb, prevouts, tx_in_sigops))
+}
+
+type WaivedOut = std::collections::HashMap<([u8; 32], u32), u64>;
+
+fn same_block_residue(waived_out: &Option<WaivedOut>, key: ([u8; 32], u32)) -> u64 {
+    waived_out
+        .as_ref()
+        .and_then(|m| m.get(&key).copied())
+        .unwrap_or(0)
+}
+
+fn stamp_waived_outputs(
+    waived_out: &mut Option<WaivedOut>,
+    txid: [u8; 32],
+    clean_in: i64,
+    fee: i64,
+    tx: &Transaction,
+) {
+    let sats: Vec<u64> = tx.output.iter().map(|o| o.value.to_sat()).collect();
+    let residue = rbitcoin_consensus::block::waived_output_residue(clean_in, fee, &sats);
+    let map = waived_out.get_or_insert_with(WaivedOut::new);
+    for (vout, left) in residue.into_iter().enumerate() {
+        if left > 0 {
+            map.insert((txid, vout as u32), left);
+        }
+    }
+}
+
+fn add_spent_value(
+    skip_fee: bool,
+    residue: u64,
+    paid: &mut i64,
+    waived: &mut i64,
+    sat: u64,
+) -> Result<(), ConfirmError> {
+    let (paid_sat, waived_sat) = if skip_fee {
+        (0, sat)
+    } else if residue == 0 {
+        (sat, 0)
+    } else {
+        let waived_sat = residue.min(sat);
+        (sat - waived_sat, waived_sat)
+    };
+    if paid_sat > 0 {
+        *paid = rbitcoin_consensus::block::add_value_in(*paid, paid_sat)?;
+    }
+    if waived_sat > 0 {
+        *waived = rbitcoin_consensus::block::add_value_in(*waived, waived_sat)?;
+    }
+    Ok(())
 }
 
 /// Local wall times for one block's structural pass (write path diagnostics).
