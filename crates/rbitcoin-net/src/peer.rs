@@ -3317,9 +3317,8 @@ pub async fn serve_getdata_tail(
         match &item {
             // Unknown hash: Core ProcessGetData answers notfound. Silence
             // holds the requester's getdata until the stall floor.
-            // `knows_header` is the index check. `header_of` reconstructs
-            // the block on this async task. A missing body is `false` from
-            // the blocking encode.
+            // `knows_header` is the index check. Body reconstruct runs on
+            // the blocking pool. A missing body is `false` from that encode.
             Inventory::Block(h) | Inventory::WitnessBlock(h)
                 if !hub.knows_header(h)
                     || !serve_getdata_full_block(hub, out_tx, session, h).await? =>
@@ -3327,7 +3326,7 @@ pub async fn serve_getdata_tail(
                 notfound.push(item);
             }
             Inventory::CompactBlock(h) => {
-                serve_getdata_compact(hub, out_tx, follow, session, h)?;
+                serve_getdata_compact(hub, out_tx, follow, session, h).await?;
             }
             Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
                 let tx = hub.mempool().and_then(|mp| mp.try_get_tx(txid));
@@ -3336,7 +3335,7 @@ pub async fn serve_getdata_tail(
                 }
             }
             Inventory::WTx(wtxid) => {
-                serve_getdata_wtx(hub, out_tx, session, item, wtxid, &mut notfound)?;
+                serve_getdata_wtx(hub, out_tx, session, item, wtxid, &mut notfound).await?;
             }
             _ => {}
         }
@@ -3376,56 +3375,97 @@ pub async fn serve_getdata_full_block(
 }
 
 #[doc(hidden)]
-pub fn serve_getdata_compact(
+pub enum CompactServe {
+    Missing,
+    Full(Block),
+    Cmpct(HeaderAndShortIds),
+}
+
+/// Reconstruct and, when the block is near the tip, build the compact
+/// announcement. Store reads and `from_block` stay off the session task.
+#[doc(hidden)]
+pub fn compact_serve_outcome(
+    cache: &BlockCache,
+    query: &Query,
+    hash: &BlockHash,
+    tip_h: u32,
+    ver: u32,
+    pref: Vec<usize>,
+) -> Result<CompactServe, NetError> {
+    crate::reactor::assert_not_reactor("compact serve");
+    let Some(block) = block_for_peer(cache, query, hash)? else {
+        return Ok(CompactServe::Missing);
+    };
+    let block_h = query
+        .height_of_hash(&hash.to_byte_array())
+        .ok()
+        .flatten()
+        .map(|ht| ht.0)
+        .unwrap_or(0);
+    if tip_h.saturating_sub(block_h) > MAX_CMPCTBLOCK_DEPTH {
+        return Ok(CompactServe::Full(block));
+    }
+    match HeaderAndShortIds::from_block(&block, rand_nonce(), ver, &pref) {
+        Ok(hsi) => {
+            rbitcoin_log::info!(
+                "{}",
+                crate::compact::cmpct_send_line(block.block_hash(), block.txdata.len(), &hsi)
+            );
+            Ok(CompactServe::Cmpct(hsi))
+        }
+        Err(_) => Ok(CompactServe::Full(block)),
+    }
+}
+
+async fn block_reconstruct_permit() -> Result<tokio::sync::OwnedSemaphorePermit, NetError> {
+    crate::msg_decode::block_decode_semaphore()
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| NetError::Protocol("decode semaphore closed"))
+}
+
+#[doc(hidden)]
+pub async fn serve_getdata_compact(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     h: &bitcoin::BlockHash,
 ) -> Result<(), NetError> {
-    let Some(block) = block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), h)? else {
-        return Ok(());
-    };
+    let permit = block_reconstruct_permit().await?;
+    let cache = Arc::clone(&hub.cache);
+    let query = Arc::clone(&hub.query);
+    let hash = *h;
     let tip_h = hub.tip_height().unwrap_or(0);
-    let block_h = hub
-        .query
-        .height_of_hash(&h.to_byte_array())
-        .ok()
-        .flatten()
-        .map(|ht| ht.0)
-        .unwrap_or(0);
-    if tip_h.saturating_sub(block_h) > MAX_CMPCTBLOCK_DEPTH {
-        return queue_served(
+    let ver = follow.cmpct_version.clamp(1, 2);
+    let pref = hub.cmpct_prefill_indexes(h).unwrap_or_else(|| vec![0]);
+    let outcome = tokio::task::spawn_blocking(move || {
+        let _region = crate::reactor::BlockingRegion::enter();
+        let _permit = permit;
+        compact_serve_outcome(cache.as_ref(), query.as_ref(), &hash, tip_h, ver, pref)
+    })
+    .await
+    .map_err(|_| NetError::Protocol("compact serve join failed"))??;
+    match outcome {
+        CompactServe::Missing => Ok(()),
+        CompactServe::Full(block) => queue_served(
             session,
             out_tx,
             PeerOut::Served(NetworkMessage::Block(block)),
-        );
-    }
-    let ver = follow.cmpct_version.clamp(1, 2);
-    let pref = hub.cmpct_prefill_indexes(h).unwrap_or_else(|| vec![0]);
-    if let Ok(hsi) = HeaderAndShortIds::from_block(&block, rand_nonce(), ver, &pref) {
-        rbitcoin_log::info!(
-            "{}",
-            crate::compact::cmpct_send_line(block.block_hash(), block.txdata.len(), &hsi)
-        );
-        queue_served(
+        ),
+        CompactServe::Cmpct(hsi) => queue_served(
             session,
             out_tx,
             PeerOut::Served(NetworkMessage::CmpctBlock(CmpctBlock {
                 compact_block: hsi,
             })),
-        )
-    } else {
-        queue_served(
-            session,
-            out_tx,
-            PeerOut::Served(NetworkMessage::Block(block)),
-        )
+        ),
     }
 }
 
 #[doc(hidden)]
-pub fn serve_getdata_wtx(
+pub async fn serve_getdata_wtx(
     hub: &ChainHub,
     out_tx: &mpsc::UnboundedSender<PeerOut>,
     session: Option<&crate::peers::LivePeer>,
@@ -3442,9 +3482,22 @@ pub fn serve_getdata_wtx(
     }
     let announced = session.is_some_and(|s| s.has_announced_wtx(wtxid));
     if announced {
-        if let Some(tx) = tx_from_tip_block(hub, wtxid) {
-            queue_accounted(session, out_tx, NetworkMessage::Tx(tx))?;
-            return Ok(());
+        if let Some(hash) = hub.tip_hash() {
+            let permit = block_reconstruct_permit().await?;
+            let cache = Arc::clone(&hub.cache);
+            let query = Arc::clone(&hub.query);
+            let wtxid = *wtxid;
+            let found = tokio::task::spawn_blocking(move || {
+                let _region = crate::reactor::BlockingRegion::enter();
+                let _permit = permit;
+                tx_from_stored_block(cache.as_ref(), query.as_ref(), &hash, &wtxid)
+            })
+            .await
+            .map_err(|_| NetError::Protocol("tip wtxid serve join failed"))??;
+            if let Some(tx) = found {
+                queue_accounted(session, out_tx, NetworkMessage::Tx(tx))?;
+                return Ok(());
+            }
         }
     }
     notfound.push(item);
@@ -5752,13 +5805,26 @@ pub fn headers_for_peer(
 #[doc(hidden)]
 pub fn tx_from_tip_block(hub: &ChainHub, wtxid: &bitcoin::Wtxid) -> Option<Transaction> {
     let hash = hub.tip_hash()?;
-    let block = block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), &hash)
+    tx_from_stored_block(hub.cache.as_ref(), hub.query.as_ref(), &hash, wtxid)
         .ok()
-        .flatten()?;
-    block
+        .flatten()
+}
+
+#[doc(hidden)]
+pub fn tx_from_stored_block(
+    cache: &BlockCache,
+    query: &Query,
+    hash: &BlockHash,
+    wtxid: &bitcoin::Wtxid,
+) -> Result<Option<Transaction>, NetError> {
+    crate::reactor::assert_not_reactor("tip wtxid serve");
+    let Some(block) = block_for_peer(cache, query, hash)? else {
+        return Ok(None);
+    };
+    Ok(block
         .txdata
         .into_iter()
-        .find(|tx| tx.compute_wtxid() == *wtxid)
+        .find(|tx| tx.compute_wtxid() == *wtxid))
 }
 
 #[doc(hidden)]
@@ -5767,6 +5833,7 @@ pub fn block_for_peer(
     query: &Query,
     hash: &BlockHash,
 ) -> Result<Option<bitcoin::Block>, NetError> {
+    crate::reactor::assert_not_reactor("block reconstruct");
     if let Some(block) = cache.get_block(hash) {
         return Ok(Some(block));
     }

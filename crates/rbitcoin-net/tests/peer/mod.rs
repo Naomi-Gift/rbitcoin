@@ -4939,6 +4939,87 @@ include!("../peer_header_dos_journey.rs");
 include!("../peer_header_sync_journey.rs");
 include!("../peer_blocksonly_journey.rs");
 
+/// Compact getdata and an announced tip wtxid reconstruct off the reactor.
+/// `assert_not_reactor` panics when `block_for_peer` runs on `tokio-rt-worker`.
+#[test]
+fn compact_and_wtxid_serve_run_off_the_reactor() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("compact-off-reactor");
+    hub.ensure_genesis().unwrap();
+    let hash = hub.tip_hash().unwrap();
+    let block = block_for_peer(&hub.cache, &hub.query, &hash)
+        .unwrap()
+        .expect("genesis body");
+    let wtxid = block.txdata[0].compute_wtxid();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let session = live_peer(&peers, 18450, 11, false);
+    session.note_announced_wtx(wtxid);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("tokio-rt-worker")
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        let hub = hub;
+        tokio::spawn(async move {
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let mut follow = PeerFollowState::new();
+            follow.cmpct_version = 2;
+            serve_getdata(
+                &hub,
+                &out_tx,
+                &mut follow,
+                Some(session.as_ref()),
+                vec![Inventory::CompactBlock(hash)],
+            )
+            .await
+            .expect("compact serve");
+            assert!(
+                matches!(
+                    out_rx.try_recv().map(PeerOut::expect_msg),
+                    Ok(NetworkMessage::CmpctBlock(_))
+                ),
+                "genesis getdata is a compact block"
+            );
+            let mut follow = PeerFollowState::new();
+            serve_getdata(
+                &hub,
+                &out_tx,
+                &mut follow,
+                Some(session.as_ref()),
+                vec![Inventory::WTx(wtxid)],
+            )
+            .await
+            .expect("wtxid serve");
+            assert!(
+                matches!(
+                    out_rx.try_recv().map(PeerOut::expect_msg),
+                    Ok(NetworkMessage::Tx(_))
+                ),
+                "announced wtxid comes from the tip block"
+            );
+            let missing = bitcoin::BlockHash::from_byte_array([9u8; 32]);
+            serve_getdata(
+                &hub,
+                &out_tx,
+                &mut follow,
+                Some(session.as_ref()),
+                vec![Inventory::CompactBlock(missing)],
+            )
+            .await
+            .expect("missing compact is not a session error");
+            assert!(
+                out_rx.try_recv().is_err(),
+                "a header-less hash stays silent"
+            );
+        })
+        .await
+        .expect("reactor task")
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Core `PrepareBlockFilterRequest`: start past stop, or a range of 1000+
 /// cfilters / 2000+ cfheaders, disconnects instead of being clamped.
 #[test]
