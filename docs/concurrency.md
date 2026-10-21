@@ -144,11 +144,13 @@ the body is missing, so the session check is gone.
 `getdata_block_lookup_stays_off_the_reactor` is the pin.
 
 **Fixed.** A compact tip announcement used to call `block_for_peer` on the
-session inside `on_tip_event`. That reconstruct now takes the block-decode
-permit and runs on the blocking pool. A missing body still falls through
-to a headers announcement. An unsolicited compact block that does not
-reconstruct yet persists that header path on the same header-job pool.
-`tip_burst_past_broadcast_capacity_still_syncs_peer` is the pin.
+session inside `on_tip_event`, then build short ids there.
+`cmpct_announce_msg` now does both on the blocking pool, under the
+block-decode permit. A missing body still falls through to a headers
+announcement. High-bandwidth relay of a body already in hand builds those
+short ids on that pool too. An unsolicited compact block that does not
+reconstruct yet persists that header path on the header-job pool.
+`cmpct_tip_announce_shortids_run_off_the_reactor` is the pin.
 
 **Fixed, already zero.** The IBD coordinator holds `shared`
 (`ibd_cancellable`) across the turn, the redial apply, and the event

@@ -5074,6 +5074,47 @@ fn getdata_block_lookup_stays_off_the_reactor() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Compact tip short ids are built with the body load, off the session worker.
+#[test]
+fn cmpct_tip_announce_shortids_run_off_the_reactor() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cmpct-tip-off-reactor");
+    hub.ensure_genesis().unwrap();
+    let hub = hub.into_arc();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("tokio-rt-worker")
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        tokio::spawn(async move {
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let mut follow = PeerFollowState::new();
+            follow.send_cmpct = true;
+            follow.cmpct_version = 2;
+            let ev = rbitcoin_net::chain::TipEvent {
+                height: hub.tip_height().unwrap(),
+                hash: hub.tip_hash().unwrap(),
+                header: hub.tip_header().unwrap(),
+                reorg_branch_len: 0,
+            };
+            on_tip_event(&hub, &out_tx, &mut follow, None, Ok(ev))
+                .await
+                .expect("tip");
+            assert!(
+                matches!(
+                    out_rx.try_recv().map(PeerOut::expect_msg),
+                    Ok(NetworkMessage::CmpctBlock(_))
+                ),
+                "genesis tip is a compact announcement"
+            );
+        })
+        .await
+        .expect("reactor task")
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Compact getdata and an announced tip wtxid reconstruct off the reactor.
 /// `assert_not_reactor` panics when `block_for_peer` runs on `tokio-rt-worker`.
 #[test]

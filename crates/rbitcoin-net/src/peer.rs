@@ -4196,7 +4196,7 @@ pub async fn on_block(
         follow.pending_blocks.insert(hash, block.clone());
         return Ok(());
     }
-    relay_new_pow_valid_block(hub, block, session);
+    relay_new_pow_valid_block(hub, block, session).await;
     on_block_accept(hub, out_tx, follow, session, block, hash).await
 }
 
@@ -4493,7 +4493,7 @@ pub async fn on_cmpct_got_block(
     log_cmpct_filled(hub, hsi, &block, &[], fill.as_deref());
     follow.requested_blocks.remove(&hash);
     drop_pending_cmpct(follow, session, hash);
-    relay_new_pow_valid_block(hub, &block, session);
+    relay_new_pow_valid_block(hub, &block, session).await;
     match accept_received_from_peer(hub, block.clone(), session).await {
         Ok(AcceptOutcome::Accepted { .. }) => {
             hub.forget_asked_block(&hash);
@@ -4638,7 +4638,7 @@ pub async fn on_blocktxn_got_block(
     fill: Option<crate::compact::CmpctFillSets>,
 ) -> Result<(), NetError> {
     log_cmpct_filled(hub, &pc.hsi, &block, pc.partial.missing(), fill.as_ref());
-    relay_new_pow_valid_block(hub, &block, session);
+    relay_new_pow_valid_block(hub, &block, session).await;
     match accept_received_from_peer(hub, block.clone(), session).await {
         Ok(AcceptOutcome::Accepted { .. }) => {
             take_requested_block(hub, &mut follow.requested_blocks, &hash);
@@ -5086,6 +5086,7 @@ pub fn cmpct_announce_from_block(
     block: &Block,
     cmpct_version: u32,
 ) -> Option<NetworkMessage> {
+    crate::reactor::assert_not_reactor("cmpct announce");
     let nonce = rand_nonce();
     let ver = cmpct_version.clamp(1, 2);
     let pref = hub
@@ -5115,30 +5116,49 @@ pub fn cmpct_announce_msg(
     cmpct_announce_from_block(hub, &block, cmpct_version)
 }
 
-/// Tip `cmpctblock`. The body load is `block_for_peer`, so it runs on the
-/// blocking pool. A missing body is `None` and the caller sends headers.
+/// Tip `cmpctblock`. The body load and the short-id pass are
+/// `cmpct_announce_msg`, so both run on the blocking pool. A missing body
+/// is `None` and the caller sends headers.
 async fn cmpct_tip_announce(
     hub: &ChainHub,
     hash: &BlockHash,
     cmpct_version: u32,
 ) -> Result<Option<NetworkMessage>, NetError> {
+    let Some(owned) = hub.shared_arc() else {
+        return Ok(cmpct_announce_msg(hub, hash, cmpct_version));
+    };
     let permit = block_reconstruct_permit().await?;
-    let cache = Arc::clone(&hub.cache);
-    let query = Arc::clone(&hub.query);
     let hash = *hash;
-    let loaded = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let _region = crate::reactor::BlockingRegion::enter();
         let _permit = permit;
-        block_for_peer(cache.as_ref(), query.as_ref(), &hash)
+        cmpct_announce_msg(owned.as_ref(), &hash, cmpct_version)
     })
     .await
-    .map_err(|_| NetError::Protocol("cmpct announce join failed"))?;
-    let Ok(block) = loaded else {
-        return Ok(None);
+    .map_err(|_| NetError::Protocol("cmpct announce join failed"))
+}
+
+/// Short ids for a block already in hand. An `Arc` hub builds them on the
+/// blocking pool. A stack hub (tests) builds them inline.
+async fn cmpct_announce_off_session(
+    hub: &ChainHub,
+    block: Block,
+    cmpct_version: u32,
+) -> Option<NetworkMessage> {
+    let Some(owned) = hub.shared_arc() else {
+        return cmpct_announce_from_block(hub, &block, cmpct_version);
     };
-    Ok(block
-        .as_ref()
-        .and_then(|block| cmpct_announce_from_block(hub, block, cmpct_version)))
+    let Ok(permit) = block_reconstruct_permit().await else {
+        return None;
+    };
+    tokio::task::spawn_blocking(move || {
+        let _region = crate::reactor::BlockingRegion::enter();
+        let _permit = permit;
+        cmpct_announce_from_block(owned.as_ref(), &block, cmpct_version)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 /// Send `cmpctblock` to peers who asked for high-bandwidth announcements
@@ -5150,7 +5170,7 @@ async fn cmpct_tip_announce(
 /// this one. `hb_to` is the opposite direction (we asked them to announce
 /// to us). Only the current tip-child (not a reorg branch). Sender is skipped.
 #[doc(hidden)]
-pub fn relay_new_pow_valid_block(
+pub async fn relay_new_pow_valid_block(
     hub: &ChainHub,
     block: &Block,
     from: Option<&crate::peers::LivePeer>,
@@ -5178,6 +5198,9 @@ pub fn relay_new_pow_valid_block(
     let Some(ph) = from.and_then(|s| s.peer_hub()) else {
         return;
     };
+    let Some(msg) = cmpct_announce_off_session(hub, block.clone(), 2).await else {
+        return;
+    };
     let from_id = from.map(|s| s.id);
     for s in ph.live_peers() {
         if from_id == Some(s.id) {
@@ -5198,10 +5221,7 @@ pub fn relay_new_pow_valid_block(
         let Some(out) = s.writer() else {
             continue;
         };
-        let Some(msg) = cmpct_announce_from_block(hub, block, 2) else {
-            continue;
-        };
-        if queue_cmpct_tip_announce(&out, msg).is_ok() {
+        if queue_cmpct_tip_announce(&out, msg.clone()).is_ok() {
             s.note_best_header_sent(hash);
         }
     }
@@ -5945,7 +5965,7 @@ pub async fn drain_pending_once(
                 continue;
             };
             pending_headers.remove(&h);
-            relay_new_pow_valid_block(hub, &block, session);
+            relay_new_pow_valid_block(hub, &block, session).await;
             match accept_received_from_peer(hub, block.clone(), session).await {
                 Ok(AcceptOutcome::Accepted { .. })
                 | Ok(AcceptOutcome::AlreadyHave)
