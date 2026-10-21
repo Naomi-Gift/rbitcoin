@@ -192,66 +192,50 @@ async fn hostile_peer_session() {
                 h
             })
             .collect();
-        handle_peer_inventory_msg(
-            &NetworkMessage::Headers(headers),
-            &hub,
-            &out_tx,
-            &mut follow,
-            Some(&peer),
-        )
-        .unwrap();
+        on_headers(&hub, &out_tx, &mut follow, Some(&peer), &headers)
+            .await
+            .unwrap();
     }
     assert_eq!(follow.pending_headers.len(), rbitcoin_net::peer::MAX_PENDING_HEADERS);
     let kept = *follow.pending_headers.keys().next().unwrap();
     let kept_hdr = follow.pending_headers[&kept];
-    handle_peer_inventory_msg(
-        &NetworkMessage::Headers(vec![kept_hdr]),
+    on_headers(
         &hub,
         &out_tx,
         &mut follow,
         Some(&peer),
+        &[kept_hdr],
     )
+    .await
     .unwrap();
     assert_eq!(follow.pending_headers.len(), rbitcoin_net::peer::MAX_PENDING_HEADERS);
     assert!(follow.pending_headers.contains_key(&kept));
     let mut extra = hdr;
     extra.nonce = 9_000_000;
     let extra_hash = extra.block_hash();
-    handle_peer_inventory_msg(
-        &NetworkMessage::Headers(vec![extra]),
-        &hub,
-        &out_tx,
-        &mut follow,
-        Some(&peer),
-    )
-    .unwrap();
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[extra])
+        .await
+        .unwrap();
     assert_eq!(follow.pending_headers.len(), rbitcoin_net::peer::MAX_PENDING_HEADERS);
     assert!(!follow.pending_headers.contains_key(&extra_hash));
     while out_rx.try_recv().is_ok() {}
 
     let gh = GetHeadersMessage::new(vec![genesis], BlockHash::from_byte_array([0u8; 32]));
-    handle_peer_inventory_msg(
-        &NetworkMessage::GetHeaders(gh.clone()),
-        &hub,
-        &out_tx,
-        &mut follow,
-        Some(&peer),
-    )
-    .unwrap();
+    on_getheaders(&hub, &out_tx, &mut follow, Some(&peer), &gh)
+        .await
+        .unwrap();
     let NetworkMessage::Headers(first) = out_rx.try_recv().unwrap().expect_msg() else {
         panic!("one getheaders under the budget must be answered");
     };
     assert_eq!(first.len(), 200, "locator after genesis walks the tip");
     let mut queued = 1usize;
     for _ in 0..400 {
-        handle_peer_inventory_msg(
-            &NetworkMessage::GetHeaders(gh.clone()),
-            &hub,
-            &out_tx,
-            &mut follow,
-            Some(&peer),
-        )
-        .unwrap();
+        if peer.send_over_budget() {
+            break;
+        }
+        on_getheaders(&hub, &out_tx, &mut follow, Some(&peer), &gh)
+            .await
+            .unwrap();
         match out_rx.try_recv() {
             Ok(_) => queued += 1,
             Err(_) => break,

@@ -7,3 +7,4 @@ Fixed
 - **A short headers reply stays on the writer.** Encoding eight headers or fewer does not hop to the blocking pool. A block and a 2,000-header reply still do.
 - **A script batch wakes one worker per chunk.** Idle script workers stay parked once those chunks are claimed. A larger batch still runs on the whole pool.
 - **Block getdata does not look up headers on a Tokio worker.** A missing header and the block body are both decided on the blocking pool. The session only queues the block or `notfound`.
+- **A compact tip announcement does not reconstruct on a Tokio worker.** The block body is loaded on the blocking pool. A missing body still goes out as headers. An unsolicited compact block persists its header on that same pool.

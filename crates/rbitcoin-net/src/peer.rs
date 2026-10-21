@@ -1423,7 +1423,7 @@ pub async fn on_tip_event(
             || (peer_has_header(hub, sent, known, ev.header.prev_blockhash)
                 && !peer_has_header(hub, sent, known, ev.hash)))
     {
-        if let Some(msg) = cmpct_announce_msg(hub, &ev.hash, follow.cmpct_version) {
+        if let Some(msg) = cmpct_tip_announce(hub, &ev.hash, follow.cmpct_version).await? {
             queue_cmpct_tip_announce(out_tx, msg)?;
             if let Some(s) = session {
                 s.note_best_header_sent(ev.hash);
@@ -4352,7 +4352,11 @@ pub async fn on_cmpctblock(
     if !follow.requested_blocks.contains(&hash)
         && !compact_unsolicited_reconstruct(hub, &hsi.header)
     {
-        persist_pending_header_path(hub, &follow.pending_headers, hash);
+        let pending = follow.pending_headers.clone();
+        run_header_job(hub, move |hub| {
+            persist_pending_header_path(hub, &pending, hash);
+        })
+        .await?;
         return Ok(());
     }
     on_cmpctblock_reconstruct(hub, out_tx, follow, session, &hsi, hash).await
@@ -5102,6 +5106,32 @@ pub fn cmpct_announce_msg(
 ) -> Option<NetworkMessage> {
     let block = block_for_peer(hub.cache.as_ref(), hub.query.as_ref(), hash).ok()??;
     cmpct_announce_from_block(hub, &block, cmpct_version)
+}
+
+/// Tip `cmpctblock`. The body load is `block_for_peer`, so it runs on the
+/// blocking pool. A missing body is `None` and the caller sends headers.
+async fn cmpct_tip_announce(
+    hub: &ChainHub,
+    hash: &BlockHash,
+    cmpct_version: u32,
+) -> Result<Option<NetworkMessage>, NetError> {
+    let permit = block_reconstruct_permit().await?;
+    let cache = Arc::clone(&hub.cache);
+    let query = Arc::clone(&hub.query);
+    let hash = *hash;
+    let loaded = tokio::task::spawn_blocking(move || {
+        let _region = crate::reactor::BlockingRegion::enter();
+        let _permit = permit;
+        block_for_peer(cache.as_ref(), query.as_ref(), &hash)
+    })
+    .await
+    .map_err(|_| NetError::Protocol("cmpct announce join failed"))?;
+    let Ok(block) = loaded else {
+        return Ok(None);
+    };
+    Ok(block
+        .as_ref()
+        .and_then(|block| cmpct_announce_from_block(hub, block, cmpct_version)))
 }
 
 /// Send `cmpctblock` to peers who asked for high-bandwidth announcements
