@@ -5074,6 +5074,22 @@ fn getdata_block_lookup_stays_off_the_reactor() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A store error on an announced tip wtxid is `notfound`, not a dropped peer.
+#[test]
+fn announced_wtx_store_error_is_notfound() {
+    let miss = announced_wtx_from_reconstruct(Err(NetError::Consensus("disk".into())));
+    assert!(miss.is_none(), "a store error is notfound");
+    assert!(announced_wtx_from_reconstruct(Ok(None)).is_none());
+    let tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![],
+    };
+    let hit = announced_wtx_from_reconstruct(Ok(Some(tx))).expect("tx kept");
+    assert!(hit.input.is_empty());
+}
+
 /// Compact tip short ids are built with the body load, off the session worker.
 #[test]
 fn cmpct_tip_announce_shortids_run_off_the_reactor() {

@@ -3563,8 +3563,8 @@ pub async fn serve_getdata_wtx(
                 tx_from_stored_block(cache.as_ref(), query.as_ref(), &hash, &wtxid)
             })
             .await
-            .map_err(|_| NetError::Protocol("tip wtxid serve join failed"))??;
-            if let Some(tx) = found {
+            .map_err(|_| NetError::Protocol("tip wtxid serve join failed"))?;
+            if let Some(tx) = announced_wtx_from_reconstruct(found) {
                 queue_accounted(session, out_tx, NetworkMessage::Tx(tx))?;
                 return Ok(());
             }
@@ -6044,12 +6044,24 @@ pub fn headers_for_peer(
     }
 }
 
+/// A store error while reading an announced tip wtxid is `notfound`.
+/// The caller still turns a join failure into [`NetError`].
+#[doc(hidden)]
+pub fn announced_wtx_from_reconstruct(
+    found: Result<Option<Transaction>, NetError>,
+) -> Option<Transaction> {
+    found.ok().flatten()
+}
+
 #[doc(hidden)]
 pub fn tx_from_tip_block(hub: &ChainHub, wtxid: &bitcoin::Wtxid) -> Option<Transaction> {
     let hash = hub.tip_hash()?;
-    tx_from_stored_block(hub.cache.as_ref(), hub.query.as_ref(), &hash, wtxid)
-        .ok()
-        .flatten()
+    announced_wtx_from_reconstruct(tx_from_stored_block(
+        hub.cache.as_ref(),
+        hub.query.as_ref(),
+        &hash,
+        wtxid,
+    ))
 }
 
 #[doc(hidden)]
