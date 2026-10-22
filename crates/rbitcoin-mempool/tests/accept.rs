@@ -2746,7 +2746,7 @@ fn review_trust_repark_does_not_use_process_bit() {
     };
     rbitcoin_log::capture_logs(false);
     rbitcoin_log::capture_logs(true);
-    let ready = mp.repark_lifted(std::slice::from_ref(&lifted), &utxos, tip, &|_| 0);
+    let ready = mp.repark_lifted(std::slice::from_ref(&lifted), &utxos, tip, &|_| 0, None);
     assert!(ready.is_empty(), "a local non-final orphan is not ready");
     assert!(!mp.graph.contains(&tx.compute_txid()));
     let logs = trust_logs();

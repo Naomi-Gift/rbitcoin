@@ -1911,7 +1911,7 @@ impl ActiveMempool {
                 Err(e) => {
                     self.restore_undone(utxos, tip);
                     self.rollback_accepted_package(&accepted, utxos, tip);
-                    for item in self.repark_lifted(&lifted, utxos, tip, &|_| 0) {
+                    for item in self.repark_lifted(&lifted, utxos, tip, &|_| 0, None) {
                         let id = item.tx.compute_txid();
                         match self.accept_tx_with(&item.tx, utxos, tip, 0, true, None) {
                             Ok(r) => {
@@ -1977,6 +1977,7 @@ impl ActiveMempool {
         utxos: &impl UtxoProvider,
         tip: ChainTipCtx,
         fee_delta: &impl Fn(&Txid) -> i64,
+        trusted: Option<u64>,
     ) -> Vec<LiftedOrphan> {
         let mut ready = Vec::new();
         for item in lifted {
@@ -1993,7 +1994,7 @@ impl ActiveMempool {
                     fee_delta: fee_delta(&txid),
                     report_orphans: true,
                     min_relay: None,
-                    waive: false,
+                    waive: trusted.is_some_and(|id| item.announcers.contains(&id)),
                 },
             ) {
                 Err(AcceptError::Orphaned { missing, .. }) => {

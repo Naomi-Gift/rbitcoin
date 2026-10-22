@@ -2516,23 +2516,31 @@ impl MempoolHub {
         // Read the priority map before the mempool write lock. A child under
         // the raw relay floor is still admissible when its delta clears it.
         let deltas = self.prioritised_txs();
+        let trusted = {
+            let id = self.trusted_session.load(Ordering::Relaxed);
+            (id != u64::MAX).then_some(id)
+        };
         let ready = {
             let mut g = self.lock_write();
-            g.repark_lifted(lifted, &utxo, tip, &|id| {
-                deltas.get(id).copied().unwrap_or(0)
-            })
+            g.repark_lifted(
+                lifted,
+                &utxo,
+                tip,
+                &|id| deltas.get(id).copied().unwrap_or(0),
+                trusted,
+            )
         };
         for item in ready {
             let id = item.tx.compute_txid();
             // Every announcer is restored under the accept lock. A disconnect
             // during the lift already edited the in-flight record.
-            let _ = self.accept_with_utxo(
-                &item.tx,
-                &utxo,
-                item.announcers.first().copied(),
-                false,
-                &item.announcers,
-            );
+            let from = item
+                .announcers
+                .iter()
+                .copied()
+                .find(|&peer| self.tx_from_trusted(Some(peer)))
+                .or_else(|| item.announcers.first().copied());
+            let _ = self.accept_with_utxo(&item.tx, &utxo, from, false, &item.announcers);
             self.forget_taken_orphan(id, item.taken_gen);
         }
     }
@@ -2733,7 +2741,12 @@ impl MempoolHub {
         self.enqueue_noted_orphans(&mut queue);
         while let Some(child) = queue.pop_front() {
             let txid = child.tx.compute_txid();
-            let _ = self.accept_with_utxo(&child.tx, utxo, None, false, &child.announcers);
+            let from = child
+                .announcers
+                .iter()
+                .copied()
+                .find(|&id| self.tx_from_trusted(Some(id)));
+            let _ = self.accept_with_utxo(&child.tx, utxo, from, false, &child.announcers);
             // Admitted or rejected without a repark. A repark already consumed
             // this generation. A newer take of the same txid keeps its own.
             self.forget_taken_orphan(txid, child.taken_gen);

@@ -4620,6 +4620,79 @@ fn trust_peer_reorg_evict_keeps_nonfinal() {
     let _ = std::fs::remove_dir_all(&store);
 }
 
+/// A non-final or script-invalid orphan announced by the trusted session is
+/// admitted when its parent arrives. Any other announcer is dropped.
+#[test]
+fn review_trust_orphan_keeps_session_waiver() {
+    use bitcoin::WPubkeyHash;
+
+    let (store, q, cbs) = copy_maturity_pad(4);
+    let mp = tmp();
+    let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    q.set_trust_peer(true);
+    let session = 7u64;
+    hub.set_trusted_session(Some(session));
+    let tip = q.tip_height().unwrap().0;
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = spend_true(cbs[0], 1_000, spk.clone());
+    let other_parent = spend_true(cbs[1], 1_000, spk.clone());
+    let mut trusted = spend_vout(
+        OutPoint {
+            txid: parent.compute_txid(),
+            vout: 0,
+        },
+        parent.output[0].value.to_sat() - 1_000,
+    );
+    trusted.lock_time = LockTime::from_height(tip + 10).unwrap();
+    trusted.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+    let mut other = spend_vout(
+        OutPoint {
+            txid: other_parent.compute_txid(),
+            vout: 0,
+        },
+        other_parent.output[0].value.to_sat() - 1_000,
+    );
+    other.lock_time = LockTime::from_height(tip + 10).unwrap();
+    other.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+    let parked = hub.accept_tx_from(&trusted, Some(session)).unwrap_err();
+    assert!(matches!(parked, AcceptError::Orphaned { .. }), "{parked}");
+    let parked_other = hub.accept_tx_from(&other, Some(99)).unwrap_err();
+    assert!(
+        matches!(parked_other, AcceptError::Orphaned { .. }),
+        "{parked_other}"
+    );
+    hub.accept_tx(&parent).expect("parent");
+    hub.accept_tx(&other_parent).expect("other parent");
+    let trusted_id = trusted.compute_txid();
+    assert!(hub.try_contains(&trusted_id), "trusted non-final orphan dropped");
+    assert!(hub.lock_read().trust_kept.contains(&trusted_id));
+    let other_id = other.compute_txid();
+    assert!(!hub.try_contains(&other_id));
+    assert!(!hub.lock_read().orphanage.contains(&other_id));
+
+    let wpkh = WPubkeyHash::from_byte_array([0x46; 20]);
+    let script_parent = spend_true(cbs[2], 1_000, ScriptBuf::new_p2wpkh(&wpkh));
+    let bad = spend_vout(
+        OutPoint {
+            txid: script_parent.compute_txid(),
+            vout: 0,
+        },
+        script_parent.output[0].value.to_sat() - 1_000,
+    );
+    let parked_bad = hub.accept_tx_from(&bad, Some(session)).unwrap_err();
+    assert!(
+        matches!(parked_bad, AcceptError::Orphaned { .. }),
+        "{parked_bad}"
+    );
+    hub.accept_tx(&script_parent).expect("p2wpkh parent");
+    let bad_id = bad.compute_txid();
+    assert!(hub.try_contains(&bad_id), "trusted script orphan dropped");
+    assert!(hub.lock_read().trust_kept.contains(&bad_id));
+    let _ = std::fs::remove_dir_all(&mp);
+    let _ = std::fs::remove_dir_all(&store);
+}
+
 /// A script failure with no session is rejected even when the mode is on.
 /// The same failure from the trusted session stays through reorg eviction.
 #[test]
