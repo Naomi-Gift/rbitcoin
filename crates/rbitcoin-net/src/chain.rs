@@ -2883,12 +2883,17 @@ impl ChainHub {
                 };
 
                 let new_height = parent_h.0.saturating_add(1);
-                validate_header(
-                    self.query.as_ref(),
-                    &self.params,
-                    Height(new_height),
-                    &block.header,
-                )
+                // The tip path waives inside `connect_at`. This is the side
+                // block, and it uses the same session bit. Proof-of-work and
+                // bad nBits stay errors because they are not on the warn list.
+                rbitcoin_query::confirm_run::waive_batch(waive, || {
+                    validate_header(
+                        self.query.as_ref(),
+                        &self.params,
+                        Height(new_height),
+                        &block.header,
+                    )
+                })
                 .map_err(|e| header_reject(&block.header, &e))?;
 
                 if new_height == tip_h {

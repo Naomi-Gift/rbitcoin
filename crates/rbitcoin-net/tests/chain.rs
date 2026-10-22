@@ -4561,6 +4561,60 @@ fn review_trust_reorg_mtp_on_second_block() {
     assert_ne!(session.tip_hash(), Some(session_tip));
 }
 
+/// A sibling that only fails the median check is held for the trusted
+/// session, and a valid child of it can move the tip. A local submit of
+/// that sibling is rejected and not held. Bad proof-of-work is not stored.
+#[test]
+fn review_trust_side_header_mtp_is_held() {
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    let (_dir, hub) = tiny_regtest_hub_labeled("review-side-mtp");
+    hub.generate_to_script(1, op_true, vec![]).unwrap();
+    hub.query.set_trust_peer(true);
+    let tip = hub.tip_hash().unwrap();
+    let genesis = hub.block_at_height(0).unwrap().unwrap();
+    let sibling = mine_distinct(genesis.block_hash(), genesis.header.time, 1, &[tip]);
+    let sibling_hash = sibling.block_hash();
+    let local = hub.accept_received_block(sibling.clone());
+    assert!(local.is_err(), "local median sibling applied: {local:?}");
+    assert!(hub.held_body(&sibling_hash).is_none());
+    assert_eq!(hub.tip_hash(), Some(tip));
+
+    let parked = rbitcoin_net::tip_accept::run_on_tip_accept(|| {
+        hub.accept_received_on_lane(sibling, true)
+    });
+    assert!(
+        matches!(parked, Ok(AcceptOutcome::IgnoredWeaker)),
+        "median sibling was not held: {parked:?}"
+    );
+    assert!(hub.held_body(&sibling_hash).is_some());
+    assert_eq!(hub.tip_hash(), Some(tip));
+
+    let child = mine(sibling_hash, genesis.header.time.saturating_add(1), 2);
+    let child_hash = child.block_hash();
+    let moved =
+        rbitcoin_net::tip_accept::run_on_tip_accept(|| hub.accept_received_on_lane(child, true));
+    assert!(
+        matches!(moved, Ok(AcceptOutcome::Accepted { .. })),
+        "valid child did not move the tip: {moved:?}"
+    );
+    assert_eq!(hub.tip_hash(), Some(child_hash));
+
+    let mut forged = mine(genesis.block_hash(), genesis.header.time.saturating_add(2), 1);
+    forged.header.bits = CompactTarget::from_consensus(0x1d00_ffff);
+    forged.header.merkle_root = forged.compute_merkle_root().unwrap();
+    while forged.header.validate_pow(forged.header.target()).is_ok() {
+        forged.header.nonce = forged.header.nonce.wrapping_add(1);
+    }
+    let forged_hash = forged.block_hash();
+    let work = hub.chain_work().unwrap();
+    let pow =
+        rbitcoin_net::tip_accept::run_on_tip_accept(|| hub.accept_received_on_lane(forged, true));
+    assert!(pow.is_err(), "no-PoW sibling stored: {pow:?}");
+    assert!(hub.held_body(&forged_hash).is_none());
+    assert_eq!(hub.chain_work().unwrap(), work);
+    assert_eq!(hub.tip_hash(), Some(child_hash));
+}
+
 /// A clean connect must not keep a second waive set.
 #[test]
 fn review_trust_clean_connect_takes_no_waive_set() {
