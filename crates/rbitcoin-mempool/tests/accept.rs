@@ -2220,8 +2220,8 @@ fn admit_waived(
     mp.commit_after_script(tx, prep)
 }
 
-/// A failed replacement puts a warned tx back, and a restart keeps the mark
-/// so the next non-final eviction still does.
+/// A failed replacement puts a warned tx back. Reopening with the mode off
+/// drops the mark, so the next non-final eviction removes the tx.
 #[test]
 fn trust_kept_survives_failed_replacement_and_restart() {
     let dir = tmp_dir();
@@ -2267,15 +2267,64 @@ fn trust_kept_survives_failed_replacement_and_restart() {
     mp.flush().unwrap();
     drop(mp);
     let mut again = ActiveMempool::open_or_create(&dir).unwrap();
+    assert!(again.trust_kept.contains(&id), "flag-on open keeps the mark");
+    again.discard_trust_marks().unwrap();
+    drop(again);
+    let mut off = ActiveMempool::open_or_create(&dir).unwrap();
     assert!(
-        again.trust_kept.contains(&id),
-        "restart forgot the trust mark"
+        !off.trust_kept.contains(&id),
+        "flag-off reopen reloaded the mark"
     );
-    again.evict_nonfinal(&utxos, tip);
+    off.evict_nonfinal(&utxos, tip);
     assert!(
-        again.graph.contains(&id),
-        "eviction after restart dropped the warned tx"
+        !off.graph.contains(&id),
+        "eviction after a flag-off reopen kept the tx"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A script-invalid tx is not put back once the mode is off.
+#[test]
+fn review_trust_flag_off_does_not_restore_bad_script() {
+    use bitcoin::WPubkeyHash;
+
+    let dir = tmp_dir();
+    let wpkh = WPubkeyHash::from_byte_array([0x21; 20]);
+    let op = OutPoint {
+        txid: Txid::from_byte_array([0x62; 32]),
+        vout: 0,
+    };
+    let mut map = HashMap::new();
+    map.insert(
+        op,
+        coin(TxOut {
+            value: Amount::from_sat(100_000),
+            script_pubkey: ScriptBuf::new_p2wpkh(&wpkh),
+        }),
+    );
+    let utxos = MapUtxoProvider { map };
+    let mut bad = spend_tx(op, 99_000);
+    bad.input[0].witness = Witness::from_slice(&[vec![0x01]]);
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let id = admit_waived(&mut mp, &bad, &utxos, TIP_OK)
+        .expect("script warns")
+        .txid;
+    assert!(mp.trust_kept.contains(&id));
+    mp.flush().unwrap();
+    drop(mp);
+    let mut again = ActiveMempool::open_or_create(&dir).unwrap();
+    again.discard_trust_marks().unwrap();
+    drop(again);
+    let mut off = ActiveMempool::open_or_create(&dir).unwrap();
+    assert!(off.graph.contains(&id));
+    assert!(!off.trust_kept.contains(&id));
+    off.remove_txid(&id).unwrap();
+    let err = off
+        .reaccept_already_admitted(&bad, None, &utxos, TIP_OK)
+        .unwrap_err();
+    assert!(matches!(err, AcceptError::Script(_)), "{err}");
+    assert!(!off.graph.contains(&id));
+    assert!(!off.trust_kept.contains(&id), "absent tx still marked");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2452,7 +2501,6 @@ fn trust_peer_admit_keeps_fee_and_skips_evict() {
     let off_log = trust_logs();
     assert!(!off_log.contains("trust-peer:"), "{off_log}");
 
-    mp.set_trust_peer(true);
     rbitcoin_log::capture_logs(true);
     let local = mp.accept_tx(&parent, &utxos, TIP_OK).unwrap_err();
     assert!(matches!(local, AcceptError::Script(_)), "{local}");
@@ -2652,7 +2700,6 @@ fn review_trust_repark_does_not_use_process_bit() {
         mtp: u32::MAX,
     };
     let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-    mp.set_trust_peer(true);
     let lifted = LiftedOrphan {
         tx: tx.clone(),
         announcers: vec![1],
@@ -2694,7 +2741,6 @@ fn review_trust_applied_tx_logs_after_commit() {
     let mut bad = spend_tx(op, 99_000);
     bad.input[0].witness = Witness::from_slice(&[vec![0x01]]);
     let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-    mp.set_trust_peer(true);
 
     rbitcoin_log::capture_logs(false);
     rbitcoin_log::capture_logs(true);

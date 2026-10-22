@@ -4594,7 +4594,6 @@ fn trust_peer_reorg_evict_keeps_nonfinal() {
         "reorg eviction must keep a session-warned non-final tx"
     );
     q.set_trust_peer(false);
-    hub.set_trust_peer(false);
     hub.evict_after_reorg();
     assert!(
         hub.try_contains(&txid),

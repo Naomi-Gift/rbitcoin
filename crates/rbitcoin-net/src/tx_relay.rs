@@ -961,6 +961,10 @@ impl MempoolHub {
         if let Some(reserved) = reserved_sigops {
             mp.set_block_reserved_sigops(reserved);
         }
+        if !query.trust_peer() {
+            mp.discard_trust_marks()
+                .map_err(|e| format!("mempool open: {e}"))?;
+        }
         let (announce, _) = broadcast::channel(256);
         let (inv_flush, _) = broadcast::channel(16);
         let (isolated_kick, _) = broadcast::channel(32);
@@ -1444,10 +1448,6 @@ impl MempoolHub {
 
     pub fn set_immediate_relay(&self, on: bool) {
         self.immediate_relay.store(on, Ordering::Relaxed);
-    }
-
-    pub fn set_trust_peer(&self, on: bool) {
-        self.lock_write().set_trust_peer(on);
     }
 
     pub fn immediate_relay(&self) -> bool {
@@ -2088,10 +2088,10 @@ impl MempoolHub {
         stages: &mut rbitcoin_mempool::AcceptStageUs,
         lock_us: &mut u64,
     ) -> Result<rbitcoin_mempool::PreparedAdmit, AcceptError> {
-        let trust = self.query.trust_peer();
         let tip = self.chain_tip_ctx();
         let t_prep = Instant::now();
-        let prepare = |g: &rbitcoin_mempool::ActiveMempool| {
+        let prep = {
+            let g = self.lock_read();
             g.prepare_admit(
                 tx,
                 utxo,
@@ -2103,17 +2103,6 @@ impl MempoolHub {
                     waive: spec.waive,
                 },
             )
-        };
-        // The flag is copied once when it changes. Steady admits keep the read lock.
-        let prep = {
-            let g = self.lock_read();
-            if g.trust_peer() == trust {
-                prepare(&g)
-            } else {
-                drop(g);
-                self.lock_write().set_trust_peer(trust);
-                prepare(&self.lock_read())
-            }
         };
         if spec.time_prepare_lock {
             *lock_us = lock_us.saturating_add(t_prep.elapsed().as_micros() as u64);

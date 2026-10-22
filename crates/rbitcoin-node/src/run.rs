@@ -465,7 +465,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             persist,
             block_reserved_sigops,
         )?;
-        mp.set_trust_peer(mp.query.trust_peer());
         mp.set_cluster_limits(cluster_count, cluster_kvb);
         if let Some(b) = bytes_per_sigop {
             mp.set_bytes_per_sigop(b);

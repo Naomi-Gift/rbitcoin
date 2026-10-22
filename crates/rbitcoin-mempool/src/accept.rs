@@ -601,11 +601,8 @@ pub struct ActiveMempool {
     pub node_clock: Arc<AtomicU64>,
     /// Accept times of the records loaded at open, until the hub takes them.
     pub loaded_accept: Vec<(Txid, Wtxid, u64)>,
-    /// `--trust-peer`: script, immature, non-final, and BIP68 faults still admit.
-    /// The hub path passes a per-tx waive instead of this process bit.
-    pub trust_peer: bool,
-    /// Txids admitted from the current trusted session. Eviction reads this,
-    /// not [`Self::trust_peer`].
+    /// Txids a trusted-session admit warned on. Eviction and restore read this.
+    /// A flag-off open clears it and the slot bytes.
     pub trust_kept: HashSet<Txid>,
 }
 
@@ -765,17 +762,17 @@ impl ActiveMempool {
             undone_accept_secs: std::collections::HashMap::new(),
             node_clock: Arc::new(AtomicU64::new(0)),
             loaded_accept: ingested.accept_secs,
-            trust_peer: false,
             trust_kept: ingested.trust_kept,
         })
     }
 
-    pub fn set_trust_peer(&mut self, on: bool) {
-        self.trust_peer = on;
-    }
-
-    pub fn trust_peer(&self) -> bool {
-        self.trust_peer
+    /// Forget every trust mark and zero the slot bytes. No flush when none were set.
+    pub fn discard_trust_marks(&mut self) -> Result<(), MempoolError> {
+        self.trust_kept.clear();
+        if self.store.clear_trust_bytes() {
+            self.flush()?;
+        }
+        Ok(())
     }
 
     pub fn live_count(&self) -> usize {

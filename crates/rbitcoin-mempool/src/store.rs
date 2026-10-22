@@ -808,6 +808,20 @@ impl Mempool {
         self.slots[off] = u8::from(on);
     }
 
+    /// Zero the trust byte on every LIVE slot. Returns whether any byte changed.
+    pub(crate) fn clear_trust_bytes(&mut self) -> bool {
+        let mut changed = false;
+        for slot in 0..self.slot_cap {
+            let off = SLOTS_HEADER + (slot as usize) * SLOT_REC;
+            if self.slots[off] != SLOT_LIVE || self.slots[off + 1] == 0 {
+                continue;
+            }
+            self.slots[off + 1] = 0;
+            changed = true;
+        }
+        changed
+    }
+
     /// Ensure body has `need` free bytes; return offset of free region. Updates logical len.
     #[doc(hidden)]
     pub fn reserve_body(&mut self, need: usize) -> Result<u64, MempoolError> {
