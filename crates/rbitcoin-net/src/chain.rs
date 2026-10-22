@@ -4328,14 +4328,10 @@ fn proposal_one_input(
 fn proposal_tx_fee(paid: u64, out_val: u64) -> Result<u64, String> {
     let paid_i = i64::try_from(paid).map_err(|_| "bad-txns-inputvalues-outofrange".to_string())?;
     let out_i = i64::try_from(out_val).map_err(|_| "bad-txns-txouttotal-toolarge".to_string())?;
-    let fee = rbitcoin_consensus::block::fee_from_values(paid_i, out_i).map_err(
-        |e| match e {
-            rbitcoin_consensus::ConsensusError::BadTx("in < out") => {
-                "bad-txns-in-belowout".to_string()
-            }
-            _ => "bad-txns-fee-outofrange".to_string(),
-        },
-    )?;
+    let fee = rbitcoin_consensus::block::fee_from_values(paid_i, out_i).map_err(|e| match e {
+        rbitcoin_consensus::ConsensusError::BadTx("in < out") => "bad-txns-in-belowout".to_string(),
+        _ => "bad-txns-fee-outofrange".to_string(),
+    })?;
     u64::try_from(fee).map_err(|_| "bad-txns-fee-outofrange".to_string())
 }
 

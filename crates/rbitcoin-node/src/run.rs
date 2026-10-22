@@ -491,7 +491,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     status.attach_mempool(&mempool);
     // Proxy and onion are how the one trusted peer is reached. This node's
     // own txs stay on that session. Isolated broadcast dials other nodes.
-    if proxy_or_onion_without_trust(config) {
+    if proxy_or_onion_without_trust(&config) {
         mempool.set_isolated_broadcast(true);
     }
     node.peers.set_net_perms(table.clone());
@@ -695,7 +695,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
     let shared_peers = std::sync::Arc::new(std::sync::Mutex::new(addrman.clone()));
     node.peers.set_addrman(std::sync::Arc::clone(&shared_peers));
-    if proxy_or_onion_without_trust(config) {
+    if proxy_or_onion_without_trust(&config) {
         let _iso = rbitcoin_net::spawn_isolated_broadcast_loop(
             Arc::clone(&mempool),
             config.listen.isolated_dialer(),

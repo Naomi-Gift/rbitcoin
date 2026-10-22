@@ -2267,7 +2267,10 @@ fn trust_kept_survives_failed_replacement_and_restart() {
     mp.flush().unwrap();
     drop(mp);
     let mut again = ActiveMempool::open_or_create(&dir).unwrap();
-    assert!(again.trust_kept.contains(&id), "flag-on open keeps the mark");
+    assert!(
+        again.trust_kept.contains(&id),
+        "flag-on open keeps the mark"
+    );
     again.discard_trust_marks().unwrap();
     drop(again);
     let mut off = ActiveMempool::open_or_create(&dir).unwrap();
@@ -2424,7 +2427,10 @@ fn review_trust_package_rollback_keeps_warned_victim() {
         .unwrap_err();
     assert!(matches!(err, AcceptError::NotFinal), "{err}");
     assert!(!mp.graph.contains(&replacement.compute_txid()));
-    assert!(mp.graph.contains(&id), "failed package lost the warned victim");
+    assert!(
+        mp.graph.contains(&id),
+        "failed package lost the warned victim"
+    );
     assert!(mp.trust_kept.contains(&id));
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2461,7 +2467,9 @@ fn review_trust_failed_restore_drops_mark() {
         .expect("replacement prepares");
     mp.store.fail_next_append = true;
     assert!(mp.commit_after_script(&replacement, prep).is_err());
-    let empty = MapUtxoProvider { map: HashMap::new() };
+    let empty = MapUtxoProvider {
+        map: HashMap::new(),
+    };
     mp.restore_undone(&empty, low);
     assert!(!mp.graph.contains(&id));
     assert!(!mp.trust_kept.contains(&id), "absent tx still marked");
@@ -2503,7 +2511,10 @@ fn review_trust_template_skips_marked_chunk() {
     let ids: Vec<_> = picked.iter().map(|(_, s)| s.txid).collect();
     assert!(ids.contains(&clean_id), "clean tx was skipped");
     assert!(!ids.contains(&bad_id), "marked tx was selected");
-    assert!(!ids.contains(&child_id), "child of a marked tx was selected");
+    assert!(
+        !ids.contains(&child_id),
+        "child of a marked tx was selected"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

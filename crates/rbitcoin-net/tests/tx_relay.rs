@@ -4665,7 +4665,10 @@ fn review_trust_orphan_keeps_session_waiver() {
     hub.accept_tx(&parent).expect("parent");
     hub.accept_tx(&other_parent).expect("other parent");
     let trusted_id = trusted.compute_txid();
-    assert!(hub.try_contains(&trusted_id), "trusted non-final orphan dropped");
+    assert!(
+        hub.try_contains(&trusted_id),
+        "trusted non-final orphan dropped"
+    );
     assert!(hub.lock_read().trust_kept.contains(&trusted_id));
     let other_id = other.compute_txid();
     assert!(!hub.try_contains(&other_id));

@@ -4607,17 +4607,14 @@ fn review_trust_local_block_rechecks_marked_script() {
     assert!(picked.iter().any(|(tx, _)| tx.compute_txid() == clean_id));
     assert!(picked.iter().all(|(tx, _)| tx.compute_txid() != bad_id));
 
-    let block = hub
-        .assemble_block_to_script(op_true, vec![bad])
-        .unwrap();
+    let block = hub.assemble_block_to_script(op_true, vec![bad]).unwrap();
     let hash = block.block_hash();
     let tip = hub.tip_hash();
     let local = hub.accept_received_block(block.clone());
     assert!(local.is_err(), "local block kept a bad script: {local:?}");
     assert_eq!(hub.tip_hash(), tip);
-    let applied = rbitcoin_net::tip_accept::run_on_tip_accept(|| {
-        hub.accept_received_on_lane(block, true)
-    });
+    let applied =
+        rbitcoin_net::tip_accept::run_on_tip_accept(|| hub.accept_received_on_lane(block, true));
     assert!(
         matches!(applied, Ok(AcceptOutcome::Accepted { .. })),
         "trusted session rejected the block: {applied:?}"
@@ -4643,9 +4640,8 @@ fn review_trust_side_header_mtp_is_held() {
     assert!(hub.held_body(&sibling_hash).is_none());
     assert_eq!(hub.tip_hash(), Some(tip));
 
-    let parked = rbitcoin_net::tip_accept::run_on_tip_accept(|| {
-        hub.accept_received_on_lane(sibling, true)
-    });
+    let parked =
+        rbitcoin_net::tip_accept::run_on_tip_accept(|| hub.accept_received_on_lane(sibling, true));
     assert!(
         matches!(parked, Ok(AcceptOutcome::IgnoredWeaker)),
         "median sibling was not held: {parked:?}"
@@ -4663,7 +4659,11 @@ fn review_trust_side_header_mtp_is_held() {
     );
     assert_eq!(hub.tip_hash(), Some(child_hash));
 
-    let mut forged = mine(genesis.block_hash(), genesis.header.time.saturating_add(2), 1);
+    let mut forged = mine(
+        genesis.block_hash(),
+        genesis.header.time.saturating_add(2),
+        1,
+    );
     forged.header.bits = CompactTarget::from_consensus(0x1d00_ffff);
     forged.header.merkle_root = forged.compute_merkle_root().unwrap();
     while forged.header.validate_pow(forged.header.target()).is_ok() {
