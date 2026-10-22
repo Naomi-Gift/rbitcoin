@@ -4626,7 +4626,7 @@ fn trust_peer_reorg_evict_keeps_nonfinal() {
 fn review_trust_orphan_keeps_session_waiver() {
     use bitcoin::WPubkeyHash;
 
-    let (store, q, cbs) = copy_maturity_pad(4);
+    let (store, q, cbs) = copy_maturity_pad(3);
     let mp = tmp();
     let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
     hub.set_relay_enabled(true);

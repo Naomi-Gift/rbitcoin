@@ -1070,7 +1070,7 @@ impl TxGraph {
         let mut used = 0u64;
         let mut sigops = reserved_sigops;
         for (_, _, ch) in scored {
-            if ch.txids.iter().any(|t| skip(t)) {
+            if ch.txids.iter().any(&skip) {
                 continue;
             }
             let mut add = Vec::new();
@@ -1081,7 +1081,7 @@ impl TxGraph {
                 }
                 self.collect_selected_with_ancestors(*t, &selected, &mut add);
             }
-            if add.is_empty() || add.iter().any(|t| skip(t)) {
+            if add.is_empty() || add.iter().any(&skip) {
                 continue;
             }
             // `add` holds only unselected txs, so these sums are the exact
