@@ -240,6 +240,50 @@ fn off_path_split_settles_outside_the_coord_lock() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Headers are stored and the walk tip is ahead, but tip+1 is not planted.
+/// Assign used to walk those headers while `shared` was held. A linear
+/// extension is not a rewind; the read still has to happen with the lock down.
+#[test]
+fn unplanted_walk_reads_headers_outside_the_coord_lock() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let genesis = hub.tip_hash().unwrap();
+    let first = rbitcoin_consensus::mine_empty_regtest(genesis, 1_500_070_100, 1);
+    hub.ensure_header(&first.header).unwrap();
+    let second = rbitcoin_consensus::mine_empty_regtest(first.block_hash(), 1_500_070_200, 2);
+    hub.ensure_header(&second.header).unwrap();
+    let mut st = IbdWorkState::new(vec![dummy_slot(0)], hub.tip_hash(), hub.tip_height());
+    st.header_walk.origin = true;
+    st.header_walk.tip.hash = Some(second.block_hash());
+    st.header_walk.tip.height = 2;
+    let shared = std::sync::Mutex::new(st);
+    let before = rbitcoin_query::header_lookup_count();
+    let _probe = rbitcoin_store::HeaderThreadProbe::arm();
+    rbitcoin_query::reset_header_lookups_under_coord_lock();
+    rbitcoin_ibd::ibd::settle_disconnected_heavier_for_test(&shared, &hub);
+    assert!(
+        rbitcoin_query::header_lookup_count() > before,
+        "the unplanted walk read stored headers"
+    );
+    assert_eq!(
+        rbitcoin_query::header_lookups_under_coord_lock(),
+        0,
+        "that read ran while the coordinator lock was down"
+    );
+    assert_eq!(rbitcoin_store::coord_lock_store_reads(), 0);
+    assert_eq!(
+        hub.tip_height(),
+        Some(0),
+        "a linear extension above genesis is not a rewind"
+    );
+    let st = shared.lock().unwrap_or_else(|err| err.into_inner());
+    assert!(
+        st.ordered.is_empty(),
+        "the linear candidate stays unplanted"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn download_gate_stops_getdata_when_tip_plus_one_unconfirmable() {
     let (dir, hub) = tmp_hub();

@@ -270,8 +270,6 @@ pub fn assign_work_ordered(
     prune_satisfied_inflight(&mut st.slots, &mut st.inflight, hub);
     prune_off_path_inflight(st);
 
-    let _ = super::reorg::consider_disconnected_heavier(st, hub);
-
     let tip = hub.tip_height().unwrap_or(0);
     let path_lo = if hub.tip_height().is_none() {
         0u32

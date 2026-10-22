@@ -158,11 +158,14 @@ reconstruct yet persists that header path on the header-job pool.
 **Fixed.** The IBD coordinator holds `shared` across the turn, the
 redial apply, and the event drains. A peer split whose height has left
 the download path is compared with the confirmed header only while that
-lock is down. `tip_height`, `has_block`, and `block_queue_*` under the
-lock are RAM. The header thread still reads the store (`load_origin`,
-resume) with the lock dropped around that IO.
-`coord_shared_lock_skips_header_and_store_io` and
-`off_path_split_settles_outside_the_coord_lock` are the pins.
+lock is down. An unplanted header-walk candidate is checked for a
+heavier fork the same way: the header walk runs with the lock down, and
+only the commit takes `shared` again. `tip_height`, `has_block`, and
+`block_queue_*` under the lock are RAM. The header thread still reads
+the store (`load_origin`, resume) with the lock dropped around that IO.
+`coord_shared_lock_skips_header_and_store_io`,
+`off_path_split_settles_outside_the_coord_lock`, and
+`unplanted_walk_reads_headers_outside_the_coord_lock` are the pins.
 
 **Deferred.** Headers decode and classify are still two blocking joins.
 `decode_framed_offload` drops its permit inside the decode job.

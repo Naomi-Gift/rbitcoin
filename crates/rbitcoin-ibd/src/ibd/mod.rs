@@ -100,6 +100,7 @@ pub use state::IbdWorkState;
 use state::{enqueue_header_cmd, HeaderCmd};
 pub use status::LoopStats;
 
+use bitcoin::hashes::Hash;
 use bitcoin::p2p::Magic;
 use rbitcoin_log::{info, warn};
 use rbitcoin_net::chain::ChainHub;
@@ -169,6 +170,53 @@ fn settle_off_path_splits<'a>(
 pub fn settle_off_path_for_test(shared: &std::sync::Mutex<state::IbdWorkState>, hub: &ChainHub) {
     let st_guard = HeldShared::lock(shared);
     drop(settle_off_path_splits(st_guard, shared, hub));
+}
+
+/// A heavier-fork check reads headers. `shared` is down across that read.
+/// No candidate keeps the lock. A hash marked invalid while the lock was
+/// down is not committed.
+fn settle_disconnected_heavier<'a>(
+    st_guard: HeldShared<'a>,
+    shared: &'a std::sync::Mutex<state::IbdWorkState>,
+    hub: &ChainHub,
+) -> HeldShared<'a> {
+    let (cands, invalid) = match reorg::heavier_fork_candidates(&st_guard, hub) {
+        Ok(pair) => pair,
+        Err(_) => return st_guard,
+    };
+    if cands.is_empty() {
+        return st_guard;
+    }
+    drop(st_guard);
+    let prepared = reorg::select_heavier_path(hub, &cands, &invalid)
+        .ok()
+        .flatten()
+        .and_then(|path| {
+            reorg::prepare_header_rewind(hub, &path)
+                .ok()
+                .flatten()
+                .map(|prep| (path, prep))
+        });
+    let mut st_guard = HeldShared::lock(shared);
+    if let Some((path, prep)) = prepared {
+        let marked = path
+            .iter()
+            .any(|hash| st_guard.reorg.invalid.contains(hash.to_byte_array()));
+        if !marked {
+            reorg::commit_header_rewind(&mut st_guard, hub, &path, &prep);
+        }
+    }
+    st_guard
+}
+
+/// Same drop, header walk, and commit as the coordinator assign turn.
+#[doc(hidden)]
+pub fn settle_disconnected_heavier_for_test(
+    shared: &std::sync::Mutex<state::IbdWorkState>,
+    hub: &ChainHub,
+) {
+    let st_guard = HeldShared::lock(shared);
+    drop(settle_disconnected_heavier(st_guard, shared, hub));
 }
 
 /// Default max **concurrent** unique block downloads (in-flight getdata).
@@ -720,6 +768,7 @@ pub async fn ibd_cancellable(
                 };
                 let tip_before_assign = hub.tip_height();
                 st_guard = settle_off_path_splits(st_guard, &shared, hub.as_ref());
+                st_guard = settle_disconnected_heavier(st_guard, &shared, hub.as_ref());
                 assign_work_ordered(
                     &mut st_guard,
                     hub.as_ref(),

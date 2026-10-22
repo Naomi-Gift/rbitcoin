@@ -357,17 +357,31 @@ pub fn connecting_search_candidates(
     }
 }
 
-/// Scan a competing work-path tip+1 for a heavier disconnected fork and
-/// rewind the confirmed tip to the LCA so the normal pipeline confirms it.
-pub fn consider_disconnected_heavier(
-    st: &mut super::state::IbdWorkState,
+/// Competing tip+1, or the walk candidate while nothing is planted above the
+/// confirmed tip. Collecting these does not read the header store.
+#[doc(hidden)]
+pub fn heavier_fork_candidates(
+    st: &super::state::IbdWorkState,
     hub: &ChainHub,
-) -> Result<bool, NetError> {
+) -> Result<(Vec<BlockHash>, HashSet<[u8; 32]>), NetError> {
     let mut cands = connecting_search_candidates(st, hub)?;
     if cands.is_empty() {
         cands.extend(unplanted_walk_tip(st, hub));
     }
     let invalid: HashSet<[u8; 32]> = st.reorg.invalid.iter().collect();
+    Ok((cands, invalid))
+}
+
+/// Scan a competing work-path tip+1 for a heavier disconnected fork and
+/// rewind the confirmed tip to the LCA so the normal pipeline confirms it.
+///
+/// [`select_heavier_path`] reads the header store. The coordinator drops
+/// `shared` before that read and commits with [`commit_header_rewind`].
+pub fn consider_disconnected_heavier(
+    st: &mut super::state::IbdWorkState,
+    hub: &ChainHub,
+) -> Result<bool, NetError> {
+    let (cands, invalid) = heavier_fork_candidates(st, hub)?;
     let Some(path) = select_heavier_path(hub, &cands, &invalid)? else {
         return Ok(false);
     };
