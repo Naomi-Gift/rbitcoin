@@ -41,14 +41,9 @@ pub fn check_header(
         }
         let expected = crate::params::genesis_block(params).header.bits;
         if header.bits != expected {
-            crate::trust::soften_at(
-                Some(0),
-                ConsensusError::BadHeader("incorrect proof of work bits"),
-            )?;
+            return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
         }
-        if let Err(e) = pow_hash_meets_target(hash, header.bits, params.pow_limit) {
-            crate::trust::soften_at(Some(0), e)?;
-        }
+        pow_hash_meets_target(hash, header.bits, params.pow_limit)?;
         return Ok(0);
     }
 
@@ -96,14 +91,9 @@ pub fn check_header(
     )
     .ok_or(ConsensusError::BadPrev)?;
     if header.bits != expected {
-        crate::trust::soften_at(
-            Some(height.0),
-            ConsensusError::BadHeader("incorrect proof of work bits"),
-        )?;
+        return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
     }
-    if let Err(e) = pow_hash_meets_target(hash, header.bits, params.pow_limit) {
-        crate::trust::soften_at(Some(height.0), e)?;
-    }
+    pow_hash_meets_target(hash, header.bits, params.pow_limit)?;
     // A waived median comparison still returns the window it checked. `0` is
     // only the empty-window case above. Callers use this as the next cutoff.
     Ok(mtp)
@@ -127,18 +117,13 @@ pub fn validate_header_on_parent(
         crate::trust::soften_at(Some(height.0), e)?;
     }
     if header.bits != expected_bits {
-        crate::trust::soften_at(
-            Some(height.0),
-            ConsensusError::BadHeader("incorrect proof of work bits"),
-        )?;
+        return Err(ConsensusError::BadHeader("incorrect proof of work bits"));
     }
-    if let Err(e) = pow_hash_meets_target(
+    pow_hash_meets_target(
         header.block_hash().to_byte_array(),
         header.bits,
         params.pow_limit,
-    ) {
-        crate::trust::soften_at(Some(height.0), e)?;
-    }
+    )?;
     Ok(())
 }
 

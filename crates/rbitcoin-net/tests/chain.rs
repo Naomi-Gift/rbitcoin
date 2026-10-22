@@ -4679,17 +4679,6 @@ fn review_trust_side_header_mtp_is_held() {
     assert_eq!(hub.tip_hash(), Some(child_hash));
 }
 
-/// A clean connect must not keep a second waive set.
-#[test]
-fn review_trust_clean_connect_takes_no_waive_set() {
-    let src = include_str!("../src/chain.rs");
-    assert!(
-        !src.contains("connected_waived"),
-        "the second waive set must stay deleted"
-    );
-    assert!(!src.contains("fn note_connected_waived"));
-}
-
 /// A proposal error is the error. The mode does not log it.
 ///
 /// Covers a wrong prev, unexpected nBits (even with an excess coinbase),

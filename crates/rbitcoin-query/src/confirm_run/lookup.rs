@@ -734,16 +734,12 @@ pub fn stamp_check_header_link(
         } else {
             let expect_prev = pipeline.and_then(|p| p.parent_hash).unwrap_or([0u8; 32]);
             rbitcoin_consensus::block::reject_prev_link(&prev_bytes, &expect_prev)?;
-            if let Err(e) = pow_hash_meets_target(hash, header.bits, params.pow_limit) {
-                rbitcoin_consensus::soften_at(Some(height.0), e)?;
-            }
+            pow_hash_meets_target(hash, header.bits, params.pow_limit)?;
         }
         return Ok(());
     }
     rbitcoin_consensus::block::reject_prev_link(&prev_bytes, &prev_meta_hash.unwrap_or([0u8; 32]))?;
-    if let Err(e) = pow_hash_meets_target(hash, header.bits, params.pow_limit) {
-        rbitcoin_consensus::soften_at(Some(height.0), e)?;
-    }
+    pow_hash_meets_target(hash, header.bits, params.pow_limit)?;
     Ok(())
 }
 

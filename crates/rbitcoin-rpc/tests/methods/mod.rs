@@ -611,7 +611,21 @@ fn trust_peer_warning_line() {
     };
     no_disagreement("getnetworkinfo", vec![]);
     no_disagreement("getblockchaininfo", vec![]);
-    no_disagreement("getblocktemplate", vec![json!({"rules": ["segwit"]})]);
+    let gbt = dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
+    match gbt.get("warnings") {
+        None => {}
+        Some(w) => {
+            let arr = w
+                .as_array()
+                .unwrap_or_else(|| panic!("warnings is an array or absent: {gbt}"));
+            assert!(!arr.is_empty(), "an empty warnings array is omitted: {gbt}");
+            assert!(
+                !arr.iter()
+                    .any(|x| x.as_str().unwrap_or("").contains("disagreement")),
+                "flag off has no trust warning: {gbt}"
+            );
+        }
+    }
 
     let addr: std::net::SocketAddr = "1.2.3.4:8333".parse().unwrap();
     let peers = rbitcoin_net::PeerHub::new();

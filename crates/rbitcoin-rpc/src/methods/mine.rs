@@ -731,7 +731,7 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
         .map(|(tx, _)| tx.compute_wtxid().to_byte_array())
         .collect();
     let witness_commit = rbitcoin_consensus::witness_commitment_script(wtxids, &[0u8; 32]);
-    Ok(json!({
+    let mut template = json!({
         "capabilities": ["proposal"],
         "version": ctx
             .chain
@@ -755,8 +755,12 @@ pub fn gbt_template(ctx: &RpcContext) -> Result<Value, Value> {
         "height": next_h,
         "rules": ["segwit"],
         "default_witness_commitment": rbitcoin_primitives::hex_encode(&(witness_commit)),
-        "warnings": rpc_warnings(ctx),
-    }))
+    });
+    let warnings = rpc_warnings(ctx);
+    if !warnings.is_empty() {
+        template["warnings"] = json!(warnings);
+    }
+    Ok(template)
 }
 
 pub fn gbt_proposal(ctx: &RpcContext, req: Option<&Value>) -> Result<Value, Value> {

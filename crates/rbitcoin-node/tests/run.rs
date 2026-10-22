@@ -53,15 +53,19 @@ fn stale_follow_needs_room_at_max_outbound() {
 /// broadcast. This node's own txs go out on the standing session.
 #[test]
 fn review_trust_proxy_uses_standing_relay() {
-    let src = include_str!("../src/run.rs");
-    let at = src
-        .find("mempool.set_isolated_broadcast(true)")
-        .expect("isolated broadcast arm");
-    let window = &src[at.saturating_sub(240)..at];
-    assert!(
-        window.contains("trust_peer_set"),
-        "isolated broadcast stays off while --trust-peer is set:\n{window}"
-    );
+    let mut cfg = NodeConfig::default();
+    assert!(!proxy_or_onion_without_trust(&cfg));
+    let socks: SocketAddr = "127.0.0.1:9050".parse().unwrap();
+    cfg.listen.proxy = Some(socks);
+    assert!(proxy_or_onion_without_trust(&cfg));
+    cfg.listen.proxy = None;
+    cfg.listen.onion = Some(socks);
+    assert!(proxy_or_onion_without_trust(&cfg));
+    cfg.trust_peer = Some(rbitcoin_net::NetAddr::Ip("192.0.2.1:8333".parse().unwrap()));
+    assert!(!proxy_or_onion_without_trust(&cfg));
+    cfg.listen.onion = None;
+    cfg.listen.proxy = Some(socks);
+    assert!(!proxy_or_onion_without_trust(&cfg));
 }
 
 #[test]

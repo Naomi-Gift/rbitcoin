@@ -491,8 +491,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     status.attach_mempool(&mempool);
     // Proxy and onion are how the one trusted peer is reached. This node's
     // own txs stay on that session. Isolated broadcast dials other nodes.
-    if (config.listen.proxy.is_some() || config.listen.onion.is_some()) && !config.trust_peer_set()
-    {
+    if proxy_or_onion_without_trust(config) {
         mempool.set_isolated_broadcast(true);
     }
     node.peers.set_net_perms(table.clone());
@@ -696,7 +695,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
     let shared_peers = std::sync::Arc::new(std::sync::Mutex::new(addrman.clone()));
     node.peers.set_addrman(std::sync::Arc::clone(&shared_peers));
-    if mempool.isolated_broadcast() && !config.trust_peer_set() {
+    if proxy_or_onion_without_trust(config) {
         let _iso = rbitcoin_net::spawn_isolated_broadcast_loop(
             Arc::clone(&mempool),
             config.listen.isolated_dialer(),
@@ -1616,6 +1615,13 @@ pub fn should_resolve_default_seeds(config: &NodeConfig) -> bool {
         && !config.listen.has_pinned_connect()
         && config.signet_challenge.is_none()
         && config.listen.proxy.is_none()
+}
+
+/// Isolated broadcast dials peers other than the pinned session.
+/// A proxy or onion path to that one peer does not turn it on.
+pub fn proxy_or_onion_without_trust(config: &NodeConfig) -> bool {
+    let proxy_or_onion = config.listen.proxy.is_some() || config.listen.onion.is_some();
+    proxy_or_onion && !config.trust_peer_set()
 }
 
 /// Genesis `--connect` whose first catch-up accepts nothing is treated as
