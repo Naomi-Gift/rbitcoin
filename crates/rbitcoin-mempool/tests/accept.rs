@@ -2344,6 +2344,81 @@ fn review_trust_restored_mark_survives_restart() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A package that fails after replacing a warned tx puts that tx back marked.
+#[test]
+fn review_trust_package_rollback_keeps_warned_victim() {
+    let dir = tmp_dir();
+    let (op, _, utxos) = chain_utxo(100_000);
+    let mut tx = spend_tx(op, 99_000);
+    tx.lock_time = LockTime::from_height(500).unwrap();
+    tx.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+    let low = ChainTipCtx {
+        height: 100,
+        mtp: u32::MAX,
+    };
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let id = admit_waived(&mut mp, &tx, &utxos, low)
+        .expect("nonfinal")
+        .txid;
+    let replacement = spend_tx(op, 90_000);
+    let mut child = spend_tx(
+        OutPoint {
+            txid: replacement.compute_txid(),
+            vout: 0,
+        },
+        80_000,
+    );
+    child.lock_time = LockTime::from_height(500).unwrap();
+    child.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+    let err = mp
+        .accept_package(&[replacement.clone(), child], &utxos, low)
+        .unwrap_err();
+    assert!(matches!(err, AcceptError::NotFinal), "{err}");
+    assert!(!mp.graph.contains(&replacement.compute_txid()));
+    assert!(mp.graph.contains(&id), "failed package lost the warned victim");
+    assert!(mp.trust_kept.contains(&id));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A victim that cannot be put back does not keep its mark.
+#[test]
+fn review_trust_failed_restore_drops_mark() {
+    let dir = tmp_dir();
+    let (op, _, utxos) = chain_utxo(100_000);
+    let mut tx = spend_tx(op, 99_000);
+    tx.lock_time = LockTime::from_height(500).unwrap();
+    tx.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+    let low = ChainTipCtx {
+        height: 100,
+        mtp: u32::MAX,
+    };
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let id = admit_waived(&mut mp, &tx, &utxos, low)
+        .expect("nonfinal")
+        .txid;
+    let replacement = spend_tx(op, 90_000);
+    let prep = mp
+        .prepare_admit(
+            &replacement,
+            &utxos,
+            TIP_OK,
+            PrepareOpts {
+                fee_delta: 0,
+                report_orphans: false,
+                min_relay: Some(0),
+                waive: false,
+            },
+        )
+        .expect("replacement prepares");
+    mp.store.fail_next_append = true;
+    assert!(mp.commit_after_script(&replacement, prep).is_err());
+    let empty = MapUtxoProvider { map: HashMap::new() };
+    mp.restore_undone(&empty, low);
+    assert!(!mp.graph.contains(&id));
+    assert!(!mp.trust_kept.contains(&id), "absent tx still marked");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Script, non-final, immature, and BIP68 faults admit when the session
 /// waive bit is set, and stay through non-final eviction. `accept_tx` stays
 /// strict even when the process flag is on. Policy and a missing parent drop.

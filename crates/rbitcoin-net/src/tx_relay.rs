@@ -2560,6 +2560,9 @@ impl MempoolHub {
             .collect();
         {
             let mut g = self.lock_write();
+            for id in accepted.iter().flat_map(|r| r.replaced_trust.iter()) {
+                g.trust_kept.insert(*id);
+            }
             for r in accepted.iter().rev() {
                 gone.extend(g.remove_txid_tree(&r.txid));
             }
@@ -2591,7 +2594,14 @@ impl MempoolHub {
                         self.publish_admitted(tx, &result, &prevouts, &utxo);
                     }
                 }
-                Err(_) => self.unindex_if_absent(tx),
+                Err(_) => {
+                    self.unindex_if_absent(tx);
+                    let id = tx.compute_txid();
+                    let mut g = self.lock_write();
+                    if !g.graph.contains(&id) {
+                        g.trust_kept.remove(&id);
+                    }
+                }
             }
         }
     }
@@ -4264,6 +4274,7 @@ impl MempoolHub {
             replaced_scripthashes: Vec::new(),
             replaced_txs: Vec::new(),
             replaced_accept_secs: Default::default(),
+            replaced_trust: Vec::new(),
             evicted: Vec::new(),
         })
     }

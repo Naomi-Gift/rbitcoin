@@ -186,6 +186,9 @@ pub struct AcceptResult {
     /// Accept times of [`Self::replaced_txs`], so a rollback restores each
     /// with its own time.
     pub replaced_accept_secs: std::collections::HashMap<Txid, u64>,
+    /// Replaced txids that were trust-marked. Rollback puts the mark back
+    /// before those bodies are re-admitted.
+    pub replaced_trust: Vec<Txid>,
     /// Txids dropped to free a slot or the weight budget while admitting this tx.
     /// Distinct from [`Self::replaced`]. The admitted tx is not in this list
     /// when the commit succeeds.
@@ -1458,6 +1461,7 @@ impl ActiveMempool {
             replaced_scripthashes,
             replaced_txs,
             replaced_accept_secs,
+            replaced_trust: kept_conflicts,
             evicted,
         })
     }
@@ -1480,6 +1484,7 @@ impl ActiveMempool {
             replaced_scripthashes: Vec::new(),
             replaced_txs: Vec::new(),
             replaced_accept_secs: std::collections::HashMap::new(),
+            replaced_trust: Vec::new(),
             evicted: Vec::new(),
         })
     }
@@ -2055,6 +2060,9 @@ impl ActiveMempool {
             .iter()
             .flat_map(|r| r.replaced_accept_secs.iter().map(|(t, s)| (*t, *s)))
             .collect();
+        for id in accepted.iter().flat_map(|r| r.replaced_trust.iter()) {
+            self.trust_kept.insert(*id);
+        }
         for r in accepted.iter().rev() {
             let _ = self.unlink_tree(&r.txid);
         }
@@ -2161,6 +2169,10 @@ impl ActiveMempool {
                 Err(_) => {
                     if !self.undone_replacements.is_empty() {
                         noted.extend(self.restore_conflicts(utxos, tip, orphans));
+                    }
+                    let id = victims[i].compute_txid();
+                    if !self.graph.contains(&id) {
+                        self.trust_kept.remove(&id);
                     }
                 }
             }
