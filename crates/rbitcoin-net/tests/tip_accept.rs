@@ -277,13 +277,39 @@ async fn full_lane_parks_instead_of_spinning() {
         releases.push(filled_rx.recv().expect("filler release"));
     }
 
-    FULL_QUEUE_SPINS.store(0, std::sync::atomic::Ordering::Relaxed);
+    FULL_QUEUE_SPINS.store(0, Ordering::Relaxed);
     let ninth = tokio::spawn(async { run_on_tip_accept_async(|| 9u8).await });
+    let started = std::time::Instant::now();
+    let mut last = 0usize;
+    let mut stable = 0u32;
+    let parked = loop {
+        let now = FULL_QUEUE_SPINS.load(Ordering::Relaxed);
+        if now > 8 {
+            break now;
+        }
+        if now > 0 && now == last {
+            stable += 1;
+            if stable >= 3 {
+                break now;
+            }
+        } else {
+            stable = 0;
+            last = now;
+        }
+        if started.elapsed() > Duration::from_secs(2) {
+            break now;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    };
+    assert!(
+        (1..=8).contains(&parked),
+        "a full queue parks after a handful of failed sends, saw {parked}"
+    );
     tokio::time::sleep(Duration::from_millis(40)).await;
-    let spins = FULL_QUEUE_SPINS.load(std::sync::atomic::Ordering::Relaxed);
+    let spins = FULL_QUEUE_SPINS.load(Ordering::Relaxed);
     assert_eq!(
-        spins, 0,
-        "a full tip-accept queue must park the sender, not yield-spin"
+        spins, parked,
+        "a parked sender must not keep retrying ({parked} -> {spins})"
     );
     assert!(!ninth.is_finished(), "the ninth job must still be waiting");
 

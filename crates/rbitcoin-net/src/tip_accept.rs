@@ -20,7 +20,8 @@ pub const TIP_ACCEPT_THREAD_NAME: &str = "tip-accept";
 #[doc(hidden)]
 pub const QUEUE_CAP: usize = 8;
 
-/// Times a full async enqueue yield-looped. A parked wait stays at zero.
+/// Failed async `try_send`s on a full tip-accept queue. A parked sender
+/// records a handful. A yield loop keeps adding.
 #[doc(hidden)]
 pub static FULL_QUEUE_SPINS: AtomicUsize = AtomicUsize::new(0);
 
@@ -283,6 +284,7 @@ pub async fn run_on_tip_accept_async<R: Send + 'static>(
             }
             Err(TrySendError::Full(j)) => {
                 job = j;
+                FULL_QUEUE_SPINS.fetch_add(1, Ordering::Relaxed);
                 #[cfg(debug_assertions)]
                 wait_park_gate().await;
                 let notified = slot_freed().notified();
@@ -301,6 +303,7 @@ pub async fn run_on_tip_accept_async<R: Send + 'static>(
                     }
                     Err(TrySendError::Full(j)) => {
                         job = j;
+                        FULL_QUEUE_SPINS.fetch_add(1, Ordering::Relaxed);
                         notified.await;
                     }
                     Err(TrySendError::Disconnected(_)) => panic!("tip-accept thread"),
