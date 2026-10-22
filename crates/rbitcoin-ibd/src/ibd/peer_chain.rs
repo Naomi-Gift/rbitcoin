@@ -257,6 +257,15 @@ impl PeerChain {
         self.probed = false;
     }
 
+    /// Split height that is no longer on `path`, if this peer has one.
+    pub fn off_path_split_height(&self, path: &HashMap<u32, BlockHash>) -> Option<u32> {
+        let (at, _) = self.split?;
+        if path.contains_key(&at) {
+            return None;
+        }
+        Some(at)
+    }
+
     /// The recorded split's height has left the path: compare it with this
     /// node's `confirmed` block there. The same block means this node took
     /// the peer's chain, so the split is gone.

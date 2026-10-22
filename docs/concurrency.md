@@ -152,14 +152,14 @@ short ids on that pool too. An unsolicited compact block that does not
 reconstruct yet persists that header path on the header-job pool.
 `cmpct_tip_announce_shortids_run_off_the_reactor` is the pin.
 
-**Fixed, already zero.** The IBD coordinator holds `shared`
-(`ibd_cancellable`) across the turn, the redial apply, and the event
-drains. A seeded two-block catch-up does no header lookup and no
-`handle_pread_all` on that task. `tip_height`, `has_block`, and
-`block_queue_*` under the lock are RAM. The header thread still reads
-the store (`load_origin`, resume) with the lock dropped around that IO.
-`coord_shared_lock_skips_header_and_store_io` is the pin. Nothing in the
-turn was moved.
+**Fixed.** The IBD coordinator holds `shared` across the turn, the
+redial apply, and the event drains. A peer split whose height has left
+the download path is compared with the confirmed header only while that
+lock is down. `tip_height`, `has_block`, and `block_queue_*` under the
+lock are RAM. The header thread still reads the store (`load_origin`,
+resume) with the lock dropped around that IO.
+`coord_shared_lock_skips_header_and_store_io` and
+`off_path_split_settles_outside_the_coord_lock` are the pins.
 
 **Deferred.** Headers decode and classify are still two blocking joins.
 `decode_framed_offload` drops its permit inside the decode job.

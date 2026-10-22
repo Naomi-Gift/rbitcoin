@@ -622,58 +622,60 @@ pub async fn ibd_cancellable(
 
         let pending_redial = {
             let mut st_guard = HeldShared::lock(&shared);
-            let st = &mut *st_guard;
-            let tip_before_confirm = hub.tip_height();
-            apply_confirm_events(
-                st,
-                hub.as_ref(),
-                &confirm_ev_rx,
-                &archive_write_next,
-                &max_ready_shared,
-                &mut last_progress,
-                Some(confirm_feed.as_ref()),
-            );
-            if hub.tip_height() < tip_before_confirm {
-                confirm_feed.clear();
-            }
-            if let Some(msg) = st.halt.take() {
-                warn!("ibd: engine fault halt: {msg}");
-                halt_err = Some(msg);
-                break;
-            }
-
-            if !drain_ready_peer_and_body_events(
-                st,
-                hub.as_ref(),
-                &mut body_rx,
-                &mut ctrl_rx,
-                &archive_write_next,
-                &loop_stats,
-                peer_sess.book_mut(),
-                local_addr,
-                Some(confirm_feed.as_ref()),
-            )? {
-                break;
-            }
-
-            let tip_now = hub.tip_height().unwrap_or(0);
-            while let Some(&front) = st.ordered.front() {
-                let past = hub.has_block(&front)
-                    || st.hash_height.get(&front).is_some_and(|&ht| ht <= tip_now);
-                if past {
-                    st.ordered.pop_front();
-                    st.ordered_set.remove(&front);
-                } else {
+            let now_cadence = Instant::now();
+            {
+                let st = &mut *st_guard;
+                let tip_before_confirm = hub.tip_height();
+                apply_confirm_events(
+                    st,
+                    hub.as_ref(),
+                    &confirm_ev_rx,
+                    &archive_write_next,
+                    &max_ready_shared,
+                    &mut last_progress,
+                    Some(confirm_feed.as_ref()),
+                );
+                if hub.tip_height() < tip_before_confirm {
+                    confirm_feed.clear();
+                }
+                if let Some(msg) = st.halt.take() {
+                    warn!("ibd: engine fault halt: {msg}");
+                    halt_err = Some(msg);
                     break;
                 }
-            }
-            let now_cadence = Instant::now();
-            if cadence.hygiene_due(now_cadence, st.ordered_bloated()) {
-                st.hygiene();
-                cadence.mark_hygiene(now_cadence);
+
+                if !drain_ready_peer_and_body_events(
+                    st,
+                    hub.as_ref(),
+                    &mut body_rx,
+                    &mut ctrl_rx,
+                    &archive_write_next,
+                    &loop_stats,
+                    peer_sess.book_mut(),
+                    local_addr,
+                    Some(confirm_feed.as_ref()),
+                )? {
+                    break;
+                }
+
+                let tip_now = hub.tip_height().unwrap_or(0);
+                while let Some(&front) = st.ordered.front() {
+                    let past = hub.has_block(&front)
+                        || st.hash_height.get(&front).is_some_and(|&ht| ht <= tip_now);
+                    if past {
+                        st.ordered.pop_front();
+                        st.ordered_set.remove(&front);
+                    } else {
+                        break;
+                    }
+                }
+                if cadence.hygiene_due(now_cadence, st.ordered_bloated()) {
+                    st.hygiene();
+                    cadence.mark_hygiene(now_cadence);
+                }
             }
 
-            if cadence.assign_due(now_cadence, st.inflight.is_empty()) {
+            if cadence.assign_due(now_cadence, st_guard.inflight.is_empty()) {
                 let tip_rate_opt = tip_rate_tracker.eta_rate(now_cadence);
                 let _ = hub.query.block_queue_update_soft_pressure(tip_rate_opt);
                 let (bq_bytes, bq_count) = hub.query.block_queue_stats();
@@ -682,20 +684,40 @@ pub async fn ibd_cancellable(
                     bq_bytes,
                     tip_rate_opt,
                 );
-                let depth = if bq_pipeline_saturated(st.inflight.len(), bq_window_covered) {
+                let depth = if bq_pipeline_saturated(st_guard.inflight.len(), bq_window_covered) {
                     AssignDepth::Critical
                 } else {
                     AssignDepth::Full
                 };
                 let tip_before_assign = hub.tip_height();
-                assign_work_ordered(st, hub.as_ref(), &cfg, &loop_stats, depth, tip_rate_opt);
+                // A split that has left the path is compared with the confirmed
+                // header. That read is store IO, so the coordinator lock is down.
+                let off_path = header_walk::split_heights_off_path(&st_guard);
+                if !off_path.is_empty() {
+                    drop(st_guard);
+                    let mut confirmed = HashMap::with_capacity(off_path.len());
+                    for height in off_path {
+                        confirmed.insert(height, peer_chain::confirmed_at(hub.as_ref(), height));
+                    }
+                    st_guard = HeldShared::lock(&shared);
+                    header_walk::apply_split_confirms(&mut st_guard, &confirmed);
+                }
+                assign_work_ordered(
+                    &mut st_guard,
+                    hub.as_ref(),
+                    &cfg,
+                    &loop_stats,
+                    depth,
+                    tip_rate_opt,
+                );
                 if hub.tip_height() < tip_before_assign {
                     confirm_feed.clear();
                 }
-                sample_peer_rates(&mut st.slots, peer_io::ibd_mono_ms());
+                sample_peer_rates(&mut st_guard.slots, peer_io::ibd_mono_ms());
                 cadence.mark_assign(now_cadence);
             }
 
+            let st = &mut *st_guard;
             offer_confirm_ready(
                 &confirm_feed,
                 &st.height_to_hash,

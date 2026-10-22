@@ -717,13 +717,32 @@ pub fn may_serve(st: &IbdWorkState, peer: usize, hash: &BlockHash) -> bool {
             || !st.slots.iter().any(|s| s.id != peer && tier(s)))
 }
 
-/// Settle each peer's recorded split against this node's confirmed chain once
-/// that height has left the path. Runs before block assignment.
-pub fn settle_peer_splits(st: &mut IbdWorkState, hub: &ChainHub) {
+/// Heights whose recorded split has left the download path.
+pub fn split_heights_off_path(st: &IbdWorkState) -> Vec<u32> {
+    let mut heights = Vec::new();
+    for slot in &st.slots {
+        if let Some(at) = slot.chain.off_path_split_height(&st.height_to_hash) {
+            heights.push(at);
+        }
+    }
+    heights.sort_unstable();
+    heights.dedup();
+    heights
+}
+
+/// Apply confirms already read for off-path splits. A height missing from
+/// `confirmed` appeared while the coordinator lock was down and waits.
+pub fn apply_split_confirms(st: &mut IbdWorkState, confirmed: &HashMap<u32, Option<BlockHash>>) {
     let path = &st.height_to_hash;
     for slot in &mut st.slots {
+        let Some(at) = slot.chain.off_path_split_height(path) else {
+            continue;
+        };
+        if !confirmed.contains_key(&at) {
+            continue;
+        }
         slot.chain
-            .settle_split(path, |ht| super::peer_chain::confirmed_at(hub, ht));
+            .settle_split(path, |ht| confirmed.get(&ht).copied().flatten());
     }
 }
 

@@ -9,3 +9,4 @@ Fixed
 - **Block getdata does not look up headers on a Tokio worker.** A missing header and the block body are both decided on the blocking pool. The session only queues the block or `notfound`.
 - **An announced tip wtxid store error is notfound.** A failure reading that block answers the getdata with notfound and keeps the peer. A failed blocking join still ends the session.
 - **A compact tip announcement does not reconstruct on a Tokio worker.** The block body and its short ids are built on the blocking pool. A missing body still goes out as headers. High-bandwidth relay of a block already in hand builds those short ids there too. An unsolicited compact block persists its header on the header-job pool.
+- **An IBD peer split does not read the header store under the coordinator lock.** Once that split's height has left the download path, the confirmed header is read with the lock down. The header thread is not stuck behind that read.
