@@ -17,10 +17,13 @@ Added
   a signet commitment stays a hard error. With `--proxy` or `--onion`,
   this node's own transactions are still announced on that one session.
   Isolated broadcast stays off. A script or non-final transaction admitted from
-  that session stays through reorg eviction, including after a restart and
-  after a replacement that does not commit. The trusted session is not a
+  that session stays through reorg eviction and a replacement that does not
+  commit. The mark is loaded again only while the mode stays on. A block
+  template skips a marked transaction, and a locally submitted block
+  rechecks that transaction's script. The trusted session is not a
   high-bandwidth compact-block peer. A hostname keeps one current socket.
-  While the mode is on, `warnings` on `getnetworkinfo`,
-  `getblockchaininfo`, and the block template names that peer. The fault
+  While the mode is on, `warnings` on `getnetworkinfo` and
+  `getblockchaininfo` names that peer. The block template includes that
+  line, and omits the `warnings` key when the array would be empty. The fault
   list is `COMPAT.md`. `services.rbitcoin.trustPeer` passes the flag with
   listen off and `max-inbound` 0.
