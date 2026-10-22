@@ -2468,6 +2468,45 @@ fn review_trust_failed_restore_drops_mark() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A marked tx is not mined, and neither is a child that needs it.
+/// A clean tx in the same pool still is.
+#[test]
+fn review_trust_template_skips_marked_chunk() {
+    let dir = tmp_dir();
+    let (ops, utxos) = chain_coins(&[100_000, 100_000]);
+    let clean = spend_tx(ops[0], 90_000);
+    let mut bad = spend_tx(ops[1], 90_000);
+    bad.lock_time = LockTime::from_height(500).unwrap();
+    bad.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+    let low = ChainTipCtx {
+        height: 100,
+        mtp: u32::MAX,
+    };
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let clean_id = mp.accept_tx(&clean, &utxos, TIP_OK).expect("clean").txid;
+    let bad_id = admit_waived(&mut mp, &bad, &utxos, low)
+        .expect("nonfinal")
+        .txid;
+    assert!(mp.trust_kept.contains(&bad_id));
+    let child = spend_tx(
+        OutPoint {
+            txid: bad_id,
+            vout: 0,
+        },
+        80_000,
+    );
+    let child_id = mp
+        .accept_tx(&child, &utxos, TIP_OK)
+        .expect("child of marked")
+        .txid;
+    let picked = mp.select_block_template(mp.template_budget(0), |_| 0);
+    let ids: Vec<_> = picked.iter().map(|(_, s)| s.txid).collect();
+    assert!(ids.contains(&clean_id), "clean tx was skipped");
+    assert!(!ids.contains(&bad_id), "marked tx was selected");
+    assert!(!ids.contains(&child_id), "child of a marked tx was selected");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Script, non-final, immature, and BIP68 faults admit when the session
 /// waive bit is set, and stay through non-final eviction. `accept_tx` stays
 /// strict even when the process flag is on. Policy and a missing parent drop.

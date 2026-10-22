@@ -4561,6 +4561,70 @@ fn review_trust_reorg_mtp_on_second_block() {
     assert_ne!(session.tip_hash(), Some(session_tip));
 }
 
+/// A local block that spends with a marked mempool tx is rejected. The same
+/// block from the trusted session is applied. The template omits that tx.
+#[test]
+fn review_trust_local_block_rechecks_marked_script() {
+    use bitcoin::WPubkeyHash;
+
+    let op_true = ScriptBuf::from_bytes(vec![0x51]);
+    let (dir, hub) = tiny_regtest_hub_labeled("review-marked-block");
+    let wpkh = WPubkeyHash::from_byte_array([0x41; 20]);
+    hub.generate_to_script(1, ScriptBuf::new_p2wpkh(&wpkh), vec![])
+        .unwrap();
+    hub.generate_to_script(101, op_true.clone(), vec![])
+        .unwrap();
+    let cb = hub
+        .query
+        .reconstruct_block_at_height(Height(1))
+        .unwrap()
+        .txdata[0]
+        .clone();
+    let value = cb.output[0].value.to_sat();
+    let mut bad = mature_spend_tx(&hub, 1);
+    bad.output[0].value = Amount::from_sat(value - 1_000);
+    bad.input[0].witness = Witness::from_slice(&[vec![0x01]]);
+    let bad_id = bad.compute_txid();
+    let clean = mature_spend_tx(&hub, 2);
+    let clean_id = clean.compute_txid();
+
+    hub.query.set_trust_peer(true);
+    let mp = attach_mp(dir.path(), &hub);
+    let session = 7u64;
+    mp.set_trusted_session(Some(session));
+    mp.accept_tx_from(&bad, Some(session))
+        .expect("trusted script admit");
+    mp.accept_tx(&clean).expect("clean spend");
+    assert!(mp.lock_read().trust_kept.contains(&bad_id));
+
+    let (_, skip) = mp.tip_script_pres(&[bad.clone(), clean.clone()]);
+    assert!(
+        !skip.contains(&bad_id.to_byte_array()),
+        "a marked tx was treated as script-checked"
+    );
+    assert!(skip.contains(&clean_id.to_byte_array()));
+    let picked = mp.select_block_template(mp.template_budget(0));
+    assert!(picked.iter().any(|(tx, _)| tx.compute_txid() == clean_id));
+    assert!(picked.iter().all(|(tx, _)| tx.compute_txid() != bad_id));
+
+    let block = hub
+        .assemble_block_to_script(op_true, vec![bad])
+        .unwrap();
+    let hash = block.block_hash();
+    let tip = hub.tip_hash();
+    let local = hub.accept_received_block(block.clone());
+    assert!(local.is_err(), "local block kept a bad script: {local:?}");
+    assert_eq!(hub.tip_hash(), tip);
+    let applied = rbitcoin_net::tip_accept::run_on_tip_accept(|| {
+        hub.accept_received_on_lane(block, true)
+    });
+    assert!(
+        matches!(applied, Ok(AcceptOutcome::Accepted { .. })),
+        "trusted session rejected the block: {applied:?}"
+    );
+    assert_eq!(hub.tip_hash(), Some(hash));
+}
+
 /// A sibling that only fails the median check is held for the trusted
 /// session, and a valid child of it can move the tip. A local submit of
 /// that sibling is rejected and not held. Bad proof-of-work is not stored.

@@ -271,13 +271,17 @@ fn select_block_txids_empty_parent_before_child_and_weight_cap() {
         }
     });
     assert_eq!(bump[0], lid, "i64-sized delta reorders selection");
-    let bumped = g.select_block_template(budget(TxGraph::template_tx_weight()), |id| {
-        if id == lid {
-            86 * 100_000_000
-        } else {
-            0
-        }
-    });
+    let bumped = g.select_block_template(
+        budget(TxGraph::template_tx_weight()),
+        |id| {
+            if id == lid {
+                86 * 100_000_000
+            } else {
+                0
+            }
+        },
+        |_| false,
+    );
     assert_eq!(bumped[0].fee_sat, 1_000, "selection reports the base fee");
 
     // Child deprioritised to 0 stays out even when it shares a package with parent.
@@ -393,7 +397,7 @@ fn select_budgets_sigops_skip_and_continue() {
 
     let g = pool(79_598);
     assert_eq!(
-        g.select_block_template(budget(TxGraph::template_tx_weight()), |_| 0),
+        g.select_block_template(budget(TxGraph::template_tx_weight()), |_| 0, |_| false),
         vec![
             Selected {
                 txid: hid,
@@ -421,7 +425,7 @@ fn budget(max_weight_wu: u64) -> SelectBudget {
 }
 
 fn select_ids(g: &TxGraph, budget: SelectBudget, delta: impl Fn(Txid) -> i64) -> Vec<Txid> {
-    g.select_block_template(budget, delta)
+    g.select_block_template(budget, delta, |_| false)
         .into_iter()
         .map(|s| s.txid)
         .collect()

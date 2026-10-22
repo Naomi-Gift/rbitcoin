@@ -1861,9 +1861,9 @@ impl MempoolHub {
             v.iter()
                 .filter(|p| {
                     let id = Txid::from_byte_array(p.txid);
-                    g.graph
-                        .get(&id)
-                        .is_some_and(|e| e.wtxid.to_byte_array() == p.wtxid)
+                    g.graph.get(&id).is_some_and(|e| {
+                        e.wtxid.to_byte_array() == p.wtxid && !g.trust_kept.contains(&id)
+                    })
                 })
                 .map(|p| p.txid)
                 .collect::<HashSet<_>>()

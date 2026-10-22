@@ -1033,11 +1033,14 @@ impl TxGraph {
     /// modified feerate is under `budget.min_sat_kvb` (`-blockmintxfee`) is
     /// skipped whole (Core `BlockAssembler` chunk floor), so a low-fee parent
     /// and its CPFP child go in or out together. `0` admits zero-fee chunks.
-    /// Each [`Selected`] carries the base fee (not the modified fee).
+    /// A chunk that contains a skipped tx, or that would pull one in as an
+    /// ancestor, is left out. Each [`Selected`] carries the base fee (not the
+    /// modified fee).
     pub fn select_block_template(
         &self,
         budget: SelectBudget,
         delta: impl Fn(Txid) -> i64,
+        skip: impl Fn(&Txid) -> bool,
     ) -> Vec<Selected> {
         let SelectBudget {
             max_weight_wu,
@@ -1067,6 +1070,9 @@ impl TxGraph {
         let mut used = 0u64;
         let mut sigops = reserved_sigops;
         for (_, _, ch) in scored {
+            if ch.txids.iter().any(|t| skip(t)) {
+                continue;
+            }
             let mut add = Vec::new();
             for t in &ch.txids {
                 let base = self.entries.get(t).map(|e| e.fee_sat as i128).unwrap_or(0);
@@ -1075,7 +1081,7 @@ impl TxGraph {
                 }
                 self.collect_selected_with_ancestors(*t, &selected, &mut add);
             }
-            if add.is_empty() {
+            if add.is_empty() || add.iter().any(|t| skip(t)) {
                 continue;
             }
             // `add` holds only unselected txs, so these sums are the exact

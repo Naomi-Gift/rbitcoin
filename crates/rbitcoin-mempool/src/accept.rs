@@ -2675,7 +2675,7 @@ impl ActiveMempool {
         delta: impl Fn(Txid) -> i64,
     ) -> Vec<(Arc<Transaction>, Selected)> {
         self.graph
-            .select_block_template(budget, delta)
+            .select_block_template(budget, delta, |id| self.trust_kept.contains(id))
             .into_iter()
             .filter_map(|s| self.bodies.get(&s.txid).map(|tx| (Arc::clone(tx), s)))
             .collect()
