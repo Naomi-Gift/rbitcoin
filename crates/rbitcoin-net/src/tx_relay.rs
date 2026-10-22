@@ -2384,11 +2384,6 @@ impl MempoolHub {
             let mut g = self.lock_write();
             g.last_accept_stages = stages;
             let committed = Self::commit_rechecked(&mut g, tx, prep, utxo, defer_trim, &sample);
-            if waive {
-                if let Ok(r) = &committed.result {
-                    g.trust_kept.insert(r.txid);
-                }
-            }
             stages = g.last_accept_stages;
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
             committed
@@ -2620,6 +2615,7 @@ impl MempoolHub {
             waive,
         };
         let mut prep = self.admit_staged(tx, utxo, spec, &mut stages, &mut lock_us)?;
+        prep.keep_mark = waive;
         // Keep the time the hub already holds, so disk and RAM agree.
         prep.keep_accept_secs = self.accept_time_txid(&prep.txid);
         let sample = self.sample_chain_coins(tx, utxo);

@@ -511,6 +511,9 @@ pub struct PreparedAdmit {
     /// Warn-and-apply faults. Logged only after [`ActiveMempool::finish_commit`]
     /// inserts the tx. Empty on the flag-off path.
     pub trust_warn: Option<Vec<String>>,
+    /// This tx was already marked and is being put back. The new slot keeps
+    /// the byte even when this admit itself does not warn.
+    pub keep_mark: bool,
 }
 
 struct AdmitInputs {
@@ -980,11 +983,7 @@ impl ActiveMempool {
                 }
             }
         }
-        let result = self.commit_after_script(tx, prep)?;
-        if waive {
-            self.trust_kept.insert(result.txid);
-        }
-        Ok(result)
+        self.commit_after_script(tx, prep)
     }
 
     #[doc(hidden)]
@@ -1151,6 +1150,7 @@ impl ActiveMempool {
             utxo_us,
             keep_accept_secs: None,
             trust_warn,
+            keep_mark: false,
         })
     }
 
@@ -1431,7 +1431,7 @@ impl ActiveMempool {
             self.trust_kept.extend(kept_conflicts);
             return Err(AcceptError::Policy("mempool full"));
         }
-        if prep.trust_warn.is_some() {
+        if prep.trust_warn.is_some() || prep.keep_mark {
             self.trust_kept.insert(txid);
             self.store.set_slot_trust_kept(slot, true);
         }
@@ -2130,6 +2130,7 @@ impl ActiveMempool {
                 waive,
             },
         )?;
+        prep.keep_mark = waive;
         prep.keep_accept_secs = accept_secs;
         if let Err(e) = verify_tx_scripts(tx, prep.prevouts.clone()) {
             match trust_script_reason(waive, &e) {
@@ -2137,11 +2138,7 @@ impl ActiveMempool {
                 None => return Err(e),
             }
         }
-        let result = self.commit_after_script(tx, prep)?;
-        if waive {
-            self.trust_kept.insert(result.txid);
-        }
-        Ok(result)
+        self.commit_after_script(tx, prep)
     }
 
     #[doc(hidden)]

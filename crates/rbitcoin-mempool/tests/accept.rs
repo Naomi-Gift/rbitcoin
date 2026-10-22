@@ -2217,9 +2217,7 @@ fn admit_waived(
     tip: ChainTipCtx,
 ) -> Result<AcceptResult, AcceptError> {
     let prep = prepare_waived(mp, tx, utxos, tip)?;
-    let result = mp.commit_after_script(tx, prep)?;
-    mp.trust_kept.insert(result.txid);
-    Ok(result)
+    mp.commit_after_script(tx, prep)
 }
 
 /// A failed replacement puts a warned tx back, and a restart keeps the mark
@@ -2274,6 +2272,71 @@ fn trust_kept_survives_failed_replacement_and_restart() {
         "restart forgot the trust mark"
     );
     again.evict_nonfinal(&utxos, tip);
+    assert!(
+        again.graph.contains(&id),
+        "eviction after restart dropped the warned tx"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A waived admit that does not warn is not marked. A later low tip evicts it,
+/// and a restart does not bring the mark back.
+#[test]
+fn review_trust_clean_admit_is_not_marked() {
+    let dir = tmp_dir();
+    let (op, _, utxos) = chain_utxo(100_000);
+    let mut tx = spend_tx(op, 99_000);
+    tx.lock_time = LockTime::from_height(500).unwrap();
+    tx.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+    let low = ChainTipCtx {
+        height: 100,
+        mtp: u32::MAX,
+    };
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let id = admit_waived(&mut mp, &tx, &utxos, TIP_OK)
+        .expect("final at TIP_OK")
+        .txid;
+    assert!(!mp.trust_kept.contains(&id), "a clean admit was marked");
+    mp.evict_nonfinal(&utxos, low);
+    assert!(!mp.graph.contains(&id));
+    mp.flush().unwrap();
+    drop(mp);
+    let mut again = ActiveMempool::open_or_create(&dir).unwrap();
+    assert!(!again.trust_kept.contains(&id));
+    again.evict_nonfinal(&utxos, low);
+    assert!(!again.graph.contains(&id));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A warned tx put back while it is currently valid keeps the slot byte.
+#[test]
+fn review_trust_restored_mark_survives_restart() {
+    let dir = tmp_dir();
+    let (op, _, utxos) = chain_utxo(100_000);
+    let mut tx = spend_tx(op, 99_000);
+    tx.lock_time = LockTime::from_height(500).unwrap();
+    tx.input[0].sequence = Sequence::from_consensus(0xfffffffe);
+    let low = ChainTipCtx {
+        height: 100,
+        mtp: u32::MAX,
+    };
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let id = admit_waived(&mut mp, &tx, &utxos, low)
+        .expect("nonfinal")
+        .txid;
+    assert!(mp.trust_kept.contains(&id));
+    mp.store.fail_next_append = true;
+    let err = mp
+        .accept_tx(&spend_tx(op, 90_000), &utxos, TIP_OK)
+        .expect_err("replacement insert fails");
+    assert!(matches!(err, AcceptError::Policy("mempool full")), "{err}");
+    assert!(mp.graph.contains(&id));
+    assert!(mp.trust_kept.contains(&id));
+    mp.flush().unwrap();
+    drop(mp);
+    let mut again = ActiveMempool::open_or_create(&dir).unwrap();
+    assert!(again.trust_kept.contains(&id), "restart dropped the mark");
+    again.evict_nonfinal(&utxos, low);
     assert!(
         again.graph.contains(&id),
         "eviction after restart dropped the warned tx"
