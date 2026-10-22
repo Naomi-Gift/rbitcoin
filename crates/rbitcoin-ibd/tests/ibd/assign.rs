@@ -217,21 +217,11 @@ fn off_path_split_settles_outside_the_coord_lock() {
         vec![0],
         "the foreign genesis split has left the path"
     );
+    let shared = std::sync::Mutex::new(st);
     let before = rbitcoin_query::header_lookup_count();
     let _probe = rbitcoin_store::HeaderThreadProbe::arm();
     rbitcoin_query::reset_header_lookups_under_coord_lock();
-    let mut confirmed = HashMap::new();
-    {
-        let _lock = rbitcoin_store::CoordSharedLock::enter();
-        assert!(rbitcoin_store::coord_shared_lock_held());
-    }
-    for height in heights {
-        confirmed.insert(
-            height,
-            rbitcoin_ibd::ibd::peer_chain::confirmed_at(&hub, height),
-        );
-    }
-    rbitcoin_ibd::ibd::header_walk::apply_split_confirms(&mut st, &confirmed);
+    rbitcoin_ibd::ibd::settle_off_path_for_test(&shared, &hub);
     assert!(
         rbitcoin_query::header_lookup_count() > before,
         "settling the split read the confirmed header"
@@ -242,6 +232,7 @@ fn off_path_split_settles_outside_the_coord_lock() {
         "that read ran while the coordinator lock was down"
     );
     assert_eq!(rbitcoin_store::coord_lock_store_reads(), 0);
+    let st = shared.lock().unwrap_or_else(|err| err.into_inner());
     assert!(
         st.slots[0].chain.left_path_by(&HashMap::new(), 0),
         "a different confirmed block leaves the peer off the path"

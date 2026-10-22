@@ -142,6 +142,35 @@ impl std::ops::DerefMut for HeldShared<'_> {
     }
 }
 
+/// Off-path split heights are compared with the confirmed header. That
+/// read is store IO, so `shared` is not held across it. A height that
+/// appears while the lock is down is absent from the map and waits.
+fn settle_off_path_splits<'a>(
+    mut st_guard: HeldShared<'a>,
+    shared: &'a std::sync::Mutex<state::IbdWorkState>,
+    hub: &ChainHub,
+) -> HeldShared<'a> {
+    let off_path = header_walk::split_heights_off_path(&st_guard);
+    if off_path.is_empty() {
+        return st_guard;
+    }
+    drop(st_guard);
+    let mut confirmed = HashMap::with_capacity(off_path.len());
+    for height in off_path {
+        confirmed.insert(height, peer_chain::confirmed_at(hub, height));
+    }
+    st_guard = HeldShared::lock(shared);
+    header_walk::apply_split_confirms(&mut st_guard, &confirmed);
+    st_guard
+}
+
+/// Same drop, read, and apply as the coordinator assign turn.
+#[doc(hidden)]
+pub fn settle_off_path_for_test(shared: &std::sync::Mutex<state::IbdWorkState>, hub: &ChainHub) {
+    let st_guard = HeldShared::lock(shared);
+    drop(settle_off_path_splits(st_guard, shared, hub));
+}
+
 /// Default max **concurrent** unique block downloads (in-flight getdata).
 ///
 /// Not a tip-distance ceiling: archive may run to the end of the known header
@@ -690,18 +719,7 @@ pub async fn ibd_cancellable(
                     AssignDepth::Full
                 };
                 let tip_before_assign = hub.tip_height();
-                // A split that has left the path is compared with the confirmed
-                // header. That read is store IO, so the coordinator lock is down.
-                let off_path = header_walk::split_heights_off_path(&st_guard);
-                if !off_path.is_empty() {
-                    drop(st_guard);
-                    let mut confirmed = HashMap::with_capacity(off_path.len());
-                    for height in off_path {
-                        confirmed.insert(height, peer_chain::confirmed_at(hub.as_ref(), height));
-                    }
-                    st_guard = HeldShared::lock(&shared);
-                    header_walk::apply_split_confirms(&mut st_guard, &confirmed);
-                }
+                st_guard = settle_off_path_splits(st_guard, &shared, hub.as_ref());
                 assign_work_ordered(
                     &mut st_guard,
                     hub.as_ref(),
