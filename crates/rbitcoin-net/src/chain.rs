@@ -802,6 +802,9 @@ impl ChainHub {
         if self.tip_hash() != Some(block.header.prev_blockhash) {
             return;
         }
+        // Wtxid membership walks every transaction. Callers on a Tokio worker
+        // enter a blocking region first.
+        crate::reactor::assert_not_reactor("cmpct prefill");
         let hash = block.block_hash();
         {
             let g = self.prefill_plan.lock().expect("prefill plan");

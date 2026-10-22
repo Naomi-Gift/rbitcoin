@@ -5138,27 +5138,42 @@ async fn cmpct_tip_announce(
     .map_err(|_| NetError::Protocol("cmpct announce join failed"))
 }
 
-/// Short ids for a block already in hand. An `Arc` hub builds them on the
-/// blocking pool. A stack hub (tests) builds them inline.
+/// Header persist, prefill, and short ids for a block already in hand.
+///
+/// An `Arc` hub does all three on the blocking pool. A stack hub (tests)
+/// does them inline. `Ok(None)` is a header the store refused or a body
+/// that did not become a compact message. A closed permit or a failed
+/// join is `Err`, the same class as [`cmpct_tip_announce`].
 async fn cmpct_announce_off_session(
     hub: &ChainHub,
     block: Block,
     cmpct_version: u32,
-) -> Option<NetworkMessage> {
+) -> Result<Option<NetworkMessage>, NetError> {
     let Some(owned) = hub.shared_arc() else {
-        return cmpct_announce_from_block(hub, &block, cmpct_version);
+        return Ok(hb_relay_message(hub, &block, cmpct_version));
     };
-    let Ok(permit) = block_reconstruct_permit().await else {
-        return None;
-    };
-    tokio::task::spawn_blocking(move || {
+    let permit = block_reconstruct_permit().await?;
+    let joined = tokio::task::spawn_blocking(move || {
         let _region = crate::reactor::BlockingRegion::enter();
         let _permit = permit;
-        cmpct_announce_from_block(owned.as_ref(), &block, cmpct_version)
+        hb_relay_message(owned.as_ref(), &block, cmpct_version)
     })
-    .await
-    .ok()
-    .flatten()
+    .await;
+    map_cmpct_relay_join(joined)
+}
+
+fn hb_relay_message(hub: &ChainHub, block: &Block, cmpct_version: u32) -> Option<NetworkMessage> {
+    if hub.ensure_header(&block.header).is_err() {
+        return None;
+    }
+    hub.remember_cmpct_prefill_from_block(block);
+    cmpct_announce_from_block(hub, block, cmpct_version)
+}
+
+/// A panicked or cancelled blocking job is not "no compact message".
+#[doc(hidden)]
+pub fn map_cmpct_relay_join<T>(joined: Result<T, tokio::task::JoinError>) -> Result<T, NetError> {
+    joined.map_err(|_| NetError::Protocol("cmpct relay join failed"))
 }
 
 /// Send `cmpctblock` to peers who asked for high-bandwidth announcements
@@ -5191,14 +5206,17 @@ pub async fn relay_new_pow_valid_block(
     if block.header.prev_blockhash != tip {
         return;
     }
-    if hub.ensure_header(&block.header).is_err() {
-        return;
-    }
-    hub.remember_cmpct_prefill_from_block(block);
+    let msg = match cmpct_announce_off_session(hub, block.clone(), 2).await {
+        Ok(msg) => msg,
+        Err(e) => {
+            rbitcoin_log::warn!("p2p: high-bandwidth compact relay skipped: {e}");
+            return;
+        }
+    };
     let Some(ph) = from.and_then(|s| s.peer_hub()) else {
         return;
     };
-    let Some(msg) = cmpct_announce_off_session(hub, block.clone(), 2).await else {
+    let Some(msg) = msg else {
         return;
     };
     let from_id = from.map(|s| s.id);

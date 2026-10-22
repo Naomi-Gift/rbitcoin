@@ -5090,6 +5090,49 @@ fn announced_wtx_store_error_is_notfound() {
     assert!(hit.input.is_empty());
 }
 
+/// A failed compact-relay blocking job is a protocol error, not a missing body.
+#[tokio::test]
+async fn cmpct_relay_join_failure_is_protocol() {
+    let joined = tokio::task::spawn_blocking(|| -> Option<NetworkMessage> {
+        panic!("short ids");
+    })
+    .await;
+    let err = map_cmpct_relay_join(joined).expect_err("join failure");
+    assert!(err.to_string().contains("cmpct relay join failed"), "{err}");
+}
+
+/// Header persist and the prefill walk for a high-bandwidth relay run off
+/// the session worker. Prefill is on, so the walk is not skipped.
+#[test]
+fn hb_relay_prefill_runs_off_the_reactor() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("hb-relay-off-reactor");
+    hub.ensure_genesis().unwrap();
+    hub.set_prefill_compact(true);
+    let prev = hub.tip_hash().unwrap();
+    let block = rbitcoin_consensus::mine_regtest_paying(
+        prev,
+        hub.tip_header().unwrap().time.saturating_add(600),
+        hub.tip_height().unwrap().saturating_add(1),
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![],
+    );
+    let hub = hub.into_arc();
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("tokio-rt-worker")
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async move {
+        tokio::spawn(async move {
+            relay_new_pow_valid_block(&hub, &block, None).await;
+        })
+        .await
+        .expect("prefill and header persist left the reactor");
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Compact tip short ids are built with the body load, off the session worker.
 #[test]
 fn cmpct_tip_announce_shortids_run_off_the_reactor() {
