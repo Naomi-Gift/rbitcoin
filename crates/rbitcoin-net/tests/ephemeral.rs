@@ -342,11 +342,17 @@ async fn ephemeral_broadcast_known_tx_one_shot() {
         );
         true
     });
+    let socks_l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy = socks_l.local_addr().unwrap();
+    let splice = tokio::spawn(async move {
+        let (s, _) = socks_l.accept().await.unwrap();
+        splice_after_userpass(s, peer_addr).await;
+    });
     let mut am = AddrMan::new();
     am.add(peer_addr);
     let tx = dummy_tx();
     isolated_broadcast_known_tx(
-        &Dialer::Direct,
+        &Dialer::socks(proxy, true),
         &Mutex::new(am),
         Magic::REGTEST,
         "/rbitcoin:test/",
@@ -355,4 +361,5 @@ async fn ephemeral_broadcast_known_tx_one_shot() {
     )
     .await;
     assert!(inbound.await.unwrap(), "one-shot reached the peer");
+    splice.abort();
 }
