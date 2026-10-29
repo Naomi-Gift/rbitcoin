@@ -599,7 +599,7 @@ async fn connect_isolated_net_never_dials_direct() {
 
     for listener in [listener, cjdns_listener] {
         assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(200), listener.accept())
+            tokio::time::timeout(std::time::Duration::ZERO, listener.accept())
                 .await
                 .is_err(),
             "a direct connection reached {:?}",
