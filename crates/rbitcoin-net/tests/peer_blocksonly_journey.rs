@@ -482,8 +482,12 @@ async fn returned_tx_ends_the_private_broadcast(
             wtxid_peer.set_wtxid_relay();
             let (w_out, mut w_rx) = mpsc::unbounded_channel();
             let mut w_follow = PeerFollowState::new();
-            push(hub, &w_out, &mut w_follow, Some(wtxid_peer.as_ref()), NetworkMessage::Inv(vec![item])).await;
-            assert!(getdata_txs(&mut w_rx).is_empty(), "a wtxid-relay peer's txid inv is ignored");
+            let unknown = Inventory::WitnessTransaction(bitcoin::Txid::from_byte_array([0x5a; 32]));
+            push(hub, &w_out, &mut w_follow, Some(wtxid_peer.as_ref()), NetworkMessage::Inv(vec![item, unknown])).await;
+            assert!(
+                getdata_txs(&mut w_rx).is_empty(),
+                "a wtxid-relay peer's txid inv is ignored for every tx, ours or not"
+            );
             peers.unregister(wtxid_peer.id);
         }
 

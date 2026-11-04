@@ -3892,6 +3892,9 @@ pub fn on_inv(
                 }
             }
             Inventory::Transaction(txid) | Inventory::WitnessTransaction(txid) => {
+                if session.is_some_and(|s| s.wtxid_relay()) {
+                    continue;
+                }
                 if tx_inv_hex.is_none() {
                     tx_inv_hex = Some(txid.to_string());
                 }
@@ -4014,7 +4017,7 @@ pub fn on_inv_txid(
         if let Some(s) = session {
             let _ = mp.add_orphan_announcer(txid, s.id);
         }
-        if !asks_back_local_tx(mp, session, txid) || session.is_some_and(|s| s.wtxid_relay()) {
+        if !asks_back_local_tx(mp, session, txid) {
             return None;
         }
     }
