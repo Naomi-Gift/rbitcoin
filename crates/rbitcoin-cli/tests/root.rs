@@ -121,11 +121,21 @@ fn rpc_url_is_host_and_port() {
 
 #[test]
 fn param_tokens_json_or_string() {
-    assert_eq!(param_value("getblockhash", 0, "0"), serde_json::json!(0));
-    assert_eq!(param_value("getblock", 0, "0"), serde_json::json!("0"));
-    assert_eq!(param_value("getblock", 1, "true"), serde_json::json!(true));
     assert_eq!(
-        param_value("getblockhash", 0, "abc"),
+        param_value("getblockhash", 0, "0").unwrap(),
+        serde_json::json!(0)
+    );
+    assert_eq!(
+        param_value("getblock", 0, "0").unwrap(),
+        serde_json::json!("0")
+    );
+    assert_eq!(
+        param_value("getblock", 1, "true").unwrap(),
+        serde_json::json!(true)
+    );
+    assert!(param_value("getblockhash", 0, "abc").is_err());
+    assert_eq!(
+        param_value("getblockstats", 0, "abc").unwrap(),
         serde_json::json!("abc")
     );
 }
@@ -341,13 +351,20 @@ fn parse_args_dash_alpha_is_still_rejected() {
 
 #[test]
 fn parse_args_double_dash_ends_option_parsing() {
-    match parse_args(&os_args(&["rbitcoin-cli", "getblockhash", "--", "-1"])) {
+    match parse_args(&os_args(&[
+        "rbitcoin-cli",
+        "getblock",
+        "--",
+        "--datadir",
+        "x",
+    ])) {
         Ok(Action::Call(cfg)) => {
-            assert_eq!(cfg.command.as_deref(), Some("getblockhash"));
-            assert_eq!(cfg.params, vec!["-1".to_string()]);
+            assert_eq!(cfg.command.as_deref(), Some("getblock"));
+            assert_eq!(cfg.datadir, PathBuf::from(".").join("datadir"));
+            assert_eq!(cfg.params, vec!["--datadir".to_string(), "x".to_string()]);
         }
         Err(e) => panic!("unexpected error: {e}"),
-        Ok(_) => panic!("expected Action::Call, got Help or Version"),
+        Ok(_) => panic!("expected Action::Call"),
     }
 }
 
@@ -372,6 +389,27 @@ fn getblock_keeps_a_digit_only_hash_a_string() {
         params,
         vec![serde_json::json!("123456789"), serde_json::json!(2)]
     );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = h.join();
+}
+
+#[cfg(unix)]
+#[test]
+fn getnetworkhashps_negative_nblocks_is_a_number() {
+    use std::os::unix::net::UnixListener;
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let (captured, h) = serve_one_rpc(UnixListener::bind(&sock).unwrap());
+    let code = cli_main([
+        "rbitcoin-cli",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "getnetworkhashps",
+        "-1",
+    ]);
+    assert!(exit_ok(code), "getnetworkhashps must succeed, got {code:?}");
+    let params = captured.lock().unwrap().take().unwrap();
+    assert_eq!(params, vec![serde_json::json!(-1)]);
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
 }
