@@ -6,8 +6,6 @@ use rbitcoin_primitives::Network;
 use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 /// [`NodeEnv::from_lookup`] over literal pairs, matched exactly. The last pair
 /// for a name wins.
 fn env_of(vars: &[(&str, &str)]) -> Result<NodeEnv, rbitcoin_node::NodeError> {
@@ -20,11 +18,7 @@ fn env_of(vars: &[(&str, &str)]) -> Result<NodeEnv, rbitcoin_node::NodeError> {
 }
 
 fn tmp_datadir() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("rbitcoin-cli-{n}"))
+    rbitcoin_store::testutil::fresh_path("node-cli")
 }
 
 /// `ExitCode` is not `PartialEq`; compare via `Debug` (stable, sufficient for tests).

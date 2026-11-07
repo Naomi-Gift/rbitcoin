@@ -5,14 +5,7 @@ use rbitcoin_store::file::FILE_HEADER_LEN;
 use std::sync::atomic::Ordering;
 
 fn tmp_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "rbitcoin-array-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+    rbitcoin_store::testutil::fresh_path("array")
 }
 
 /// `get` samples `len` and the slot under one sequence counter. A `truncate`

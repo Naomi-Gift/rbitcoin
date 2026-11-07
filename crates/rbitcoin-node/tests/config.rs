@@ -3,14 +3,10 @@ use rbitcoin_node::config::*;
 use rbitcoin_primitives::Network;
 use rbitcoin_store::HeadScale;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 fn tmp() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("rbitcoin-node-cfg-{n}"))
+    rbitcoin_store::testutil::fresh_path("node-cfg")
 }
 
 #[test]

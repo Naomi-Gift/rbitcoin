@@ -3,14 +3,7 @@ use rbitcoin_store::error::StoreError;
 use rbitcoin_store::hashhead::*;
 
 fn tmp_path() -> std::path::PathBuf {
-    std::env::temp_dir().join(format!(
-        "rbitcoin-hh-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ))
+    rbitcoin_store::testutil::fresh_path("hh")
 }
 
 #[test]

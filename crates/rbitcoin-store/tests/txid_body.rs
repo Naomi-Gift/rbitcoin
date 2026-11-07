@@ -1,15 +1,8 @@
 use rbitcoin_primitives::Fk;
 use rbitcoin_store::error::StoreError;
 use rbitcoin_store::txid_body::*;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 fn tmp() -> std::path::PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("rbitcoin-txid-body-{n}"));
-    let _ = std::fs::remove_dir_all(&p);
+    let p = rbitcoin_store::testutil::fresh_path("txid-body");
     std::fs::create_dir_all(&p).unwrap();
     p
 }

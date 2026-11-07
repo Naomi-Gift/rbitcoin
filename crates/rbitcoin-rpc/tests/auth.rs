@@ -1,14 +1,9 @@
 use rbitcoin_rpc::auth::*;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn tmp() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    std::env::temp_dir().join(format!("rbitcoin-rpc-auth-{n}"))
+    rbitcoin_store::testutil::fresh_path("rpc-auth")
 }
 
 #[test]
