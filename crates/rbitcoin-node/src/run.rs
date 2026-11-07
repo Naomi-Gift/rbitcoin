@@ -779,7 +779,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         config.listen.connect_dns.clone(),
         config.network.default_p2p_port(),
     );
-    let dns_resolved = if shutdown.requested() {
+    // A `--proxy` resolves connect names itself; a local lookup would leak them.
+    let dns_resolved = if shutdown.requested() || config.listen.proxy.is_some() {
         Vec::new()
     } else {
         resolve_connect_dns(&config.listen.connect_dns, config.network).await

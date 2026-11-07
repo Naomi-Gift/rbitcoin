@@ -1705,3 +1705,47 @@ fn tx_relay_room_ignores_outbound_and_non_relay() {
         "outbound relay and a non-relaying inbound are outside the tx-relay cap"
     );
 }
+
+/// With `--proxy`, a `--connect` or `addnode` name goes to the proxy as a
+/// domain (SOCKS address type 3). The node never asks the OS resolver, so
+/// the unresolvable `.invalid` name still produces a dial.
+#[test]
+fn proxy_dials_connect_host_by_name() {
+    let hub = PeerHub::new();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    hub.set_dialer(tx);
+    hub.set_proxies(rbitcoin_net::NetProxies {
+        dialer: rbitcoin_net::Dialer::socks("127.0.0.1:9050".parse().unwrap(), true),
+        i2p_sam: None,
+    });
+    hub.set_connect_hosts(vec!["peer.invalid:8333".into()], 8333);
+    hub.redial_remembered();
+    hub.addnode_host("other.invalid", "onetry", 8333).unwrap();
+    let got = take_dials(&mut rx);
+    let names: Vec<_> = got
+        .iter()
+        .map(|d| match &d.target {
+            DialTarget::Domain { host, port } => format!("{host}:{port}"),
+            DialTarget::Socket(a) => panic!("resolved locally to {a}"),
+        })
+        .collect();
+    assert_eq!(names, ["peer.invalid:8333", "other.invalid:8333"]);
+}
+
+/// An IPv6 literal needs no lookup. Under `--proxy` it stays a socket target,
+/// not a domain cut at its last colon.
+#[test]
+fn proxy_keeps_ipv6_literals_as_sockets() {
+    let hub = PeerHub::new();
+    hub.set_proxies(rbitcoin_net::NetProxies {
+        dialer: rbitcoin_net::Dialer::socks("127.0.0.1:9050".parse().unwrap(), true),
+        i2p_sam: None,
+    });
+    hub.note_default_port(8333);
+    for literal in ["::1", "2001:db8::1"] {
+        match hub.host_dial_target(literal).unwrap() {
+            DialTarget::Socket(addr) => assert_eq!(addr.port(), 8333),
+            DialTarget::Domain { host, .. } => panic!("{literal} became domain {host}"),
+        }
+    }
+}
