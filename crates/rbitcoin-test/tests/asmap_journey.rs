@@ -127,10 +127,7 @@ impl Drop for NodeProc {
 }
 
 fn node_bin() -> PathBuf {
-    // Cargo 1.95 names this `CARGO_BIN_EXE_journey-node` (the target name,
-    // hyphen kept). Do not rebuild that path from `CARGO_TARGET_DIR`: the
-    // nightly mutants job leaves the variable unset, and cargo then writes
-    // `target/debug`, not `target/dev`.
+    // Cargo 1.95 keeps the hyphen in `CARGO_BIN_EXE_journey-node`.
     let bin = PathBuf::from(env!("CARGO_BIN_EXE_journey-node"));
     assert!(
         bin.is_file(),
@@ -140,9 +137,6 @@ fn node_bin() -> PathBuf {
     bin
 }
 
-/// Nightly mutants does not set `CARGO_TARGET_DIR`. Cargo then writes
-/// `target/debug/journey-node`. A runtime lookup of `target/dev` misses it
-/// and the workspace baseline exits before any mutant.
 #[test]
 fn journey_node_ignores_a_decoy_target_dir() {
     if std::env::var_os("RBITCOIN_DECOY_TARGET").is_some() {
