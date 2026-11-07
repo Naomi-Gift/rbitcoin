@@ -11,6 +11,82 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
+/// Mirrors the non-string parameter positions the RPC handlers read in
+/// `crates/rbitcoin-rpc/src/methods/`. A handler change that adds or moves a
+/// non-string parameter must add or update the matching row here in the same
+/// change, or a new argument ships as a string.
+const CONVERT_PARAMS: &[(&str, usize, ParamFormat)] = &[
+    ("addconnection", 2, ParamFormat::Json),
+    ("addnode", 2, ParamFormat::Json),
+    ("addpeeraddress", 1, ParamFormat::Json),
+    ("addpeeraddress", 2, ParamFormat::Json),
+    ("decoderawtransaction", 1, ParamFormat::Json),
+    ("disconnectnode", 1, ParamFormat::Json),
+    ("echojson", 0, ParamFormat::Json),
+    ("echojson", 1, ParamFormat::Json),
+    ("echojson", 2, ParamFormat::Json),
+    ("echojson", 3, ParamFormat::Json),
+    ("echojson", 4, ParamFormat::Json),
+    ("echojson", 5, ParamFormat::Json),
+    ("echojson", 6, ParamFormat::Json),
+    ("echojson", 7, ParamFormat::Json),
+    ("echojson", 8, ParamFormat::Json),
+    ("echojson", 9, ParamFormat::Json),
+    ("estimaterawfee", 0, ParamFormat::Json),
+    ("estimaterawfee", 1, ParamFormat::Json),
+    ("estimatesmartfee", 0, ParamFormat::Json),
+    ("estimatesmartfee", 2, ParamFormat::Json),
+    ("generate", 0, ParamFormat::Json),
+    ("generate", 1, ParamFormat::Json),
+    ("generateblock", 1, ParamFormat::Json),
+    ("generateblock", 2, ParamFormat::Json),
+    ("generatetoaddress", 0, ParamFormat::Json),
+    ("generatetoaddress", 2, ParamFormat::Json),
+    ("generatetodescriptor", 0, ParamFormat::Json),
+    ("generatetodescriptor", 2, ParamFormat::Json),
+    ("getblock", 1, ParamFormat::Json),
+    ("getblockhash", 0, ParamFormat::Json),
+    ("getblockheader", 1, ParamFormat::Json),
+    ("getblockstats", 0, ParamFormat::JsonOrString),
+    ("getblockstats", 1, ParamFormat::Json),
+    ("getblocktemplate", 0, ParamFormat::Json),
+    ("getmempoolancestors", 1, ParamFormat::Json),
+    ("getmempooldescendants", 1, ParamFormat::Json),
+    ("getnetworkhashps", 0, ParamFormat::Json),
+    ("getnetworkhashps", 1, ParamFormat::Json),
+    ("getnodeaddresses", 0, ParamFormat::Json),
+    ("getorphantxs", 0, ParamFormat::Json),
+    ("getrawmempool", 0, ParamFormat::Json),
+    ("getrawmempool", 1, ParamFormat::Json),
+    ("getrawtransaction", 1, ParamFormat::Json),
+    ("gettxout", 1, ParamFormat::Json),
+    ("gettxout", 2, ParamFormat::Json),
+    ("gettxspendingprevout", 0, ParamFormat::Json),
+    ("importmempool", 1, ParamFormat::Json),
+    ("mockscheduler", 0, ParamFormat::Json),
+    ("prioritisetransaction", 1, ParamFormat::Json),
+    ("prioritisetransaction", 2, ParamFormat::Json),
+    ("sendrawtransaction", 1, ParamFormat::JsonOrString),
+    ("sendrawtransaction", 2, ParamFormat::JsonOrString),
+    ("setmocktime", 0, ParamFormat::Json),
+    ("stop", 0, ParamFormat::Json),
+    ("submitpackage", 0, ParamFormat::Json),
+    ("submitpackage", 1, ParamFormat::JsonOrString),
+    ("submitpackage", 2, ParamFormat::JsonOrString),
+    ("testmempoolaccept", 0, ParamFormat::Json),
+    ("testmempoolaccept", 1, ParamFormat::JsonOrString),
+    ("waitforblock", 1, ParamFormat::Json),
+    ("waitforblockheight", 0, ParamFormat::Json),
+    ("waitforblockheight", 1, ParamFormat::Json),
+    ("waitfornewblock", 0, ParamFormat::Json),
+];
+
+#[derive(Clone, Copy)]
+enum ParamFormat {
+    Json,
+    JsonOrString,
+}
+
 #[doc(hidden)]
 pub fn usage() -> String {
     format!(
@@ -80,44 +156,56 @@ pub fn flag_name_and_eq(raw: &str) -> Option<(&str, Option<&str>)> {
     }
 }
 
+fn is_negative_number(a: &str) -> bool {
+    a.as_bytes().get(1).is_some_and(|b| b.is_ascii_digit())
+}
+
 #[doc(hidden)]
 pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
     let mut cfg = CliConfig::default();
+    let mut positional_only = false;
     let mut i = 1usize;
     while i < args.len() {
         let a = args[i].to_string_lossy();
-        if a == "--help" || a == "-h" {
-            return Ok(Action::Help);
-        }
-        if a == "--version" || a == "-V" {
-            return Ok(Action::Version);
-        }
-        if a.starts_with('-') && !a.starts_with("--") {
-            return Err(format!("unknown argument `{a}`"));
-        }
-        if let Some((name, eq)) = flag_name_and_eq(a.as_ref()) {
-            let val = match eq {
-                Some(v) => {
-                    if v.is_empty() {
-                        return Err(format!("--{name} requires a value"));
-                    }
-                    v.to_string()
-                }
-                None => take_value(args, &mut i, &format!("--{name}"))?,
-            };
-            match name {
-                "datadir" => cfg.datadir = PathBuf::from(val),
-                "network" => {
-                    cfg.network =
-                        Network::parse(&val).map_err(|e| format!("invalid --network: {e}"))?;
-                }
-                "rpc-url" => cfg.rpc_url = Some(val),
-                "rpc-socket" => cfg.socket = Some(PathBuf::from(val)),
-                "rpc-token-file" => cfg.token_file = Some(PathBuf::from(val)),
-                other => return Err(format!("unknown argument `--{other}`")),
+        if !positional_only {
+            if a == "--help" || a == "-h" {
+                return Ok(Action::Help);
             }
-            i += 1;
-            continue;
+            if a == "--version" || a == "-V" {
+                return Ok(Action::Version);
+            }
+            if a == "--" {
+                positional_only = true;
+                i += 1;
+                continue;
+            }
+            if a.starts_with('-') && !a.starts_with("--") && !is_negative_number(a.as_ref()) {
+                return Err(format!("unknown argument `{a}`"));
+            }
+            if let Some((name, eq)) = flag_name_and_eq(a.as_ref()) {
+                let val = match eq {
+                    Some(v) => {
+                        if v.is_empty() {
+                            return Err(format!("--{name} requires a value"));
+                        }
+                        v.to_string()
+                    }
+                    None => take_value(args, &mut i, &format!("--{name}"))?,
+                };
+                match name {
+                    "datadir" => cfg.datadir = PathBuf::from(val),
+                    "network" => {
+                        cfg.network =
+                            Network::parse(&val).map_err(|e| format!("invalid --network: {e}"))?;
+                    }
+                    "rpc-url" => cfg.rpc_url = Some(val),
+                    "rpc-socket" => cfg.socket = Some(PathBuf::from(val)),
+                    "rpc-token-file" => cfg.token_file = Some(PathBuf::from(val)),
+                    other => return Err(format!("unknown argument `--{other}`")),
+                }
+                i += 1;
+                continue;
+            }
         }
         if cfg.command.is_none() {
             cfg.command = Some(a.into_owned());
@@ -235,9 +323,26 @@ pub fn read_token(path: &Path) -> Result<String, String> {
     Ok(t.to_string())
 }
 
+fn convert_format(method: &str, index: usize) -> Option<ParamFormat> {
+    for &(m, i, f) in CONVERT_PARAMS {
+        if m == method && i == index {
+            return Some(f);
+        }
+    }
+    None
+}
+
 #[doc(hidden)]
-pub fn param_value(raw: &str) -> Value {
-    serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string()))
+pub fn param_value(method: &str, index: usize, raw: &str) -> Result<Value, String> {
+    match convert_format(method, index) {
+        None => Ok(Value::String(raw.to_string())),
+        Some(ParamFormat::Json) => {
+            serde_json::from_str(raw).map_err(|_| format!("Error parsing JSON: {raw}"))
+        }
+        Some(ParamFormat::JsonOrString) => {
+            Ok(serde_json::from_str(raw).unwrap_or_else(|_| Value::String(raw.to_string())))
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -337,7 +442,12 @@ pub fn dispatch_call(cfg: &CliConfig) -> Result<String, String> {
     if cmd == "help" {
         return Ok(usage());
     }
-    let params: Vec<Value> = cfg.params.iter().map(|p| param_value(p)).collect();
+    let params: Vec<Value> = cfg
+        .params
+        .iter()
+        .enumerate()
+        .map(|(i, p)| param_value(cmd, i, p))
+        .collect::<Result<_, _>>()?;
     let sock = socket_path(cfg);
     let result = if cfg.rpc_url.is_none() && (cfg.socket.is_some() || sock.exists()) {
         let stream = connect_unix(&sock)?;
