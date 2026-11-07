@@ -2,15 +2,9 @@ use rbitcoin_node::config::NodeConfig;
 use rbitcoin_node::error::NodeError;
 use rbitcoin_node::lock::*;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 fn tmp() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("rbitcoin-dirlock-{n}"));
-    let _ = std::fs::remove_dir_all(&p);
+    let p = rbitcoin_store::testutil::fresh_path("dirlock");
     std::fs::create_dir_all(&p).unwrap();
     p
 }

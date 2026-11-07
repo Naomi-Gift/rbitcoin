@@ -6,14 +6,8 @@ use rbitcoin_store::segmented_head::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 fn tmp() -> PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("rbitcoin-seghead-{n}"));
+    let p = rbitcoin_store::testutil::fresh_path("seghead");
     std::fs::create_dir_all(&p).unwrap();
     p
 }

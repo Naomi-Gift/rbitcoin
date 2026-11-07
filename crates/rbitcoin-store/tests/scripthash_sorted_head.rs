@@ -6,14 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
 fn tmp() -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "rbitcoin-shsort-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
+    let p = rbitcoin_store::testutil::fresh_path("shsort");
     let _ = std::fs::create_dir_all(&p);
     p.join("head")
 }

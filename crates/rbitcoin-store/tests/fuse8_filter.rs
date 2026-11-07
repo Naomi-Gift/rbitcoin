@@ -1,14 +1,8 @@
 use rbitcoin_store::binary_fuse8::{BinaryFuse8, Fingerprints};
 use rbitcoin_store::error::StoreError;
 use rbitcoin_store::fuse8_filter::*;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 fn tmp() -> std::path::PathBuf {
-    let n = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let p = std::env::temp_dir().join(format!("rbitcoin-fuse8-{n}"));
+    let p = rbitcoin_store::testutil::fresh_path("fuse8");
     let _ = std::fs::create_dir_all(&p);
     p
 }
