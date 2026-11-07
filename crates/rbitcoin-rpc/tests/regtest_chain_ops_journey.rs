@@ -642,7 +642,12 @@ fn chain_ops_generate_count_is_core_int(ctx: &RpcContext) {
 /// negative height is already reached.
 fn chain_ops_index_args_are_core_ints(ctx: &RpcContext) {
     let txid = json!("00".repeat(32));
-    for n in [json!(4_294_967_296_u64), json!(-1), json_num("1.5")] {
+    for n in [
+        json!(4_294_967_296_u64),
+        json!(-1),
+        json_num("-0"),
+        json_num("1.5"),
+    ] {
         let err = dispatch(ctx, "gettxout", vec![txid.clone(), n.clone()]).unwrap_err();
         assert_eq!(err["code"], ERR_MISC, "gettxout n={n}: {err}");
         assert_eq!(err["message"], "JSON integer out of range", "gettxout n={n}: {err}");

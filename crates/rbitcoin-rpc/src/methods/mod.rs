@@ -666,6 +666,7 @@ pub fn json_u64(v: &Value) -> Option<u64> {
 
 /// Core `UniValue::getInt<T>`: a non-number is `-3`. A fraction, an
 /// exponent, or a value outside `T` is `-1` `JSON integer out of range`.
+/// An unsigned `T` refuses any leading minus, `-0` included.
 pub fn core_json_int<T: TryFrom<i64>>(v: &Value) -> Result<T, Value> {
     let Value::Number(n) = v else {
         return Err(rpc_error(
@@ -676,7 +677,9 @@ pub fn core_json_int<T: TryFrom<i64>>(v: &Value) -> Result<T, Value> {
             ),
         ));
     };
+    let unsigned_minus = T::try_from(-1).is_err() && n.to_string().starts_with('-');
     n.as_i64()
+        .filter(|_| !unsigned_minus)
         .and_then(|t| T::try_from(t).ok())
         .ok_or_else(|| rpc_error(ERR_MISC, "JSON integer out of range"))
 }
