@@ -127,44 +127,40 @@ impl Drop for NodeProc {
 }
 
 fn node_bin() -> PathBuf {
-    let profile = if cfg!(debug_assertions) {
-        "debug"
-    } else {
-        "release"
-    };
-    let target = match std::env::var("CARGO_TARGET_DIR") {
-        Ok(dir) => {
-            let path = PathBuf::from(dir);
-            if path.is_absolute() {
-                path
-            } else {
-                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                    .join("../..")
-                    .join(path)
-            }
-        }
-        Err(_) => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/dev"),
-    };
-    let plain = target.join(profile).join("journey-node");
-    // `cargo llvm-cov` keeps `CARGO_TARGET_DIR` and builds under
-    // `$CARGO_TARGET_DIR/llvm-cov-target`. The plain `debug/` bin is absent there.
-    let covered = target
-        .join("llvm-cov-target")
-        .join(profile)
-        .join("journey-node");
-    let bin = if covered.is_file()
-        && (std::env::var_os("CARGO_LLVM_COV").is_some() || !plain.is_file())
-    {
-        covered
-    } else {
-        plain
-    };
+    // Cargo 1.95 keeps the hyphen in `CARGO_BIN_EXE_journey-node`.
+    let bin = PathBuf::from(env!("CARGO_BIN_EXE_journey-node"));
     assert!(
         bin.is_file(),
         "operator CLI missing at {} (journey-node is rbitcoin_node::process_main)",
         bin.display()
     );
     bin
+}
+
+#[test]
+fn journey_node_ignores_a_decoy_target_dir() {
+    if std::env::var_os("RBITCOIN_DECOY_TARGET").is_some() {
+        assert_eq!(
+            node_bin(),
+            PathBuf::from(env!("CARGO_BIN_EXE_journey-node")),
+            "spawn path followed CARGO_TARGET_DIR instead of the bin cargo built"
+        );
+        return;
+    }
+    let exe = std::env::current_exe().expect("test executable");
+    let out = Command::new(exe)
+        .env("CARGO_TARGET_DIR", "/no/such/mutants-target")
+        .env("RBITCOIN_DECOY_TARGET", "1")
+        .arg("asmap_journey::journey_node_ignores_a_decoy_target_dir")
+        .arg("--exact")
+        .output()
+        .expect("re-exec test binary");
+    assert!(
+        out.status.success(),
+        "decoy CARGO_TARGET_DIR changed the journey-node path\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 fn spawn_node(dir: &Path, extra: &[&str]) -> NodeProc {
