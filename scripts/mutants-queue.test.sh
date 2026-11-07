@@ -593,6 +593,10 @@ assert "deps_started == 1" in between
 assert "[[ -f \"$deps_log\" ]]" not in text
 assert "--test-workspace" not in text
 assert "workspace-baseline.log" in text
+assert "show_baseline_failure" in text
+assert "grep -m 40" in text
+assert "tail -n 80 \"$OUT/workspace-baseline.log\"" in text
+assert "cat \"$OUT/workspace-baseline.log\"" not in text
 ' "$NIGHTLY"
 assert_ok "one job budget is 4 hours" \
   grep -q 'MUTANTS_BUDGET_SEC:-14400' "$NIGHTLY"

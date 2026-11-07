@@ -5,6 +5,7 @@ use rbitcoin_store::integrity::*;
 use rbitcoin_store::store::Store;
 use rbitcoin_store::tx_table::{InputRecord, OutputRecord, TxRecord};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn tmp() -> PathBuf {
@@ -12,10 +13,34 @@ fn tmp() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_nanos();
-    let p = std::env::temp_dir().join(format!("rbitcoin-integrity-{n}"));
-    let _ = std::fs::remove_dir_all(&p);
+    integrity_dir(n)
+}
+
+fn integrity_dir(tick: u128) -> PathBuf {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let id = N.fetch_add(1, Ordering::Relaxed);
+    let p = std::env::temp_dir().join(format!(
+        "rbitcoin-integrity-{}-{tick}-{id}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&p).unwrap();
     p
+}
+
+#[test]
+fn one_clock_tick_does_not_share_an_integrity_dir() {
+    let a = integrity_dir(1);
+    let b = integrity_dir(1);
+    assert_ne!(a, b, "two integrity stores from one clock sample");
+    for dir in [&a, &b] {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join("meta"))
+            .unwrap_or_else(|e| panic!("meta in {}: {e}", dir.display()));
+    }
+    let _ = std::fs::remove_dir_all(a);
+    let _ = std::fs::remove_dir_all(b);
 }
 
 fn hdr(prev: Fk, parent_hash: [u8; 32], salt: u8) -> HeaderRecord {
