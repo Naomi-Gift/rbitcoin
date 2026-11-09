@@ -907,6 +907,64 @@ fn dns_seeds_not_resolved_locally_when_proxy() {
 }
 
 #[test]
+fn proxy_seeds_follow_the_local_seed_rules() {
+    use rbitcoin_primitives::Network;
+    let proxied = |network| {
+        let mut cfg = NodeConfig::default().with_network(network);
+        cfg.listen.proxy = Some("127.0.0.1:9050".parse().unwrap());
+        cfg
+    };
+    assert!(should_queue_proxy_seeds(&proxied(Network::Signet)));
+    assert!(!should_queue_proxy_seeds(&NodeConfig::default()));
+    assert!(
+        !should_queue_proxy_seeds(&proxied(Network::Regtest)),
+        "regtest has no seed to ask"
+    );
+
+    let mut connect = proxied(Network::Signet);
+    connect.listen.connect = vec![rbitcoin_net::NetAddr::from_socket(
+        "127.0.0.1:38333".parse().unwrap(),
+    )];
+    assert!(
+        !should_queue_proxy_seeds(&connect),
+        "--connect pins the peers"
+    );
+
+    let mut named = proxied(Network::Signet);
+    named.listen.connect_dns = vec!["node.example:38333".into()];
+    assert!(!should_queue_proxy_seeds(&named));
+
+    let mut custom = proxied(Network::Signet);
+    custom.signet_challenge = Some(bitcoin::ScriptBuf::from_bytes(vec![0x51]));
+    assert!(
+        !should_queue_proxy_seeds(&custom),
+        "default signet seeds serve another chain"
+    );
+
+    let mut no_seeds = proxied(Network::Signet);
+    no_seeds.listen.use_seeds = false;
+    assert!(!should_queue_proxy_seeds(&no_seeds));
+}
+
+#[tokio::test]
+async fn regtest_proxy_start_does_not_wait_for_seeds() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-regtest-proxy-seeds-{nanos}"));
+    let proxy_l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
+    cfg.listen.proxy = Some(proxy_l.local_addr().unwrap());
+    cfg.max_run_secs = Some(0);
+    let result = tokio::time::timeout(Duration::from_secs(30), run_p2p(cfg)).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+        .expect("regtest has no seed answer to wait for")
+        .unwrap();
+}
+
+#[test]
 fn proxy_seed_bootstrap_queues_domain_addrfetch() {
     let peers = rbitcoin_net::PeerHub::new();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<rbitcoin_net::DialRequest>();

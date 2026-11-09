@@ -803,11 +803,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             addrman.len().saturating_sub(n_before),
             addrman.len()
         );
-    } else if !config.trust_peer_set()
-        && config.listen.proxy.is_some()
-        && config.listen.use_seeds
-        && !shutdown.requested()
-    {
+    } else if should_queue_proxy_seeds(&config) && !shutdown.requested() {
         proxy_seeds_queued = true;
         let n = queue_proxy_seed_addrfetch(&node.peers, config.network);
         info!("ibd: SOCKS proxy set — queued {n} seed hostnames via SOCKS addrfetch");
@@ -1724,6 +1720,16 @@ pub fn should_resolve_default_seeds(config: &NodeConfig) -> bool {
         && !config.listen.has_pinned_connect()
         && config.signet_challenge.is_none()
         && config.listen.proxy.is_none()
+}
+
+#[doc(hidden)]
+pub fn should_queue_proxy_seeds(config: &NodeConfig) -> bool {
+    !config.trust_peer_set()
+        && config.listen.proxy.is_some()
+        && config.listen.use_seeds
+        && !config.listen.has_pinned_connect()
+        && config.signet_challenge.is_none()
+        && !socks_dns_seed_dests(config.network).is_empty()
 }
 
 /// Isolated broadcast dials peers other than the pinned session.
