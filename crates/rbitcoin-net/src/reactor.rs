@@ -6,12 +6,14 @@
 use std::cell::{Cell, RefCell};
 use std::future::Future;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::thread;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 tokio::task_local! {
     static API_STORE_BUDGET: Arc<Semaphore>;
+    static STORE_BUDGET_WAITERS: Arc<AtomicUsize>;
 }
 
 thread_local! {
@@ -110,6 +112,30 @@ pub async fn with_store_budget<R>(budget: Arc<Semaphore>, fut: impl Future<Outpu
     API_STORE_BUDGET.scope(budget, fut).await
 }
 
+/// Same task as [`with_store_budget`]. [`acquire_armed_store_budget`] counts a
+/// caller that found the budget empty.
+pub async fn with_store_budget_waiters<R>(
+    waiters: Arc<AtomicUsize>,
+    fut: impl Future<Output = R>,
+) -> R {
+    STORE_BUDGET_WAITERS.scope(waiters, fut).await
+}
+
+struct StoreBudgetWait(Arc<AtomicUsize>);
+
+impl StoreBudgetWait {
+    fn enter(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for StoreBudgetWait {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// `tokio::spawn` does not keep the task-local budget. Copy it into the
 /// child so a detached admit still waits for a store permit.
 pub fn spawn_with_store_budget<T: Send + 'static>(
@@ -132,7 +158,16 @@ pub async fn acquire_armed_store_budget() -> Option<OwnedSemaphorePermit> {
     let Ok(sem) = API_STORE_BUDGET.try_with(Arc::clone) else {
         return None;
     };
-    Some(sem.acquire_owned().await.expect("store budget"))
+    match Arc::clone(&sem).try_acquire_owned() {
+        Ok(permit) => Some(permit),
+        Err(_) => {
+            let _waiting = STORE_BUDGET_WAITERS
+                .try_with(Arc::clone)
+                .ok()
+                .map(StoreBudgetWait::enter);
+            Some(sem.acquire_owned().await.expect("store budget"))
+        }
+    }
 }
 
 /// Park `permit` on this thread. [`release_store_permit`] drops it before

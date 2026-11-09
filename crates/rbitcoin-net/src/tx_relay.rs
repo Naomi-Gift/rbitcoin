@@ -25,7 +25,7 @@ use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::ops::Bound;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast;
@@ -1161,6 +1161,9 @@ pub struct MempoolHub {
     /// Tip whose mempool strip has finished. Block templates build on this.
     /// The query tip is visible earlier, before `remove_for_block_spent`.
     template_prev: Mutex<Option<[u8; 32]>>,
+    /// Readers blocked in [`Self::template_prev`]. The uncontended path does
+    /// not touch it.
+    template_prev_waiters: AtomicUsize,
     /// Hash the active [`TemplateHold`] will publish on drop. Nested holds
     /// write this; only the outer hold sends it.
     template_commit: Mutex<Option<[u8; 32]>>,
@@ -1251,6 +1254,14 @@ std::thread_local! {
     /// does not publish. The outer drop sends the committed tip, or a
     /// generation that moved while the hold was out and nothing committed.
     static TEMPLATE_HOLD_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+struct TemplatePrevWait<'a>(&'a AtomicUsize);
+
+impl Drop for TemplatePrevWait<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 fn template_hold_enter() {
@@ -1487,6 +1498,7 @@ impl MempoolHub {
             template_updates: AtomicU64::new(0),
             template_watch: tokio::sync::watch::channel(0).0,
             template_prev: Mutex::new(None),
+            template_prev_waiters: AtomicUsize::new(0),
             template_commit: Mutex::new(None),
             pool_settle: AtomicU64::new(0),
             age_inv: Mutex::new(BTreeMap::new()),
@@ -5802,7 +5814,24 @@ impl MempoolHub {
         if let Some(sample) = TEMPLATE_PREV_SAMPLE.with(Cell::get) {
             return sample;
         }
-        *self.template_prev.lock().unwrap()
+        match self.template_prev.try_lock() {
+            Ok(guard) => *guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => *poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.template_prev_waiters.fetch_add(1, Ordering::SeqCst);
+                let _leave = TemplatePrevWait(&self.template_prev_waiters);
+                let guard = self
+                    .template_prev
+                    .lock()
+                    .unwrap_or_else(|err| err.into_inner());
+                *guard
+            }
+        }
+    }
+
+    /// Readers parked in [`Self::template_prev`].
+    pub fn template_prev_waiters(&self) -> usize {
+        self.template_prev_waiters.load(Ordering::SeqCst)
     }
 
     /// `None` when connect holds the tip mutex. An armed thread-local sample

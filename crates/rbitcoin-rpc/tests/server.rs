@@ -27,6 +27,47 @@ fn tcp_addr(handle: &RpcHandle) -> SocketAddr {
     handle.local_addr.expect("tcp listen")
 }
 
+/// `run_rpc` stores the bound address before the accept task is polled.
+async fn connect_tcp(addr: SocketAddr) -> tokio::net::TcpStream {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match tokio::net::TcpStream::connect(addr).await {
+            Ok(stream) => return stream,
+            Err(err) => {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "connect {addr}: {err}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+    }
+}
+
+async fn wait_for_store_budget(ctx: &rbitcoin_rpc::methods::RpcContext) {
+    let waiters = {
+        let active = ctx.active.lock().unwrap_or_else(|err| err.into_inner());
+        Arc::clone(&active.store_budget_waiters)
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while waiters.load(Ordering::SeqCst) == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("a caller blocked on the store budget");
+}
+
+async fn wait_for_template_prev(mp: &MempoolHub) {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while mp.template_prev_waiters() == 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("a reader blocked on template_prev");
+}
+
 async fn read_keepalive_reply<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
     let mut reader = BufReader::new(stream);
@@ -283,7 +324,7 @@ async fn post_raw(
         "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {auth_h}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut stream = connect_tcp(addr).await;
     stream.write_all(req.as_bytes()).await.unwrap();
     stream.write_all(body).await.unwrap();
     let mut buf = Vec::new();
@@ -311,7 +352,7 @@ async fn exchange_rpc(addr: SocketAddr, auth: &RpcAuth, body: &[u8]) -> (u16, St
         "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {auth_h}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut stream = connect_tcp(addr).await;
     stream.write_all(req.as_bytes()).await.unwrap();
     stream.write_all(body).await.unwrap();
     let mut reader = BufReader::new(stream);
@@ -369,7 +410,6 @@ async fn jsonrpc_http_body_matches_core_line() {
         client_version: 190_000,
     };
     let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
     let addr = tcp_addr(&handle);
     let auth = &handle.auth;
 
@@ -1777,7 +1817,7 @@ async fn batch_waits_to_retake_the_queue_after_a_long_poll() {
     });
     // getblockcount takes the only slot. The batch drops it before the
     // long-poll shows in getrpcinfo.
-    wait_for_active_call(&ctx, "waitfornewblock", true).await;
+    wait_for_active_call(&ctx.active, "waitfornewblock", true).await;
     let held = work_queue
         .clone()
         .try_acquire_owned()
@@ -1787,7 +1827,7 @@ async fn batch_waits_to_retake_the_queue_after_a_long_poll() {
         .expect("chain")
         .generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), Vec::new())
         .expect("publish a tip");
-    wait_for_active_call(&ctx, "waitfornewblock", false).await;
+    wait_for_active_call(&ctx.active, "waitfornewblock", false).await;
     for _ in 0..10 {
         tokio::task::yield_now().await;
     }
@@ -1946,7 +1986,7 @@ async fn getblockcount_finishes_while_the_store_permit_is_held() {
         )
         .await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    wait_for_store_budget(&ctx).await;
     assert!(
         !mixed_call.is_finished(),
         "a batch with a store read ran while the only permit was held"
@@ -1979,10 +2019,12 @@ fn store_budget_wait_does_not_need_a_pool_thread() {
         let budget = ctx.query.api_read_budget();
         let hold = budget.clone().acquire_owned().await.expect("permit");
         let (gate_tx, gate_rx) = tokio::sync::oneshot::channel::<()>();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
         let parked = tokio::task::spawn_blocking(move || {
+            let _ = entered_tx.send(());
             let _ = gate_rx.blocking_recv();
         });
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        entered_rx.await.expect("the pool thread entered");
         let state = AppState {
             ctx: Arc::clone(&ctx),
             auth: RpcAuth::new("test-token"),
@@ -2001,14 +2043,20 @@ fn store_budget_wait_does_not_need_a_pool_thread() {
             )
             .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        wait_for_store_budget(&ctx).await;
         assert!(
             !call.is_finished(),
             "the read ran while the only permit was held"
         );
         assert_eq!(budget.available_permits(), 0);
         drop(hold);
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while budget.available_permits() != 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the request took the permit");
         assert_eq!(
             budget.available_permits(),
             0,
@@ -2062,7 +2110,6 @@ async fn long_poll_does_not_hold_the_store_budget() {
     let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
     let addr = tcp_addr(&handle);
     let auth = handle.auth.clone();
     let waiter = tokio::spawn(async move {
@@ -2075,7 +2122,7 @@ async fn long_poll_does_not_hold_the_store_budget() {
         .to_string();
         post_raw(addr, &auth, body.as_bytes()).await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    wait_for_active_call(&handle.active, "waitfornewblock", true).await;
     let (st, body) = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         post_raw(
@@ -2124,7 +2171,6 @@ async fn batched_long_poll_does_not_hold_the_store_budget() {
     let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
         .await
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
     let addr = tcp_addr(&handle);
     let auth = handle.auth.clone();
     let waiter = tokio::spawn(async move {
@@ -2145,7 +2191,7 @@ async fn batched_long_poll_does_not_hold_the_store_budget() {
         .to_string();
         post_raw(addr, &auth, body.as_bytes()).await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    wait_for_active_call(&handle.active, "waitfornewblock", true).await;
     let (st, body) = tokio::time::timeout(
         std::time::Duration::from_secs(2),
         post_raw(
@@ -2366,7 +2412,7 @@ fn plain_getblocktemplate_samples_template_prev_off_the_pool() {
     rt.block_on(async {
         let (ctx, dir, mp) = gbt_prev_ctx();
         ctx.query.set_api_read_budget(1);
-        let (holder, release) = hold_template_prev(mp);
+        let (holder, release) = hold_template_prev(Arc::clone(&mp));
         let gbt_state = gbt_app(Arc::clone(&ctx));
         let body = serde_json::json!({
             "jsonrpc": "1.0",
@@ -2381,7 +2427,7 @@ fn plain_getblocktemplate_samples_template_prev_off_the_pool() {
             )
             .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        wait_for_template_prev(&mp).await;
         assert!(
             !gbt.is_finished(),
             "template returned while template_prev was held"
@@ -2446,12 +2492,11 @@ fn gbt_longpoll_poll_does_not_hold_pool_or_budget() {
             )
             .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        wait_for_active_call(&ctx.active, "getblocktemplate", true).await;
         assert!(!waiter.is_finished(), "long-poll returned before the hold");
-        // The poll loop is running. The next `template_prev` sample blocks
-        // here, off the pool and off the disk permit.
+        // The poll is parked. A tip hold does not wake it, and the next
+        // `template_prev` sample, if one is in flight, blocks off the pool.
         let (holder, release) = hold_template_prev(Arc::clone(&mp));
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert!(
             !waiter.is_finished(),
             "long-poll returned while the tip was held"
@@ -2533,7 +2578,7 @@ fn getblocktemplate_rebuilds_when_the_tip_moves_during_the_permit_wait() {
             )
             .await
         });
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        wait_for_store_budget(&ctx).await;
         assert!(
             !gbt.is_finished(),
             "template returned before the store permit was free"
@@ -3054,9 +3099,13 @@ async fn unix_socket_needs_no_http_auth() {
 }
 
 /// Waits until `method` is or is no longer listed in `getrpcinfo`.
-async fn wait_for_active_call(ctx: &rbitcoin_rpc::methods::RpcContext, method: &str, listed: bool) {
+async fn wait_for_active_call(
+    active: &std::sync::Mutex<rbitcoin_rpc::methods::RpcActive>,
+    method: &str,
+    listed: bool,
+) {
     let seen = || {
-        ctx.active
+        active
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .snapshot()
@@ -3392,6 +3441,7 @@ async fn earlier_wait_reports_the_tip_from_when_it_finished() {
     let (ctx, _dir) = http_wait_ctx();
     let genesis = rbitcoin_rpc::methods::tip_hash_height(&ctx).unwrap().0;
     let hub = Arc::clone(ctx.chain.as_ref().expect("hub"));
+    let watch = Arc::clone(&ctx);
     let state = AppState {
         ctx,
         auth: RpcAuth::new("test-token"),
@@ -3409,7 +3459,9 @@ async fn earlier_wait_reports_the_tip_from_when_it_finished() {
     let call = tokio::spawn(async move {
         rpc_post(State(state), axum::extract::Request::new(Body::from(body))).await
     });
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    wait_for_active_call(&watch.active, "waitfornewblock", true).await;
+    wait_for_active_call(&watch.active, "waitfornewblock", false).await;
+    wait_for_active_call(&watch.active, "waitfornewblock", true).await;
     let miner = std::thread::spawn(move || {
         hub.generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
             .expect("mine");
