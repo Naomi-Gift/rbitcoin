@@ -20,7 +20,7 @@ fn netaddr_onion_parse_roundtrip() {
             );
             assert_eq!(port, 8333);
         }
-        NetAddr::Ip(_) | NetAddr::I2p { .. } | NetAddr::Cjdns { .. } => {
+        NetAddr::Ip(_) | NetAddr::I2p { .. } | NetAddr::Cjdns { .. } | NetAddr::Name { .. } => {
             panic!("expected onion")
         }
     }
@@ -166,4 +166,19 @@ fn clearnet_bogon_conjunctions_stay_tight() {
     ] {
         assert!(!clearnet_unroutable(ip), "{ip} stays routable");
     }
+}
+
+#[test]
+fn name_key_is_per_host_and_port_and_never_enters_the_book() {
+    let a = NetAddr::name("Peer.Example", 8333).unwrap();
+    assert_eq!(a, NetAddr::name("peer.example", 8333).unwrap());
+    assert_ne!(a, NetAddr::name("peer.example", 8334).unwrap());
+    assert_ne!(a, NetAddr::name("other.example", 8333).unwrap());
+    assert_eq!(a.to_string(), "peer.example:8333");
+    let mut book = rbitcoin_net::seeds::AddrMan::new();
+    book.add_addr(a);
+    assert!(
+        book.is_empty(),
+        "a name is dialed, never gossiped or booked"
+    );
 }

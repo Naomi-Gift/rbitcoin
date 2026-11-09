@@ -1705,3 +1705,206 @@ fn tx_relay_room_ignores_outbound_and_non_relay() {
         "outbound relay and a non-relaying inbound are outside the tx-relay cap"
     );
 }
+
+/// A `--proxy --connect name` session carries the proxy link like a proxied IP
+/// does, so the peer is told the onion address we listen on.
+#[test]
+fn a_proxied_name_session_is_told_the_onion_we_listen_on() {
+    let (hub, _rx) = proxied_hub();
+    hub.set_discover(true);
+    hub.set_p2p_onion(
+        "24yjwaf2ni6wz44pmqpw3jyjhksoko7wxzelp6uyep2pdlgb5epbnoqd.onion".into(),
+        8333,
+    );
+    let target = hub.host_dial_target("peer.invalid:8333").unwrap();
+    let session = hub.register_connecting_net(
+        target.version_socket(),
+        target.net_addr(),
+        target.version_socket(),
+        false,
+        PeerConnType::Manual,
+    );
+    session.set_wants_addrv2();
+    match session.take_self_announce_msg() {
+        Some(NetworkMessage::AddrV2(v)) => {
+            assert!(
+                v.iter()
+                    .any(|m| matches!(m.addr, bitcoin::p2p::address::AddrV2::TorV3(_))),
+                "{v:?}"
+            );
+        }
+        other => panic!("expected the onion in an AddrV2, got {other:?}"),
+    }
+}
+
+/// With 1024 names interned, a new name has no key of its own. The dial is
+/// refused, not keyed `0.0.0.0:port` where it would share a key with every
+/// other overflow name. Runs in its own process: the interner is global.
+#[test]
+fn a_full_interner_refuses_a_name_dial_instead_of_sharing_one_key() {
+    const CHILD: &str = "RBTC_NAME_CAP_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().expect("test exe"))
+            .args([
+                "--exact",
+                "peers::a_full_interner_refuses_a_name_dial_instead_of_sharing_one_key",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("spawn");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        return;
+    }
+    for i in 0..1024 {
+        assert!(rbitcoin_net::NetAddr::name(&format!("fill-{i}.example"), 1).is_some());
+    }
+    assert!(rbitcoin_net::NetAddr::name("over.example", 8333).is_none());
+    let (hub, _rx) = proxied_hub();
+    let target = DialTarget::Domain {
+        host: "over.example".into(),
+        port: 8333,
+    };
+    let err = hub.dial_manual_target(target).unwrap_err();
+    assert!(err.contains("too many distinct"), "{err}");
+}
+
+/// Asking about a name nobody added (a live check, `addnode remove`) must not
+/// spend one of the interner's slots, or a flood of removes fills it for good.
+#[test]
+fn asking_about_unknown_names_leaves_the_interner_alone() {
+    let hub = PeerHub::new();
+    for i in 0..2000 {
+        let target = DialTarget::Domain {
+            host: format!("never-added-{i}.example"),
+            port: 8333,
+        };
+        assert!(!hub.is_target_live(&target));
+        assert!(!hub.disconnect_target(&target));
+    }
+    assert!(rbitcoin_net::NetAddr::name("added-after.example", 8333).is_some());
+}
+
+/// With `--proxy`, a `--connect` or `addnode` name goes to the proxy as a
+/// domain (SOCKS address type 3). The node never asks the OS resolver, so
+/// the unresolvable `.invalid` name still produces a dial.
+#[test]
+fn proxy_dials_connect_host_by_name() {
+    let hub = PeerHub::new();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    hub.set_dialer(tx);
+    hub.set_proxies(rbitcoin_net::NetProxies {
+        dialer: rbitcoin_net::Dialer::socks("127.0.0.1:9050".parse().unwrap(), true),
+        i2p_sam: None,
+    });
+    hub.set_connect_hosts(vec!["peer.invalid:8333".into()], 8333);
+    hub.redial_remembered();
+    hub.addnode_host("other.invalid", "onetry", 8333).unwrap();
+    let got = take_dials(&mut rx);
+    let names: Vec<_> = got
+        .iter()
+        .map(|d| match &d.target {
+            DialTarget::Domain { host, port } => format!("{host}:{port}"),
+            DialTarget::Socket(a) => panic!("resolved locally to {a}"),
+        })
+        .collect();
+    assert_eq!(names, ["peer.invalid:8333", "other.invalid:8333"]);
+}
+
+/// An IPv6 literal needs no lookup. Under `--proxy` it stays a socket target,
+/// not a domain cut at its last colon.
+#[test]
+fn proxy_keeps_ipv6_literals_as_sockets() {
+    let hub = PeerHub::new();
+    hub.set_proxies(rbitcoin_net::NetProxies {
+        dialer: rbitcoin_net::Dialer::socks("127.0.0.1:9050".parse().unwrap(), true),
+        i2p_sam: None,
+    });
+    hub.note_default_port(8333);
+    for literal in ["::1", "2001:db8::1"] {
+        match hub.host_dial_target(literal).unwrap() {
+            DialTarget::Socket(addr) => assert_eq!(addr.port(), 8333),
+            DialTarget::Domain { host, .. } => panic!("{literal} became domain {host}"),
+        }
+    }
+}
+
+fn proxied_hub() -> (
+    std::sync::Arc<PeerHub>,
+    mpsc::UnboundedReceiver<DialRequest>,
+) {
+    let hub = PeerHub::new();
+    let (tx, rx) = mpsc::unbounded_channel();
+    hub.set_dialer(tx);
+    hub.set_proxies(rbitcoin_net::NetProxies {
+        dialer: rbitcoin_net::Dialer::socks("127.0.0.1:9050".parse().unwrap(), true),
+        i2p_sam: None,
+    });
+    (hub, rx)
+}
+
+/// A `--proxy` name is the live key of its session. A redial pass while the
+/// session is up opens no second one, and two names on one port stay apart.
+#[test]
+fn proxy_names_are_the_live_key_of_their_sessions() {
+    let (hub, mut rx) = proxied_hub();
+    hub.set_connect_hosts(vec!["a.invalid:8333".into(), "b.invalid:8333".into()], 8333);
+    hub.redial_remembered();
+    let first = take_dials(&mut rx);
+    assert_eq!(first.len(), 2);
+    let a = first
+        .iter()
+        .find(|d| matches!(&d.target, DialTarget::Domain { host, .. } if host == "a.invalid"))
+        .unwrap();
+    let _session = hub.register_connecting_net(
+        a.target.version_socket(),
+        a.target.net_addr(),
+        a.target.version_socket(),
+        false,
+        PeerConnType::Manual,
+    );
+    drop(first);
+    hub.redial_remembered();
+    let again: Vec<_> = take_dials(&mut rx)
+        .into_iter()
+        .map(|d| match d.target {
+            DialTarget::Domain { host, .. } => host,
+            DialTarget::Socket(a) => panic!("resolved locally to {a}"),
+        })
+        .collect();
+    assert_eq!(
+        again,
+        ["b.invalid"],
+        "a.invalid is live; only b.invalid is dialed"
+    );
+}
+
+/// The session of the `--trust-peer` hostname is the trusted session, so the
+/// block and tx waiver applies to it.
+#[test]
+fn proxied_trust_peer_hostname_is_the_trusted_session() {
+    let (hub, _rx) = proxied_hub();
+    hub.set_trust_peer(None, Some("trusted.invalid".into()));
+    let target = hub.host_dial_target("trusted.invalid:8333").unwrap();
+    let trusted = hub.register_connecting_net(
+        target.version_socket(),
+        target.net_addr(),
+        target.version_socket(),
+        false,
+        PeerConnType::Manual,
+    );
+    assert!(hub.session_is_trusted_peer(&trusted));
+    let other = hub.host_dial_target("other.invalid:8333").unwrap();
+    let stranger = hub.register_connecting_net(
+        other.version_socket(),
+        other.net_addr(),
+        other.version_socket(),
+        false,
+        PeerConnType::Manual,
+    );
+    assert!(!hub.session_is_trusted_peer(&stranger));
+}

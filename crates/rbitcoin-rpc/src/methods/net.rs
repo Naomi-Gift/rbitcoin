@@ -217,8 +217,14 @@ pub fn disconnectnode(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
         return Ok(Value::Null);
     }
     if let Some(a) = params.get(0, "address").and_then(|v| v.as_str()) {
-        let addr = rbitcoin_net::parse_peer_net(a)
-            .map_err(|e| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?;
+        let addr = match rbitcoin_net::parse_peer_net(a) {
+            Ok(addr) => addr,
+            Err(e) => listed
+                .iter()
+                .map(|p| p.net)
+                .find(|net| net.to_string().eq_ignore_ascii_case(a))
+                .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, e.to_string()))?,
+        };
         if !listed.iter().any(|p| p.net == addr) || !hub.disconnect_net(addr) {
             return Err(not_found());
         }

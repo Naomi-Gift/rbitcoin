@@ -781,6 +781,8 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     );
     let dns_resolved = if shutdown.requested() {
         Vec::new()
+    } else if config.listen.proxy.is_some() {
+        proxied_connect_names(&config.listen.connect_dns, config.network)
     } else {
         resolve_connect_dns(&config.listen.connect_dns, config.network).await
     };
@@ -804,7 +806,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             config.network.as_str()
         );
         let n_before = addrman.len();
-        addrman.inject(rbitcoin_net::resolve_dns_seeds(config.network));
+        if should_resolve_dns_seeds(&config) {
+            addrman.inject(rbitcoin_net::resolve_dns_seeds(config.network));
+        }
         let fixed = addrman.add_fixed_seeds(config.network);
         info!(
             "ibd: seeds resolved (+{} new, {fixed} fixed, book={})",
@@ -815,6 +819,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         proxy_seeds_queued = true;
         let n = queue_proxy_seed_addrfetch(&node.peers, config.network);
         info!("ibd: SOCKS proxy set — queued {n} seed hostnames via SOCKS addrfetch");
+    } else if should_add_fixed_seeds_behind_proxy(&config) && !shutdown.requested() {
+        let fixed = addrman.add_fixed_seeds(config.network);
+        info!("ibd: no clearnet reachable behind the proxy; +{fixed} fixed seeds");
     } else if config.signet_challenge.is_some()
         && !config.listen.has_pinned_connect()
         && addrman.is_empty()
@@ -1723,7 +1730,14 @@ pub fn should_resolve_default_seeds(config: &NodeConfig) -> bool {
 pub fn should_queue_proxy_seeds(config: &NodeConfig) -> bool {
     seeds_allowed(config)
         && config.listen.proxy.is_some()
+        && config.listen.clearnet_reachable()
         && !socks_dns_seed_dests(config.network).is_empty()
+}
+
+/// Behind `--proxy` with no clearnet reachable, no seed hostname is asked,
+/// so the fixed onion, I2P, and CJDNS seeds are the only first peers.
+fn should_add_fixed_seeds_behind_proxy(config: &NodeConfig) -> bool {
+    seeds_allowed(config) && config.listen.proxy.is_some() && !config.listen.clearnet_reachable()
 }
 
 fn seeds_allowed(config: &NodeConfig) -> bool {
@@ -1731,6 +1745,13 @@ fn seeds_allowed(config: &NodeConfig) -> bool {
         && !config.trust_peer_set()
         && !config.listen.has_pinned_connect()
         && config.signet_challenge.is_none()
+}
+
+/// DNS seed hostnames are looked up only when this node can dial IPv4 or
+/// IPv6. Under `--only-net onion` the fixed onion seeds still apply.
+#[doc(hidden)]
+pub fn should_resolve_dns_seeds(config: &NodeConfig) -> bool {
+    should_resolve_default_seeds(config) && config.listen.clearnet_reachable()
 }
 
 /// Isolated broadcast dials peers other than the pinned session.
@@ -1760,6 +1781,28 @@ pub fn catch_up_with_connect(
 /// Tip-follow may run below `--min-chain-work`. Relay stays off until the floor.
 pub fn relay_while_following(meets_min_work: bool, blocks_only: bool, in_ibd: bool) -> bool {
     meets_min_work && !blocks_only && !in_ibd
+}
+
+/// `--connect` names under `--proxy`: pinned by name, so the proxy resolves them.
+pub fn proxied_connect_names(hosts: &[String], network: Network) -> Vec<rbitcoin_net::NetAddr> {
+    let port = network.default_p2p_port();
+    hosts
+        .iter()
+        .filter_map(|h| {
+            let with_port = rbitcoin_net::ensure_host_port(h, Some(port)).ok()?;
+            if let Ok(net) = rbitcoin_net::parse_peer_net(&with_port) {
+                return Some(net);
+            }
+            let (host, port) = with_port.rsplit_once(':')?;
+            let name = rbitcoin_net::NetAddr::name(host, port.parse().ok()?);
+            if name.is_none() {
+                rbitcoin_log::warn!(
+                    "not pinning {with_port}: too many distinct proxied host names"
+                );
+            }
+            name
+        })
+        .collect()
 }
 
 pub async fn resolve_connect_dns(hosts: &[String], network: Network) -> Vec<rbitcoin_net::NetAddr> {
