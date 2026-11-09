@@ -5150,8 +5150,6 @@ struct HeadersApply {
     /// The last header was new, accepted, connected, and beats our tip work.
     stamp_block_announcement: bool,
 }
-
- 
 /// Evict from `pending` until `incoming` new headers fit under
 /// `MAX_PENDING_HEADERS`, or until nothing safe is left to evict.
 ///
@@ -5168,10 +5166,10 @@ fn evict_pending_for_room(
     let over = |p: &HashMap<BlockHash, bitcoin::block::Header>| {
         p.len().saturating_add(incoming) > MAX_PENDING_HEADERS
     };
- 
+
     // The new batch's own pending ancestors stay, whatever happens below.
     let mut protected = pending_ancestors(pending, prev);
- 
+
     // (1) Non-connecting headers. A root is a pending header whose parent is
     // not pending; its whole subtree connects iff that parent is stored (and
     // is not the all-zero hash). One store lookup per root.
@@ -5198,7 +5196,7 @@ fn evict_pending_for_room(
     if !over(pending) {
         return;
     }
- 
+
     // (2) Connected forks that lose on chain work to our active tip. A tip is
     // a pending header with no pending child. Headers shared with any tip
     // that does not lose are protected.
@@ -5210,6 +5208,7 @@ fn evict_pending_for_room(
         .collect();
     let mut losing = Vec::new();
     for tip in tips {
+        // `None` means the work could not be compared: keep that fork.
         if announced_work_cmp(hub, pending, tip) == Some(std::cmp::Ordering::Less) {
             losing.push(tip);
         } else {
@@ -5228,7 +5227,6 @@ fn evict_pending_for_room(
     }
 }
 
-
 /// `start` and its ancestors that are in `pending`, walking at most
 /// `PENDING_WALK_LIMIT` steps. Reads only the pending map.
 fn pending_ancestors(
@@ -5246,7 +5244,7 @@ fn pending_ancestors(
     }
     out
 }
- 
+
 /// The oldest pending ancestor of `hash` (whose parent is not pending),
 /// memoised in `root_of`. Bounded by `PENDING_WALK_LIMIT`.
 fn pending_root(
@@ -5273,6 +5271,10 @@ fn pending_root(
     root
 }
 
+/// The header's hash meets the target its own `bits` claim. This does not
+/// check that `bits` is the right difficulty for its height; that happens
+/// when the header path is persisted. Delete this if the crate already has
+/// a `header_claimed_pow_ok` and import that one instead.
 fn header_claimed_pow_ok(hdr: &bitcoin::block::Header) -> bool {
     hdr.validate_pow(hdr.target()).is_ok()
 }
@@ -5332,22 +5334,22 @@ fn classify_headers(
             apply.misbehave = true;
             return apply;
         }
-        // The batch's own proof of work is checked before it may displace
-        // anything in this peer's pending map. A header that fails it never
-        // evicts, whatever its parent.
-        if !headers.iter().take(n).all(header_claimed_pow_ok) {
-            apply.misbehave = true;
-            return apply;
-        }
         // The all-zero hash is only genesis's parent. A header claiming it is
         // not a continuation of any chain we hold.
-        let connecting =
-            prev != BlockHash::all_zeros() && header_announcement_connects(hub, pending_before, prev);
+        let connecting = prev != BlockHash::all_zeros()
+            && header_announcement_connects(hub, pending_before, prev);
         let incoming = headers
             .iter()
             .filter(|hdr| !pending.contains_key(&hdr.block_hash()))
             .count();
         if connecting && pending.len().saturating_add(incoming) > MAX_PENDING_HEADERS {
+            // A batch may displace pending headers only once its own claimed
+            // proof of work checks. One that fails is refused: nothing is
+            // evicted or admitted. Batches that fit under the cap are not
+            // checked here; this gate is about eviction only.
+            if !headers.iter().take(n).all(header_claimed_pow_ok) {
+                return apply;
+            }
             // Make room without discarding a fork that could beat this batch.
             // First drop pending headers whose path does not reach a header we
             // store; then drop connected forks whose tip loses on chain work to
