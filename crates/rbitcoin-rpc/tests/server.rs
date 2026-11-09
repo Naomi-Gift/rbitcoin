@@ -813,7 +813,7 @@ where
 /// socket. A body past the cap, a bad credential, and REST stay rejected.
 #[tokio::test]
 async fn large_block_submit_and_proposal_clear_http_413() {
-    let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-big-block").expect("temp dir");
+    let dir = rbitcoin_store::testutil::TempDir::for_socket().expect("temp dir");
     let hub = rbitcoin_net::ChainHub::new(
         Query::open_or_create_tiny(dir.join("store")).unwrap(),
         rbitcoin_consensus::ChainParams::regtest(),
@@ -1325,7 +1325,7 @@ async fn published_tip_wakes_waitfornewblock(handle: &RpcHandle, hub: &rbitcoin_
 async fn stalled_rpc_connections_expire_and_free_capacity() {
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-accept-cap").expect("dir");
+    let dir = rbitcoin_store::testutil::TempDir::for_socket().expect("dir");
     let q = Query::open_or_create_tiny(dir.join("store")).unwrap();
     let hub = rbitcoin_net::ChainHub::new(
         q,

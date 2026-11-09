@@ -3714,7 +3714,15 @@ async fn sv2_tp_bootstrap() {
     assert_eq!(sent["result"], tx.compute_txid().to_string(), "{sent}");
     // An identical resend does not rebuild; a changed budget does.
     c.coinbase_output_constraints(0, 1).await.unwrap();
-    let t2 = sv2_template(sv2_recv(&mut c).await);
+    // When the hold check builds `t` before the tip event, that event rebuilds
+    // once on the same prev hash from the empty mempool, queued before the
+    // spend. Skip it.
+    let mut t2 = sv2_template(sv2_recv(&mut c).await);
+    if t2.merkle_path.is_empty() {
+        assert!(!t2.future_template, "tip rebuild: same prev hash");
+        assert_eq!(t2.value_remaining, t.value_remaining, "tip rebuild: no txs");
+        t2 = sv2_template(sv2_recv(&mut c).await);
+    }
     assert!(!t2.future_template, "same prev hash: no new SetNewPrevHash");
     assert!(t2.template_id > t.template_id);
     assert_eq!(t2.value_remaining, t.value_remaining + fee);
