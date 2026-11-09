@@ -615,6 +615,10 @@ fn spawn_journey(netns: bool) -> Output {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    ignore = "adds addresses with ip(8) or runs in an unshare(1) netns; Linux only"
+)]
 async fn outbound_full_relay_refills_to_max_outbound() {
     let isolated = std::env::var_os("RBITCOIN_REFILL_NS").is_some()
         || std::env::var_os("RBITCOIN_REFILL_CHILD").is_some();
