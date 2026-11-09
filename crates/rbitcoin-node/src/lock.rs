@@ -7,9 +7,20 @@ use std::io;
 use std::path::Path;
 
 /// Held exclusive `.lock` files. Dropping releases the flock.
+///
+/// A duplicated fd shares the flock. Closing the original would leave the
+/// datadir busy until that dup closed too. `LOCK_UN` releases it now.
 #[derive(Debug)]
 pub struct DirLocks {
     pub _files: Vec<File>,
+}
+
+impl Drop for DirLocks {
+    fn drop(&mut self) {
+        for file in &self._files {
+            unlock(file);
+        }
+    }
 }
 
 /// Core-shaped lock refusal (operator name is rbitcoin; harness maps CLIENT_NAME).
@@ -84,13 +95,27 @@ pub fn try_exclusive(file: &File) -> Result<(), LockBusy> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd;
-        // SAFETY: `file` is open. `LOCK_NB` returns instead of blocking.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(LockBusy)
+        // EINTR is a caught signal, not another node. A short EAGAIN retry
+        // covers a lock that was released in the same millisecond. A live
+        // node still loses.
+        for attempt in 0..8 {
+            // SAFETY: `file` is open. `LOCK_NB` returns instead of blocking.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if rc == 0 {
+                return Ok(());
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            let again = err.raw_os_error() == Some(libc::EAGAIN)
+                || err.raw_os_error() == Some(libc::EWOULDBLOCK);
+            if !again || attempt + 1 == 8 {
+                return Err(LockBusy);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
+        Err(LockBusy)
     }
     #[cfg(windows)]
     {
@@ -101,5 +126,23 @@ pub fn try_exclusive(file: &File) -> Result<(), LockBusy> {
     {
         let _ = file;
         Ok(())
+    }
+}
+
+fn unlock(file: &File) {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        for _ in 0..64 {
+            // SAFETY: `file` is open. `LOCK_UN` releases this description's flock.
+            let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+            if rc == 0 || io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                break;
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
     }
 }
