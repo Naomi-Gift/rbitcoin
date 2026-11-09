@@ -81,6 +81,9 @@ const CONVERT_PARAMS: &[(&str, usize, ParamFormat)] = &[
     ("waitfornewblock", 0, ParamFormat::Json),
 ];
 
+const RPCWAIT_ATTEMPTS: u32 = 30;
+const RPCWAIT_DELAY: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Copy)]
 enum ParamFormat {
     Json,
@@ -101,6 +104,7 @@ pub fn usage() -> String {
            -h, --help             this message\n\
            -V, --version          print version\n\
            -stdin                 read extra args from stdin, one per line until EOF\n\
+           -rpcwait               retries the connection until the node is up, in a bounded loop\n\
          \n\
          Local: --datadir talks to {{datadir}}/rpc.sock (no token). TCP uses Bearer\n\
          from {{datadir}}/rpc.token. Plain HTTP, same as the node.",
@@ -118,6 +122,7 @@ pub struct CliConfig {
     pub command: Option<String>,
     pub params: Vec<String>,
     pub stdin: bool,
+    pub rpcwait: bool,
 }
 
 impl Default for CliConfig {
@@ -131,6 +136,7 @@ impl Default for CliConfig {
             command: None,
             params: Vec::new(),
             stdin: false,
+            rpcwait: false,
         }
     }
 }
@@ -140,6 +146,15 @@ pub enum Action {
     Help,
     Version,
     Call(CliConfig),
+}
+
+enum RpcStream {
+    Unix(socket2::Socket),
+    Tcp {
+        stream: TcpStream,
+        host: String,
+        port: u16,
+    },
 }
 
 #[doc(hidden)]
@@ -184,6 +199,11 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
             }
             if a == "-stdin" {
                 cfg.stdin = true;
+                i += 1;
+                continue;
+            }
+            if a == "-rpcwait" {
+                cfg.rpcwait = true;
                 i += 1;
                 continue;
             }
@@ -339,6 +359,25 @@ pub fn read_stdin_args(reader: impl BufRead) -> Result<Vec<String>, String> {
         .collect()
 }
 
+#[doc(hidden)]
+pub fn retry_connect<T>(
+    mut attempt: impl FnMut() -> Result<T, String>,
+    attempts: u32,
+    delay: Duration,
+) -> Result<T, String> {
+    let mut last_err = None;
+    for attempt_num in 0..attempts {
+        match attempt() {
+            Ok(value) => return Ok(value),
+            Err(e) => last_err = Some(e),
+        }
+        if attempt_num + 1 < attempts {
+            std::thread::sleep(delay);
+        }
+    }
+    Err(last_err.unwrap_or_else(|| "rpcwait: zero attempts".to_string()))
+}
+
 fn convert_format(method: &str, index: usize) -> Option<ParamFormat> {
     for &(m, i, f) in CONVERT_PARAMS {
         if m == method && i == index {
@@ -452,6 +491,37 @@ pub fn format_result(v: &Value) -> String {
     }
 }
 
+fn connect_stream(cfg: &CliConfig) -> Result<RpcStream, String> {
+    let sock = socket_path(cfg);
+    if cfg.rpc_url.is_none() && (cfg.socket.is_some() || sock.exists()) {
+        Ok(RpcStream::Unix(connect_unix(&sock)?))
+    } else {
+        let (host, port) = match cfg.rpc_url.as_deref() {
+            Some(u) => parse_rpc_addr(u)?,
+            None => ("127.0.0.1".into(), cfg.network.default_rpc_port()),
+        };
+        let stream = connect_tcp(&host, port)?;
+        stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
+        stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
+        Ok(RpcStream::Tcp { stream, host, port })
+    }
+}
+
+fn rpc_call(
+    stream: RpcStream,
+    cfg: &CliConfig,
+    cmd: &str,
+    params: &[Value],
+) -> Result<Value, String> {
+    match stream {
+        RpcStream::Unix(s) => rpc_http(s, "localhost", 0, None, cmd, params),
+        RpcStream::Tcp { stream, host, port } => {
+            let token = read_token(&token_path(cfg))?;
+            rpc_http(stream, &host, port, Some(&token), cmd, params)
+        }
+    }
+}
+
 #[doc(hidden)]
 pub fn dispatch_call(cfg: &CliConfig) -> Result<String, String> {
     let cmd = cfg.command.as_deref().ok_or_else(usage)?;
@@ -464,22 +534,12 @@ pub fn dispatch_call(cfg: &CliConfig) -> Result<String, String> {
         .enumerate()
         .map(|(i, p)| param_value(cmd, i, p))
         .collect::<Result<_, _>>()?;
-    let sock = socket_path(cfg);
-    let result = if cfg.rpc_url.is_none() && (cfg.socket.is_some() || sock.exists()) {
-        let stream = connect_unix(&sock)?;
-        rpc_http(stream, "localhost", 0, None, cmd, &params)?
+    let stream = if cfg.rpcwait {
+        retry_connect(|| connect_stream(cfg), RPCWAIT_ATTEMPTS, RPCWAIT_DELAY)?
     } else {
-        let (host, port) = match cfg.rpc_url.as_deref() {
-            Some(u) => parse_rpc_addr(u)?,
-            None => ("127.0.0.1".into(), cfg.network.default_rpc_port()),
-        };
-        let stream = connect_tcp(&host, port)?;
-        stream.set_read_timeout(Some(Duration::from_secs(30))).ok();
-        stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
-        let token = read_token(&token_path(cfg))?;
-        rpc_http(stream, &host, port, Some(&token), cmd, &params)?
+        connect_stream(cfg)?
     };
-    Ok(format_result(&result))
+    Ok(format_result(&rpc_call(stream, cfg, cmd, &params)?))
 }
 
 /// Requested output on stdout. A reader that closed the pipe (`| head -1`)

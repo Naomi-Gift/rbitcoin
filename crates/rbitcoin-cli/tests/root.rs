@@ -70,6 +70,16 @@ fn os_args(args: &[&str]) -> Vec<OsString> {
     args.iter().map(OsString::from).collect()
 }
 
+#[cfg(unix)]
+fn reply_rpc_error(mut stream: impl Read + Write) {
+    let body = "{\"jsonrpc\":\"1.0\",\"id\":\"1\",\"result\":null,\"error\":{\"code\":-1,\"message\":\"boom\"}}\n";
+    let resp = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = stream.write_all(resp.as_bytes());
+}
+
 #[test]
 fn rpc_url_is_host_and_port() {
     assert_eq!(
@@ -167,6 +177,7 @@ fn usage_describes_every_option() {
         "-h, --help",
         "-V, --version",
         "-stdin",
+        "-rpcwait",
     ] {
         assert!(u.contains(needle), "usage must list {needle}");
     }
@@ -521,4 +532,117 @@ fn parse_args_double_dash_stdin_is_rejected() {
         Err(e) => e,
     };
     assert!(err.contains("unknown argument"), "--stdin -> {err}");
+}
+
+#[test]
+fn retry_connect_retries_until_success() {
+    let mut calls = 0;
+    let out = retry_connect(
+        || {
+            calls += 1;
+            if calls < 3 {
+                Err("connection refused".to_string())
+            } else {
+                Ok(42)
+            }
+        },
+        3,
+        std::time::Duration::ZERO,
+    );
+    assert_eq!(out, Ok(42));
+    assert_eq!(calls, 3);
+}
+
+#[test]
+fn retry_connect_gives_up_after_attempts() {
+    let mut calls = 0;
+    let out = retry_connect(
+        || {
+            calls += 1;
+            Err::<i32, String>("connection refused".to_string())
+        },
+        2,
+        std::time::Duration::ZERO,
+    );
+    assert!(out.is_err());
+    assert_eq!(calls, 2);
+}
+
+#[test]
+fn parse_args_rpcwait_is_a_flag() {
+    match parse_args(&os_args(&["rbitcoin-cli", "-rpcwait", "getblockcount"])) {
+        Ok(Action::Call(cfg)) => {
+            assert_eq!(cfg.command.as_deref(), Some("getblockcount"));
+            assert!(cfg.rpcwait, "-rpcwait must set the rpcwait flag");
+        }
+        Err(e) => panic!("-rpcwait must parse, got: {e}"),
+        Ok(_) => panic!("expected Action::Call"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rpcwait_does_not_repeat_the_call() {
+    use std::os::unix::net::UnixListener;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::time::Instant;
+
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let listener = UnixListener::bind(&sock).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let requests = Arc::new(AtomicUsize::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let (req, halt) = (requests.clone(), stop.clone());
+    let h = thread::spawn(move || {
+        while !halt.load(Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((s, _)) => {
+                    req.fetch_add(1, Ordering::SeqCst);
+                    reply_rpc_error(s);
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(_) => break,
+            }
+        }
+    });
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rbitcoin-cli"))
+        .arg("--rpc-socket")
+        .arg(&sock)
+        .arg("-rpcwait")
+        .arg("getblockcount")
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + std::time::Duration::from_secs(3);
+    let mut exited = false;
+    let status = loop {
+        if let Some(s) = child.try_wait().unwrap() {
+            exited = true;
+            break s;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            break child.wait().unwrap();
+        }
+        thread::sleep(std::time::Duration::from_millis(20));
+    };
+    stop.store(true, Ordering::SeqCst);
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = h.join();
+
+    assert!(
+        exited,
+        "-rpcwait must return the RPC error, not retry the call"
+    );
+    assert!(!status.success(), "the RPC error must exit non-zero");
+    assert_eq!(
+        requests.load(Ordering::SeqCst),
+        1,
+        "the call must be sent exactly once"
+    );
 }

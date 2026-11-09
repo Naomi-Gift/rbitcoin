@@ -121,7 +121,7 @@ socket is present, the client uses `127.0.0.1` and the network RPC port. Bearer
 comes from `{datadir}/rpc.token` or `--rpc-token-file`. Prints the JSON-RPC
 `result` (strings unquoted). `-stdin` reads extra arguments from standard input, one per line until EOF,
 appended after the command-line arguments (Core-compatible; for values that
-should not appear in the process list).
+should not appear in the process list). `-rpcwait` retries the connection until the node is up, in a bounded loop.
 
 ```bash
 rbitcoin-cli --datadir datadir getblockcount
