@@ -5150,7 +5150,6 @@ struct HeadersApply {
     /// The last header was new, accepted, connected, and beats our tip work.
     stamp_block_announcement: bool,
 }
-
 fn classify_headers(
     hub: &ChainHub,
     headers: &[bitcoin::block::Header],
@@ -5180,131 +5179,120 @@ fn classify_headers(
     let mut ignored_below_floor = false;
     if n == 0 {
         // Empty headers is a failed getheaders response, not an announcement.
-    } else {
-        let prev = headers[0].prev_blockhash;
-        // Decide whether the batch attaches to our chain (or a pending path)
-        // BEFORE the cheap floor shortcut. `headers_are_below_floor` only sees
-        // the pending headers, not the work of ancestors already on our chain,
-        // so on a fresh node it can wrongly refuse the very first connecting
-        // batch (e.g. regtest heights 1..=3 off genesis). That left the peer's
-        // best-known header unset (`synced_headers`/`synced_blocks` = -1).
-        // A connecting batch is judged by the exact `header_path_meets_minwork`
-        // check below instead.
+    } else if n > 0 && !noban && headers_are_below_floor(hub, pending_before, headers) {
+        // Work stays under the floor from the pending headers alone. Do not
+        // read parent headers, do not move this peer's best-known tip, and
+        // do not ask for the next page of a batch we refused.
+        for hdr in headers.iter().take(n) {
+            let hash = hdr.block_hash();
+            apply.from_peer.push(hash);
+            admit_pending_header(&mut pending, hash, *hdr);
+            apply.admits.push((hash, *hdr));
+        }
+        let last = headers[n - 1].block_hash();
+        apply.ignore_height = Some(pending_announced_height(&pending, last));
+        ignored_below_floor = true;
+    } else if let Some(first) = headers.first() {
+        let prev = first.prev_blockhash;
+        if hub.is_block_invalid(&prev)
+            || headers
+                .iter()
+                .take(n)
+                .any(|h| hub.is_block_invalid(&h.block_hash()))
+        {
+            // Headers on a cached-invalid chain: disconnect
+            // (`p2p_unrequested_blocks` step 8 follow-up header).
+            apply.misbehave = true;
+            return apply;
+        }
         let connecting = header_announcement_connects(hub, pending_before, prev);
-        if !connecting && !noban && headers_are_below_floor(hub, pending_before, headers) {
-            // Work stays under the floor from the pending headers alone. Do not
-            // read parent headers, do not move this peer's best-known tip, and
-            // do not ask for the next page of a batch we refused.
-            for hdr in headers.iter().take(n) {
-                let hash = hdr.block_hash();
-                apply.from_peer.push(hash);
-                admit_pending_header(&mut pending, hash, *hdr);
-                apply.admits.push((hash, *hdr));
+        // A peer can fill its bounded map with unrelated, valid-work forks.
+        // When a later batch continues a chain we can prove connects, retain
+        // only that chain's pending ancestors before admitting it. This gives
+        // useful progress room without increasing the per-peer memory cap.
+        let incoming = headers
+            .iter()
+            .filter(|hdr| !pending.contains_key(&hdr.block_hash()))
+            .count();
+        if connecting && pending.len().saturating_add(incoming) > MAX_PENDING_HEADERS {
+            let mut ancestors = HashSet::new();
+            let mut h = prev;
+            for _ in 0..PENDING_WALK_LIMIT {
+                let Some(hdr) = pending.get(&h) else {
+                    break;
+                };
+                ancestors.insert(h);
+                h = hdr.prev_blockhash;
             }
-            let last = headers[n - 1].block_hash();
-            apply.ignore_height = Some(pending_announced_height(&pending, last));
-            ignored_below_floor = true;
+            pending.retain(|hash, _| ancestors.contains(hash));
+            apply.evicts = pending_before
+                .keys()
+                .filter(|hash| !pending.contains_key(*hash))
+                .copied()
+                .collect();
+        }
+        for hdr in headers.iter().take(n) {
+            let hash = hdr.block_hash();
+            apply.from_peer.push(hash);
+            apply.best_known.push(hash);
+            admit_pending_header(&mut pending, hash, *hdr);
+            apply.admits.push((hash, *hdr));
+        }
+        if !connecting {
+            if n < MAX_HEADERS_RESULTS {
+                apply.getheaders = Some(headers_sync_locator(hub, None));
+            }
         } else {
-            if hub.is_block_invalid(&prev)
-                || headers
-                    .iter()
-                    .take(n)
-                    .any(|h| hub.is_block_invalid(&h.block_hash()))
-            {
-                // Headers on a cached-invalid chain: disconnect
-                // (`p2p_unrequested_blocks` step 8 follow-up header).
-                apply.misbehave = true;
+            let last = headers[n - 1].block_hash();
+            // Core `chain_start.nHeight + headers.size()`. One-header
+            // tip announces still accumulate via `follow.pending_headers`
+            // (`p2p_headers_sync_with_minchainwork` height=14).
+            let announced_h = announced_headers_height(hub, &pending, last);
+            let work_cmp = announced_work_cmp(hub, &pending, last);
+            let our_tip = hub.tip_height().unwrap_or(0);
+            if announced_tip_is_hopeless(our_tip, announced_h, work_cmp) && !noban {
+                apply.disconnect = Some((announced_h, our_tip));
                 return apply;
             }
-            // A peer can fill its bounded map with unrelated, valid-work forks.
-            // When a later batch continues a chain we can prove connects, retain
-            // only that chain's pending ancestors before admitting it. This gives
-            // useful progress room without increasing the per-peer memory cap.
-            let incoming = headers
-                .iter()
-                .filter(|hdr| !pending.contains_key(&hdr.block_hash()))
-                .count();
-            if connecting && pending.len().saturating_add(incoming) > MAX_PENDING_HEADERS {
-                let mut ancestors = HashSet::new();
-                let mut h = prev;
-                for _ in 0..PENDING_WALK_LIMIT {
-                    let Some(hdr) = pending.get(&h) else {
-                        break;
-                    };
-                    ancestors.insert(h);
-                    h = hdr.prev_blockhash;
-                }
-                pending.retain(|hash, _| ancestors.contains(hash));
-                apply.evicts = pending_before
-                    .keys()
-                    .filter(|hash| !pending.contains_key(*hash))
-                    .copied()
-                    .collect();
-            }
-            for hdr in headers.iter().take(n) {
-                let hash = hdr.block_hash();
-                apply.from_peer.push(hash);
-                apply.best_known.push(hash);
-                admit_pending_header(&mut pending, hash, *hdr);
-                apply.admits.push((hash, *hdr));
-            }
-            if !connecting {
-                if n < MAX_HEADERS_RESULTS {
-                    apply.getheaders = Some(headers_sync_locator(hub, None));
-                }
-            } else {
-                let last = headers[n - 1].block_hash();
-                // Core `chain_start.nHeight + headers.size()`. One-header
-                // tip announces still accumulate via `follow.pending_headers`
-                // (`p2p_headers_sync_with_minchainwork` height=14).
-                let announced_h = announced_headers_height(hub, &pending, last);
-                let work_cmp = announced_work_cmp(hub, &pending, last);
-                let our_tip = hub.tip_height().unwrap_or(0);
-                if announced_tip_is_hopeless(our_tip, announced_h, work_cmp) && !noban {
-                    apply.disconnect = Some((announced_h, our_tip));
-                    return apply;
-                }
-                if !header_path_meets_minwork(hub, &pending, last) {
-                    if noban {
-                        let should_stamp = work_cmp == Some(std::cmp::Ordering::Greater)
-                            && !header_is_stored(hub, &last);
-                        persist_pending_header_path(hub, &pending, last);
-                        apply.stamp_block_announcement =
-                            should_stamp && header_is_stored(hub, &last);
-                        apply.sync_height = Some(announced_h);
-                    } else {
-                        apply.ignore_height = Some(announced_h);
-                        ignored_below_floor = true;
-                    }
-                    // Core: do not download bodies until the chain meets
-                    // `-minimumchainwork` (`p2p_headers_sync_with_minchainwork`).
-                } else {
-                    // This check is deliberately after the below-floor early path:
-                    // that path must not touch the header store or walk parents.
+            if !header_path_meets_minwork(hub, &pending, last) {
+                if noban {
                     let should_stamp = work_cmp == Some(std::cmp::Ordering::Greater)
                         && !header_is_stored(hub, &last);
                     persist_pending_header_path(hub, &pending, last);
                     apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
                     apply.sync_height = Some(announced_h);
-                    let keep = connecting_header_path(hub, &pending, last);
-                    let mut requested = requested_before.clone();
-                    release_asks_off_path(hub, &mut requested, &keep);
-                    apply.drop_asks = requested_before
-                        .iter()
-                        .copied()
-                        .filter(|h| !requested.contains(h))
-                        .collect();
-                    let mut want = fetchable_header_path_bodies(
-                        hub,
-                        &pending,
-                        last,
-                        &PendingBlocks::new(),
-                        &requested,
-                    );
-                    want.retain(|h| !have_bodies.contains(h) && !requested.contains(h));
-                    want.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested.len()));
-                    apply.want_bodies = want;
+                } else {
+                    apply.ignore_height = Some(announced_h);
+                    ignored_below_floor = true;
                 }
+                // Core: do not download bodies until the chain meets
+                // `-minimumchainwork` (`p2p_headers_sync_with_minchainwork`).
+            } else {
+                // This check is deliberately after the below-floor early path:
+                // that path must not touch the header store or walk parents.
+                let should_stamp =
+                    work_cmp == Some(std::cmp::Ordering::Greater) && !header_is_stored(hub, &last);
+                persist_pending_header_path(hub, &pending, last);
+                apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
+                apply.sync_height = Some(announced_h);
+                let keep = connecting_header_path(hub, &pending, last);
+                let mut requested = requested_before.clone();
+                release_asks_off_path(hub, &mut requested, &keep);
+                apply.drop_asks = requested_before
+                    .iter()
+                    .copied()
+                    .filter(|h| !requested.contains(h))
+                    .collect();
+                let mut want = fetchable_header_path_bodies(
+                    hub,
+                    &pending,
+                    last,
+                    &PendingBlocks::new(),
+                    &requested,
+                );
+                want.retain(|h| !have_bodies.contains(h) && !requested.contains(h));
+                want.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested.len()));
+                apply.want_bodies = want;
             }
         }
     }
