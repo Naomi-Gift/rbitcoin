@@ -405,8 +405,9 @@ impl AddrMan {
     /// Core's fixed-seed fallback (`ThreadOpenConnections`): add `network`'s
     /// [`fixed_seeds`] for each net this process can dial that has no row in
     /// the book. Returns how many rows were added. The table is not read
-    /// when no net is wanted, and Tor and I2P lines for unwanted nets are
-    /// skipped before the parse.
+    /// when no net is wanted. Tor and I2P lines for unwanted nets, and the
+    /// IP and CJDNS lines when none of those three is wanted, are skipped
+    /// before the parse.
     pub fn add_fixed_seeds(&mut self, network: Network) -> usize {
         let wanted: Vec<OnlyNet> = OnlyNet::ALL
             .into_iter()
@@ -416,8 +417,14 @@ impl AddrMan {
             .collect();
         let mut added = 0;
         if !wanted.is_empty() {
+            let clearnet_wanted = wanted
+                .iter()
+                .any(|net| matches!(net, OnlyNet::Ipv4 | OnlyNet::Ipv6 | OnlyNet::Cjdns));
             let seeds = fixed_seed_lines(network)
-                .filter(|line| suffix_net(line).is_none_or(|net| wanted.contains(&net)))
+                .filter(|line| match suffix_net(line) {
+                    Some(net) => wanted.contains(&net),
+                    None => clearnet_wanted,
+                })
                 .map(parse_fixed_seed);
             for addr in seeds {
                 if !wanted.contains(&OnlyNet::of(addr)) || self.by_addr.contains_key(&addr) {

@@ -1167,6 +1167,17 @@ fn fixed_seed_fallback_parses_only_lines_it_can_keep() {
         1033,
         "clearnet only: Tor and I2P lines are skipped unparsed; CJDNS needs the parse"
     );
+
+    let mut onion = AddrMan::new();
+    onion.set_onion_reachable(true);
+    onion.set_only_net(vec![OnlyNet::Onion]);
+    let before = fixed_seed_parses();
+    assert_eq!(onion.add_fixed_seeds(Network::Mainnet), 512);
+    assert_eq!(
+        fixed_seed_parses() - before,
+        512,
+        "onion only: IP and CJDNS lines are skipped unparsed"
+    );
 }
 
 #[test]
