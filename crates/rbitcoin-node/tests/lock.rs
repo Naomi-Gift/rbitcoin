@@ -43,6 +43,21 @@ fn second_lock_on_same_datadir_is_busy() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A duplicated fd shares the flock. Dropping the guard must release it,
+/// or the next launch in this process reports the datadir as busy.
+#[cfg(unix)]
+#[test]
+fn drop_releases_the_lock_even_if_the_fd_was_duplicated() {
+    let dir = tmp();
+    let cfg = NodeConfig::default().with_datadir(&dir).with_tiny_heads();
+    let held = lock_node_dirs(&cfg).expect("lock");
+    let dup = held._files[0].try_clone().expect("dup");
+    drop(held);
+    lock_node_dirs(&cfg).expect("drop released the flock while the dup is open");
+    drop(dup);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn lock_does_not_create_core_blocks_dir() {
     let dir = tmp();
