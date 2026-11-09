@@ -684,9 +684,21 @@ async fn getheaders_of_a_reorg_tip_does_not_hold_its_child() {
             break;
         }
     }
-    // Let the reorg batch finish. The next block is a new announcement.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let _ = collect_header_tips(&mut sess.reader, sess.magic, Duration::from_millis(20)).await;
+    // A reorg tip stays in `pending_tip` for `TIP_ANNOUNCE_BATCH`. A block
+    // mined inside that window is held with it. The batch is closed once
+    // that interval has passed and a short read sees no further headers.
+    let parent_at = std::time::Instant::now();
+    loop {
+        assert!(
+            std::time::Instant::now() < reply_deadline,
+            "reorg headers kept arriving past the deadline"
+        );
+        let more =
+            collect_header_tips(&mut sess.reader, sess.magic, Duration::from_millis(20)).await;
+        if more.is_empty() && parent_at.elapsed() >= rbitcoin_net::peer::TIP_ANNOUNCE_BATCH {
+            break;
+        }
+    }
     hub.generate_to_script(1, script, vec![]).unwrap();
     let child = hub.tip_hash().unwrap();
     assert_ne!(child, offered);
@@ -1333,8 +1345,7 @@ async fn queued_decode_holds_block_requests_across_heartbeat() {
 
 /// Past the 10s getdata stall, a hash the download timer still owns stays
 /// in flight, so the ping suspend holds. The peer drops when that window
-/// reaches one block interval, not at the stall clock. The stall clock is
-/// wall time, so this waits it out.
+/// reaches one block interval, not at the stall clock.
 #[tokio::test]
 async fn getdata_stall_keeps_a_hash_the_download_timer_owns() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getdata-keeps-window");
@@ -1349,8 +1360,8 @@ async fn getdata_stall_keeps_a_hash_the_download_timer_owns() {
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(hash);
     let (out_tx, _out_rx) = mpsc::unbounded_channel();
-    let mut since = Some(std::time::Instant::now());
-    tokio::time::sleep(BLOCK_GETDATA_TIMEOUT + Duration::from_secs(1)).await;
+    let mut since =
+        Some(std::time::Instant::now() - BLOCK_GETDATA_TIMEOUT - Duration::from_secs(1));
     for _ in 0..2 {
         on_heartbeat(
             &hub,
@@ -1555,8 +1566,6 @@ async fn queued_decode_keeps_the_block_ahead_of_ping_and_disconnect() {
             header,
             reorg_branch_len: 0,
         });
-        // The tip arm has no completion signal while the decode permit is held.
-        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(peers.disconnect_id(s.live.id), "the peer is registered");
         assert!(
             !s.live.take_block_from_peer(&hash),
