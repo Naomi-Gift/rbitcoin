@@ -2481,13 +2481,22 @@ impl ChainHub {
     }
 
     /// Core `UpdateTime`: the clock, raised to
-    /// [`rbitcoin_query::next_block_mintime`].
+    /// [`rbitcoin_query::next_block_mintime`]. Past the future limit no block
+    /// on the tip is valid yet, and Core's `CreateNewBlock` refuses
+    /// (bitcoin/bitcoin#36192).
     #[doc(hidden)]
     pub fn generate_block_time(&self, tip_h: u32) -> Result<u32, NetError> {
         let mintime =
             rbitcoin_query::next_block_mintime(self.query.as_ref(), &self.params, Height(tip_h))
                 .map_err(NetError::from_confirm)?;
-        Ok(mintime.max(self.clock.now_secs() as u32))
+        let now = self.clock.now_secs();
+        let time = mintime.max(now as u32);
+        if rbitcoin_consensus::time_too_new(time, now) {
+            return Err(NetError::Rules(
+                rbitcoin_consensus::ConsensusError::BadHeader("timestamp too far in future"),
+            ));
+        }
+        Ok(time)
     }
 
     /// Mine one block paying `script_pubkey` without connecting it.

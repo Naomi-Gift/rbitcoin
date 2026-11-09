@@ -6833,6 +6833,74 @@ fn getblocktemplate_mintime_is_one_past_the_tip_median() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core bitcoin/bitcoin#36192: six blocks at the two-hour future limit put the
+/// median there, so the next block's floor is past the limit and
+/// `getblocktemplate` fails as Core's `TestBlockValidity` does. The generate
+/// RPCs share Core's `CreateNewBlock` and fail the same way without mining.
+/// One second later the floor is at the limit and the template is stamped
+/// with it.
+#[test]
+fn getblocktemplate_fails_while_the_next_block_floor_is_past_the_future_limit() {
+    let (ctx, dir, hub) = ctx_regtest_hub();
+    let ctx = Arc::new(ctx);
+    let genesis = hub.tip_header().unwrap().time;
+    let now = genesis + 100_000;
+    let limit = now + 7_200;
+    dispatch(&ctx, "setmocktime", vec![json!(now)]).unwrap();
+    // Five blocks keep the median low while the six at the limit connect.
+    for h in 1..=11 {
+        let time = if h <= 5 { genesis + h } else { limit };
+        let prev = hub.tip_hash().unwrap();
+        let b = rbitcoin_consensus::mine_regtest_paying(prev, time, h, true_spk(), vec![]);
+        let r = dispatch(&ctx, "submitblock", vec![json!(block_hex(&b))]).unwrap();
+        assert!(r.is_null(), "height {h}: {r}");
+    }
+    let mtp = rbitcoin_query::median_time_past(hub.query.as_ref(), Height(11)).unwrap();
+    assert_eq!(mtp, limit);
+    let template = || dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]);
+
+    let too_new = |e: Value| {
+        assert_eq!(e["code"], ERR_MISC, "{e}");
+        assert_eq!(
+            e["message"],
+            "TestBlockValidity failed: time-too-new, block timestamp too far in the future",
+        );
+    };
+    too_new(template().expect_err("the next block cannot be valid yet"));
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    for (method, params) in [
+        ("generate", vec![json!(1)]),
+        ("generatetodescriptor", vec![json!(1), json!("raw(51)")]),
+        ("generateblock", vec![json!("raw(51)"), json!([])]),
+        (
+            "generateblock",
+            vec![json!("raw(51)"), json!([]), json!(false)],
+        ),
+    ] {
+        too_new(dispatch(&ctx, method, params.clone()).expect_err(method));
+        let call = dispatch_tip_connect(&ctx, method, RpcParams::positional(params));
+        too_new(rt.block_on(call).expect_err(method));
+    }
+    assert_eq!(hub.tip_height(), Some(11));
+
+    dispatch(&ctx, "setmocktime", vec![json!(now + 1)]).unwrap();
+    let gbt = template().unwrap();
+    assert_eq!(gbt["mintime"], limit + 1, "{gbt}");
+    assert_eq!(gbt["curtime"], limit + 1, "{gbt}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The limit is judged on the whole clock, not its low 32 bits.
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    dispatch(&ctx, "setmocktime", vec![json!(1u64 << 32)]).unwrap();
+    dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Core `GetMinimumTime` on every network: a period's last block is not
 /// before its first block, and a period's first block is at most 600 seconds
 /// before its parent. A node whose clock is behind still builds and mines

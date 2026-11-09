@@ -124,7 +124,8 @@ pub use block::{
 pub use clock::{with_now, NodeClock};
 pub use error::{block_reject_log_line, block_reject_reason, script_flag_paren, ConsensusError};
 pub use header::{
-    check_header, next_work_bits, validate_header_on_parent, ParentHeader, PeriodFirst,
+    check_header, next_work_bits, time_too_new, validate_header_on_parent, ParentHeader,
+    PeriodFirst, MAX_FUTURE_BLOCK_TIME,
 };
 pub use id_map::{IdMap, OutPointHasher, OutPointSet, TxidHasher, TxidMap, TxidSet};
 pub use milestone::{Milestone, MilestoneAnchor};

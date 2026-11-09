@@ -218,7 +218,7 @@ pub fn generate_with_mempool(
     };
     let hashes = miner
         .generate_to_script(nblocks, script, extras, true)
-        .map_err(|e| rpc_error(ERR_MISC, e))?;
+        .map_err(|e| generate_error(&e))?;
     Ok(hashes_json(&hashes))
 }
 
@@ -250,7 +250,7 @@ pub async fn generate_with_mempool_async(
     let hashes = chain
         .generate_to_script_for_rpc_async(nblocks, script, extras, true)
         .await
-        .map_err(|e| rpc_error(ERR_MISC, submit_reject_reason(&e)))?;
+        .map_err(|e| generate_error(&submit_reject_reason(&e)))?;
     Ok(hashes_json(&hashes))
 }
 
@@ -482,10 +482,29 @@ pub fn generateblock_missing_input_error(e: &str, extra: &[Transaction]) -> Valu
     generateblock_validity_error(e)
 }
 
+/// Core `CreateNewBlock`'s `TestBlockValidity` refusal of a block time past
+/// the future limit (bitcoin/bitcoin#36192). Every template and generate RPC
+/// returns it as `-1`.
+const CREATE_TIME_TOO_NEW: &str =
+    "TestBlockValidity failed: time-too-new, block timestamp too far in the future";
+
+/// A `generate*` failure: `-1` with the reject reason, or with Core's
+/// `CreateNewBlock` text when the next block's time is past the future limit.
+fn generate_error(reason: &str) -> Value {
+    if reason == "time-too-new" {
+        return rpc_error(ERR_MISC, CREATE_TIME_TOO_NEW);
+    }
+    rpc_error(ERR_MISC, reason)
+}
+
 /// Core `generateblock` after `TestBlockValidity`: `-25 TestBlockValidity failed: <reason>`.
+/// A time past the future limit fails earlier, in `CreateNewBlock`.
 pub fn generateblock_validity_error(e: &str) -> Value {
     let s = e.strip_prefix("consensus: ").unwrap_or(e);
     let s = s.strip_prefix("protocol: ").unwrap_or(s);
+    if s.contains("time-too-new") {
+        return generate_error("time-too-new");
+    }
     for needle in [
         "bad-txns-inputs-missingorspent",
         "bad-txns-duplicate",
@@ -495,7 +514,6 @@ pub fn generateblock_validity_error(e: &str) -> Value {
         "bad-blk-length",
         "bad-diffbits",
         "time-too-old",
-        "time-too-new",
         "bad-txnmrklroot",
     ] {
         if s.contains(needle) {
@@ -972,11 +990,13 @@ fn gbt_tip(ctx: &RpcContext) -> Result<GbtTip, Value> {
 }
 
 /// Core `NextEmptyBlockIndex`: the next block's time floor, its `UpdateTime`
-/// time, and the work it must meet at that time.
+/// time, and the work it must meet at that time. `too_new` when that time is
+/// past the node's future limit, so no block on the tip is valid yet.
 struct NextBlock {
     mintime: u32,
     curtime: u32,
     bits: u32,
+    too_new: bool,
 }
 
 fn next_block(
@@ -988,16 +1008,16 @@ fn next_block(
     let now = ctx
         .chain
         .as_ref()
-        .map(|c| c.clock.now_secs() as u32)
+        .map(|c| c.clock.now_secs())
         .unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as u32)
+                .map(|d| d.as_secs())
                 .unwrap_or(0)
         });
     let mintime = rbitcoin_query::next_block_mintime(ctx.query.as_ref(), params, Height(tip_h))
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
-    let curtime = mintime.max(now);
+    let curtime = mintime.max(now as u32);
     let next_h = Height(tip_h.saturating_add(1));
     let bits = rbitcoin_query::expected_next_bits(ctx.query.as_ref(), params, next_h, curtime)
         .map(|c| c.to_consensus())
@@ -1006,6 +1026,7 @@ fn next_block(
         mintime,
         curtime,
         bits,
+        too_new: rbitcoin_consensus::time_too_new(curtime, now),
     })
 }
 
@@ -1140,7 +1161,13 @@ fn gbt_sketch(ctx: &RpcContext) -> Result<GbtSketch, Value> {
         mintime,
         curtime,
         bits,
+        too_new,
     } = next_block(ctx, &params, tip_h, tip_bits)?;
+    // Core bitcoin/bitcoin#36192: `CreateNewBlock`'s `TestBlockValidity`
+    // refuses a template the node itself would reject.
+    if too_new {
+        return Err(rpc_error(ERR_MISC, CREATE_TIME_TOO_NEW));
+    }
     Ok(GbtSketch {
         prev_hex,
         updates,

@@ -1315,6 +1315,38 @@ fn template_time_holds_the_last_of_period_floor() {
     assert_eq!(built.header_timestamp, first_time);
 }
 
+/// Core bitcoin/bitcoin#36192: with six blocks at the two-hour future limit
+/// the next block's floor is past it, so no template is built. One second
+/// later the template is stamped at the floor.
+#[test]
+fn template_holds_while_the_next_block_floor_is_past_the_future_limit() {
+    let tc = padded_chain_with("sv2-future-floor", 100, ChainParams::regtest());
+    let now = tc.tip_time + 100_000;
+    let limit = now + 7_200;
+    tc.chain.clock.set_mock(i64::from(now));
+    let mut prev = tc.chain.tip_header().expect("tip").block_hash();
+    for h in 101..=106u32 {
+        let block = mine_empty_regtest(prev, limit, h);
+        prev = block.block_hash();
+        assert_eq!(
+            tc.chain.accept_block(block).unwrap(),
+            rbitcoin_net::AcceptOutcome::Accepted { height: h }
+        );
+    }
+    let tip = tc.chain.query.tip_height().unwrap();
+    assert_eq!(median_time_past(&tc.chain.query, tip).unwrap(), limit);
+
+    let held = rbitcoin_sv2::template::build(&tc.chain, 0, 0).unwrap();
+    assert!(held.is_none(), "no template past the future limit");
+
+    tc.chain.clock.set_mock(i64::from(now + 1));
+    let built = rbitcoin_sv2::template::build(&tc.chain, 0, 0)
+        .unwrap()
+        .expect("template");
+    assert_eq!(built.prev_hash, prev.to_byte_array());
+    assert_eq!(built.header_timestamp, limit + 1);
+}
+
 /// Under `regtest_pow_bits_overlay` the template carries the overlay target,
 /// and a solution ground against it becomes the tip.
 #[tokio::test(flavor = "multi_thread")]
