@@ -2428,20 +2428,6 @@ fn package_tree_requires_the_child_to_spend_each_member() {
     assert!(!ActiveMempool::package_is_child_with_parents_tree(&[
         parent, child, grandchild
     ]));
-    // The index compare is gone. A one-tx self-spend is not a peer
-    // message, because the txid commits to the prevout. `seen.contains`
-    // is what `testmempoolaccept` rejects.
-    let src = include_str!("accept.rs");
-    let start = src.find("pub fn check_package_shape(").expect("shape");
-    let end = start
-        + src[start..]
-            .find("pub fn package_is_child_with_parents_tree(")
-            .expect("child");
-    let shape = &src[start..end];
-    assert!(!shape.contains("p <"), "index compare must stay deleted");
-    assert!(!shape.contains("i > p"));
-    assert!(!shape.contains("<="));
-    assert!(!shape.contains(">="));
 }
 
 /// Recent-reject and extra-txn maps. No RPC returns them. A later peer
@@ -2512,19 +2498,6 @@ fn a_full_pinned_slot_table_evicts_one_chunk_then_stops() {
     mp.accept_tx(&incoming, &utxos, TIP_OK).unwrap();
     assert_eq!(mp.live_count(), 2, "one eviction frees the pinned table");
     assert!(mp.graph.contains(&incoming.compute_txid()));
-    // DEAD is a free slot, so eviction stops on the next pass. The old
-    // `guard += 1` / 10000 cap cannot be reached by a freed slot.
-    let src = include_str!("accept.rs");
-    let start = src.find("fn evict_worst_chunks(").expect("evict");
-    let end = start
-        + src[start..]
-            .find("fn evict_worst_chunk_once(")
-            .expect("once");
-    let evict = &src[start..end];
-    assert!(!evict.contains("+="), "eviction cap must stay deleted");
-    assert!(!evict.contains("10_000"));
-    assert!(!evict.contains("saturating_add"));
-    assert!(!evict.contains("||"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

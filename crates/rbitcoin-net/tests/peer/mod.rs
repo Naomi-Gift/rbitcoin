@@ -3627,15 +3627,6 @@ fn desirable_service_flags_match_core() {
     assert_eq!(desirable_service_flags(limited_wit, 138), pruned);
     assert!(has_all_desirable_service_flags(limited_wit, 138));
     assert!(has_all_desirable_service_flags(limited_wit_v2, 138));
-
-    assert_eq!(
-        expected_services_disconnect_log(0, full.to_u64()),
-        "p2p: does not offer the expected services (00000000 offered, 00000009 expected)"
-    );
-    assert_eq!(
-        expected_services_disconnect_log(limited_wit.to_u64(), full.to_u64()),
-        "p2p: does not offer the expected services (00000408 offered, 00000009 expected)"
-    );
 }
 
 #[test]
@@ -3650,29 +3641,13 @@ fn expect_services_from_conn_matches_core() {
 }
 
 #[test]
-fn handshake_disconnect_log_needles() {
-    assert_eq!(
-        rbitcoin_net::peer::ping_prior_to_verack_log(0),
-        "p2p: Unsupported message \"ping\" prior to verack from peer=0"
-    );
-    assert_eq!(
-        rbitcoin_net::peer::non_version_before_handshake_log("ping", 1),
-        "p2p: non-version message before version handshake. Message \"ping\" from peer=1"
-    );
-    assert_eq!(
-        rbitcoin_net::peer::obsolete_version_log(31799, 5),
-        "p2p: using obsolete version 31799, disconnecting peer=5"
-    );
+fn min_peer_proto_version_hides_an_unspecified_addr() {
     assert_eq!(rbitcoin_net::peer::MIN_PEER_PROTO_VERSION, 31800);
     let hidden = rbitcoin_net::peer::hidden_addr_from();
     let zero = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     assert_eq!(
         hidden,
         bitcoin::p2p::address::Address::new(&zero, bitcoin::p2p::ServiceFlags::NONE)
-    );
-    assert_eq!(
-        rbitcoin_net::peer::advertising_address_log("42.42.42.42:18445", 3),
-        "p2p: Advertising address 42.42.42.42:18445 to peer=3"
     );
 }
 

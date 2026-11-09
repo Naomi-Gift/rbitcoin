@@ -99,7 +99,7 @@ Do not copy that matrix here.
 | Netgroup | Permutation. Address grouping |
 | Subsidy table | Permutation. Height arithmetic |
 | `multi_hop_bad_prev_*` | Permutation. Confirm outcome distinct from `badprev_orphan_does_not_blacklist_then_reorg_reconstructs` |
-| Sole-preferred stall | Check against `p2p_timeout_getaddr_and_keepalive_ping`. Duplicate when that journey already keeps the peer and still sends `getheaders` |
+| Sole-preferred stall | Permutation. The only preferred download peer stays connected. `p2p_timeout_getaddr_and_keepalive_ping` drops a stalling inbound once another preferred outbound exists |
 | Handshake format needles | Shrink. The formatters stay; production logs them. The test does not pin the whole sentence |
 | `stamp_reject_names_*` | Shrink. `stamp_reject_operator_msg` stays on the confirm path. The test keeps the wipe distinction, not the counter text |
 | `decode_rpc_subset` | Permutation. Live decode through the RPC method table |
