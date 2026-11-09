@@ -858,9 +858,9 @@ checksum = "add0ac067452ff1aca8c5002111bd6b1c895baee6e45fcbc44e0193aea17be56"
 
 [[package]]
 name = "noise_sv2"
-version = "2.0.0"
+version = "2.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "21d54d5ba485f6a44a4195336cdbedca81e9afa875e656d7b28661ca9974c475"
+checksum = "4203061a5fdb8edc19f2e8d0208c8784d89290f6ad2b2839b3af253394d13ebf"
 dependencies = [
  "chacha20poly1305",
  "rand",
