@@ -82,8 +82,9 @@ the clause. `feature_block.py` stays skip. The proxy answers MiniWallet `scantxo
 coinbase from `/tx/:txid`, genesis coinbase omitted). It does not expand
 descriptors. `rpc_scantxoutset.py` and `rpc_signrawtransactionwithkey.py`
 are inventory skips. The node implements neither `scantxoutset` nor
-`gettxoutsetinfo`. `rpc_packages.py` `run` includes the package-dialect
-shim (same honesty as `WAIT_TIP_IDLE`).
+`gettxoutsetinfo`. `rpc_packages.py` uses the package-dialect shim (same
+honesty as `WAIT_TIP_IDLE`). It is skip until `submitpackage` reports
+`other-wtxid` (#1486).
 
 ## When a script is red
 
@@ -215,7 +216,8 @@ Shim-only scripts that used to be `run` stay skip: `feature_help.py`
 (`no-prune`), `feature_dirsymlinks.py` stays skip (`core-internal`). Dummy `blk00000.dat`
 still exists so `rpc_getblockstats.py`'s rename-file needle can run; the rest
 of that script is `submitblock` + archive `getblockstats`. `feature_port.py`
-is `run`: `-bind`/`-port` become `--listen` on those sockets.
+maps `-bind`/`-port` to `--listen` on those sockets. It is skip until the
+P2P listener is exclusive (#1485).
 `p2p_opportunistic_1p1c.py` is skip (`core-net-policy`): a peer's low-fee
 parent and its child are admitted together only when the child spends the
 parent's 0-value anchor (#1407). Core does this for any low-fee parent, and
