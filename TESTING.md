@@ -672,7 +672,7 @@ The official tarball is glibc; GitHub Actions `ubuntu-latest` runs it. A NixOS
 host cannot exec it without a foreign-glibc loader — that is CI-only, not a
 default-suite concern.
 
-Inventory for Bitcoin Core **v32.1** functional tests lives in
+Inventory for Bitcoin Core functional tests (master `d206226b`) lives in
 [`scripts/core-functional/`](scripts/core-functional/)
 ([`docs/core-functional.md`](docs/core-functional.md)).
 `python3 scripts/core-functional/check_inventory.py` is the completeness

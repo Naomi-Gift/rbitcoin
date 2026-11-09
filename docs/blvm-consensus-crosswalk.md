@@ -142,7 +142,7 @@ compiled. A regtest node with those features on would disagree with us.
 Paths are under `crates/`. Tests are `#[test]` functions unless noted.
 `core_script_tests_all_rows`, `core_tx_valid_all_rows`,
 `core_tx_invalid_all_rows`, `core_sighash_all_rows`, and
-`core_bip341_wallet_vectors_all_rows` are the Core v32.1 corpora
+`core_bip341_wallet_vectors_all_rows` are the pinned Core corpora
 (consensus-tests C15–C19). “corpus” below means those harnesses.
 
 ### 1. Header

@@ -1,10 +1,12 @@
 # Bitcoin Core functional tests (rbitcoin)
 
-Pin: **Bitcoin Core v32.1** (`f0de87f040621468b956f01f526a43a010310501`).
+Pin: Bitcoin Core master `d206226b` (after v32.1, at bitcoin/bitcoin#36458),
+`d206226b4993f0330d809ca81851fb6976574ee7`. Official binaries and the
+release check stay on **v32.1** (`[release]` below).
 
 `scripts/core-functional/` holds the inventory, checkers, runner, and
 the test-only bitcoind shim. Core’s Python tests and `src/test/data` live in the
-**`third_party/bitcoin` submodule** (v32.1). We do **not** copy the 284
+**`third_party/bitcoin` submodule** (the pin). We do **not** copy the 289
 `*.py` files into this repo. Official `bitcoind` binaries for differential
 fuzz are **not** built from the submodule (sparse `src/test/data` + `test`
 only); `fetch-bitcoind.sh` downloads the `[release]` tarball into
@@ -117,14 +119,17 @@ python3 scripts/core-functional/check_inventory.py
 ```
 
 `--tests-dir PATH` compares against a Core checkout’s `test/functional`.
-Without it, the checker uses `scripts/core-functional/v32.1-tests.txt`
-(the v32.1 filename list).
+Without it, the checker uses `scripts/core-functional/d206226b-tests.txt`
+(the pin's filename list).
 
 ## Inventory schema
 
 `scripts/core-functional/inventory.toml`:
 
-Top-level `pin` / `core_commit` identify the Core tree. Optional `[release]`
+Top-level `core_commit` is the Core test tree (`init-submodule.sh` `PIN_SHA`).
+`pin` is the last Core release: `check_core_release.py` compares it, and
+it names the `[release]` tarballs. Those can differ when the tree is a
+master commit. Optional `[release]`
 pins official `bitcoind` tarball SHA256s for differential fuzz
 (`scripts/core-functional/release_pin.py`, `fetch-bitcoind.sh`). The
 inventory checker only reads `[[test]]` rows and ignores `[release]`.
@@ -137,7 +142,7 @@ inventory checker only reads `[[test]]` rows and ignores `[release]`.
 | `analog` | required when `reason` is `no-prune`, `core-internal`, `no-utxo-set`, or `rpc-missing` (`none` if we will not re-home; otherwise a scenario name or follow-up) |
 | `log_map` | optional; later `debuglog_map.toml` keys |
 
-A file on disk (or in `v32.1-tests.txt`) that is missing from the inventory,
+A file on disk (or in `d206226b-tests.txt`) that is missing from the inventory,
 or an inventory row with no file, **fails the checker**.
 
 `run` means an **unmodified** Core script is green against rbitcoin **and**
@@ -318,7 +323,7 @@ and would wipe our store after remine.
 (Core `_initialize_chain` payees: PRIV_KEYS[0:3] + MiniWallet P2TR) into
 `scripts/core-functional/cache/store` (gitignored). `run.sh` preseeds empty
 `test/cache/node0/regtest/{blocks,chainstate}` and passes that directory as
-`--cachedir` after v32.1's own temp cache argument, so the preseed wins. The
+`--cachedir` after Core's own temp cache argument, so the preseed wins. The
 shim copies `RBITCOIN_CACHE/store` only when the dest has those two dirs and
 no `store/` (clean-chain starts stay empty).
 
