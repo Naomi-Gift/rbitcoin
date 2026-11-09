@@ -739,6 +739,10 @@ def translate(
 
     for v in whitebind_vals:
         apply_whitebind(v, binds, extra_node_args)
+    # Core's framework writes noban_tx_relay as a conf whitelist= line.
+    for v in read_conf_keys(datadir / "bitcoin.conf", "whitelist"):
+        if v:
+            extra_node_args.extend(node_args("whitelist", v))
 
     node_dir = datadir / network
     node_dir.mkdir(parents=True, exist_ok=True)
