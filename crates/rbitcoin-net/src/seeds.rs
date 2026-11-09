@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 
 use crate::asmap::AsMap;
-use crate::netaddr::{parse_net_addr, NetAddr, OnlyNet};
+use crate::netaddr::{parse_net_addr, strip_i2p_suffix, strip_onion_suffix, NetAddr, OnlyNet};
 use crate::netgroup::{netgroup, select_diverse};
 
 #[doc(hidden)]
@@ -95,18 +95,53 @@ fn fixed_seed_text(network: Network) -> &'static str {
 }
 
 /// Core's fixed seeds for `network` (IPv4, IPv6, Tor v3, I2P, CJDNS), in
-/// Core's order.
+/// Core's order, parsed as the caller pulls them.
 ///
 /// The table stays Core's text so a refresh is a byte copy that diffs
-/// against Core. The parse runs once per start, over about 2,000 lines.
+/// against Core.
 #[doc(hidden)]
-pub fn fixed_seeds(network: Network) -> Vec<NetAddr> {
+pub fn fixed_seeds(network: Network) -> impl Iterator<Item = NetAddr> {
+    fixed_seed_lines(network).map(parse_fixed_seed)
+}
+
+/// The address text of each table line, comments and blanks dropped.
+fn fixed_seed_lines(network: Network) -> impl Iterator<Item = &'static str> {
     fixed_seed_text(network)
         .lines()
         .map(|line| line.split_once('#').map_or(line, |(addr, _)| addr).trim())
         .filter(|addr| !addr.is_empty())
-        .map(|addr| parse_net_addr(addr).expect("Core fixed seed parses"))
-        .collect()
+}
+
+/// The net a seed line names by its suffix (Tor, I2P), read before the
+/// parse. `None` is clearnet, where only the parse tells IPv4, IPv6, and
+/// CJDNS apart.
+fn suffix_net(addr: &str) -> Option<OnlyNet> {
+    let host = addr.rsplit_once(':').map_or(addr, |(host, _)| host);
+    if strip_i2p_suffix(host).is_some() {
+        Some(OnlyNet::I2p)
+    } else if strip_onion_suffix(host).is_some() {
+        Some(OnlyNet::Onion)
+    } else {
+        None
+    }
+}
+
+#[cfg(debug_assertions)]
+std::thread_local! {
+    static FIXED_SEED_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Fixed-seed lines this thread has parsed.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn fixed_seed_parses() -> usize {
+    FIXED_SEED_PARSES.with(|n| n.get())
+}
+
+fn parse_fixed_seed(addr: &str) -> NetAddr {
+    #[cfg(debug_assertions)]
+    FIXED_SEED_PARSES.with(|n| n.set(n.get() + 1));
+    parse_net_addr(addr).expect("Core fixed seed parses")
 }
 
 /// Default P2P port for a network.
@@ -369,20 +404,28 @@ impl AddrMan {
 
     /// Core's fixed-seed fallback (`ThreadOpenConnections`): add `network`'s
     /// [`fixed_seeds`] for each net this process can dial that has no row in
-    /// the book. Returns how many rows were added.
+    /// the book. Returns how many rows were added. The table is not read
+    /// when no net is wanted, and Tor and I2P lines for unwanted nets are
+    /// skipped before the parse.
     pub fn add_fixed_seeds(&mut self, network: Network) -> usize {
-        let present: Vec<OnlyNet> = OnlyNet::ALL
+        let wanted: Vec<OnlyNet> = OnlyNet::ALL
             .into_iter()
-            .filter(|net| self.order.iter().any(|a| OnlyNet::of(*a) == *net))
+            .filter(|net| {
+                self.reachable(*net) && !self.order.iter().any(|a| OnlyNet::of(*a) == *net)
+            })
             .collect();
         let mut added = 0;
-        for addr in fixed_seeds(network) {
-            let net = OnlyNet::of(addr);
-            if present.contains(&net) || !self.reachable(net) || self.by_addr.contains_key(&addr) {
-                continue;
+        if !wanted.is_empty() {
+            let seeds = fixed_seed_lines(network)
+                .filter(|line| suffix_net(line).is_none_or(|net| wanted.contains(&net)))
+                .map(parse_fixed_seed);
+            for addr in seeds {
+                if !wanted.contains(&OnlyNet::of(addr)) || self.by_addr.contains_key(&addr) {
+                    continue;
+                }
+                self.add_addr(addr);
+                added += 1;
             }
-            self.add_addr(addr);
-            added += 1;
         }
         self.sort_order_ipv4_first();
         added

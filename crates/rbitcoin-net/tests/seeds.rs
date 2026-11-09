@@ -592,7 +592,7 @@ fn network_ports_and_seed_lists() {
     assert_eq!(default_rpc_port(Network::Signet), 38332);
     assert_eq!(default_rpc_port(Network::Regtest), 18443);
     assert!(dns_seeds(Network::Regtest).is_empty());
-    assert!(fixed_seeds(Network::Regtest).is_empty());
+    assert_eq!(fixed_seeds(Network::Regtest).count(), 0);
     // Regtest has no seeds → resolve paths stay empty (no network I/O).
     assert!(resolve_dns_seeds(Network::Regtest).is_empty());
 }
@@ -1068,7 +1068,7 @@ fn fixed_seeds_are_core_v32_tables() {
     ] {
         assert_eq!(sha256::Hash::hash(bytes).to_string(), want, "{file}");
     }
-    let main = fixed_seeds(Network::Mainnet);
+    let main: Vec<NetAddr> = fixed_seeds(Network::Mainnet).collect();
     assert_eq!(per_net(main.iter().copied()), [512, 512, 512, 512, 9]);
     for want in [
         "3.11.75.34:8333",
@@ -1087,15 +1087,15 @@ fn fixed_seeds_are_core_v32_tables() {
             .all(|a| a.port() == 8333 || matches!(a, NetAddr::I2p { port: 0, .. })),
         "a mainnet fixed seed has a port Core does not use"
     );
-    let test = fixed_seeds(Network::Testnet);
+    let test: Vec<NetAddr> = fixed_seeds(Network::Testnet).collect();
     assert_eq!(per_net(test.iter().copied()), [67, 37, 76, 6, 4]);
     assert!(test.contains(&net_addr("3.253.163.14:18333")));
-    let signet = fixed_seeds(Network::Signet);
+    let signet: Vec<NetAddr> = fixed_seeds(Network::Signet).collect();
     assert_eq!(per_net(signet.iter().copied()), [75, 57, 72, 7, 3]);
     assert!(signet.contains(&net_addr(
         "2uqd5pbaxn26o7fl7nqtm2khetqocislppxtxrpqg55wtbcqdrf2y5qd.onion:38333"
     )));
-    let testnet4 = fixed_seeds(Network::Testnet4);
+    let testnet4: Vec<NetAddr> = fixed_seeds(Network::Testnet4).collect();
     assert_eq!(per_net(testnet4.iter().copied()), [56, 55, 78, 14, 4]);
     for want in [
         "3.234.184.245:48333",
@@ -1107,7 +1107,7 @@ fn fixed_seeds_are_core_v32_tables() {
             "testnet4 fixed seeds lack {want}"
         );
     }
-    assert!(fixed_seeds(Network::Regtest).is_empty());
+    assert_eq!(fixed_seeds(Network::Regtest).count(), 0);
 }
 
 #[test]
@@ -1144,6 +1144,29 @@ fn fixed_seeds_fill_only_reachable_nets_the_book_lacks() {
         "`--onion` with a DNS answer adds onion seeds and no clearnet seed"
     );
     assert_eq!(dns_answered.add_fixed_seeds(Network::Mainnet), 0);
+}
+
+#[test]
+fn fixed_seed_fallback_parses_only_lines_it_can_keep() {
+    let mut full = AddrMan::new();
+    let v6: SocketAddr = "[2001:4860::1]:8333".parse().unwrap();
+    full.inject([addr(1), v6]);
+    let before = fixed_seed_parses();
+    assert_eq!(full.add_fixed_seeds(Network::Mainnet), 0);
+    assert_eq!(
+        fixed_seed_parses() - before,
+        0,
+        "a book that covers every reachable net never reads the table"
+    );
+
+    let mut clear = AddrMan::new();
+    let before = fixed_seed_parses();
+    assert_eq!(clear.add_fixed_seeds(Network::Mainnet), 1024);
+    assert_eq!(
+        fixed_seed_parses() - before,
+        1033,
+        "clearnet only: Tor and I2P lines are skipped unparsed; CJDNS needs the parse"
+    );
 }
 
 #[test]
