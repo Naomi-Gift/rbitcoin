@@ -6999,11 +6999,11 @@ fn reconsider_losing_fork_parks_only_the_leaf() {
     );
     let forks: Vec<BlockHash> = hub.fork_tips.read().unwrap().iter().collect();
     assert!(
-        forks.iter().any(|h| *h == c3_hash),
+        forks.contains(&c3_hash),
         "leaf must stay a fork tip: {forks:?}"
     );
     assert!(
-        !forks.iter().any(|h| *h == c2_hash),
+        !forks.contains(&c2_hash),
         "an ancestor under a parked leaf is not itself a fork tip: {forks:?}"
     );
     let _ = std::fs::remove_dir_all(dir);

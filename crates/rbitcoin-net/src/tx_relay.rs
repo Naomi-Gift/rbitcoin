@@ -3210,12 +3210,7 @@ impl MempoolHub {
         if !fee_only {
             return None;
         }
-        if rbitcoin_consensus::policy::dust_vouts(parent)
-            .next()
-            .is_none()
-        {
-            return None;
-        }
+        rbitcoin_consensus::policy::dust_vouts(parent).next()?;
         self.lock_write().lift_dust_spender(parent, peer, |child| {
             self.try_recent_reject(&package_hash(parent, child))
         })

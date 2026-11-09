@@ -914,9 +914,9 @@ mod lane_mutants {
 
     #[tokio::test(flavor = "current_thread")]
     async fn the_permit_holder_stays_exempt() {
-        let _one = one_at_a_time();
         // `block_on` has no task id. The owner compare runs only inside `spawn`.
         let exempt = tokio::spawn(async {
+            let _one = one_at_a_time();
             assert!(tokio::task::try_id().is_some(), "spawned work is a task");
             let permit = LanePermit::take();
             assert!(

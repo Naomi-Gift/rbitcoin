@@ -4015,6 +4015,7 @@ fn failed_peer_anchor_pair_waits_for_the_next_block() {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn submit_package_rpc_admits_cpfp_below_minrelay() {
     let (_store, owned_q, owned_cbs) = pad_cbs(12);
     let q = &owned_q;
