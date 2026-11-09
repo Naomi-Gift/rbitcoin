@@ -9,6 +9,7 @@ use rbitcoin_log::{self, error, info, warn, Level};
 use rbitcoin_primitives::Network;
 use rbitcoin_store::HeadScale;
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -64,6 +65,19 @@ pub struct ParsedOperatorFlags {
     pub kvs: Vec<(String, String)>,
 }
 
+/// Requested output on stdout. A reader that closed the pipe (`| head -1`)
+/// is not an error; any other write error is exit 1.
+fn print_stdout(text: &str) -> Result<(), ExitCode> {
+    match writeln!(std::io::stdout().lock(), "{text}") {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => {
+            eprintln!("error: stdout: {e}");
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
 #[doc(hidden)]
 pub fn parse_operator_flags(args: &[OsString]) -> Result<OperatorFlagEnd, ExitCode> {
     let mut i = 1usize;
@@ -76,11 +90,11 @@ pub fn parse_operator_flags(args: &[OsString]) -> Result<OperatorFlagEnd, ExitCo
         let a = args[i].to_string_lossy();
         match a.as_ref() {
             "--help" | "-h" => {
-                eprintln!("{}", operator_usage());
+                print_stdout(&operator_usage())?;
                 return Ok(OperatorFlagEnd::Help);
             }
             "--version" | "-V" => {
-                eprintln!("rbitcoin-node {}", env!("CARGO_PKG_VERSION"));
+                print_stdout(concat!("rbitcoin-node ", env!("CARGO_PKG_VERSION")))?;
                 return Ok(OperatorFlagEnd::Version);
             }
             "--smoke" => {
@@ -432,11 +446,13 @@ Cold files: --datadir-cold PATH puts append-only IBD files under PATH/store\n\
   Default off keeps the SSD confirm schedule.\n\
 Conf: --conf FILE (snake_case key=value; CLI kebab overrides conf). See OPERATOR.md and docs/rpc.md.\n\
 Advanced debug/IO knobs remain RBITCOIN_* env (not required for normal sync; preserved if CLI omits).\n\
-IBD densify: up to 1024 concurrent getdata, max 16 in transit per peer.\n\
+IBD densify: up to {ibd_window} concurrent getdata, max {per_peer} in transit per peer.\n\
   Relay / RPC initialblockdownload after catch-up: --min-chain-work + --max-tip-age (24h).",
         env!("CARGO_PKG_VERSION"),
         main_height = default_milestone_height(Network::Mainnet),
         testnet_height = default_milestone_height(Network::Testnet),
+        ibd_window = rbitcoin_ibd::DEFAULT_IBD_WINDOW,
+        per_peer = rbitcoin_ibd::DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER,
     )
 }
 

@@ -411,3 +411,39 @@ fn getnetworkhashps_negative_nblocks_is_a_number() {
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
 }
+/// Help and version are requested output: stdout, exit 0, nothing on stderr.
+#[test]
+fn help_and_version_print_to_stdout() {
+    for (flag, want) in [
+        ("--help", "rbitcoin-cli"),
+        ("-h", "rbitcoin-cli"),
+        ("--version", env!("CARGO_PKG_VERSION")),
+        ("-V", env!("CARGO_PKG_VERSION")),
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rbitcoin-cli"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{flag} must exit 0");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(stdout.contains(want), "{flag} stdout: {stdout:?}");
+        assert!(out.stderr.is_empty(), "{flag} wrote to stderr");
+    }
+}
+
+/// A reader that already closed stdout is not an error: exit 0, no panic.
+#[test]
+fn help_and_version_to_a_closed_stdout_exit_zero() {
+    for args in [&["--help"][..], &["-h"], &["--version"], &["-V"], &["help"]] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rbitcoin-cli"))
+            .args(args)
+            .stdout(writer)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: {:?} {stderr}", out.status);
+        assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
+    }
+}
