@@ -106,8 +106,8 @@ pub use rbitcoin_mempool::{
 };
 pub use reactor::{
     acquire_armed_store_budget, hold_store_permit, off_pool, off_pool_budgeted,
-    release_store_permit, spawn_with_store_budget, with_store_budget, BlockingRegion,
-    StorePermitGuard,
+    release_store_permit, spawn_with_store_budget, with_store_budget, with_store_budget_waiters,
+    BlockingRegion, StorePermitGuard,
 };
 pub use seeds::{
     default_port, default_rpc_port, dns_seeds, resolve_dns_seeds, socks_dns_seed_dests, AddrMan,

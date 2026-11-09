@@ -684,9 +684,24 @@ async fn getheaders_of_a_reorg_tip_does_not_hold_its_child() {
             break;
         }
     }
-    // Let the reorg batch finish. The next block is a new announcement.
-    tokio::time::sleep(Duration::from_millis(400)).await;
-    let _ = collect_header_tips(&mut sess.reader, sess.magic, Duration::from_millis(20)).await;
+    // A reorg tip stays in `pending_tip` for `TIP_ANNOUNCE_BATCH`. A block
+    // mined inside that window is held with it. The batch is closed once
+    // that interval has passed and a short read sees no further headers.
+    // This deadline starts here. The getheaders loop may already have used
+    // most of `reply_deadline`.
+    let parent_at = std::time::Instant::now();
+    let batch_deadline = parent_at + Duration::from_secs(2);
+    loop {
+        assert!(
+            std::time::Instant::now() < batch_deadline,
+            "reorg headers kept arriving past the deadline"
+        );
+        let more =
+            collect_header_tips(&mut sess.reader, sess.magic, Duration::from_millis(20)).await;
+        if more.is_empty() && parent_at.elapsed() >= rbitcoin_net::peer::TIP_ANNOUNCE_BATCH {
+            break;
+        }
+    }
     hub.generate_to_script(1, script, vec![]).unwrap();
     let child = hub.tip_hash().unwrap();
     assert_ne!(child, offered);
@@ -1333,8 +1348,7 @@ async fn queued_decode_holds_block_requests_across_heartbeat() {
 
 /// Past the 10s getdata stall, a hash the download timer still owns stays
 /// in flight, so the ping suspend holds. The peer drops when that window
-/// reaches one block interval, not at the stall clock. The stall clock is
-/// wall time, so this waits it out.
+/// reaches one block interval, not at the stall clock.
 #[tokio::test]
 async fn getdata_stall_keeps_a_hash_the_download_timer_owns() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("getdata-keeps-window");
@@ -1349,8 +1363,8 @@ async fn getdata_stall_keeps_a_hash_the_download_timer_owns() {
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(hash);
     let (out_tx, _out_rx) = mpsc::unbounded_channel();
-    let mut since = Some(std::time::Instant::now());
-    tokio::time::sleep(BLOCK_GETDATA_TIMEOUT + Duration::from_secs(1)).await;
+    let mut since =
+        Some(std::time::Instant::now() - BLOCK_GETDATA_TIMEOUT - Duration::from_secs(1));
     for _ in 0..2 {
         on_heartbeat(
             &hub,
@@ -1555,8 +1569,6 @@ async fn queued_decode_keeps_the_block_ahead_of_ping_and_disconnect() {
             header,
             reorg_branch_len: 0,
         });
-        // The tip arm has no completion signal while the decode permit is held.
-        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(peers.disconnect_id(s.live.id), "the peer is registered");
         assert!(
             !s.live.take_block_from_peer(&hash),
@@ -3627,15 +3639,6 @@ fn desirable_service_flags_match_core() {
     assert_eq!(desirable_service_flags(limited_wit, 138), pruned);
     assert!(has_all_desirable_service_flags(limited_wit, 138));
     assert!(has_all_desirable_service_flags(limited_wit_v2, 138));
-
-    assert_eq!(
-        expected_services_disconnect_log(0, full.to_u64()),
-        "p2p: does not offer the expected services (00000000 offered, 00000009 expected)"
-    );
-    assert_eq!(
-        expected_services_disconnect_log(limited_wit.to_u64(), full.to_u64()),
-        "p2p: does not offer the expected services (00000408 offered, 00000009 expected)"
-    );
 }
 
 #[test]
@@ -3650,29 +3653,13 @@ fn expect_services_from_conn_matches_core() {
 }
 
 #[test]
-fn handshake_disconnect_log_needles() {
-    assert_eq!(
-        rbitcoin_net::peer::ping_prior_to_verack_log(0),
-        "p2p: Unsupported message \"ping\" prior to verack from peer=0"
-    );
-    assert_eq!(
-        rbitcoin_net::peer::non_version_before_handshake_log("ping", 1),
-        "p2p: non-version message before version handshake. Message \"ping\" from peer=1"
-    );
-    assert_eq!(
-        rbitcoin_net::peer::obsolete_version_log(31799, 5),
-        "p2p: using obsolete version 31799, disconnecting peer=5"
-    );
+fn min_peer_proto_version_hides_an_unspecified_addr() {
     assert_eq!(rbitcoin_net::peer::MIN_PEER_PROTO_VERSION, 31800);
     let hidden = rbitcoin_net::peer::hidden_addr_from();
     let zero = std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0);
     assert_eq!(
         hidden,
         bitcoin::p2p::address::Address::new(&zero, bitcoin::p2p::ServiceFlags::NONE)
-    );
-    assert_eq!(
-        rbitcoin_net::peer::advertising_address_log("42.42.42.42:18445", 3),
-        "p2p: Advertising address 42.42.42.42:18445 to peer=3"
     );
 }
 

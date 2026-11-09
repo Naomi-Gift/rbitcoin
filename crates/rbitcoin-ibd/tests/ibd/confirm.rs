@@ -870,12 +870,9 @@ fn stamp_reject_names_leftover_unresolved() {
     let msg =
         stamp_reject_operator_msg("missing prevout", &rbitcoin_query::ConfirmStats::default());
     assert!(msg.contains("missing prevout"), "{msg}");
-    assert!(msg.contains("unresolved"), "{msg}");
-    assert!(msg.contains("leftover_n="), "{msg}");
-    assert!(msg.contains("leftover_hit="), "{msg}");
     assert!(
         !msg.contains("corrupt"),
-        "must not look like store wipe: {msg}"
+        "a missing prevout must not tell the operator to wipe the store: {msg}"
     );
     assert_eq!(
         stamp_reject_operator_msg(
@@ -886,8 +883,8 @@ fn stamp_reject_names_leftover_unresolved() {
     );
 }
 
-/// 257581: leftover_n/hit is not enough — we need the missing prev_txid and
-/// whether write-behind still holds it (TipOnly is durable head only).
+/// A stamp miss names the missing prevout so the operator can look it up.
+/// `corrupt` is the store-wipe wording and must not appear.
 #[test]
 fn stamp_reject_names_union_miss_txid() {
     let mut raw = [0u8; 32];
@@ -895,13 +892,8 @@ fn stamp_reject_names_union_miss_txid() {
     raw[31] = 0xcd;
     let msg =
         format_stamp_reject_missing_prevout(1914, 1913, 1, Some(raw), true, Some("head"), 0, false);
-    assert!(msg.contains("leftover_n=1914"), "{msg}");
-    assert!(msg.contains("leftover_hit=1913"), "{msg}");
-    assert!(msg.contains("miss_n=1"), "{msg}");
-    assert!(msg.contains("miss_txid="), "{msg}");
-    assert!(msg.contains("pending=1"), "{msg}");
-    assert!(msg.contains("miss_on=head"), "{msg}");
-    assert!(msg.contains("miss_cands=0"), "{msg}");
+    assert!(msg.contains("missing prevout"), "{msg}");
+    assert!(!msg.contains("corrupt"), "{msg}");
     let disp = rbitcoin_primitives::display_hash_hex(raw);
     assert!(
         msg.contains(&disp),

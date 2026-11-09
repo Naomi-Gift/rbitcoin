@@ -2,15 +2,27 @@
 
 ## Preference order (dev-cycle aware)
 
-| Prefer | Avoid |
-|--------|--------|
-| **Journey scenarios**: one setup a peer, client, or operator could use, then a **sequence** of asserts on what they would observe | Many skinny scenarios that each remine maturity and re-open the store |
-| The socket, RPC, HTTP route, operator config, or scripted peer | An in-process helper the product never calls, or a thread-local the client does not share |
-| A pure result only in the narrow case under [True journeys](#true-journeys) | A new pure unit a session or a reopened store can already show, or a unit whose job is a private branch |
-| **One entry** per production path (the journey owns the asserts) | A `#[test]` that only calls other tests, or those tests kept as private bodies |
-| Core JSON corpora for **script engine** breadth | A second parallel script suite |
+Four layers. A new test picks the cheapest layer that still fails when
+the user-visible behavior breaks.
 
-**Fewer scenario functions, fewer store opens, and fewer pure results, not less coverage** — put more asserts on one story. The pure-result rule is [True journeys](#true-journeys).
+| Layer | What it pins | Use it when |
+|-------|----------------|-------------|
+| Spec and differential | The behavior matches Bitcoin across inputs we will not write by hand | Core script, sighash, and BIP341 corpora; `bitcoind` fuzz differentials; nightly Core functional |
+| Journey | One session, one reopened datadir, one reorg, one peer, or one client | The outcome is a response, a push, a reject, bytes on disk, or a tip after reopen |
+| Unit | Neighboring inputs of one shipped function | A journey already reaches that function, and the next case needs another maturity pad, another header window, or another live peer |
+| Model | A schedule no test can force | loom and shuttle |
+
+A journey asserts the outcome once the setup exists. It does not grow a
+case for every neighboring input. The unit owns that neighborhood. One
+entry per outcome: the journey or the unit, not both for the same case.
+That is not one owner for every boundary.
+
+If the journey already has the chain, add the assert there. Fewer store
+opens, not fewer asserts. Core JSON corpora stay one script suite.
+
+A unit of a private branch, a counter the client does not share, or a
+helper's name is not a layer. If no peer, client, or operator can cause
+the behavior, delete the behavior in the same change.
 
 ### True journeys
 
@@ -20,17 +32,19 @@ Distinct cases that only share a costly chain are separate `#[test]`s. Build tha
 
 A `#[test]` whose body only calls other tests is neither shape. If each callee still opens its own store, the suite gains one name and the same N boots. If the callees are independent, give each its own name on the shared fixture. Do not keep the old functions as private bodies the new test calls.
 
-If no peer, client, or operator can cause the behavior, delete the behavior in the same change. A small test stays only when the function's return is the consensus or schema result and a session cannot reach it without an absurd chain: pure arithmetic, a codec with no socket, two networks that cannot be the same chain. Say which of those it is, next to the test. Store state is a surface: a tip after reopen, and bytes a later open reads back, are observed results, not pure ones. When a story shows a result a pure unit used to own, delete the pure unit in that commit. The set of pure results gets smaller over time. Do not add one because it is faster to land. A small unit is not a cheaper substitute for a journey the session can already run. A tall chain the rest of the story never builds is a named second chapter on a second setup. Two setups only when the objects cannot be the same.
+A unit is the right test for the neighborhood of a shipped function a journey already reaches: a codec with no socket, consensus or schema arithmetic, two networks that cannot be the same chain, or the one-past bound of a rule the journey already rejects once. Say which of those it is, next to the test, when it is not obvious from the name. Store state is a surface: a tip after reopen, and bytes a later open reads back, are observed results. When a journey shows the same outcome a unit already asserts, delete the twin in that commit. A tall chain the rest of the story never builds is a named second chapter on a second setup. Two setups only when the objects cannot be the same.
 
-Push the entry up. Prefer the surface a real session uses over an in-process dispatch the product never calls. In-process is for a fact that surface cannot show. Do not assert a thread-local, a counter on a worker the client does not share, or a helper's name. If the only proof lives there, it is not the contract yet.
+Push the entry up when the journey already has the setup. Prefer the surface a real session uses over an in-process dispatch the product never calls. In-process is for a fact that surface cannot show without another chain. Do not assert a thread-local, a counter on a worker the client does not share, or a helper's name. If the only proof lives there, it is not the contract yet.
 
-A small unit is faster to land. It also freezes behavior a real node never exhibits, and later work has to preserve that accident. Assert what changes the result for a real user, peer, or operator. That includes rare real cases: a lagged subscriber, a pruned witness, a cap that returns an RPC error while ping still works. It does not include an internal shape no session can hit.
+Assert what changes the result for a real user, peer, or operator. That includes rare real cases: a lagged subscriber, a pruned witness, a cap that returns an RPC error while ping still works. It does not include an internal shape no session can hit. A unit that freezes that shape is the accident later work has to preserve.
 
 ### Waits
 
-A test waits on a signal the production path already publishes: the tip, the template generation, the stop bit, or a semaphore the server acquires. The assert is what a session sees after that wake: the tip, a peer row, the template. A counter, a park note, or a thread-local that exists only so the test can see a thread park is not that signal. Add one only when the production path itself was polling and the wake replaces that poll.
+A test waits on a signal the production path already publishes: the tip, the template generation, the stop bit, `active_commands`, a peer row, or a semaphore the server acquires. `store_budget_waiters` and `template_prev_waiters` are that signal when the call is blocked before `dispatch` lists it: the disk budget is full, or `template_prev` is waiting on the tip mutex. The assert is what a session sees after that wake. Any other counter, park note, or thread-local that exists only so the test can see a thread park is not a signal.
 
-A deadline stays a clock. The 50 ms session heartbeat, the two-minute RPC long-poll cap, and a process that holds a bound port until the parent kills it are clocks. They are not the condition the test is waiting for.
+A bare `sleep`, then an assert, is a flake. A poll until a condition the test already names, with a deadline, is a normal async test. Prefer `NodeClock`, `setmocktime`, `set_mock_now`, or a backdated `Instant` when that is the clock the code reads. `tokio::time::pause` plus `advance` is that clock. Do not add a new clock so a test can avoid a poll. The P2P wall table below is a budget. It is not permission to sleep.
+
+The 50 ms session heartbeat, the two-minute RPC long-poll cap, and a process that holds a bound port until the parent kills it are production clocks. They are not the condition the test is waiting for. When the code under test reads one of those clocks, advance the clock. Do not sleep the wall interval.
 
 ### Default CI is the pin
 
@@ -57,8 +71,8 @@ When adding or folding a pin:
 | Do | Do not |
 |----|--------|
 | Extend an existing [catalog](#scenario-catalog) journey (same `/tmp` pad, more asserts) | A new skinny scenario that remine-pads the same chain |
-| Fold a twin unit once the journey hits the same shipped path | Twin unit + scenario for the same reject string |
-| Delete a lower test only in a commit where a surface journey already hits those lines, so the 91% ratio holds. When no surface can hit the lines, delete the production branch and the test that only painted it in that same commit | A new small test for a path a peer, client, or operator can already hit, or a private-helper test written to turn coverage or CRAP green. Handshake **format** needles, `decode_rpc_subset`, and BIP324 encode vectors stay only until the live v2 journey observes those bytes |
+| Fold a twin once the journey asserts the same outcome | Twin unit + scenario for the same outcome. A unit that owns the neighboring bounds stays |
+| Delete a lower test only in a commit where a surface journey already asserts that outcome, so the 91% ratio holds. When no session result changes, delete the production branch and the test in that same commit | A new test whose only job is a line, a CRAP score, or a log sentence. A permutation unit of a function a journey already reaches is a real pin |
 | Live P2P/RPC on `cross_surface` / `integration_multinode` catalog tests | Grow `node_cli_and_surface_smoke` into a second live node |
 | New P2P behavior on `p2p_timeout_*` / compact / feeler / inbound-full | Stuff more asserts onto `two_node` |
 
@@ -67,16 +81,29 @@ floor and the CRAP gate are under [Coverage](#coverage). A missing promised
 fact is `StoreError::Corrupt("invariant: …")`
 ([`docs/invariants.md`](docs/invariants.md)).
 
-Internal witnesses still exist for store packed / v17 / fuse / scripthash
-machines, unsorted pack/lag, the IBD wave fence / 8×8000, scripthash
-write-behind / uring CAS, handshake format needles, `getaddr_cache_*`,
-sole-preferred stall, `stamp_reject_names_*`, `multi_hop_bad_prev_*`,
-the rate-limiter, netgroup, and the subsidy table. Which structure check
-already runs on `submitblock` is
-[`docs/consensus-tests.md`](docs/consensus-tests.md). Do not copy that
-matrix here. The next change that touches one of these witnesses applies
-the two rules above. It does not add another witness, and the list is not
-a permanent exception.
+Witnesses that are not themselves a journey carry one of three labels.
+Permutation stays. Duplicate dies when a journey already asserts that
+outcome. Dead means no user-visible result: delete the production code
+and the test together. Which structure check already runs on
+`submitblock` is [`docs/consensus-tests.md`](docs/consensus-tests.md).
+Do not copy that matrix here.
+
+| Witness | Label |
+|---------|--------|
+| Store packed / v17 / fuse / scripthash machines | Permutation. On-disk layout a later open reads |
+| Unsorted pack / lag | Permutation. Same |
+| IBD wave fence / 8×8000 | Permutation. Cap neighborhood |
+| Scripthash write-behind / uring CAS | Permutation. A schedule a journey cannot aim |
+| `getaddr_cache_*` | Permutation. Cache key and TTL |
+| Rate-limiter | Permutation. Peer disconnect under the cap |
+| Netgroup | Permutation. Address grouping |
+| Subsidy table | Permutation. Height arithmetic |
+| `multi_hop_bad_prev_*` | Permutation. Confirm outcome distinct from `badprev_orphan_does_not_blacklist_then_reorg_reconstructs` |
+| Sole-preferred stall | Permutation. The only preferred download peer stays connected. `p2p_timeout_getaddr_and_keepalive_ping` drops a stalling inbound once another preferred outbound exists |
+| Handshake format needles | Shrink. The formatters stay; production logs them. The test does not pin the whole sentence |
+| `stamp_reject_names_*` | Shrink. `stamp_reject_operator_msg` stays on the confirm path. The test keeps the wipe distinction, not the counter text |
+| `decode_rpc_subset` | Permutation. Live decode through the RPC method table |
+
 Optional leftovers (more HTTP methods on `cross_surface`, a tiny
 legacy-head `Store::open` fixture, testnet 20-minute min-diff header walk)
 are not a backlog.
@@ -730,11 +757,22 @@ the mutant. The operator VM never runs it; that disk rule is
 [`rearden-vm-HOST.md`](rearden-vm-HOST.md).
 
 A new production behavior still needs a test that fails when that behavior
-is removed or inverted. Put that assert on a catalog journey. A `MISSED`
-mutant that changes a result a peer, client, or operator can observe is
-killed by extending that journey. A `MISSED` mutant on an expression no
-session can flip into a different client-visible result is a candidate to
-delete the expression, not a candidate for a new unit. The nightly job
-stays an oracle. It does not become a pull-request check. A same-crate
-twin that only existed to satisfy a package-local mutant is a deletion
-candidate once a workspace run shows the journey catching it.
+is removed or inverted. Kill a `MISSED` mutant in this order:
+
+1. Add the assert on a catalog journey that already reaches the expression.
+2. A unit of the shipped function, when the mutant is one cell of a
+   neighborhood and a journey already reaches the function. The test or
+   the pull request names that neighborhood. That unit is a kill.
+3. Delete the expression when no session result changes.
+   `#[mutants::skip]` only when the expression must stay for a reason the
+   suite cannot see. Write that reason on the attribute.
+4. A unit whose assert is a counter, a log sentence, or a private field
+   is not a kill. A unit added only to hold the line-coverage floor is
+   not a kill.
+
+The hand-edit proof above still applies: the suite fails while the missed
+operator is applied and passes once the expression is restored. A compile
+error is not that proof. The nightly job stays an oracle. It does not
+become a pull-request check. A same-crate twin that only existed to
+satisfy a package-local mutant is a deletion candidate once a workspace
+run shows the journey catching it.

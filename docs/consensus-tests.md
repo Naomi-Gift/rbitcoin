@@ -164,9 +164,9 @@ version floors and exact +2h).
 ## Adding a new rule
 
 1. Add a row to the inventory above (or mark **rust-bitcoin** / **lib** if delegated).
-2. Prefer a pure unit test in `rbitcoin-consensus` when no chain state is needed; otherwise `consensus_rules` or a focused scenario.
+2. Prefer a pure unit test in `rbitcoin-consensus` when no chain state is needed; otherwise `consensus_rules` or a focused scenario. Some journey still hits the rule once with one realistic block. The unit keeps the boundary matrix, including H8's exact `+2h` case on the header unit. Do not move that case onto `header_and_spending_boundaries`.
 3. For Core corpora: every row must pass; never reintroduce allowlist/skip debt.
-4. Assert on the **error signal** string/variant so removing the check fails the test.
+4. Assert the reject code or variant a caller matches, so removing the check fails the test. Do not pin incidental log prose.
 
 Dependency gate: `cargo tree -i bitcoinconsensus` must not resolve
 (product workspace). The isolated [`fuzz/`](../fuzz/) workspace may depend on
