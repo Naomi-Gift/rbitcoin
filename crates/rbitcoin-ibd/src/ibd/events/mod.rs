@@ -1229,22 +1229,31 @@ pub fn take_confirm_events(
     let mut deferred = Vec::new();
     while let Ok(ev) = rx.try_recv() {
         match ev {
-            super::confirm::ConfirmEvent::Accepted { hash, wire_bytes } => {
+            super::confirm::ConfirmEvent::Accepted {
+                hash,
+                height,
+                wire_bytes,
+            } => {
                 *last_progress = Instant::now();
                 st.confirm_stuck_since = None;
                 remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                 st.body.mark_archived(hash);
                 let tip = hub.tip_height().unwrap_or(0);
-                // The write thread moves the tip to the end of the batch before
-                // these events arrive. Charging `tip` would bill the matched
-                // prefix against the lead. The block's own height is the lead.
-                let height = st.hash_height.get(&hash).copied().unwrap_or(0);
-                super::header_walk::note_unproven_class_a(st, height, wire_bytes);
+                // The write recorded this height. `hash_height` may already be
+                // gone if a fork promotion ran first. The store wins when it
+                // has a row: a rewind that replaced this height must not spend
+                // the new chain's lead. The map covers a write the test has
+                // not flushed.
+                if accepted_height_stands(st, hub, height, hash) {
+                    super::header_walk::note_unproven_class_a(st, height, wire_bytes);
+                    if let Some(f) = feed {
+                        f.release_lead_reserve(height);
+                    }
+                }
                 archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
                 st.max_ready_height = st.max_ready_height.max(tip);
                 max_ready_shared.store(st.max_ready_height, Ordering::Relaxed);
                 if let Some(f) = feed {
-                    f.release_lead_reserve(height);
                     f.release_isolate_if_tip(tip);
                 }
             }
@@ -1282,6 +1291,18 @@ pub fn take_confirm_events(
         st.confirm_quiesce = false;
     }
     deferred
+}
+
+/// This accept still belongs to `height`. A stored row decides. With no row,
+/// the in-memory map does.
+fn accepted_height_stands(st: &IbdWorkState, hub: &ChainHub, height: u32, hash: BlockHash) -> bool {
+    match hub
+        .query
+        .header_at_height(rbitcoin_primitives::Height(height))
+    {
+        Ok(Some((_, rec))) => rec.hash == *hash.as_byte_array(),
+        _ => st.hash_height.get(&hash).copied() == Some(height),
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled

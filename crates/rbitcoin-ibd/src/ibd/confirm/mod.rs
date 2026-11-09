@@ -1044,8 +1044,14 @@ pub fn accepted_block_wire(sizes: &[u64], index: usize) -> u64 {
 }
 
 pub enum ConfirmEvent {
-    /// Tip advanced; hash is the confirmed block.
-    Accepted { hash: BlockHash, wire_bytes: u64 },
+    /// Tip advanced. `height` is the block that was written. The coordinator
+    /// must not look that up in `hash_height`: a fork promotion can remove
+    /// the entry before this event is read.
+    Accepted {
+        hash: BlockHash,
+        height: u32,
+        wire_bytes: u64,
+    },
     /// Height is the attempted confirm height (for operator logs).
     Reject {
         height: u32,
@@ -2325,6 +2331,7 @@ pub fn spawn_confirm_engine(
                             if event_tx_wb
                                 .send(ConfirmEvent::Accepted {
                                     hash,
+                                    height: *height,
                                     wire_bytes: share,
                                 })
                                 .is_err()
@@ -2407,6 +2414,7 @@ pub fn spawn_confirm_engine(
                                             if event_tx_wb
                                                 .send(ConfirmEvent::Accepted {
                                                     hash: ha,
+                                                    height: *h,
                                                     wire_bytes: share,
                                                 })
                                                 .is_err()
@@ -2463,7 +2471,7 @@ pub fn spawn_confirm_engine(
                             debug!(
                                 "ibd: confirm write skip already-committed @{height} ({msg})"
                             );
-                            for (index, (_, raw)) in heights_hashes.iter().enumerate() {
+                            for (index, (ht, raw)) in heights_hashes.iter().enumerate() {
                                 let h = BlockHash::from_byte_array(*raw);
                                 if hub_wb.has_block(&h) {
                                     loop_stats_wb
@@ -2472,6 +2480,7 @@ pub fn spawn_confirm_engine(
                                     accepted_wb.fetch_add(1, Ordering::SeqCst);
                                     let _ = event_tx_wb.send(ConfirmEvent::Accepted {
                                         hash: h,
+                                        height: *ht,
                                         wire_bytes: accepted_block_wire(&wire_sizes, index),
                                     });
                                 }

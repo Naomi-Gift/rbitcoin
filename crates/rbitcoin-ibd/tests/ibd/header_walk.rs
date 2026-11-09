@@ -6622,8 +6622,9 @@ fn a_clock_behind_the_starting_median_does_not_start_the_walk() {
     let (s0, _rx) = slot(0);
     let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
     ensure_origin(&mut st, &hub);
-    assert!(!st.header_walk.origin);
+    assert!(st.header_walk.origin);
     assert!(st.header_walk.clock_refused);
+    assert_eq!(unproven_confirm_limit(&st), Some(UNPROVEN_LEAD_BLOCKS));
     let _ = dir;
 }
 
@@ -6648,7 +6649,7 @@ fn a_refused_clock_does_not_store_headers() {
     ensure_origin(&mut st, &hub);
     let logs = rbitcoin_log::take_logs();
     rbitcoin_log::capture_logs(false);
-    assert!(!st.header_walk.origin);
+    assert!(st.header_walk.origin);
     assert!(st.header_walk.clock_refused);
     let before = hub.query.store().header_count();
     apply(&mut st, &hub, 0, headers_after(gen_hdr, 5, 1));
@@ -6660,6 +6661,16 @@ fn a_refused_clock_does_not_store_headers() {
             .count(),
         1,
         "the refusal is logged once"
+    );
+    assert_eq!(
+        unproven_confirm_limit(&st),
+        Some(UNPROVEN_LEAD_BLOCKS),
+        "a refused clock does not lift the confirm lead"
+    );
+    assert_eq!(
+        rewind_depth_cap(&st, &hub),
+        UNPROVEN_LEAD_BLOCKS,
+        "a refused clock keeps the wide rewind while the tip is under the floor"
     );
     let _ = dir;
 }
@@ -6936,11 +6947,13 @@ fn class_a_lead_counts_the_block_height_not_the_tip() {
     let (tx, rx) = std::sync::mpsc::channel();
     tx.send(ConfirmEvent::Accepted {
         hash: at_match.block_hash(),
+        height: 10,
         wire_bytes: 40,
     })
     .unwrap();
     tx.send(ConfirmEvent::Accepted {
         hash: above.block_hash(),
+        height: 11,
         wire_bytes: 60,
     })
     .unwrap();
@@ -6961,6 +6974,71 @@ fn class_a_lead_counts_the_block_height_not_the_tip() {
         unproven_offer_bounds(&st).bytes_left,
         Some(UNPROVEN_LEAD_BYTES - 60),
         "only the block above the matched height spends the lead, even when the tip has not moved"
+    );
+}
+
+/// Promoting a fork removes `hash_height` before the accept event is read.
+/// The block is still the confirmed header. Its bytes stay on the lead, and
+/// clearing the feed does not give that reservation back.
+#[test]
+fn a_promoted_fork_keeps_the_charge_for_a_block_that_stays() {
+    use rbitcoin_ibd::ibd::confirm::{ConfirmEvent, ConfirmFeed};
+    use rbitcoin_ibd::ibd::events::take_confirm_events;
+    use std::sync::atomic::AtomicU32;
+    use std::time::Instant;
+
+    let (_dir, hub, mut st, _gen) = opened("unproven-promote-charge", true);
+    let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+    hub.generate_to_script(11, op_true, vec![]).unwrap();
+    let tip = hub.tip_height().unwrap();
+    let hash = hub.tip_hash().unwrap();
+    assert!(tip > 10);
+    st.header_walk.witness_height = Some(10);
+    assert!(
+        !st.hash_height.contains_key(&hash),
+        "the promotion already dropped this hash"
+    );
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(
+        Some(tip + UNPROVEN_LEAD_BLOCKS),
+        10,
+        Some(UNPROVEN_LEAD_BYTES),
+    );
+    {
+        let mut guard = feed.inner.lock().unwrap();
+        guard.lead_bytes_left = Some(UNPROVEN_LEAD_BYTES - 144);
+        guard.lead_reserved.insert(tip, 144);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(ConfirmEvent::Accepted {
+        hash,
+        height: tip,
+        wire_bytes: 144,
+    })
+    .unwrap();
+    drop(tx);
+    let write_next = AtomicU32::new(0);
+    let max_ready = AtomicU32::new(0);
+    let mut progress = Instant::now();
+    let _ = take_confirm_events(
+        &mut st,
+        &hub,
+        &rx,
+        &write_next,
+        &max_ready,
+        &mut progress,
+        Some(&feed),
+    );
+    feed.clear();
+    assert_eq!(
+        st.header_walk.lead_class_a.get(&tip),
+        Some(&144),
+        "a block that is still confirmed spends the lead"
+    );
+    assert_eq!(
+        feed.inner.lock().unwrap().lead_bytes_left,
+        Some(UNPROVEN_LEAD_BYTES - 144),
+        "clearing the feed must not refund a block that stayed"
     );
 }
 
@@ -7127,6 +7205,34 @@ fn an_empty_rewind_keeps_class_a_on_the_confirmed_tip() {
     );
 }
 
+/// A confirmed rewind onto another chain drops the match and the bytes of the
+/// chain that was left. The new chain does not inherit them.
+#[test]
+fn a_confirmed_rewind_onto_another_chain_drops_the_old_match() {
+    let (_dir, hub, mut st, gen) = opened("unproven-rewind-other-chain", true);
+    st.header_walk.checkpoints.push(Checkpoint {
+        hash: gen.block_hash(),
+        height: 2_000,
+        height_wide: 2_000,
+        work: st.header_walk.tip_work(),
+        header: Some(gen),
+        times: vec![gen.time],
+        diff: DiffSnap::default(),
+        supplied_by: Some(st.slots[0].net),
+    });
+    st.header_walk.witness_height = Some(2_000);
+    st.header_walk.lead_class_a.insert(1_500, 144);
+    on_confirmed_rewind(&mut st, &hub, 0);
+    assert!(
+        st.header_walk.witness_height.is_none(),
+        "chain B was not matched"
+    );
+    assert!(
+        !st.header_walk.lead_class_a.contains_key(&1_500),
+        "bytes from the chain that was left do not shrink the new lead"
+    );
+}
+
 /// Retiring the candidate under the floor clears the proved latch and the match.
 #[test]
 fn retiring_a_candidate_under_the_floor_caps_the_replacement() {
@@ -7189,7 +7295,7 @@ fn a_refused_clock_starts_once_the_clock_catches_up() {
     let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
     ensure_origin(&mut st, &hub);
     assert!(st.header_walk.clock_refused);
-    assert!(!st.header_walk.origin);
+    assert!(st.header_walk.origin);
     set_walk_unix_for_test(Some(u64::from(gen_hdr.time).saturating_add(1)));
     ensure_origin(&mut st, &hub);
     assert!(st.header_walk.origin);

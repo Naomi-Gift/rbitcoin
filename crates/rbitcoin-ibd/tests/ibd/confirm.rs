@@ -3145,7 +3145,9 @@ fn next_accepted(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(8);
     loop {
         match rx.recv_timeout(std::time::Duration::from_millis(50)) {
-            Ok(ConfirmEvent::Accepted { hash, wire_bytes }) => return (hash, wire_bytes),
+            Ok(ConfirmEvent::Accepted {
+                hash, wire_bytes, ..
+            }) => return (hash, wire_bytes),
             Ok(ConfirmEvent::Reject { height, err, .. }) => {
                 panic!("confirm reject @{height}: {err}")
             }

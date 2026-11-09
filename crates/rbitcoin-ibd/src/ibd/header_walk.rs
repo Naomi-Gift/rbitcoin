@@ -483,6 +483,8 @@ pub fn install_origin(st: &mut IbdWorkState, hub: &ChainHub, loaded: OriginLoade
         }
     }
     if !arm_walk_bounds(st, hub) {
+        // Keep the loaded base. Wiping the walk would look proved and lift
+        // the confirm caps over headers already stored.
         refuse_walk_clock(st);
         return;
     }
@@ -492,10 +494,9 @@ pub fn install_origin(st: &mut IbdWorkState, hub: &ChainHub, loaded: OriginLoade
 }
 
 fn refuse_walk_clock(st: &mut IbdWorkState) {
-    let epoch = st.header_walk.report_epoch;
     let logged = st.header_walk.clock_logged;
-    st.header_walk = HeaderWalk::default();
-    st.header_walk.report_epoch = epoch;
+    st.header_walk.origin = true;
+    st.header_walk.proven = false;
     st.header_walk.clock_refused = true;
     st.header_walk.clock_logged = true;
     if !logged {
@@ -3697,6 +3698,24 @@ pub fn base_conflicts(st: &IbdWorkState, hub: &ChainHub, walk: &HeaderWalk) -> b
     }
 }
 
+/// A confirmed rewind disconnects every height above `lca_h`. A match that
+/// sits above that fork is the chain that was left. A match at or below the
+/// fork can stay. Class A above the fork is not the new chain's lead.
+fn settle_lead_after_confirmed_rewind(st: &mut IbdWorkState, lca_h: u32) {
+    if st.header_walk.witness_height.is_some_and(|h| h > lca_h) {
+        let floor = st.header_walk.base_height;
+        let kept = st
+            .header_walk
+            .checkpoints
+            .iter()
+            .filter(|c| c.supplied_by.is_some() && c.height <= lca_h && c.height > floor)
+            .map(|c| c.height)
+            .max();
+        st.header_walk.witness_height = kept;
+    }
+    st.header_walk.lead_class_a.retain(|&h, _| h <= lca_h);
+}
+
 /// A confirmed reorg under the walk's base drops `header.adopt`. The file must
 /// not bring back a hash from the chain that was disconnected. A reorg under
 /// the milestone height drops the latched hash. Putting that hash back is
@@ -3712,6 +3731,10 @@ pub fn on_confirmed_rewind(st: &mut IbdWorkState, hub: &ChainHub, lca_h: u32) {
         forget_adopt(hub);
         return;
     }
+    // The confirmed chain left these heights. A match above the fork belongs
+    // to the chain that was disconnected, and its Class A bytes are not the
+    // new chain's lead.
+    settle_lead_after_confirmed_rewind(st, lca_h);
     if hub.milestone.height == 0 || !st.header_walk.origin {
         return;
     }

@@ -1695,6 +1695,7 @@ fn ibd_bad_prev_fork() {
         &mut st,
         ConfirmEvent::Accepted {
             hash: a1,
+            height: 0,
             wire_bytes: 0,
         },
     );
