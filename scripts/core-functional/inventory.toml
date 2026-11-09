@@ -240,9 +240,7 @@ analog = "no BIP37 bloom; script restarts with -peerbloomfilters (upload-target 
 
 [[test]]
 name = "feature_minchainwork.py"
-status = "skip"
-reason = "node-behavior"
-analog = "follow-up #1484: outbound insufficient-work disconnect during IBD (bitcoin/bitcoin#36426)"
+status = "run"
 
 [[test]]
 name = "feature_notifications.py"

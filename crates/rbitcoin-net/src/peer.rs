@@ -5143,6 +5143,9 @@ struct HeadersApply {
     want_bodies: Vec<BlockHash>,
     /// Locator for one follow-up `getheaders`, if the batch still wants a page.
     getheaders: Option<Vec<BlockHash>>,
+    headers_len: usize,
+    /// Best-known header-chain work is under `-minimumchainwork`.
+    peer_below_floor: bool,
 }
 
 fn classify_headers(
@@ -5166,6 +5169,8 @@ fn classify_headers(
         drop_asks: Vec::new(),
         want_bodies: Vec::new(),
         getheaders: None,
+        headers_len: n,
+        peer_below_floor: false,
     };
     let mut ignored_below_floor = false;
     if n == 0 {
@@ -5258,7 +5263,48 @@ fn classify_headers(
         let from = headers.get(n - 1).map(|h| h.block_hash());
         apply.getheaders = Some(headers_sync_locator(hub, from));
     }
+    if n > 0 {
+        if let Some(last) = headers.last() {
+            apply.peer_below_floor = peer_headers_below_floor(hub, &pending, last.block_hash());
+        }
+    }
     apply
+}
+
+/// This headers message ended the peer's chain, and that chain's work is
+/// under `-minimumchainwork`, while we are still in IBD.
+///
+/// Core drops outbound full-relay and block-relay peers there. A full page
+/// can continue, so it is not their tip yet. Inbound and manual peers stay.
+#[doc(hidden)]
+pub fn outbound_insufficient_work_disconnect(
+    in_ibd: bool,
+    header_count: usize,
+    conn: crate::peers::PeerConnType,
+    peer_below_floor: bool,
+) -> bool {
+    in_ibd
+        && header_count > 0
+        && header_count < MAX_HEADERS_RESULTS
+        && peer_below_floor
+        && matches!(
+            conn,
+            crate::peers::PeerConnType::OutboundFullRelay | crate::peers::PeerConnType::BlockRelay
+        )
+}
+
+fn peer_headers_below_floor(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+) -> bool {
+    let Some(min) = hub.min_chain_work_floor() else {
+        return false;
+    };
+    match work_of_header_path(hub, pending, tip) {
+        Some(work) => work.to_be_bytes() < min,
+        None => false,
+    }
 }
 
 fn apply_headers(
@@ -5297,6 +5343,21 @@ fn apply_headers(
     }
     if let Some(announced_h) = apply.ignore_height {
         rbitcoin_log::info!("{}", ignoring_low_work_chain_log(announced_h));
+    }
+    if let Some(s) = session.filter(|s| {
+        outbound_insufficient_work_disconnect(
+            hub.in_ibd(),
+            apply.headers_len,
+            s.conn_type,
+            apply.peer_below_floor,
+        )
+    }) {
+        rbitcoin_log::info!(
+            "outbound peer headers chain has insufficient work, peer={}",
+            s.id
+        );
+        s.request_disconnect();
+        return Ok(());
     }
     for hash in &apply.drop_asks {
         follow.requested_blocks.remove(hash);
