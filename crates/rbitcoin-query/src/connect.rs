@@ -1382,7 +1382,6 @@ impl Query {
             .unwrap_or([0u8; 32]);
         let tx_fks = self.block_tx_fks(height)?;
 
-        log_disconnect_tip(height.0, &hash, tx_fks.len());
         let mut by_sh: HashMap<[u8; 32], Vec<Fk>> = HashMap::new();
         for &tx_fk in &tx_fks {
             let outputs = self.tx_output_run_class_a(tx_fk)?;
