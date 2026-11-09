@@ -7,6 +7,7 @@ See docs/core-functional.md. No network, no node.
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from pathlib import Path
 
@@ -34,6 +35,7 @@ VALID_REASONS = frozenset(
         "policy-libre",
         "rpc-missing",
         "rpc-dialect",
+        "node-behavior",
         "core-cpp-unit",
         "prev-release",
         "harness",
@@ -108,6 +110,9 @@ def check(inventory_path: Path, disk_names: list[str]) -> list[str]:
                 analog = row.get("analog")
                 if not analog or not str(analog).strip():
                     errors.append(f"missing analog: {name}")
+            elif reason == "node-behavior":
+                if not re.search(r"#\d+", str(row.get("analog") or "")):
+                    errors.append(f"node-behavior needs a #issue: {name}")
         else:
             errors.append(f"{name}: status must be run or skip")
 

@@ -140,7 +140,7 @@ inventory checker only reads `[[test]]` rows and ignores `[release]`.
 | `name` | `*.py` basename, unique |
 | `status` | `run` or `skip` |
 | `reason` | required on `skip`; **forbidden** on `run`; never `unknown` |
-| `analog` | required when `reason` is `no-prune`, `core-internal`, `no-utxo-set`, or `rpc-missing` (`none` if we will not re-home; otherwise a scenario name or follow-up) |
+| `analog` | required when `reason` is `no-prune`, `core-internal`, `no-utxo-set`, `rpc-missing`, or `rpc-dialect` (`none` if we will not re-home; otherwise a scenario name or follow-up); for `node-behavior` it must cite the follow-up issue (`#N`) |
 | `log_map` | optional; later `debuglog_map.toml` keys |
 
 A file on disk (or in `d206226b-tests.txt`) that is missing from the inventory,
@@ -182,6 +182,7 @@ First production-green pair (historical): `feature_uacomment.py`
 | `policy-libre` | assertion *is* Core standardness |
 | `rpc-missing` | method/harness not implemented yet (shrinks; requires `analog` follow-up) |
 | `rpc-dialect` | Method is **shipped** (COMPAT done) but the unmodified Core script still fails on type-check / field / error-text zoo (requires `analog`) |
+| `node-behavior` | Core's script checks P2P, relay, or startup behavior the node does not match yet. `analog` must cite the follow-up issue (`#N`) |
 | `core-cpp-unit` | Boost units — never in this runner |
 | `prev-release` | previous-release binaries |
 | `harness` | `test_runner.py`, `combine_logs.py`, framework self-tests |
