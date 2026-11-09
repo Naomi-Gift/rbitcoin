@@ -411,6 +411,6 @@ Production is `script/p2tr.rs` and the tapscript arm of
 Their spec-lock annotations and Z3 runs were not re-executed. A row
 marked **match** means the reject we ship is the one Core ships for
 that sentence. It does not mean the Orange Paper formula was checked
-in a solver. Historical mainnet script acceptance is the Core v32.1
+in a solver. Historical mainnet script acceptance is the pinned Core
 corpora plus block 866,342, as in
 [`consensus-tests.md`](./consensus-tests.md).

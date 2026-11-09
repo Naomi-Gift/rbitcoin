@@ -623,8 +623,8 @@ status = "run"
 [[test]]
 name = "p2p_block_times.py"
 status = "skip"
-reason = "rpc-missing"
-analog = "follow-up: getpeerinfo last_block_announcement"
+reason = "rpc-dialect"
+analog = "follow-up: getpeerinfo has no last_block_announcement"
 
 [[test]]
 name = "p2p_blockfilters.py"
