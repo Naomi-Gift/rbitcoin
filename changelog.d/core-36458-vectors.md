@@ -10,4 +10,9 @@ Changed
   strict DER, and a CONST_SCRIPTCODE row without WITNESS reaches the
   interpreter. A target dir staged at the old pin picks up the new JSON.
   Official `bitcoind` binaries and the release check stay on v32.1. The
-  5 new functional scripts are inventory skips (#1476).
+  5 new functional scripts are inventory skips. Eight run-set scripts are
+  skips until master's new checks pass: reply order before a pong
+  (#1483), insufficient-work outbound disconnect (#1484), exclusive P2P
+  bind (#1485), `submitpackage` `other-wtxid` (#1486), and orphan
+  requests after a rejected parent (#1487). The functional shim now reads
+  `whitelist=` from `bitcoin.conf` (#1476).
