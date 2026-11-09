@@ -687,10 +687,13 @@ async fn getheaders_of_a_reorg_tip_does_not_hold_its_child() {
     // A reorg tip stays in `pending_tip` for `TIP_ANNOUNCE_BATCH`. A block
     // mined inside that window is held with it. The batch is closed once
     // that interval has passed and a short read sees no further headers.
+    // This deadline starts here. The getheaders loop may already have used
+    // most of `reply_deadline`.
     let parent_at = std::time::Instant::now();
+    let batch_deadline = parent_at + Duration::from_secs(2);
     loop {
         assert!(
-            std::time::Instant::now() < reply_deadline,
+            std::time::Instant::now() < batch_deadline,
             "reorg headers kept arriving past the deadline"
         );
         let more =
