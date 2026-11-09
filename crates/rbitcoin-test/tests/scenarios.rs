@@ -920,10 +920,13 @@ fn pin_disconnect_logs_and_rewinds_ibd_marks(q: &Query, top: u32, top_hash: &[u8
         "DisconnectTip: hash={} height={top} tx=1",
         BlockHash::from_byte_array(*top_hash)
     );
+    let disconnects = logs
+        .iter()
+        .filter(|(_, m)| m.contains("DisconnectTip:"))
+        .collect::<Vec<_>>();
     assert!(
-        logs.iter()
-            .any(|(l, m)| *l == rbitcoin_log::Level::Warn && m.contains(&line)),
-        "{logs:?}"
+        matches!(disconnects[..], [(rbitcoin_log::Level::Warn, m)] if m.contains(&line)),
+        "one DisconnectTip line per block: {logs:?}"
     );
     assert_eq!(q.lookup_taken_hi(), Some(top - 1));
     assert_eq!(q.lookup_started_hi(), Some(top - 1));
