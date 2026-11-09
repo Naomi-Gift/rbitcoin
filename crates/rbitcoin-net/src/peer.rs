@@ -5276,17 +5276,21 @@ fn classify_headers(
 ///
 /// Core drops outbound full-relay and block-relay peers there. A full page
 /// can continue, so it is not their tip yet. Inbound and manual peers stay.
+/// `prior_best_meets_floor` is the peer's stored best-known header from
+/// before this message. Core keeps that when the new header has less work.
 #[doc(hidden)]
 pub fn outbound_insufficient_work_disconnect(
     in_ibd: bool,
     header_count: usize,
     conn: crate::peers::PeerConnType,
     peer_below_floor: bool,
+    prior_best_meets_floor: bool,
 ) -> bool {
     in_ibd
         && header_count > 0
         && header_count < MAX_HEADERS_RESULTS
         && peer_below_floor
+        && !prior_best_meets_floor
         && matches!(
             conn,
             crate::peers::PeerConnType::OutboundFullRelay | crate::peers::PeerConnType::BlockRelay
@@ -5301,8 +5305,24 @@ fn peer_headers_below_floor(
     let Some(min) = hub.min_chain_work_floor() else {
         return false;
     };
-    match work_of_header_path(hub, pending, tip) {
+    // Pending work only. `work_of_header_path` reads parent headers, and a
+    // below-floor batch must not.
+    match pending_path_work(hub, pending, tip) {
         Some(work) => work.to_be_bytes() < min,
+        None => false,
+    }
+}
+
+fn hash_meets_work_floor(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    hash: BlockHash,
+) -> bool {
+    let Some(min) = hub.min_chain_work_floor() else {
+        return false;
+    };
+    match pending_path_work(hub, pending, hash) {
+        Some(work) => work.to_be_bytes() >= min,
         None => false,
     }
 }
@@ -5318,6 +5338,9 @@ fn apply_headers(
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
+    // Before this message overwrites it. A low-work fork must not replace
+    // a best-known header that already meets the floor.
+    let prior_best = session.and_then(|s| s.best_known());
     for hash in apply.from_peer {
         if let Some(s) = session {
             s.note_block_from_peer(hash);
@@ -5345,11 +5368,14 @@ fn apply_headers(
         rbitcoin_log::info!("{}", ignoring_low_work_chain_log(announced_h));
     }
     if let Some(s) = session.filter(|s| {
+        let prior_meets = apply.peer_below_floor
+            && prior_best.is_some_and(|h| hash_meets_work_floor(hub, &follow.pending_headers, h));
         outbound_insufficient_work_disconnect(
             hub.in_ibd(),
             apply.headers_len,
             s.conn_type,
             apply.peer_below_floor,
+            prior_meets,
         )
     }) {
         rbitcoin_log::info!(

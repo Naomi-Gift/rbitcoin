@@ -1925,8 +1925,8 @@ async fn peer_header_dos_and_self_announce() {
 
 /// During IBD, a headers batch that ends the peer's chain and sits under
 /// `-minimumchainwork` drops outbound full-relay and block-relay peers.
-/// Inbound, manual, feeler, and addr-fetch stay. A chain that already meets
-/// the floor does not drop the outbound peer.
+/// Inbound, manual, feeler, and addr-fetch stay. Equal work on a stale tip
+/// stays in IBD and does not drop the outbound peer.
 #[tokio::test]
 async fn outbound_low_work_headers_disconnect_during_ibd() {
     use rbitcoin_net::peers::PeerConnType;
@@ -2033,6 +2033,13 @@ async fn outbound_low_work_headers_disconnect_during_ibd() {
 
     let met = hub.chain_work().unwrap().to_be_bytes();
     hub.set_minimum_chain_work(Some(met));
+    let tip_time = u64::from(hub.tip_header().unwrap().time);
+    hub.clock
+        .set_mock(i64::try_from(tip_time + hub.max_tip_age_secs() + 1).unwrap());
+    assert!(
+        hub.in_ibd(),
+        "a stale tip stays in initial block download when work meets the floor"
+    );
     rbitcoin_log::capture_logs(true);
     let enough = send(
         &hub,
@@ -2054,6 +2061,53 @@ async fn outbound_low_work_headers_disconnect_during_ibd() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Core keeps `pindexBestKnownBlock` at the higher-work header. A later
+/// short fork under the floor must not drop that outbound peer.
+#[tokio::test]
+async fn known_good_chain_survives_a_later_low_work_fork() {
+    use rbitcoin_net::peers::PeerConnType;
+    use std::sync::atomic::Ordering;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ibd-best-known");
+    let mut floor = [0u8; 32];
+    floor[30] = 0x10;
+    hub.set_minimum_chain_work(Some(floor));
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(4, op_true(), vec![]).unwrap();
+    let met = hub.chain_work().unwrap().to_be_bytes();
+    hub.set_minimum_chain_work(Some(met));
+    let tip_time = u64::from(hub.tip_header().unwrap().time);
+    hub.clock
+        .set_mock(i64::try_from(tip_time + hub.max_tip_age_secs() + 1).unwrap());
+    assert!(
+        hub.in_ibd(),
+        "a stale tip stays in initial block download"
+    );
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer_as(&peers, 18511, 91, PeerConnType::OutboundFullRelay);
+    peer.note_best_known(hub.tip_hash().unwrap());
+    let fork = regtest_header_chain(header_at(&hub, 0).block_hash(), 1);
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    rbitcoin_log::capture_logs(true);
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(fork),
+    )
+    .await;
+    assert!(
+        !peer.stop.load(Ordering::SeqCst),
+        "a later low-work fork keeps a peer whose best known meets the floor"
+    );
+    assert!(!logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn full_headers_page_is_not_an_insufficient_work_disconnect() {
     use rbitcoin_net::codec::MAX_HEADERS_RESULTS;
@@ -2064,6 +2118,7 @@ fn full_headers_page_is_not_an_insufficient_work_disconnect() {
             MAX_HEADERS_RESULTS,
             PeerConnType::OutboundFullRelay,
             true,
+            false,
         ),
         "a full page is not the peer's tip"
     );
@@ -2072,24 +2127,35 @@ fn full_headers_page_is_not_an_insufficient_work_disconnect() {
         MAX_HEADERS_RESULTS - 1,
         PeerConnType::BlockRelay,
         true,
+        false,
+    ));
+    assert!(!outbound_insufficient_work_disconnect(
+        true,
+        MAX_HEADERS_RESULTS - 1,
+        PeerConnType::OutboundFullRelay,
+        true,
+        true,
     ));
     assert!(!outbound_insufficient_work_disconnect(
         false,
         1,
         PeerConnType::OutboundFullRelay,
         true,
+        false,
     ));
     assert!(!outbound_insufficient_work_disconnect(
         true,
         1,
         PeerConnType::Manual,
         true,
+        false,
     ));
     assert!(!outbound_insufficient_work_disconnect(
         true,
         0,
         PeerConnType::OutboundFullRelay,
         true,
+        false,
     ));
 }
 
