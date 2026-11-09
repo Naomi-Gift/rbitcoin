@@ -176,10 +176,10 @@ fn unresolved_heights_skips_complete_and_respects_cap() {
         q.mark_resolve_complete(h).unwrap();
     }
     let skip: HashSet<u32> = [16, 17].into_iter().collect();
-    let got = q.unresolved_heights(10, &skip, 8);
+    let got = q.unresolved_heights(10, &skip, 8, None);
     assert_eq!(got, vec![18, 19, 20, 21, 22, 23]);
-    assert_eq!(q.unresolved_heights(10, &skip, 3), vec![18, 19, 20]);
-    assert!(q.unresolved_heights(10, &skip, 0).is_empty());
+    assert_eq!(q.unresolved_heights(10, &skip, 3, None), vec![18, 19, 20]);
+    assert!(q.unresolved_heights(10, &skip, 0, None).is_empty());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -192,16 +192,25 @@ fn unresolved_heights_stops_at_first_gap() {
     q.enqueue(13, [13u8; 32], 1, b"b").unwrap();
     let none = HashSet::new();
     assert!(
-        q.unresolved_heights(10, &none, 8).is_empty(),
+        q.unresolved_heights(10, &none, 8, None).is_empty(),
         "missing path_lo must not skip ahead: {:?}",
-        q.unresolved_heights(10, &none, 8)
+        q.unresolved_heights(10, &none, 8, None)
     );
     q.enqueue(10, [10u8; 32], 1, b"c").unwrap();
     q.enqueue(11, [11u8; 32], 1, b"d").unwrap();
-    assert_eq!(q.unresolved_heights(10, &none, 8), vec![10, 11, 12, 13]);
+    assert_eq!(
+        q.unresolved_heights(10, &none, 8, None),
+        vec![10, 11, 12, 13]
+    );
     // Hole at 12 after removing it — prefix only.
     q.dequeue_height(12).unwrap();
-    assert_eq!(q.unresolved_heights(10, &none, 8), vec![10, 11]);
+    assert_eq!(q.unresolved_heights(10, &none, 8, None), vec![10, 11]);
+    let mut lens = Vec::new();
+    assert_eq!(
+        q.unresolved_heights(10, &none, 8, Some(&mut lens)),
+        vec![10, 11]
+    );
+    assert_eq!(lens, vec![1, 1]);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

@@ -292,7 +292,19 @@ impl BlockQueue {
     /// Contiguous unresolved heights from `path_lo`. Stops at the first height
     /// not on the queue (a hole). Skips resolve-complete and `skip` without
     /// treating those as a gap. Capped at `cap`.
-    pub fn unresolved_heights(&self, path_lo: u32, skip: &HashSet<u32>, cap: usize) -> Vec<u32> {
+    ///
+    /// When `lens` is set, it receives each returned height's wire charge
+    /// during this walk. Callers must not lock the queue again per height.
+    pub fn unresolved_heights(
+        &self,
+        path_lo: u32,
+        skip: &HashSet<u32>,
+        cap: usize,
+        mut lens: Option<&mut Vec<u64>>,
+    ) -> Vec<u32> {
+        if let Some(slot) = lens.as_mut() {
+            slot.clear();
+        }
         if cap == 0 {
             return Vec::new();
         }
@@ -303,6 +315,17 @@ impl BlockQueue {
                 break;
             }
             if !self.is_resolve_complete(h) && !skip.contains(&h) {
+                if let Some(slot) = lens.as_mut() {
+                    let Some(wire) = self
+                        .height_to_id
+                        .get(&h)
+                        .and_then(|id| self.index.get(id))
+                        .map(|e| e.body.charge())
+                    else {
+                        break;
+                    };
+                    slot.push(wire);
+                }
                 out.push(h);
             }
             h = match h.checked_add(1) {

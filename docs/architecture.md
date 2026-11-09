@@ -131,7 +131,9 @@ a LevelDB bag.
 The node follows the **fully valid** chain with **strictly most cumulative
 work** (Bitcoin rule). Header work only **ranks candidates**; full block
 connect decides the tip. IBD rewinds at most 1,024 blocks
-(`REWIND_MAX_DEPTH`). Tip-follow cannot assemble a side branch that forks
+(`REWIND_MAX_DEPTH`) once the confirmed tip has proved minimum chain work.
+While that tip is still under the floor, a rewind may drop 65,536 blocks.
+Tip-follow cannot assemble a side branch that forks
 more than 288 blocks below the tip (held-body window) and does not hand
 off to the IBD rewind. Deeper reorgs are open
 ([088](./external_findings/088-tip-chain-selection.md)).
@@ -178,7 +180,7 @@ tip; re-rank.
 
 | Path | Behavior |
 |------|----------|
-| **IBD** | Up to 1,024 blocks (`REWIND_MAX_DEPTH`). When headers prove a **strictly heavier** branch, **rewind** the confirmed tip to the LCA (`ChainHub::rewind_to_height`) and plant that branch as the linear work path. The shipped lookup→load→scripts→write pipeline then confirms it — no side-channel gather, no `HELD_CAP` apply, no `accept_branch` of 40 mid bodies. Resume seed does this before confirm starts. BadPrev / competing tip+1 is the same helper (backstop). Work-path slots stay **first-wins and prev-anchored**. Offer will not stamp tip+1 unless `prev ==` store tip. Do **not** `mark_missing` the winning-path hash. `lookup_taken_hi` rewinds to the LCA. |
+| **IBD** | Up to 1,024 blocks (`REWIND_MAX_DEPTH`) once the confirmed tip has proved minimum chain work. While the header walk is unproved, confirm may follow a second peer's matched headers by 65,536 blocks or 1 GiB of Class A above that match; those caps lift when the walk proves work. While the confirmed tip is still under the floor, even after the header candidate is proved, a rewind may drop 65,536 blocks; the abandoned blocks stay on disk. When headers prove a **strictly heavier** branch, **rewind** the confirmed tip to the LCA (`ChainHub::rewind_to_height`) and plant that branch as the linear work path. The shipped lookup→load→scripts→write pipeline then confirms it — no side-channel gather, no `HELD_CAP` apply, no `accept_branch` of 40 mid bodies. Resume seed does this before confirm starts. BadPrev / competing tip+1 is the same helper (backstop). Work-path slots stay **first-wins and prev-anchored**. Offer will not stamp tip+1 unless `prev ==` store tip. Do **not** `mark_missing` the winning-path hash. `lookup_taken_hi` rewinds to the LCA. |
 | **Tip-follow** | Pending cap 128. Complete bodies: `accept_received_block` → hold by hash → `accept_branch`. |
 | **Resume** | `resume_work_path_after_tip`: child score = subtree header work, then depth; Class A body only tie-breaks. A greater-work sibling **rewinds to the LCA** and becomes the linear path. Body preference alone must never re-elect an archived losing fork. |
 | **Invalid heavy** | Heavier header path that fails connect does not win; re-rank remaining candidates (may adopt a third valid chain). Invalid marks are **process-local**. |

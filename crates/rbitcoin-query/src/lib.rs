@@ -1974,11 +1974,15 @@ impl Query {
     /// Heights `≤ lookup_taken_hi` are already on loadq (`take_raw` removed
     /// the BQ row). They are not a fetch hole — start after that high-water.
     /// A missing height *above* the high-water still stops the walk.
+    ///
+    /// When `lens` is set, it receives each returned height's wire charge
+    /// under this same lock.
     pub fn block_queue_unresolved_heights(
         &self,
         path_lo: u32,
         skip: &HashSet<u32>,
         cap: usize,
+        lens: Option<&mut Vec<u64>>,
     ) -> Vec<u32> {
         let start = match self.lookup_taken_hi() {
             Some(hi) => path_lo.max(hi.saturating_add(1)),
@@ -1987,7 +1991,7 @@ impl Query {
         self.block_queue
             .lock()
             .unwrap()
-            .unresolved_heights(start, skip, cap)
+            .unresolved_heights(start, skip, cap, lens)
     }
 
     /// Body-queue intake: raw payload for `height` without dequeue.

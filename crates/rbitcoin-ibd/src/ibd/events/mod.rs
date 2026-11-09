@@ -358,7 +358,7 @@ pub fn on_headers_batch(
         }
         stored.push(hdr);
     }
-    super::header_walk::note_stored_candidate(st, hub, &stored);
+    super::header_walk::note_stored_candidate(st, hub, peer, &stored);
     added
 }
 
@@ -677,8 +677,9 @@ pub fn plan_header_batch(
             mark.outer_len,
         );
     }
+    let clock_refused = st.header_walk.clock_refused;
     let plan = plan_header_reply(st, hub, peer, headers);
-    if matches!(plan, HeaderPlan::Done) {
+    if matches!(plan, HeaderPlan::Done) && !clock_refused {
         finish_mark(st, hub, peer, &mark);
     }
     (mark, plan)
@@ -691,6 +692,12 @@ pub fn plan_header_reply(
     peer: usize,
     headers: Vec<bitcoin::block::Header>,
 ) -> HeaderPlan {
+    if st.header_walk.clock_refused {
+        if st.header_walk.probe_open != Some(peer) {
+            let _ = super::header_walk::take_header_ask(st, peer);
+        }
+        return HeaderPlan::Done;
+    }
     // A batch that crossed this peer's open probe leaves that ask in flight.
     let ask = if st.header_walk.probe_open == Some(peer) {
         super::header_walk::HeaderAsk::Unsolicited
@@ -709,22 +716,34 @@ pub fn plan_header_reply(
             HeaderPlan::Done
         };
     }
-    if super::header_walk::refuse_invalid_batch(st, peer, &headers) {
+    if super::header_walk::short_below_floor(st, hub, &headers) {
         return HeaderPlan::Done;
     }
-    let class = super::header_walk::classify(st, hub, ask, &headers);
+    let linked = super::header_walk::pow_linked(&headers);
+    super::header_walk::note_header_witness(st, hub, peer, ask, &headers, linked);
+    if super::header_walk::refuse_invalid_linked(st, peer, &headers, linked) {
+        return HeaderPlan::Done;
+    }
+    let class = super::header_walk::classify_linked(st, hub, ask, &headers, linked);
     let mut headers = headers;
     let keep = match class {
         super::header_walk::HeaderClass::WalkAbsorb => {
             let before = super::header_walk::candidate_tip(st);
-            if super::header_walk::absorb_lookahead(st, hub, peer, ask, &headers)
-                && super::header_walk::candidate_tip(st) == before
-            {
+            let absorbed = super::header_walk::absorb_lookahead(st, hub, peer, ask, &headers);
+            let extended = super::header_walk::candidate_tip(st) != before;
+            // At the soft cap the checkpoint is the record. Under it, the
+            // confirm window still stores the headers.
+            if absorbed && (!extended || st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP) {
                 return HeaderPlan::Done;
             }
             headers.len()
         }
-        super::header_walk::HeaderClass::WalkStore => headers.len(),
+        super::header_walk::HeaderClass::WalkStore => {
+            if super::header_walk::store_would_pass_length(st, headers.len()) {
+                return HeaderPlan::Done;
+            }
+            headers.len()
+        }
         super::header_walk::HeaderClass::Stray => {
             let before = super::header_walk::candidate_tip(st);
             if super::header_walk::suppress_competing_chain(st, hub, peer, &headers)
@@ -992,6 +1011,17 @@ fn answer_probe(
     if !headers.is_empty() {
         note_announcement(st, peer);
         note_peer_headers(st, hub, peer, headers);
+        if !st.header_walk.proven {
+            let linked = super::header_walk::pow_linked(headers);
+            super::header_walk::note_header_witness(
+                st,
+                hub,
+                peer,
+                super::header_walk::HeaderAsk::InWindow,
+                headers,
+                linked,
+            );
+        }
         // A header this node has not seen: the peer's chain leaves this one
         // or runs past the path. The walk asks it, as after a block inv.
         let last = headers[headers.len() - 1].block_hash();
@@ -1199,16 +1229,22 @@ pub fn take_confirm_events(
     let mut deferred = Vec::new();
     while let Ok(ev) = rx.try_recv() {
         match ev {
-            super::confirm::ConfirmEvent::Accepted { hash } => {
+            super::confirm::ConfirmEvent::Accepted { hash, wire_bytes } => {
                 *last_progress = Instant::now();
                 st.confirm_stuck_since = None;
                 remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                 st.body.mark_archived(hash);
                 let tip = hub.tip_height().unwrap_or(0);
+                // The write thread moves the tip to the end of the batch before
+                // these events arrive. Charging `tip` would bill the matched
+                // prefix against the lead. The block's own height is the lead.
+                let height = st.hash_height.get(&hash).copied().unwrap_or(0);
+                super::header_walk::note_unproven_class_a(st, height, wire_bytes);
                 archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
                 st.max_ready_height = st.max_ready_height.max(tip);
                 max_ready_shared.store(st.max_ready_height, Ordering::Relaxed);
                 if let Some(f) = feed {
+                    f.release_lead_reserve(height);
                     f.release_isolate_if_tip(tip);
                 }
             }
