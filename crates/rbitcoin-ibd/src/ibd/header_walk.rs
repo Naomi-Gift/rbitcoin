@@ -536,6 +536,9 @@ pub fn ensure_origin(st: &mut IbdWorkState, hub: &ChainHub) {
     if st.header_walk.origin {
         if st.header_walk.clock_refused && arm_walk_bounds(st, hub) {
             st.header_walk.clock_refused = false;
+            // The loaded tip may already be past the floor. No new header
+            // arrives to publish that work.
+            publish_work(st, hub);
         }
         return;
     }

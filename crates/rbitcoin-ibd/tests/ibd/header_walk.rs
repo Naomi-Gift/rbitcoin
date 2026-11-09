@@ -7346,6 +7346,44 @@ fn a_refused_clock_starts_once_the_clock_catches_up() {
     let _ = dir;
 }
 
+/// Headers already past the work floor stay unproved while the clock is behind.
+/// When the clock catches up, that tip is proved without another header.
+#[test]
+fn a_caught_up_clock_proves_headers_already_past_the_floor() {
+    let _clock = ResetClock;
+    let (dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("unproven-clock-prove");
+    hub.ensure_genesis().unwrap();
+    hub.milestone = rbitcoin_consensus::Milestone {
+        height: 0,
+        anchor: Some(rbitcoin_consensus::MilestoneAnchor {
+            hash: BlockHash::from_byte_array([0xab; 32]),
+            min_work_be: [0; 32],
+        }),
+    };
+    let gen = hub.tip_hash().unwrap();
+    let gen_hdr = hub.header_of(&gen).unwrap();
+    set_walk_unix_for_test(Some(
+        u64::from(gen_hdr.time).saturating_sub(WALK_CLOCK_SKEW + 1),
+    ));
+    let (s0, rx0) = slot(0);
+    std::mem::forget(rx0);
+    let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+    ensure_origin(&mut st, &hub);
+    assert!(st.header_walk.clock_refused);
+    assert!(st.header_walk.origin);
+    assert!(!st.header_walk.proven);
+    assert_eq!(unproven_confirm_limit(&st), Some(UNPROVEN_LEAD_BLOCKS));
+    set_walk_unix_for_test(Some(u64::from(gen_hdr.time).saturating_add(1)));
+    ensure_origin(&mut st, &hub);
+    assert!(!st.header_walk.clock_refused);
+    assert!(
+        st.header_walk.proven,
+        "a tip already past the floor is proved when the clock catches up"
+    );
+    assert_eq!(unproven_confirm_limit(&st), None);
+    let _ = dir;
+}
+
 /// While the clock is still refused, an answer is not a missed ask and the
 /// peer stays on the walk.
 #[test]
