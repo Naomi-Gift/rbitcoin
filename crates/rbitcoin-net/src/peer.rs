@@ -5327,6 +5327,26 @@ fn hash_meets_work_floor(
     }
 }
 
+/// Core moves `pindexBestKnownBlock` only when the new header's work is
+/// greater or equal. Unknown work does not replace a stored header.
+fn best_known_moves_forward(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    current: Option<BlockHash>,
+    next: BlockHash,
+) -> bool {
+    let Some(next_work) = pending_path_work(hub, pending, next) else {
+        return false;
+    };
+    let Some(old) = current else {
+        return true;
+    };
+    match pending_path_work(hub, pending, old) {
+        Some(old_work) => next_work >= old_work,
+        None => true,
+    }
+}
+
 fn apply_headers(
     apply: HeadersApply,
     hub: &ChainHub,
@@ -5338,21 +5358,22 @@ fn apply_headers(
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
-    // Before this message overwrites it. A low-work fork must not replace
-    // a best-known header that already meets the floor.
+    // Read before this message. The disconnect compares that hash.
     let prior_best = session.and_then(|s| s.best_known());
     for hash in apply.from_peer {
         if let Some(s) = session {
             s.note_block_from_peer(hash);
         }
     }
-    for hash in apply.best_known {
-        if let Some(s) = session {
-            s.note_best_known(hash);
-        }
-    }
     for (hash, hdr) in apply.admits {
         admit_pending_header(&mut follow.pending_headers, hash, hdr);
+    }
+    for hash in apply.best_known {
+        if let Some(s) = session {
+            if best_known_moves_forward(hub, &follow.pending_headers, s.best_known(), hash) {
+                s.note_best_known(hash);
+            }
+        }
     }
     if let Some((announced_h, our_tip)) = apply.disconnect {
         rbitcoin_log::info!("p2p: disconnect stale fork tip announced={announced_h} our={our_tip}");

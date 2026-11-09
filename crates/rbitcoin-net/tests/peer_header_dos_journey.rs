@@ -2105,6 +2105,29 @@ async fn known_good_chain_survives_a_later_low_work_fork() {
     assert!(!logs_have(
         "outbound peer headers chain has insufficient work"
     ));
+    assert_eq!(
+        peer.best_known(),
+        Some(hub.tip_hash().unwrap()),
+        "a low-work fork does not replace a best known header that meets the floor"
+    );
+    let again = regtest_header_chain(header_at(&hub, 0).block_hash(), 1);
+    rbitcoin_log::capture_logs(true);
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(again),
+    )
+    .await;
+    assert!(
+        !peer.stop.load(Ordering::SeqCst),
+        "a second low-work fork keeps the peer"
+    );
+    assert!(!logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+    assert_eq!(peer.best_known(), Some(hub.tip_hash().unwrap()));
     let _ = std::fs::remove_dir_all(dir);
 }
 
