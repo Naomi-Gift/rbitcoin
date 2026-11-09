@@ -514,6 +514,25 @@ fi
 
 # Conf `whitebind=` (TestNode replace_in_config) must listen even when the
 # leftover bind is onion-only (`p2p_permissions.py`).
+# Core's framework writes noban_tx_relay as a conf line, not argv.
+WL_CONF="$WORKDIR/wl-conf"
+mkdir -p "$WL_CONF"
+cat >"$WL_CONF/bitcoin.conf" <<'EOF'
+regtest=1
+[regtest]
+port=11002
+rpcport=16002
+whitelist=noban,in,out@127.0.0.1
+EOF
+OUT_WLC="$("$SHIM" --print-cmd -datadir="$WL_CONF" -regtest 2>/dev/null)" || OUT_WLC=""
+if printf '%s' "$OUT_WLC" | grep -q -- "--net-permission=noban,in,out@127.0.0.1"; then
+  echo "ok - conf whitelist maps to --net-permission"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - conf whitelist maps to --net-permission (got: $OUT_WLC)"
+  FAIL=$((FAIL + 1))
+fi
+
 WB_CONF="$WORKDIR/wb-conf"
 mkdir -p "$WB_CONF"
 cat >"$WB_CONF/bitcoin.conf" <<'EOF'

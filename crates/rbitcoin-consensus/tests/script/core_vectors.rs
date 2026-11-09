@@ -17,7 +17,7 @@ use bitcoin::script::Script;
 use bitcoin::{Amount, ScriptBuf, Witness};
 use serde_json::Value;
 
-fn load_json() -> Value {
+fn load_rows() -> Vec<Value> {
     let path = super::core_fixture::stage_core_json("script_tests.json");
     let s = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("missing {path:?}: {e}"));
     serde_json::from_str(&s).expect("script_tests.json")
@@ -108,16 +108,9 @@ fn parse_flags(s: &str) -> CoreFlags {
         match p.as_str() {
             "P2SH" => f.p2sh = true,
             "DERSIG" => f.dersig = true,
-            "STRICTENC" => {
-                // STRICTENC implies IsValidSignatureEncoding + hashtype + pubkey type.
-                f.dersig = true;
-                f.strictenc = true;
-            }
+            "STRICTENC" => f.strictenc = true,
             "MINIMALDATA" => f.minimal_data = true,
-            "LOW_S" => {
-                f.low_s = true;
-                f.dersig = true; // Core CheckSignatureEncoding: LOW_S requires DER
-            }
+            "LOW_S" => f.low_s = true,
             "NULLFAIL" => f.nullfail = true,
             "NULLDUMMY" => f.null_dummy = true,
             "MINIMALIF" => f.minimal_if = true,
@@ -152,10 +145,7 @@ fn apply_eval_flags(ctx: &mut EvalContext<'_>, flags: &CoreFlags) {
     ctx.strictenc = flags.strictenc;
     ctx.null_dummy = flags.null_dummy;
     ctx.minimal_if = flags.minimal_if;
-    // STRICTENC/LOW_S also force DER encoding checks via bip66_active in checksig.
-    if flags.dersig || flags.strictenc || flags.low_s {
-        ctx.bip66_active = true;
-    }
+    ctx.const_scriptcode = flags.extra.iter().any(|e| e == "CONST_SCRIPTCODE");
 }
 
 /// Core script_tests witness cell: hex items + optional `#SCRIPT#` / `#CONTROLBLOCK#`,
@@ -315,7 +305,7 @@ fn script_row_job(
         let flags = rbitcoin_consensus::block::ScriptVerifyFlags {
             bip65_active: flags.cltv,
             bip112_active: flags.csv,
-            bip66_active: flags.dersig || flags.strictenc || flags.low_s,
+            bip66_active: flags.dersig,
             bip16_active: flags.p2sh,
             taproot_active: flags.taproot,
             minimal_if: flags.minimal_if,
@@ -357,7 +347,7 @@ fn eval_bare_pair(
             SigVersion::Base,
             flags.cltv,
             flags.csv,
-            flags.dersig || flags.strictenc || flags.low_s,
+            flags.dersig,
         );
         apply_eval_flags(&mut ctx, flags);
         let _ = interpreter::eval_script(ss, &mut stack, &ctx).map_err(|e| format!("{e}"))?;
@@ -375,7 +365,7 @@ fn eval_bare_pair(
         SigVersion::Base,
         flags.cltv,
         flags.csv,
-        flags.dersig || flags.strictenc || flags.low_s,
+        flags.dersig,
     );
     apply_eval_flags(&mut ctx, flags);
     let need = interpreter::eval_script(spk, &mut stack, &ctx).map_err(|e| format!("{e}"))?;
@@ -405,7 +395,7 @@ fn eval_bare_pair(
             SigVersion::Base,
             flags.cltv,
             flags.csv,
-            flags.dersig || flags.strictenc || flags.low_s,
+            flags.dersig,
         );
         apply_eval_flags(&mut ctx_r, flags);
         let need_r = interpreter::eval_script(redeem_script, &mut stack, &ctx_r)
@@ -455,8 +445,7 @@ struct RowStats {
 }
 
 fn run_all_script_rows() -> RowStats {
-    let root = load_json();
-    let arr = root.as_array().expect("script_tests root array");
+    let arr = load_rows();
     let mut st = RowStats {
         total: 0,
         ran: 0,
@@ -604,7 +593,7 @@ fn core_script_tests_all_rows() {
 }
 
 /// Our script corpus, in addition to Core's JSON. Each `row` is Core
-/// `script_tests.json` form. The v32.1 oracle in `script-oracle/` runs the
+/// `script_tests.json` form. The pinned Core oracle in `script-oracle/` runs the
 /// same file.
 #[test]
 fn script_corpus_rows_match_our_interpreter() {
