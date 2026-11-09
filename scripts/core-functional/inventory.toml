@@ -856,7 +856,9 @@ reason = "core-log"
 
 [[test]]
 name = "p2p_sendheaders.py"
-status = "run"
+status = "skip"
+reason = "node-behavior"
+analog = "follow-up #1497: an unconnecting headers message does not answer getheaders (bitcoin/bitcoin#36422)"
 
 [[test]]
 name = "p2p_sendtxrcncl.py"
