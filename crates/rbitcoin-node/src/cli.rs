@@ -9,6 +9,7 @@ use rbitcoin_log::{self, error, info, warn, Level};
 use rbitcoin_primitives::Network;
 use rbitcoin_store::HeadScale;
 use std::ffi::OsString;
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -65,6 +66,19 @@ pub struct ParsedOperatorFlags {
 }
 
 #[doc(hidden)]
+/// Requested output on stdout. A reader that closed the pipe (`| head -1`)
+/// is not an error; any other write error is exit 1.
+fn print_stdout(text: &str) -> Result<(), ExitCode> {
+    match writeln!(std::io::stdout().lock(), "{text}") {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        Err(e) => {
+            eprintln!("error: stdout: {e}");
+            Err(ExitCode::from(1))
+        }
+    }
+}
+
 pub fn parse_operator_flags(args: &[OsString]) -> Result<OperatorFlagEnd, ExitCode> {
     let mut i = 1usize;
     let mut smoke = false;
@@ -76,11 +90,11 @@ pub fn parse_operator_flags(args: &[OsString]) -> Result<OperatorFlagEnd, ExitCo
         let a = args[i].to_string_lossy();
         match a.as_ref() {
             "--help" | "-h" => {
-                println!("{}", operator_usage());
+                print_stdout(&operator_usage())?;
                 return Ok(OperatorFlagEnd::Help);
             }
             "--version" | "-V" => {
-                println!("rbitcoin-node {}", env!("CARGO_PKG_VERSION"));
+                print_stdout(concat!("rbitcoin-node ", env!("CARGO_PKG_VERSION")))?;
                 return Ok(OperatorFlagEnd::Version);
             }
             "--smoke" => {

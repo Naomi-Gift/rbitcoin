@@ -467,6 +467,19 @@ pub fn dispatch_call(cfg: &CliConfig) -> Result<String, String> {
 }
 
 /// Process entry used by `main` and high-level scenarios.
+/// Requested output on stdout. A reader that closed the pipe (`| head -1`)
+/// is not an error; any other write error is exit 1.
+fn print_stdout(text: &str) -> ExitCode {
+    match writeln!(std::io::stdout().lock(), "{text}") {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("error: stdout: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
 pub fn cli_main<I, T>(args: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,
@@ -481,19 +494,10 @@ where
         }
     };
     match action {
-        Action::Help => {
-            println!("{}", usage());
-            ExitCode::SUCCESS
-        }
-        Action::Version => {
-            println!("rbitcoin-cli {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
+        Action::Help => print_stdout(&usage()),
+        Action::Version => print_stdout(concat!("rbitcoin-cli ", env!("CARGO_PKG_VERSION"))),
         Action::Call(cfg) => match dispatch_call(&cfg) {
-            Ok(out) => {
-                println!("{out}");
-                ExitCode::SUCCESS
-            }
+            Ok(out) => print_stdout(&out),
             Err(e) => {
                 eprintln!("error: {e}");
                 ExitCode::from(1)

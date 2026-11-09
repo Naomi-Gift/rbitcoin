@@ -1346,3 +1346,20 @@ fn help_names_ibd_download_defaults() {
     );
     assert!(h.contains(&want), "help must say {want:?}");
 }
+
+/// A reader that already closed stdout is not an error: exit 0, no panic.
+#[test]
+fn help_and_version_to_a_closed_stdout_exit_zero() {
+    for args in [&["--help"][..], &["-h"], &["--version"], &["-V"]] {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(reader);
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rbitcoin-node"))
+            .args(args)
+            .stdout(writer)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{args:?}: {:?} {stderr}", out.status);
+        assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
+    }
+}
