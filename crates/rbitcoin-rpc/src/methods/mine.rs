@@ -218,7 +218,7 @@ pub fn generate_with_mempool(
     };
     let hashes = miner
         .generate_to_script(nblocks, script, extras, true)
-        .map_err(|e| rpc_error(ERR_MISC, e))?;
+        .map_err(|e| generate_error(&e))?;
     Ok(hashes_json(&hashes))
 }
 
@@ -250,7 +250,7 @@ pub async fn generate_with_mempool_async(
     let hashes = chain
         .generate_to_script_for_rpc_async(nblocks, script, extras, true)
         .await
-        .map_err(|e| rpc_error(ERR_MISC, submit_reject_reason(&e)))?;
+        .map_err(|e| generate_error(&submit_reject_reason(&e)))?;
     Ok(hashes_json(&hashes))
 }
 
@@ -482,10 +482,29 @@ pub fn generateblock_missing_input_error(e: &str, extra: &[Transaction]) -> Valu
     generateblock_validity_error(e)
 }
 
+/// Core `CreateNewBlock`'s `TestBlockValidity` refusal of a block time past
+/// the future limit (bitcoin/bitcoin#36192). Every template and generate RPC
+/// returns it as `-1`.
+const CREATE_TIME_TOO_NEW: &str =
+    "TestBlockValidity failed: time-too-new, block timestamp too far in the future";
+
+/// A `generate*` failure: `-1` with the reject reason, or with Core's
+/// `CreateNewBlock` text when the next block's time is past the future limit.
+fn generate_error(reason: &str) -> Value {
+    if reason == "time-too-new" {
+        return rpc_error(ERR_MISC, CREATE_TIME_TOO_NEW);
+    }
+    rpc_error(ERR_MISC, reason)
+}
+
 /// Core `generateblock` after `TestBlockValidity`: `-25 TestBlockValidity failed: <reason>`.
+/// A time past the future limit fails earlier, in `CreateNewBlock`.
 pub fn generateblock_validity_error(e: &str) -> Value {
     let s = e.strip_prefix("consensus: ").unwrap_or(e);
     let s = s.strip_prefix("protocol: ").unwrap_or(s);
+    if s.contains("time-too-new") {
+        return generate_error("time-too-new");
+    }
     for needle in [
         "bad-txns-inputs-missingorspent",
         "bad-txns-duplicate",
@@ -495,7 +514,6 @@ pub fn generateblock_validity_error(e: &str) -> Value {
         "bad-blk-length",
         "bad-diffbits",
         "time-too-old",
-        "time-too-new",
         "bad-txnmrklroot",
     ] {
         if s.contains(needle) {
@@ -1148,10 +1166,7 @@ fn gbt_sketch(ctx: &RpcContext) -> Result<GbtSketch, Value> {
     // Core bitcoin/bitcoin#36192: `CreateNewBlock`'s `TestBlockValidity`
     // refuses a template the node itself would reject.
     if too_new {
-        return Err(rpc_error(
-            ERR_MISC,
-            "TestBlockValidity failed: time-too-new, block timestamp too far in the future",
-        ));
+        return Err(rpc_error(ERR_MISC, CREATE_TIME_TOO_NEW));
     }
     Ok(GbtSketch {
         prev_hex,
