@@ -3098,6 +3098,40 @@ async fn unix_socket_needs_no_http_auth() {
     handle.shutdown().await;
 }
 
+fn listed_since(
+    active: &std::sync::Mutex<rbitcoin_rpc::methods::RpcActive>,
+    method: &str,
+) -> Option<std::time::Instant> {
+    active
+        .lock()
+        .unwrap_or_else(|err| err.into_inner())
+        .snapshot()
+        .into_iter()
+        .find(|(name, _)| name == method)
+        .map(|(_, at)| at)
+}
+
+/// Waits until `method` is listed. `previous` is the start time that does
+/// not count: the next entry of the same method.
+async fn wait_for_listing(
+    active: &std::sync::Mutex<rbitcoin_rpc::methods::RpcActive>,
+    method: &str,
+    previous: Option<std::time::Instant>,
+) -> std::time::Instant {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Some(at) = listed_since(active, method) {
+                if previous != Some(at) {
+                    return at;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{method} did not become active"))
+}
+
 /// Waits until `method` is or is no longer listed in `getrpcinfo`.
 async fn wait_for_active_call(
     active: &std::sync::Mutex<rbitcoin_rpc::methods::RpcActive>,
@@ -3452,16 +3486,18 @@ async fn earlier_wait_reports_the_tip_from_when_it_finished() {
         require_auth: false,
     };
     let body = serde_json::json!([
-        {"jsonrpc":"1.0","id":1,"method":"waitfornewblock","params":[80]},
+        {"jsonrpc":"1.0","id":1,"method":"waitfornewblock","params":[2_000]},
         {"jsonrpc":"1.0","id":2,"method":"waitfornewblock","params":[5_000]}
     ])
     .to_string();
     let call = tokio::spawn(async move {
         rpc_post(State(state), axum::extract::Request::new(Body::from(body))).await
     });
-    wait_for_active_call(&watch.active, "waitfornewblock", true).await;
-    wait_for_active_call(&watch.active, "waitfornewblock", false).await;
-    wait_for_active_call(&watch.active, "waitfornewblock", true).await;
+    // The two waits share a method name and the gap between them is one
+    // poll, so the listing does not drop long enough to see. The second
+    // entry has a new start time. Mine only after that entry is current.
+    let first = wait_for_listing(&watch.active, "waitfornewblock", None).await;
+    wait_for_listing(&watch.active, "waitfornewblock", Some(first)).await;
     let miner = std::thread::spawn(move || {
         hub.generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
             .expect("mine");
