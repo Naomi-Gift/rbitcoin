@@ -244,7 +244,7 @@ merely touch net or RPC (too slow). Default `cargo test` is the PR pin
 ship PR (see [`releases.md`](./releases.md)). The `release-extra` job in
 `release-gate.yml` fails when a ship PR did not get a green
 `core-functional`, `overlay-functional`, and `warnet-example`.
-The `core-functional` job is **30 minutes** (70 `test_runner` jobs: 64
+The `core-functional` job is **30 minutes** (69 `test_runner` jobs: 63
 inventory `run`; Core expands transport twins and `wallet_txn_*` flags).
 
 When that job is red, the inner loop is **local**, not another CI wait.

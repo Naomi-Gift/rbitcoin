@@ -336,7 +336,9 @@ status = "run"
 
 [[test]]
 name = "feature_signet.py"
-status = "run"
+status = "skip"
+reason = "rpc-missing"
+analog = "follow-up #1488: signet_<magic> datadir for a custom -signetchallenge"
 
 [[test]]
 name = "feature_startupnotify.py"
