@@ -648,14 +648,17 @@ fn send_parked() -> &'static tokio::sync::Notify {
     N.get_or_init(tokio::sync::Notify::new)
 }
 
-/// The async sender is inside its `slot_freed` wait.
+/// The async sender is inside its `slot_freed` wait. Only a `Notified`
+/// created before the park sees it.
 #[doc(hidden)]
 pub fn send_parked_notify() -> &'static tokio::sync::Notify {
     send_parked()
 }
 
+/// `notify_waiters` stores no permit, so a park with no listener does not
+/// fire a listener created later.
 fn note_send_parked() {
-    send_parked().notify_one();
+    send_parked().notify_waiters();
 }
 
 fn note_async_enqueued() {
