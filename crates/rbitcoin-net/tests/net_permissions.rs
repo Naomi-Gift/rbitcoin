@@ -197,6 +197,51 @@ fn whitelist_prefix_and_ipv6() {
 }
 
 #[test]
+fn prefix_masks_keep_the_named_bits() {
+    let host = |o: [u8; 4]| IpAddr::V4(Ipv4Addr::new(o[0], o[1], o[2], o[3]));
+    let v4 = parse_whitelist("noban@10.0.0.0/8").unwrap();
+    assert!(v4.subnet.contains(host([10, 1, 2, 3])));
+    assert!(!v4.subnet.contains(host([11, 0, 0, 1])));
+    let pair = parse_whitelist("noban@10.0.0.0/31").unwrap();
+    assert!(pair.subnet.contains(host([10, 0, 0, 0])));
+    assert!(pair.subnet.contains(host([10, 0, 0, 1])));
+    assert!(!pair.subnet.contains(host([10, 0, 0, 2])));
+    let one = parse_whitelist("noban@10.1.2.3/32").unwrap();
+    assert!(one.subnet.contains(host([10, 1, 2, 3])));
+    assert!(!one.subnet.contains(host([10, 1, 2, 4])));
+    let any = parse_whitelist("noban@0.0.0.0/0").unwrap();
+    assert!(any.subnet.contains(host([8, 8, 8, 8])));
+
+    let v6 = parse_whitelist("noban@2001:db8::/32").unwrap();
+    assert!(v6
+        .subnet
+        .contains(IpAddr::V6("2001:db8:1::".parse().unwrap())));
+    assert!(!v6
+        .subnet
+        .contains(IpAddr::V6("2001:db9::".parse().unwrap())));
+}
+
+#[test]
+fn whitebind_matches_only_that_socket() {
+    let wb = parse_whitebind("noban@127.0.0.1:18444").unwrap();
+    let mut t = NetPermTable::default();
+    t.whitebind.push(wb);
+    let hit = SocketAddr::from(([127, 0, 0, 1], 18444));
+    let other = SocketAddr::from(([127, 0, 0, 1], 18445));
+    assert!(t.flags_for(ip(), true, hit).has(NetPermissionFlags::NOBAN));
+    assert!(
+        !t.flags_for(ip(), true, other)
+            .has(NetPermissionFlags::NOBAN),
+        "a different port is not this bind"
+    );
+    assert_eq!(
+        t.flags_for(ip(), false, hit),
+        NetPermissionFlags::NONE,
+        "whitebind is inbound only"
+    );
+}
+
+#[test]
 fn ipv6_cidr_matches_only_v6() {
     let g = parse_whitelist("noban@::1").unwrap();
     assert!(g.subnet.contains(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)));
@@ -238,6 +283,11 @@ fn flags_bitor_and_unmatched_subnet() {
     let a = NetPermissionFlags::NOBAN | NetPermissionFlags::RELAY;
     assert!(a.has(NetPermissionFlags::NOBAN));
     assert!(a.has(NetPermissionFlags::RELAY));
+    let same = NetPermissionFlags::NOBAN | NetPermissionFlags::NOBAN;
+    assert!(
+        same.has(NetPermissionFlags::NOBAN),
+        "or with the same flag must keep that bit"
+    );
     let mut b = NetPermissionFlags::BLOOM;
     b |= NetPermissionFlags::ADDR;
     assert_eq!(b.to_strings(), ["bloomfilter", "addr"]);

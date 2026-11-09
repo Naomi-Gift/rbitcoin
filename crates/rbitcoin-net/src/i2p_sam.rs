@@ -488,9 +488,10 @@ pub fn i2p_b64_encode(raw: &[u8]) -> String {
         let b1 = if i + 1 < raw.len() { raw[i + 1] } else { 0 };
         let b2 = if i + 2 < raw.len() { raw[i + 2] } else { 0 };
         out.push(ALPH[(b0 >> 2) as usize] as char);
-        out.push(ALPH[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+        // The two pieces occupy different bits of the index.
+        out.push(ALPH[(((b0 & 3) << 4) + (b1 >> 4)) as usize] as char);
         if i + 1 < raw.len() {
-            out.push(ALPH[(((b1 & 15) << 2) | (b2 >> 6)) as usize] as char);
+            out.push(ALPH[(((b1 & 15) << 2) + (b2 >> 6)) as usize] as char);
         }
         if i + 2 < raw.len() {
             out.push(ALPH[(b2 & 63) as usize] as char);

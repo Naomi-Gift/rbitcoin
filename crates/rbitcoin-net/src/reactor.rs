@@ -61,14 +61,6 @@ fn reject_off_pool_reentry() {
     }
 }
 
-struct LeaveOffPool;
-
-impl Drop for LeaveOffPool {
-    fn drop(&mut self) {
-        ON_OFF_POOL.with(|c| c.set(false));
-    }
-}
-
 fn off_pool_tx() -> mpsc::Sender<Box<dyn FnOnce() + Send>> {
     static TX: OnceLock<mpsc::Sender<Box<dyn FnOnce() + Send>>> = OnceLock::new();
     TX.get_or_init(|| {
@@ -97,8 +89,9 @@ pub async fn off_pool<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static)
     reject_off_pool_reentry();
     let (tx, rx) = tokio::sync::oneshot::channel();
     let job = Box::new(move || {
+        // The flag lives on this thread. The next job sets it again, and
+        // nothing here reads it between jobs.
         ON_OFF_POOL.with(|c| c.set(true));
-        let _leave = LeaveOffPool;
         let result = catch_unwind(AssertUnwindSafe(f));
         let _ = tx.send(result);
     });
@@ -210,6 +203,32 @@ mod off_pool_reentry {
     }
 }
 
+#[cfg(test)]
+mod store_permit_drop {
+    use super::{acquire_armed_store_budget, hold_store_permit, with_store_budget};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::Semaphore;
+
+    #[tokio::test]
+    async fn dropping_the_guard_returns_the_permit() {
+        let sem = Arc::new(Semaphore::new(1));
+        with_store_budget(sem, async {
+            let first = acquire_armed_store_budget().await;
+            let guard = hold_store_permit(first);
+            drop(guard);
+            let again =
+                tokio::time::timeout(Duration::from_millis(200), acquire_armed_store_budget())
+                    .await;
+            assert!(
+                again.is_ok(),
+                "the dropped guard must release the store permit"
+            );
+        })
+        .await;
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod off_pool_lane {
     use super::off_pool;
@@ -234,6 +253,26 @@ mod off_pool_lane {
     /// Eight callers blocked inside `off_pool` still share one OS thread.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn one_thread_runs_every_off_pool_job() {
+        off_pool(|| ()).await;
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+        let extra = std::thread::Builder::new()
+            .name("rbtc-off-pool".into())
+            .spawn(move || {
+                let _ = stop_rx.recv();
+            })
+            .expect("extra off-pool thread");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut named = off_pool_threads();
+        while named < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "named rbtc-off-pool threads stayed at {named}"
+            );
+            tokio::task::yield_now().await;
+            named = off_pool_threads();
+        }
+        drop(stop_tx);
+        extra.join().expect("extra off-pool thread");
         let started = Arc::new(AtomicUsize::new(0));
         let arrived = Arc::new(AtomicUsize::new(0));
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
