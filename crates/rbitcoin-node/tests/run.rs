@@ -944,6 +944,15 @@ fn proxy_seeds_follow_the_local_seed_rules() {
     let mut no_seeds = proxied(Network::Signet);
     no_seeds.listen.use_seeds = false;
     assert!(!should_queue_proxy_seeds(&no_seeds));
+
+    let mut trusted = proxied(Network::Signet);
+    trusted.trust_peer = Some(rbitcoin_net::NetAddr::from_socket(
+        "127.0.0.1:38333".parse().unwrap(),
+    ));
+    assert!(
+        !should_queue_proxy_seeds(&trusted),
+        "--trust-peer pins one peer"
+    );
 }
 
 #[tokio::test]
@@ -957,7 +966,7 @@ async fn regtest_proxy_start_does_not_wait_for_seeds() {
     let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
     cfg.listen.proxy = Some(proxy_l.local_addr().unwrap());
     cfg.max_run_secs = Some(0);
-    let result = tokio::time::timeout(Duration::from_secs(30), run_p2p(cfg)).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), run_p2p(cfg)).await;
     let _ = std::fs::remove_dir_all(&dir);
     result
         .expect("regtest has no seed answer to wait for")
