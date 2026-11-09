@@ -1315,3 +1315,34 @@ fn regtest_retarget_from_argv_and_conf() {
     .is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Help and version are requested output: stdout, exit 0, nothing on stderr.
+#[test]
+fn help_and_version_print_to_stdout() {
+    for (flag, want) in [
+        ("--help", "usage:"),
+        ("-h", "usage:"),
+        ("--version", env!("CARGO_PKG_VERSION")),
+        ("-V", env!("CARGO_PKG_VERSION")),
+    ] {
+        let out = std::process::Command::new(env!("CARGO_BIN_EXE_rbitcoin-node"))
+            .arg(flag)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{flag} must exit 0");
+        let stdout = String::from_utf8(out.stdout).unwrap();
+        assert!(stdout.contains(want), "{flag} stdout: {stdout:?}");
+        assert!(out.stderr.is_empty(), "{flag} wrote to stderr");
+    }
+}
+
+#[test]
+fn help_names_ibd_download_defaults() {
+    let h = operator_usage();
+    let want = format!(
+        "up to {} concurrent getdata, max {} in transit per peer",
+        rbitcoin_ibd::DEFAULT_IBD_WINDOW,
+        rbitcoin_ibd::DEFAULT_BLOCKS_IN_TRANSIT_PER_PEER,
+    );
+    assert!(h.contains(&want), "help must say {want:?}");
+}

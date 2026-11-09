@@ -482,11 +482,11 @@ where
     };
     match action {
         Action::Help => {
-            eprintln!("{}", usage());
+            println!("{}", usage());
             ExitCode::SUCCESS
         }
         Action::Version => {
-            eprintln!("rbitcoin-cli {}", env!("CARGO_PKG_VERSION"));
+            println!("rbitcoin-cli {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
         }
         Action::Call(cfg) => match dispatch_call(&cfg) {
