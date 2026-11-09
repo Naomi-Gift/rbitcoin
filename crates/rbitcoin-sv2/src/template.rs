@@ -6,7 +6,7 @@ use bitcoin::consensus::encode::serialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Amount, ScriptBuf, Target, Transaction, TxOut};
 use rbitcoin_consensus::{
-    bip34_height_script, block_subsidy, witness_commitment_script, MAX_BLOCK_WEIGHT,
+    bip34_height_script, block_subsidy, time_too_new, witness_commitment_script, MAX_BLOCK_WEIGHT,
 };
 use rbitcoin_net::{ChainHub, SelectBudget};
 use rbitcoin_primitives::Height;
@@ -104,7 +104,9 @@ pub fn build(
 }
 
 /// Timestamp and `nBits` for `prev`, using the same rules as [`build`].
-/// `Ok(None)` when `prev` is not the header at its height.
+/// `Ok(None)` when `prev` is not the header at its height, or when the
+/// timestamp is past the node's future limit (Core bitcoin/bitcoin#36192):
+/// no block on `prev` is valid yet, and the session holds until it is.
 pub(crate) fn stamp_for(chain: &ChainHub, prev: [u8; 32]) -> io::Result<Option<TemplateStamp>> {
     let Some(tip) = chain
         .query
@@ -120,9 +122,13 @@ pub(crate) fn stamp_for(chain: &ChainHub, prev: [u8; 32]) -> io::Result<Option<T
     if header.block_hash().to_byte_array() != prev {
         return Ok(None);
     }
+    let now = chain.clock.now_secs();
     let header_timestamp = next_block_mintime(&chain.query, &chain.params, tip)
         .map_err(|e| io::Error::other(format!("sv2: tip mintime: {e}")))?
-        .max(chain.clock.now_secs() as u32);
+        .max(now as u32);
+    if time_too_new(header_timestamp, now) {
+        return Ok(None);
+    }
     let bits = expected_next_bits(
         &chain.query,
         &chain.params,

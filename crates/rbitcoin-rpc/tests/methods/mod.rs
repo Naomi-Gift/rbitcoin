@@ -6833,6 +6833,49 @@ fn getblocktemplate_mintime_is_one_past_the_tip_median() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core bitcoin/bitcoin#36192: six blocks at the two-hour future limit put the
+/// median there, so the next block's floor is past the limit and
+/// `getblocktemplate` fails as Core's `TestBlockValidity` does. One second
+/// later the floor is at the limit and the template is stamped with it.
+#[test]
+fn getblocktemplate_fails_while_the_next_block_floor_is_past_the_future_limit() {
+    let (ctx, dir, hub) = ctx_regtest_hub();
+    let genesis = hub.tip_header().unwrap().time;
+    let now = genesis + 100_000;
+    let limit = now + 7_200;
+    dispatch(&ctx, "setmocktime", vec![json!(now)]).unwrap();
+    // Five blocks keep the median low while the six at the limit connect.
+    for h in 1..=11 {
+        let time = if h <= 5 { genesis + h } else { limit };
+        let prev = hub.tip_hash().unwrap();
+        let b = rbitcoin_consensus::mine_regtest_paying(prev, time, h, true_spk(), vec![]);
+        let r = dispatch(&ctx, "submitblock", vec![json!(block_hex(&b))]).unwrap();
+        assert!(r.is_null(), "height {h}: {r}");
+    }
+    let mtp = rbitcoin_query::median_time_past(hub.query.as_ref(), Height(11)).unwrap();
+    assert_eq!(mtp, limit);
+    let template = || dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]);
+
+    let e = template().expect_err("the next block cannot be valid yet");
+    assert_eq!(e["code"], ERR_MISC, "{e}");
+    assert_eq!(
+        e["message"],
+        "TestBlockValidity failed: time-too-new, block timestamp too far in the future",
+    );
+
+    dispatch(&ctx, "setmocktime", vec![json!(now + 1)]).unwrap();
+    let gbt = template().unwrap();
+    assert_eq!(gbt["mintime"], limit + 1, "{gbt}");
+    assert_eq!(gbt["curtime"], limit + 1, "{gbt}");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // The limit is judged on the whole clock, not its low 32 bits.
+    let (ctx, dir, _hub) = ctx_regtest_hub();
+    dispatch(&ctx, "setmocktime", vec![json!(1u64 << 32)]).unwrap();
+    dispatch(&ctx, "getblocktemplate", vec![json!({"rules": ["segwit"]})]).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Core `GetMinimumTime` on every network: a period's last block is not
 /// before its first block, and a period's first block is at most 600 seconds
 /// before its parent. A node whose clock is behind still builds and mines

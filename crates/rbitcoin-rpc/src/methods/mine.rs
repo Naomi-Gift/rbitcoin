@@ -972,11 +972,13 @@ fn gbt_tip(ctx: &RpcContext) -> Result<GbtTip, Value> {
 }
 
 /// Core `NextEmptyBlockIndex`: the next block's time floor, its `UpdateTime`
-/// time, and the work it must meet at that time.
+/// time, and the work it must meet at that time. `too_new` when that time is
+/// past the node's future limit, so no block on the tip is valid yet.
 struct NextBlock {
     mintime: u32,
     curtime: u32,
     bits: u32,
+    too_new: bool,
 }
 
 fn next_block(
@@ -988,16 +990,16 @@ fn next_block(
     let now = ctx
         .chain
         .as_ref()
-        .map(|c| c.clock.now_secs() as u32)
+        .map(|c| c.clock.now_secs())
         .unwrap_or_else(|| {
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs() as u32)
+                .map(|d| d.as_secs())
                 .unwrap_or(0)
         });
     let mintime = rbitcoin_query::next_block_mintime(ctx.query.as_ref(), params, Height(tip_h))
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
-    let curtime = mintime.max(now);
+    let curtime = mintime.max(now as u32);
     let next_h = Height(tip_h.saturating_add(1));
     let bits = rbitcoin_query::expected_next_bits(ctx.query.as_ref(), params, next_h, curtime)
         .map(|c| c.to_consensus())
@@ -1006,6 +1008,7 @@ fn next_block(
         mintime,
         curtime,
         bits,
+        too_new: rbitcoin_consensus::time_too_new(curtime, now),
     })
 }
 
@@ -1140,7 +1143,16 @@ fn gbt_sketch(ctx: &RpcContext) -> Result<GbtSketch, Value> {
         mintime,
         curtime,
         bits,
+        too_new,
     } = next_block(ctx, &params, tip_h, tip_bits)?;
+    // Core bitcoin/bitcoin#36192: `CreateNewBlock`'s `TestBlockValidity`
+    // refuses a template the node itself would reject.
+    if too_new {
+        return Err(rpc_error(
+            ERR_MISC,
+            "TestBlockValidity failed: time-too-new, block timestamp too far in the future",
+        ));
+    }
     Ok(GbtSketch {
         prev_hex,
         updates,

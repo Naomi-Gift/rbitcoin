@@ -184,6 +184,14 @@ pub fn pow_hash_meets_target(
     Ok(())
 }
 
+/// Core `MAX_FUTURE_BLOCK_TIME`: how far past the node clock a block time may be.
+pub const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
+
+/// Core `time-too-new`: `time` is more than [`MAX_FUTURE_BLOCK_TIME`] past `now`.
+pub fn time_too_new(time: u32, now: u64) -> bool {
+    u64::from(time) > now.saturating_add(MAX_FUTURE_BLOCK_TIME)
+}
+
 /// BIP34/66/65 `nVersion` floors and the 2-hour future-time cap (wall clock).
 ///
 /// Core `ContextualCheckBlockHeader`. Assemble uses this instead of a second
@@ -193,9 +201,7 @@ pub fn check_header_version_and_future_time(
     height: Height,
     header: &Header,
 ) -> Result<(), ConsensusError> {
-    const MAX_FUTURE_BLOCK_TIME: u64 = 2 * 60 * 60;
-    let now = crate::clock::current_now();
-    if u64::from(header.time) > now.saturating_add(MAX_FUTURE_BLOCK_TIME) {
+    if time_too_new(header.time, crate::clock::current_now()) {
         return Err(ConsensusError::BadHeader("timestamp too far in future"));
     }
     let ver = header.version.to_consensus();
