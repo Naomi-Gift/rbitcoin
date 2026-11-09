@@ -353,7 +353,9 @@ impl NetPermTable {
         }
         if inbound {
             for g in &self.whitebind {
-                if g.addr == bind || (g.addr.ip() == bind.ip() && g.addr.port() == bind.port()) {
+                // `SocketAddr` equality is the IP and the port. A second
+                // copy of that compare does not change the match.
+                if g.addr == bind {
                     flags |= g.flags;
                 }
             }

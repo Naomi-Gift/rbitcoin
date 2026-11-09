@@ -545,9 +545,6 @@ pub fn decode_cmd_payload(
         "tx" => one(d, NetworkMessage::Tx)?,
         "ping" => one(d, NetworkMessage::Ping)?,
         "pong" => one(d, NetworkMessage::Pong)?,
-        // Bloom is off. `PartialMerkleTree` allocates `n * 8` bools from the
-        // flags compact-size before a short payload can fail the read.
-        "merkleblock" => return Ok(None),
         "filterload" => one(d, NetworkMessage::FilterLoad)?,
         "filteradd" => one(d, NetworkMessage::FilterAdd)?,
         "getcfilters" => one(d, NetworkMessage::GetCFilters)?,
@@ -599,6 +596,9 @@ pub fn decode_cmd_payload(
             }
             NetworkMessage::Headers(hs)
         }
+        // Bloom is off. `PartialMerkleTree` allocates `n * 8` bools from the
+        // flags compact-size before a short payload can fail the read, so
+        // merkleblock stays unknown with the other undecoded commands.
         _ => return Ok(None),
     }))
 }

@@ -574,3 +574,44 @@ fn witness_tx_cmpctblock_and_blocktxn_still_decode() {
         other => panic!("expected block, got {other:?}"),
     }
 }
+
+#[test]
+fn skip_consumes_an_exact_tail() {
+    let mut data: &[u8] = &[1, 2, 3, 4];
+    assert!(skip(&mut data, 4));
+    assert!(data.is_empty());
+}
+
+#[test]
+fn take_len_bytes_exact_fit_is_fits_and_over_is_too_large() {
+    let mut exact: &[u8] = &[4, 1, 2, 3, 4];
+    assert!(matches!(take_len_bytes(&mut exact), Bound::Fits));
+    assert!(exact.is_empty());
+    let mut over: &[u8] = &[5, 1, 2, 3, 4];
+    assert!(
+        matches!(take_len_bytes(&mut over), Bound::TooLarge(_)),
+        "a length past the buffer is too large"
+    );
+}
+
+#[test]
+fn walk_witness_allows_an_empty_element_that_fills_the_tail() {
+    let mut data: &[u8] = &[1, 0];
+    assert!(
+        matches!(walk_witness(&mut data), Bound::Fits),
+        "one empty element uses the last byte"
+    );
+}
+
+#[test]
+fn walk_cmpctblock_rejects_one_prefill_in_twelve_bytes() {
+    let mut data = vec![0u8; 88];
+    data.push(0);
+    data.push(1);
+    data.extend_from_slice(&[0u8; 12]);
+    let mut cur: &[u8] = &data;
+    assert!(
+        matches!(walk_cmpctblock(&mut cur), Bound::TooLarge(_)),
+        "one prefill needs more than twelve bytes"
+    );
+}

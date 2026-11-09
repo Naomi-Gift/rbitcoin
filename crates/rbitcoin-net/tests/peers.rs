@@ -1637,3 +1637,71 @@ fn concurrent_tx_relay_newcomers_keep_the_inbound_share() {
         );
     }
 }
+
+#[test]
+fn second_dial_of_the_same_target_stacks() {
+    let hub = PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 8333);
+    let target = DialTarget::Socket(addr);
+    let first = hub.dial_in_flight(&target);
+    let second = hub.dial_in_flight(&target);
+    let n = first
+        .counts
+        .lock()
+        .unwrap()
+        .get(&first.key)
+        .expect("in flight")
+        .n;
+    assert_eq!(n, 2, "two guards on one target count two dials");
+    drop((first, second));
+}
+
+#[test]
+fn try_evict_inbound_disconnects_one_peer() {
+    let hub = PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    for i in 0..30u8 {
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(i + 1, 1, 0, 1)), 8333);
+        hub.register_connecting(addr, bind, true, PeerConnType::Inbound);
+    }
+    let before = hub.snapshot().len();
+    assert!(hub.try_evict_inbound(), "an inbound peer is evicted");
+    assert_eq!(
+        hub.snapshot().len(),
+        before - 1,
+        "eviction disconnects that peer"
+    );
+}
+
+#[test]
+fn tx_relay_room_ignores_outbound_and_non_relay() {
+    let hub = PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8333);
+    let newcomer = hub.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)), 8333),
+        bind,
+        &ver("/new/"),
+        true,
+        PeerConnType::Inbound,
+    );
+    hub.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(2, 0, 0, 1)), 8333),
+        bind,
+        &ver("/out/"),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let mut quiet = ver("/quiet/");
+    quiet.relay = false;
+    hub.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::new(3, 0, 0, 1)), 8333),
+        bind,
+        &quiet,
+        true,
+        PeerConnType::Inbound,
+    );
+    assert!(
+        hub.make_room_for_tx_relay_inbound(&newcomer, 2),
+        "outbound relay and a non-relaying inbound are outside the tx-relay cap"
+    );
+}

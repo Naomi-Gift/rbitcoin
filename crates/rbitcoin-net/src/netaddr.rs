@@ -170,7 +170,7 @@ pub fn ipv4_unroutable(v: Ipv4Addr) -> bool {
         || v.is_loopback()
         || v.is_private()
         || v.is_link_local()
-        || v.is_broadcast()
+        // `is_broadcast` is only `255.255.255.255`, already in `240.0.0.0/4`.
         || v.is_multicast()
         || v.is_documentation()
         || ipv4_shared(v)
@@ -191,7 +191,7 @@ pub fn clearnet_unroutable(ip: IpAddr) -> bool {
                 return ipv4_unroutable(v4);
             }
             v.is_unspecified()
-                || v.is_loopback()
+                // `::1` is IPv4-compatible `0.0.0.1`, which is this-network.
                 || v.is_unicast_link_local()
                 || v.is_unique_local()
                 || v.is_multicast()
@@ -391,7 +391,8 @@ pub fn encode_i2p_name(dest: &[u8; 32]) -> String {
     let mut acc = 0u32;
     let mut bits = 0u32;
     for &b in dest {
-        acc = (acc << 8) | u32::from(b);
+        // The shift cleared the low 8 bits, so adding the byte is the same as or.
+        acc = (acc << 8) + u32::from(b);
         bits += 8;
         while bits >= 5 {
             bits -= 5;

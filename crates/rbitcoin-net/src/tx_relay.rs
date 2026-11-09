@@ -96,7 +96,9 @@ pub async fn sample_template_prev_for_build(mp: Option<Arc<MempoolHub>>) -> Temp
             (sample, settle)
         })
         .await;
-        if settle % 2 == 1 {
+        // Odd means a tip update holds the mark. Do not take a store permit
+        // until that update finishes. `settle & 1` is the parity test.
+        if settle & 1 == 1 {
             tokio::task::yield_now().await;
             continue;
         }
@@ -168,13 +170,6 @@ tokio::task_local! {
     /// thread cannot see it, so publish records txids only after that join.
     /// A mutex keeps the admit future `Send`: a `RefCell` guard is not.
     static ASYNC_PROMOTE_NOTES: std::sync::Mutex<Option<Vec<Txid>>>;
-}
-
-#[cfg(debug_assertions)]
-thread_local! {
-    /// Fired while `template_prev` is held. Off until a test arms it on this thread.
-    static MAINT_PUBLISH_HOOK: std::cell::Cell<Option<fn(&MempoolHub)>> =
-        const { std::cell::Cell::new(None) };
 }
 
 /// Record `txid` when a walk is already running. Returns false when this
@@ -1013,18 +1008,17 @@ impl LocalOrigin {
 
     /// The oldest waiting txid, now taken, and how many still wait.
     fn take(&mut self) -> Option<(Txid, usize)> {
-        let mut oldest: Option<(u64, Txid, u32)> = None;
-        let mut waiting = 0usize;
-        for (txid, turn) in &self.txs {
-            let IsolatedTurn::Waiting { order, sends } = *turn else {
-                continue;
-            };
-            waiting += 1;
-            if oldest.is_none_or(|(m, _, _)| order < m) {
-                oldest = Some((order, *txid, sends));
-            }
-        }
-        let (_, txid, sends) = oldest?;
+        let waiting: Vec<(u64, Txid, u32)> = self
+            .txs
+            .iter()
+            .filter_map(|(txid, turn)| {
+                let IsolatedTurn::Waiting { order, sends } = *turn else {
+                    return None;
+                };
+                Some((order, *txid, sends))
+            })
+            .collect();
+        let (_, txid, sends) = waiting.iter().copied().min_by_key(|(order, _, _)| *order)?;
         self.txs.insert(
             txid,
             IsolatedTurn::Taken {
@@ -1032,7 +1026,7 @@ impl LocalOrigin {
                 sends,
             },
         );
-        Some((txid, waiting - 1))
+        Some((txid, waiting.len() - 1))
     }
 }
 
@@ -1281,17 +1275,12 @@ pub struct TemplateHold<'a> {
     /// that races in before that increment still sends itself.
     updates_at_enter: u64,
     /// This thread already holds the mark. Drop does not publish.
-    nested: bool,
+    pub(crate) nested: bool,
 }
 
 impl TemplateHold<'_> {
     pub(crate) fn commit(&mut self, hash: [u8; 32]) {
         *self.commit.lock().unwrap() = Some(hash);
-    }
-
-    /// True when an outer hold on this thread owns the publish.
-    pub(crate) fn is_nested(&self) -> bool {
-        self.nested
     }
 }
 
@@ -1948,29 +1937,8 @@ impl MempoolHub {
             self.note_block_fee_history(h);
         }
         self.pool_maintained.store(true, Ordering::Release);
-        #[cfg(debug_assertions)]
-        self.fire_maint_publish_hook();
         drop(slot);
         true
-    }
-
-    /// Observe maintenance publish. The hook runs on this thread.
-    #[cfg(debug_assertions)]
-    #[doc(hidden)]
-    pub fn set_maint_publish_hook(hook: fn(&MempoolHub)) {
-        MAINT_PUBLISH_HOOK.with(|slot| slot.set(Some(hook)));
-    }
-
-    #[cfg(debug_assertions)]
-    fn fire_maint_publish_hook(&self) {
-        let hook = MAINT_PUBLISH_HOOK.with(|slot| slot.take());
-        if let Some(hook) = hook {
-            assert!(
-                self.template_prev.try_lock().is_err(),
-                "maintenance published after the template lock was released"
-            );
-            hook(self);
-        }
     }
 
     /// One-shot: relay just turned on and fee history has not been preloaded.
@@ -2223,8 +2191,6 @@ impl MempoolHub {
             .filter(|t| !g.graph.contains(t))
             .collect();
         if !gone.is_empty() {
-            let _ = g.maybe_compact();
-            let _ = g.persist_if_dirty();
             self.mark_fee_dirty();
         }
         drop(g);
@@ -3241,13 +3207,10 @@ impl MempoolHub {
             AcceptError::Policy("min relay fee") | AcceptError::Policy("mempool min fee")
         );
         let peer = origin.peer()?;
-        if !fee_only
-            || rbitcoin_consensus::policy::dust_vouts(parent)
-                .next()
-                .is_none()
-        {
+        if !fee_only {
             return None;
         }
+        rbitcoin_consensus::policy::dust_vouts(parent).next()?;
         self.lock_write().lift_dust_spender(parent, peer, |child| {
             self.try_recent_reject(&package_hash(parent, child))
         })
@@ -3257,7 +3220,11 @@ impl MempoolHub {
     /// park it again under its peers.
     fn settle_lifted(&self, lifted: &rbitcoin_mempool::LiftedOrphan, parent: Txid, admitted: bool) {
         let child = lifted.tx.compute_txid();
-        if admitted || self.try_recent_reject(&lifted.tx.compute_wtxid()) {
+        if admitted {
+            self.forget_taken_orphan(child, lifted.taken_gen);
+            return;
+        }
+        if self.try_recent_reject(&lifted.tx.compute_wtxid()) {
             self.forget_taken_orphan(child, lifted.taken_gen);
             return;
         }
@@ -3539,11 +3506,7 @@ impl MempoolHub {
                 }
                 Err(_) => {
                     self.unindex_if_absent(tx);
-                    let id = tx.compute_txid();
-                    let mut g = self.lock_write();
-                    if !g.graph.contains(&id) {
-                        g.trust_kept.remove(&id);
-                    }
+                    self.drop_trust_unless_live(&tx.compute_txid());
                 }
             }
         }
@@ -3595,11 +3558,7 @@ impl MempoolHub {
                         let hub = Arc::clone(self);
                         crate::reactor::off_pool(move || {
                             hub.unindex_if_absent(&tx);
-                            let id = tx.compute_txid();
-                            let mut g = hub.lock_write();
-                            if !g.graph.contains(&id) {
-                                g.trust_kept.remove(&id);
-                            }
+                            hub.drop_trust_unless_live(&tx.compute_txid());
                         })
                         .await;
                     }
@@ -3704,6 +3663,14 @@ impl MempoolHub {
     #[doc(hidden)]
     pub fn relay_indexed(&self, txid: &Txid) -> bool {
         self.wtxid_by_txid.lock().unwrap().contains_key(txid)
+    }
+
+    /// A failed re-admit keeps the trust mark when the tx is still in the pool.
+    fn drop_trust_unless_live(&self, id: &Txid) {
+        let mut g = self.lock_write();
+        if !g.graph.contains(id) {
+            g.trust_kept.remove(id);
+        }
     }
 
     #[doc(hidden)]
@@ -6657,7 +6624,7 @@ impl MempoolHub {
             let IsolatedTurn::Sent { due, sends } = *turn else {
                 continue;
             };
-            if due > now || sends >= ISOLATED_SEND_CAP {
+            if due.saturating_sub(now) > 0 || sends >= ISOLATED_SEND_CAP {
                 continue;
             }
             order += 1;

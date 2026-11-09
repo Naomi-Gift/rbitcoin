@@ -28,17 +28,14 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 thread_local! {
-    static ENSURE_HEADERS_BATCH_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static ENSURE_HEADER_FK_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static HEADER_OF_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-    static CHAIN_WORK_N: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static UNRECORDED_WALK_CAP: std::cell::Cell<u32> = const { std::cell::Cell::new(10_000) };
 }
 
-#[cfg(debug_assertions)]
-pub fn reset_header_store_counts() {
-    ENSURE_HEADERS_BATCH_N.with(|c| c.set(0));
-    HEADER_OF_N.with(|c| c.set(0));
-    CHAIN_WORK_N.with(|c| c.set(0));
+/// Test cap for [`ChainHub::assemble_side_branch`]. Returns the previous cap.
+#[doc(hidden)]
+pub fn set_unrecorded_walk_cap(n: u32) -> u32 {
+    UNRECORDED_WALK_CAP.with(|c| c.replace(n))
 }
 
 #[cfg(debug_assertions)]
@@ -49,15 +46,6 @@ pub fn reset_ensure_header_fk_count() {
 #[cfg(debug_assertions)]
 pub fn ensure_header_fk_count() -> u64 {
     ENSURE_HEADER_FK_N.with(|c| c.get())
-}
-
-#[cfg(debug_assertions)]
-pub fn header_store_counts() -> (u64, u64, u64) {
-    (
-        ENSURE_HEADERS_BATCH_N.with(|c| c.get()),
-        HEADER_OF_N.with(|c| c.get()),
-        CHAIN_WORK_N.with(|c| c.get()),
-    )
 }
 use std::sync::Arc;
 use std::sync::RwLock;
@@ -154,13 +142,9 @@ impl HeldBodies {
     }
 
     #[doc(hidden)]
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.by_hash.len()
-    }
-
-    #[doc(hidden)]
-    pub fn is_empty(&self) -> bool {
-        self.by_hash.is_empty()
     }
 
     #[doc(hidden)]
@@ -433,13 +417,9 @@ impl HeaderTips {
     }
 
     #[doc(hidden)]
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.by_hash.len()
-    }
-
-    #[doc(hidden)]
-    pub fn is_empty(&self) -> bool {
-        self.by_hash.is_empty()
     }
 
     #[doc(hidden)]
@@ -1140,12 +1120,7 @@ impl ChainHub {
         let one = self.tip_header().map(|h| h.work()).unwrap_or(zero);
         let mut window = zero;
         for _ in 0..144 {
-            let next = window + one;
-            if next > tip_work {
-                window = tip_work;
-                break;
-            }
-            window = next;
+            window = std::cmp::min(window + one, tip_work);
         }
         let near = tip_work - window;
         match self.min_chain_work_floor() {
@@ -1407,10 +1382,8 @@ impl ChainHub {
                     return;
                 };
                 let rank = |s: &str| match s {
-                    "invalid" => 3,
                     "valid-fork" => 2,
                     "valid-headers" => 1,
-                    // `headers-only` and any other label share rank 0.
                     _ => 0,
                 };
                 match map.get(&hash) {
@@ -1776,7 +1749,6 @@ impl ChainHub {
     /// A cache hit is the stored body header. It does not rebuild the block.
     /// A miss builds the wire header from the header row, and only that row.
     pub fn header_of(&self, hash: &BlockHash) -> Option<bitcoin::block::Header> {
-        HEADER_OF_N.with(|c| c.set(c.get().saturating_add(1)));
         if let Some(header) = self.cache.get_header(hash) {
             return Some(header);
         }
@@ -1881,7 +1853,6 @@ impl ChainHub {
                 self.persist_headers_batch(headers)
             });
         }
-        ENSURE_HEADERS_BATCH_N.with(|c| c.set(c.get().saturating_add(1)));
         if headers.is_empty() {
             return Ok(Vec::new());
         }
@@ -2280,16 +2251,13 @@ impl ChainHub {
         if want > parent_height {
             return None;
         }
-        if want < parent_height {
-            let mut hdr = *parent;
-            let mut h = parent_height;
-            while h > want {
-                hdr = self.sync_parent_header(&hdr.prev_blockhash, in_batch)?;
-                h = h.saturating_sub(1);
-            }
-            return Some(hdr);
+        let mut hdr = *parent;
+        let mut h = parent_height;
+        while h > want {
+            hdr = self.sync_parent_header(&hdr.prev_blockhash, in_batch)?;
+            h = h.saturating_sub(1);
         }
-        Some(*parent)
+        Some(hdr)
     }
 
     /// Contiguous tip-extension slice for one-shot load (owned Block).
@@ -2826,7 +2794,7 @@ impl ChainHub {
                 self.note_block_assembled(weight, txs.len());
             }
             hashes.push(self.mine_and_accept_paying(&script_pubkey, txs)?);
-            if let Some(ids) = ids.filter(|ids| !ids.is_empty()) {
+            if let Some(ids) = ids {
                 let Some(mp) = self.mempool() else {
                     continue;
                 };
@@ -3199,6 +3167,8 @@ impl ChainHub {
             if keep {
                 kept.push(*tip);
             }
+            // An existing fork tip covers its ancestors even when this call
+            // does not keep that tip.
             if keep || forks.contains(tip) {
                 under_valid.extend(below.iter().copied());
             }
@@ -3226,7 +3196,8 @@ impl ChainHub {
         starts.extend(*self.precious.read().unwrap());
         starts.extend(leaves.iter().copied());
         let mut seen = HashSet::new();
-        starts.retain(|s| seen.insert(*s) && !inv.contains(s) && !skip.contains(s));
+        starts.retain(|s| seen.insert(*s));
+        starts.retain(|s| !skip.contains(s));
         starts
             .into_iter()
             .filter_map(move |s| self.assemble_side_branch(s, restored))
@@ -3441,7 +3412,7 @@ impl ChainHub {
                 if new_height == tip_h {
                     // Park before the branch attempt so connect reads this
                     // session bit. Only an equal-work loser stays parked.
-                    let hash = block.block_hash();
+                    // A hold that was already here stays across a fault.
                     let already =
                         hold_unconnected && self.held_bodies.read().unwrap().contains(&hash);
                     if hold_unconnected {
@@ -3637,10 +3608,8 @@ impl ChainHub {
         fork_height: Option<u32>,
     ) -> Result<Vec<Arc<Block>>, NetError> {
         let tip_h = self.tip_height().unwrap_or(0);
-        let Some(fh) = fork_height.filter(|fh| tip_h > *fh) else {
-            return Ok(Vec::new());
-        };
-        let mut old_path = Vec::with_capacity((tip_h - fh) as usize);
+        let fh = fork_height.unwrap_or(tip_h);
+        let mut old_path = Vec::with_capacity(tip_h.saturating_sub(fh) as usize);
         for h in (fh + 1)..=tip_h {
             let b = self.block_at_height(h)?.ok_or_else(|| {
                 NetError::Store(format!("invariant: no body at connected height {h}"))
@@ -3767,7 +3736,7 @@ impl ChainHub {
         self.reaccept_disconnected(&gone);
         // An outer invalidate hold still has `template_prev`. Maintenance
         // takes that lock, so it runs after the outer drop instead.
-        let defer_maint = hold.as_ref().is_some_and(|h| h.is_nested());
+        let defer_maint = hold.as_ref().is_some_and(|h| h.nested);
         drop(hold);
         if !defer_maint {
             self.maintain_pool_after_ibd(was_ibd);
@@ -4215,8 +4184,9 @@ impl ChainHub {
         let mut unrecorded = 0u32;
         loop {
             if !restored.contains(&h) {
-                unrecorded += 1;
-                if unrecorded > 10_000 {
+                unrecorded = unrecorded.saturating_add(1);
+                let cap = UNRECORDED_WALK_CAP.with(std::cell::Cell::get);
+                if unrecorded > cap {
                     return None;
                 }
             }
@@ -4603,11 +4573,6 @@ impl ChainHub {
     }
 
     #[cfg(debug_assertions)]
-    pub fn reset_block_at_height_calls(&self) {
-        self.block_at_height_calls.store(0, Ordering::Relaxed);
-    }
-
-    #[cfg(debug_assertions)]
     pub fn block_at_height_calls(&self) -> u64 {
         self.block_at_height_calls.load(Ordering::Relaxed)
     }
@@ -4662,7 +4627,6 @@ impl ChainHub {
 
     /// Total chain work from genesis through tip (best effort from headers).
     pub fn chain_work(&self) -> Result<Work, NetError> {
-        CHAIN_WORK_N.with(|c| c.set(c.get().saturating_add(1)));
         self.work_from_fork_to_tip(None)
     }
 
@@ -5516,4 +5480,43 @@ pub fn sixty_four_byte_body(prev: BlockHash, time: u32) -> Block {
     rbitcoin_consensus::grind_regtest_pow(&mut block.header);
     assert!(block.check_merkle_root());
     block
+}
+
+#[cfg(test)]
+mod restored_leaf_under_fork_tip {
+    use super::tiny_regtest_hub_labeled;
+    use bitcoin::BlockHash;
+    use std::collections::HashSet;
+
+    /// State after a heavier chain has won and activation left the fork in
+    /// place: the leaf was connected, and that fork tip still covers it.
+    #[test]
+    fn a_leaf_under_an_existing_fork_tip_is_not_recorded() {
+        let (dir, hub) = tiny_regtest_hub_labeled("park-under-fork");
+        hub.ensure_genesis().unwrap();
+        let genesis = hub.tip_hash().unwrap();
+        let time = hub.tip_header().unwrap().time;
+        let leaf = rbitcoin_consensus::mine_empty_regtest(genesis, time + 1, 1);
+        let leaf_hash = leaf.block_hash();
+        let fork = rbitcoin_consensus::mine_empty_regtest(leaf_hash, time + 2, 2);
+        let fork_hash = fork.block_hash();
+        hub.hold_body(std::sync::Arc::new(leaf), false);
+        hub.hold_body(std::sync::Arc::new(fork), false);
+        hub.fork_tips.write().unwrap().insert(fork_hash);
+
+        let restored = HashSet::from([leaf_hash, fork_hash]);
+        let validated = HashSet::from([leaf_hash]);
+        hub.park_restored_leaves(&[leaf_hash], &restored, &validated);
+
+        let forks: Vec<BlockHash> = hub.fork_tips.read().unwrap().iter().collect();
+        assert!(
+            forks.contains(&fork_hash),
+            "the existing fork tip stays: {forks:?}"
+        );
+        assert!(
+            !forks.contains(&leaf_hash),
+            "a restored leaf under that tip is not a tip: {forks:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }

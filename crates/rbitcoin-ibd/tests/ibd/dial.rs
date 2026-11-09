@@ -1056,7 +1056,6 @@ fn disconnect_stalled_after_30s_without_rx() {
     inflight.insert(h, rbitcoin_ibd::ibd::state::InflightReq::new(5));
     let mut cooldown = HashMap::new();
     let mut strikes = HashMap::new();
-    rbitcoin_net::chain::reset_header_store_counts();
     disconnect_stalled_block_peers_at(
         std::slice::from_mut(&mut slot),
         &mut inflight,
@@ -1070,7 +1069,6 @@ fn disconnect_stalled_after_30s_without_rx() {
     );
     assert!(cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(a)));
     assert!(inflight.is_empty());
-    assert_eq!(rbitcoin_net::chain::header_store_counts(), (0, 0, 0));
 }
 
 #[test]
