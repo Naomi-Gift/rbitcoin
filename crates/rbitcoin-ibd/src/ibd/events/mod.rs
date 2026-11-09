@@ -1239,12 +1239,12 @@ pub fn take_confirm_events(
                 remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                 st.body.mark_archived(hash);
                 let tip = hub.tip_height().unwrap_or(0);
-                // The write recorded this height. `hash_height` may already be
-                // gone if a fork promotion ran first. The store wins when it
-                // has a row: a rewind that replaced this height must not spend
-                // the new chain's lead. The map covers a write the test has
-                // not flushed.
-                if accepted_height_stands(st, hub, height, hash) {
+                // The write recorded this height. Do not look it up: a fork
+                // promotion can drop `hash_height` first, and a header read
+                // here runs while the coordinator holds `shared`. A rewind
+                // already marked this drain stale, so a height above the new
+                // tip is the chain that was left and must not be charged.
+                if !st.confirm_quiesce || height <= tip {
                     super::header_walk::note_unproven_class_a(st, height, wire_bytes);
                     if let Some(f) = feed {
                         f.release_lead_reserve(height);
@@ -1291,18 +1291,6 @@ pub fn take_confirm_events(
         st.confirm_quiesce = false;
     }
     deferred
-}
-
-/// This accept still belongs to `height`. A stored row decides. With no row,
-/// the in-memory map does.
-fn accepted_height_stands(st: &IbdWorkState, hub: &ChainHub, height: u32, hash: BlockHash) -> bool {
-    match hub
-        .query
-        .header_at_height(rbitcoin_primitives::Height(height))
-    {
-        Ok(Some((_, rec))) => rec.hash == *hash.as_byte_array(),
-        _ => st.hash_height.get(&hash).copied() == Some(height),
-    }
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled

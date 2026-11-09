@@ -7042,6 +7042,45 @@ fn a_promoted_fork_keeps_the_charge_for_a_block_that_stays() {
     );
 }
 
+/// A rewind already marked this drain stale. An accept for a height above
+/// the new tip is the chain that was left.
+#[test]
+fn a_stale_accept_above_the_rewound_tip_does_not_spend_the_lead() {
+    use rbitcoin_ibd::ibd::confirm::ConfirmEvent;
+    use rbitcoin_ibd::ibd::events::take_confirm_events;
+    use std::sync::atomic::AtomicU32;
+    use std::time::Instant;
+
+    let (_dir, hub, mut st, _gen) = opened("unproven-stale-accept", true);
+    st.header_walk.witness_height = Some(10);
+    st.confirm_quiesce = true;
+    let hash = mine(hub.tip_hash().unwrap(), 4).block_hash();
+    let (tx, rx) = std::sync::mpsc::channel();
+    tx.send(ConfirmEvent::Accepted {
+        hash,
+        height: 11,
+        wire_bytes: 60,
+    })
+    .unwrap();
+    drop(tx);
+    let write_next = AtomicU32::new(0);
+    let max_ready = AtomicU32::new(0);
+    let mut progress = Instant::now();
+    let _ = take_confirm_events(
+        &mut st,
+        &hub,
+        &rx,
+        &write_next,
+        &max_ready,
+        &mut progress,
+        None,
+    );
+    assert!(
+        st.header_walk.lead_class_a.is_empty(),
+        "a height above the rewound tip does not spend the new lead"
+    );
+}
+
 #[test]
 fn a_second_lookup_does_not_spend_the_lead_twice() {
     use rbitcoin_ibd::ibd::confirm::{take_unproven_lead, ConfirmFeed};
