@@ -1209,15 +1209,20 @@ pub fn getblock_unknown_hash(
     if let Some(block) = ctx.chain.as_ref().and_then(|c| c.held_body(&typed)) {
         return disconnected_block_value(ctx, &hash, &block, verbosity);
     }
-    let header_only = ctx.chain.as_ref().is_some_and(|c| c.knows_header(&typed))
-        || ctx.query.get_header_by_hash(&hash).ok().flatten().is_some();
-    if header_only {
+    if knows_header(ctx, &hash) {
         return Err(rpc_error(
             ERR_MISC,
             "Block not available (not fully downloaded)",
         ));
     }
     Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))
+}
+
+/// A header row, or a side-branch body held in RAM.
+fn knows_header(ctx: &RpcContext, hash: &[u8; 32]) -> bool {
+    let typed = BlockHash::from_byte_array(*hash);
+    ctx.chain.as_ref().is_some_and(|c| c.knows_header(&typed))
+        || ctx.query.get_header_by_hash(hash).ok().flatten().is_some()
 }
 
 pub fn confirmations(ctx: &RpcContext, height: Height) -> u32 {
@@ -1246,7 +1251,14 @@ pub fn getblockfilter(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Val
         .query
         .basic_filter_for_hash(&hash)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, "Block not found"))?;
+        .ok_or_else(|| {
+            let message = if knows_header(ctx, &hash) {
+                "Filter not found. Block was not connected to active chain."
+            } else {
+                "Block not found"
+            };
+            rpc_error(ERR_INVALID_ADDRESS_OR_KEY, message)
+        })?;
     use bitcoin::hashes::Hash;
     Ok(json!({
         "filter": rbitcoin_primitives::hex_encode(&body),
