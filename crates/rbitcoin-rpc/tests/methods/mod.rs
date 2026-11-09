@@ -615,7 +615,7 @@ fn filter_header_hex(filter_hex: &str, parent_header_hex: &str) -> String {
 fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
     use bitcoin::bip158::BlockFilter;
 
-    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let (ctx, dir, hub) = ctx_from_mature_pad(300_000_000);
     ctx.query.set_block_filter_index(true).unwrap();
     assert_eq!(ctx.query.filter_index_next(), Some(0));
 
@@ -720,6 +720,28 @@ fn getblockfilter_rebuilds_unsealed_and_chains_from_a_sealed_parent() {
             stale_two["header"].as_str().unwrap(),
         )),
         "a stale grandchild walks back to the sealed fork point, got {stale_three}"
+    );
+
+    // Core #36613: the tip is height 1 again and its filter is sealed. A
+    // header submitted on it is a known block that never connected.
+    let header_only = rbitcoin_consensus::mine_regtest_paying(
+        hub.tip_hash().unwrap(),
+        hub.tip_header().unwrap().time + 60,
+        hub.tip_height().unwrap() + 1,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![],
+    );
+    dispatch(&ctx, "submitheader", vec![json!(block_hex(&header_only))]).unwrap();
+    let never = dispatch(
+        &ctx,
+        "getblockfilter",
+        vec![json!(header_only.block_hash().to_string())],
+    )
+    .unwrap_err();
+    assert_eq!(never["code"], ERR_INVALID_ADDRESS_OR_KEY, "{never}");
+    assert_eq!(
+        never["message"], "Filter not found. Block was not connected to active chain.",
+        "{never}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -8774,6 +8796,17 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
         rpc_message(&tip_filter).contains("still in the process of being indexed"),
         "{tip_filter}"
     );
+    // Nothing is sealed, yet a block that never connected says so first:
+    // a submitted header, and a side-branch body held in RAM.
+    for never_connected in [&off_hash, &held_hash] {
+        let e = dispatch(&ctx, "getblockfilter", vec![json!(never_connected)]).unwrap_err();
+        assert_eq!(e["code"], ERR_INVALID_ADDRESS_OR_KEY, "{e}");
+        assert_eq!(
+            rpc_message(&e),
+            "Filter not found. Block was not connected to active chain.",
+            "{e}"
+        );
+    }
     let unknown_filter = dispatch(
         &ctx,
         "getblockfilter",

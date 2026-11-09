@@ -248,22 +248,30 @@ impl Query {
     /// genesis header, or a stale branch walked back to that sealed fork
     /// point. An unsealed best-chain gap is refused before the body is
     /// rebuilt.
+    ///
+    /// `None` is a block that never connected: an unknown hash, or a header
+    /// off the best chain with no stored body. That is answered before the
+    /// parent walk, so the parent's state does not answer for it.
     pub fn basic_filter_for_hash(
         &self,
         hash: &[u8; 32],
     ) -> Result<Option<(Vec<u8>, FilterHeader)>, QueryError> {
-        if let Some(h) = self.height_of_hash(hash)? {
+        let height = self.height_of_hash(hash)?;
+        if let Some(h) = height {
             if let Some(row) = self.basic_filter_at(h.0)? {
                 return Ok(Some(row));
             }
         }
-        let Some(prev) = self.header_prev_hash(hash)? else {
+        let Some((header_fk, _)) = self.get_header_by_hash(hash)? else {
             return Ok(None);
         };
-        let parent_header = self.parent_basic_filter_header(&prev)?;
-        let Some(block) = self.block_body_for_filter(hash)? else {
+        if height.is_none() && !self.store.header_txs.has_body(header_fk)? {
             return Ok(None);
-        };
+        }
+        let parent_header = self.parent_basic_filter_header(&self.prev_header_hash(hash)?)?;
+        let block = self
+            .block_body_for_filter(hash)?
+            .ok_or(StoreError::Corrupt("invariant: blockfilter body missing"))?;
         let spent = self.spent_scripts(&block)?;
         let filter = self.basic_filter_content(&block, &spent)?;
         Ok(Some((
