@@ -3132,6 +3132,36 @@ async fn wait_for_listing(
     .unwrap_or_else(|_| panic!("{method} did not become active"))
 }
 
+/// Waits until a new listing of `method` stays. `dispatch` lists the call
+/// again while it returns a tip the wait already saved, and that entry
+/// ends immediately. A parked wait keeps the same start time.
+async fn wait_for_settled_listing(
+    active: &std::sync::Mutex<rbitcoin_rpc::methods::RpcActive>,
+    method: &str,
+    previous: std::time::Instant,
+) -> std::time::Instant {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        let mut current = None;
+        let mut since = std::time::Instant::now();
+        loop {
+            match listed_since(active, method) {
+                Some(at) if at != previous => {
+                    if current != Some(at) {
+                        current = Some(at);
+                        since = std::time::Instant::now();
+                    } else if since.elapsed() >= std::time::Duration::from_millis(50) {
+                        return at;
+                    }
+                }
+                _ => current = None,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{method} did not stay active"))
+}
+
 /// Waits until `method` is or is no longer listed in `getrpcinfo`.
 async fn wait_for_active_call(
     active: &std::sync::Mutex<rbitcoin_rpc::methods::RpcActive>,
@@ -3493,11 +3523,11 @@ async fn earlier_wait_reports_the_tip_from_when_it_finished() {
     let call = tokio::spawn(async move {
         rpc_post(State(state), axum::extract::Request::new(Body::from(body))).await
     });
-    // The two waits share a method name and the gap between them is one
-    // poll, so the listing does not drop long enough to see. The second
-    // entry has a new start time. Mine only after that entry is current.
+    // The two waits share a method name. `dispatch` also lists the first
+    // call for a moment while it returns the tip that wait already saved.
+    // Mine only after a later listing has stayed, which is the second wait.
     let first = wait_for_listing(&watch.active, "waitfornewblock", None).await;
-    wait_for_listing(&watch.active, "waitfornewblock", Some(first)).await;
+    wait_for_settled_listing(&watch.active, "waitfornewblock", first).await;
     let miner = std::thread::spawn(move || {
         hub.generate_to_script(1, bitcoin::ScriptBuf::from_bytes(vec![0x51]), vec![])
             .expect("mine");
