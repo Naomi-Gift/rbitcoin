@@ -4062,7 +4062,13 @@ fn unrecorded_side_walk_stops_past_the_cap() {
     let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
     let genesis = hub.tip_hash().expect("genesis");
-    let old = set_unrecorded_walk_cap(3);
+    struct RestoreWalkCap(u32);
+    impl Drop for RestoreWalkCap {
+        fn drop(&mut self) {
+            set_unrecorded_walk_cap(self.0);
+        }
+    }
+    let _restore = RestoreWalkCap(set_unrecorded_walk_cap(3));
     let b1 = mine(genesis, 1_300_080_000, 1);
     let b2 = mine(b1.block_hash(), b1.header.time + 600, 2);
     let b3 = mine(b2.block_hash(), b2.header.time + 600, 3);
@@ -4079,7 +4085,6 @@ fn unrecorded_side_walk_stops_past_the_cap() {
             .is_none(),
         "the fourth unrecorded header stops the walk"
     );
-    set_unrecorded_walk_cap(old);
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -4364,6 +4369,55 @@ fn store_fault_on_tip_connect_does_not_cache_block_invalid() {
     );
     assert_eq!(hub.tip_hash(), Some(t2.block_hash()));
 
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Equal-height accept parks before the branch attempt. A store fault must
+/// drop a hold this call just created. A hold that was already there stays.
+/// An equal-work loser stays parked.
+#[test]
+fn equal_height_store_fault_drops_only_a_fresh_hold() {
+    let (dir, hub, b1, t2) = hub_with_truncated_body();
+    let rival = spend_block(b1.block_hash(), t2.header.time + 1, 2, coinbase_out(&b1));
+    let hash = rival.block_hash();
+    *hub.precious.write().unwrap() = Some(hash);
+    let err = hub
+        .accept_received_block(rival.clone())
+        .expect_err("truncated txout on the equal-height reorg");
+    assert!(matches!(err, NetError::Store(_)), "{err:?}");
+    assert!(
+        hub.held_body(&hash).is_none(),
+        "a fresh equal-height hold must not survive a store fault"
+    );
+    assert!(!hub.is_block_invalid(&hash));
+
+    hub.hold_body(Arc::new(rival.clone()), false);
+    let err = hub
+        .accept_received_block(rival)
+        .expect_err("the same fault with a hold that was already there");
+    assert!(matches!(err, NetError::Store(_)), "{err:?}");
+    assert!(
+        hub.held_body(&hash).is_some(),
+        "a hold from an earlier call stays across the store fault"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let genesis = hub.tip_hash().unwrap();
+    let tip = mine(genesis, 1_300_080_000, 1);
+    hub.accept_block(tip.clone()).unwrap();
+    let loser = mine_distinct(genesis, tip.header.time + 1, 1, &[tip.block_hash()]);
+    let loser_hash = loser.block_hash();
+    let out = hub.accept_received_block(loser).unwrap();
+    assert!(
+        matches!(out, AcceptOutcome::IgnoredWeaker),
+        "equal work without precious stays a loser: {out:?}"
+    );
+    assert!(
+        hub.held_body(&loser_hash).is_some(),
+        "an equal-work loser stays parked"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

@@ -3157,6 +3157,10 @@ impl ChainHub {
             let keep = leaves.contains(tip) && was_connected;
             if keep {
                 kept.push(*tip);
+            }
+            // An existing fork tip covers its ancestors even when this call
+            // does not keep that tip.
+            if keep || forks.contains(tip) {
                 under_valid.extend(below.iter().copied());
             }
         }
@@ -3399,11 +3403,21 @@ impl ChainHub {
                 if new_height == tip_h {
                     // Park before the branch attempt so connect reads this
                     // session bit. Only an equal-work loser stays parked.
+                    // A hold that was already here stays across a fault.
+                    let already =
+                        hold_unconnected && self.held_bodies.read().unwrap().contains(&hash);
                     if hold_unconnected {
                         // Re-hold so a trusted session can set the waive bit.
                         self.hold_body(Arc::clone(&block), waive);
                     }
-                    return self.accept_branch_locked(std::slice::from_ref(&block));
+                    let out = self.accept_branch_locked(std::slice::from_ref(&block));
+                    if hold_unconnected
+                        && !already
+                        && !matches!(out, Ok(AcceptOutcome::IgnoredWeaker))
+                    {
+                        self.drop_held(hash);
+                    }
+                    return out;
                 }
 
                 if hold_unconnected {
@@ -5457,4 +5471,43 @@ pub fn sixty_four_byte_body(prev: BlockHash, time: u32) -> Block {
     rbitcoin_consensus::grind_regtest_pow(&mut block.header);
     assert!(block.check_merkle_root());
     block
+}
+
+#[cfg(test)]
+mod restored_leaf_under_fork_tip {
+    use super::tiny_regtest_hub_labeled;
+    use bitcoin::BlockHash;
+    use std::collections::HashSet;
+
+    /// State after a heavier chain has won and activation left the fork in
+    /// place: the leaf was connected, and that fork tip still covers it.
+    #[test]
+    fn a_leaf_under_an_existing_fork_tip_is_not_recorded() {
+        let (dir, hub) = tiny_regtest_hub_labeled("park-under-fork");
+        hub.ensure_genesis().unwrap();
+        let genesis = hub.tip_hash().unwrap();
+        let time = hub.tip_header().unwrap().time;
+        let leaf = rbitcoin_consensus::mine_empty_regtest(genesis, time + 1, 1);
+        let leaf_hash = leaf.block_hash();
+        let fork = rbitcoin_consensus::mine_empty_regtest(leaf_hash, time + 2, 2);
+        let fork_hash = fork.block_hash();
+        hub.hold_body(std::sync::Arc::new(leaf), false);
+        hub.hold_body(std::sync::Arc::new(fork), false);
+        hub.fork_tips.write().unwrap().insert(fork_hash);
+
+        let restored = HashSet::from([leaf_hash, fork_hash]);
+        let validated = HashSet::from([leaf_hash]);
+        hub.park_restored_leaves(&[leaf_hash], &restored, &validated);
+
+        let forks: Vec<BlockHash> = hub.fork_tips.read().unwrap().iter().collect();
+        assert!(
+            forks.contains(&fork_hash),
+            "the existing fork tip stays: {forks:?}"
+        );
+        assert!(
+            !forks.contains(&leaf_hash),
+            "a restored leaf under that tip is not a tip: {forks:?}"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
