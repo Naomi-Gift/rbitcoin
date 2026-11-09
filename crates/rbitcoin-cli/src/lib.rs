@@ -466,7 +466,6 @@ pub fn dispatch_call(cfg: &CliConfig) -> Result<String, String> {
     Ok(format_result(&result))
 }
 
-/// Process entry used by `main` and high-level scenarios.
 /// Requested output on stdout. A reader that closed the pipe (`| head -1`)
 /// is not an error; any other write error is exit 1.
 fn print_stdout(text: &str) -> ExitCode {
@@ -480,6 +479,7 @@ fn print_stdout(text: &str) -> ExitCode {
     }
 }
 
+/// Process entry used by `main` and high-level scenarios.
 pub fn cli_main<I, T>(args: I) -> ExitCode
 where
     I: IntoIterator<Item = T>,

@@ -65,7 +65,6 @@ pub struct ParsedOperatorFlags {
     pub kvs: Vec<(String, String)>,
 }
 
-#[doc(hidden)]
 /// Requested output on stdout. A reader that closed the pipe (`| head -1`)
 /// is not an error; any other write error is exit 1.
 fn print_stdout(text: &str) -> Result<(), ExitCode> {
@@ -79,6 +78,7 @@ fn print_stdout(text: &str) -> Result<(), ExitCode> {
     }
 }
 
+#[doc(hidden)]
 pub fn parse_operator_flags(args: &[OsString]) -> Result<OperatorFlagEnd, ExitCode> {
     let mut i = 1usize;
     let mut smoke = false;
