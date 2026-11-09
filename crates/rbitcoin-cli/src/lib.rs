@@ -5,7 +5,7 @@
 use rbitcoin_primitives::Network;
 use serde_json::Value;
 use std::ffi::OsString;
-use std::io::{Read, Write};
+use std::io::{BufRead, Read, Write};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -100,6 +100,7 @@ pub fn usage() -> String {
            --rpc-token-file PATH  Bearer token (default PATH/rpc.token from --datadir)\n\
            -h, --help             this message\n\
            -V, --version          print version\n\
+           -stdin                 read extra args from stdin, one per line until EOF\n\
          \n\
          Local: --datadir talks to {{datadir}}/rpc.sock (no token). TCP uses Bearer\n\
          from {{datadir}}/rpc.token. Plain HTTP, same as the node.",
@@ -116,6 +117,7 @@ pub struct CliConfig {
     pub token_file: Option<PathBuf>,
     pub command: Option<String>,
     pub params: Vec<String>,
+    pub stdin: bool,
 }
 
 impl Default for CliConfig {
@@ -128,6 +130,7 @@ impl Default for CliConfig {
             token_file: None,
             command: None,
             params: Vec::new(),
+            stdin: false,
         }
     }
 }
@@ -176,6 +179,11 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
             }
             if a == "--" {
                 positional_only = true;
+                i += 1;
+                continue;
+            }
+            if a == "-stdin" {
+                cfg.stdin = true;
                 i += 1;
                 continue;
             }
@@ -321,6 +329,14 @@ pub fn read_token(path: &Path) -> Result<String, String> {
         return Err(format!("token file {}: empty", path.display()));
     }
     Ok(t.to_string())
+}
+
+#[doc(hidden)]
+pub fn read_stdin_args(reader: impl BufRead) -> Result<Vec<String>, String> {
+    reader
+        .lines()
+        .map(|line| line.map_err(|e| format!("read stdin: {e}")))
+        .collect()
 }
 
 fn convert_format(method: &str, index: usize) -> Option<ParamFormat> {
@@ -496,12 +512,23 @@ where
     match action {
         Action::Help => print_stdout(&usage()),
         Action::Version => print_stdout(concat!("rbitcoin-cli ", env!("CARGO_PKG_VERSION"))),
-        Action::Call(cfg) => match dispatch_call(&cfg) {
-            Ok(out) => print_stdout(&out),
-            Err(e) => {
-                eprintln!("error: {e}");
-                ExitCode::from(1)
+        Action::Call(mut cfg) => {
+            if cfg.stdin {
+                match read_stdin_args(std::io::stdin().lock()) {
+                    Ok(extra) => cfg.params.extend(extra),
+                    Err(e) => {
+                        eprintln!("error: {e}");
+                        return ExitCode::from(2);
+                    }
+                }
             }
-        },
+            match dispatch_call(&cfg) {
+                Ok(out) => print_stdout(&out),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
     }
 }

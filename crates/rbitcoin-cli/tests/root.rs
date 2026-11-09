@@ -166,6 +166,7 @@ fn usage_describes_every_option() {
         "--rpc-token-file PATH",
         "-h, --help",
         "-V, --version",
+        "-stdin",
     ] {
         assert!(u.contains(needle), "usage must list {needle}");
     }
@@ -446,4 +447,78 @@ fn help_and_version_to_a_closed_stdout_exit_zero() {
         assert!(out.status.success(), "{args:?}: {:?} {stderr}", out.status);
         assert!(!stderr.contains("panicked"), "{args:?}: {stderr}");
     }
+}
+
+#[test]
+fn parse_args_stdin_is_a_flag() {
+    match parse_args(&os_args(&["rbitcoin-cli", "-stdin", "getblockcount"])) {
+        Ok(Action::Call(cfg)) => {
+            assert_eq!(cfg.command.as_deref(), Some("getblockcount"));
+            assert!(cfg.stdin, "-stdin must set the stdin flag");
+        }
+        Err(e) => panic!("-stdin must parse, got: {e}"),
+        Ok(_) => panic!("expected Action::Call"),
+    }
+}
+
+#[test]
+fn read_stdin_args_reads_one_per_line_until_eof() {
+    assert_eq!(
+        read_stdin_args(std::io::Cursor::new(b"pass\nphrase\n")).unwrap(),
+        vec!["pass".to_string(), "phrase".to_string()]
+    );
+    assert!(read_stdin_args(std::io::Cursor::new(b""))
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        read_stdin_args(std::io::Cursor::new(b"a\r\nb\r\n")).unwrap(),
+        vec!["a".to_string(), "b".to_string()]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn stdin_flag_appends_args_from_stdin() {
+    use std::os::unix::net::UnixListener;
+    use std::process::{Command, Stdio};
+
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let (captured, h) = serve_one_rpc(UnixListener::bind(&sock).unwrap());
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_rbitcoin-cli"))
+        .arg("--rpc-socket")
+        .arg(&sock)
+        .arg("-stdin")
+        .arg("getblock")
+        .arg("123456789")
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        stdin.write_all(b"2\n").unwrap();
+    }
+    let status = child.wait().unwrap();
+    assert!(
+        status.success(),
+        "rbitcoin-cli -stdin must exit 0, got {status:?}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = h.join();
+
+    let params = captured.lock().unwrap().take().unwrap();
+    assert_eq!(
+        params,
+        vec![serde_json::json!("123456789"), serde_json::json!(2)]
+    );
+}
+
+#[test]
+fn parse_args_double_dash_stdin_is_rejected() {
+    let err = match parse_args(&os_args(&["rbitcoin-cli", "--stdin", "getblockcount"])) {
+        Ok(_) => panic!("--stdin should have been rejected"),
+        Err(e) => e,
+    };
+    assert!(err.contains("unknown argument"), "--stdin -> {err}");
 }
