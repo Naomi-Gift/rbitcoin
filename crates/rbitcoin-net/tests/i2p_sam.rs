@@ -824,9 +824,7 @@ async fn sam_status_error_is_one_attempt() {
                 };
                 hits2.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn(async move {
-                    for line in [
-                        "HELLO REPLY RESULT=NOVERSION",
-                    ] {
+                    for line in ["HELLO REPLY RESULT=NOVERSION"] {
                         if read_line(&mut sock).await.is_err() {
                             return;
                         }
@@ -844,7 +842,11 @@ async fn sam_status_error_is_one_attempt() {
         Err(err) => err,
     };
     assert!(err.to_string().contains("i2p sam hello"), "{err}");
-    assert_eq!(hits.load(Ordering::SeqCst), 1, "a hello failure is not retried");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "a hello failure is not retried"
+    );
 }
 
 #[tokio::test(flavor = "current_thread")]
@@ -907,7 +909,11 @@ async fn stream_i2p_error_is_one_attempt() {
     };
     let err = dialer.stream_connect("peer.b32.i2p").await.unwrap_err();
     assert!(err.to_string().contains("i2p sam stream"), "{err}");
-    assert_eq!(hits.load(Ordering::SeqCst), 1, "a stream status is not retried");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        1,
+        "a stream status is not retried"
+    );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let forward_addr = listener.local_addr().unwrap();

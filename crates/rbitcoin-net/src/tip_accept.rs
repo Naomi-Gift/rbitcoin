@@ -939,10 +939,7 @@ mod lane_mutants {
         let rel = Arc::clone(&release);
         let holder = thread::spawn(move || hold_lane_mutex_for_tests(&rel));
         thread::sleep(Duration::from_millis(50));
-        assert!(
-            !holder.is_finished(),
-            "the hold returns only after release"
-        );
+        assert!(!holder.is_finished(), "the hold returns only after release");
         {
             let (lock, cv) = &*release;
             *lock.lock().unwrap() = true;

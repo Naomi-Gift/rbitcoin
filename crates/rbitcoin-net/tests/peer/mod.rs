@@ -5660,6 +5660,11 @@ fn persist_pending_path_starts_after_the_last_stored_header() {
         1,
         "only the new header is checked, not the stored fork path"
     );
+    assert_eq!(
+        hub.take_header_contextual_checks(),
+        0,
+        "take clears the count"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

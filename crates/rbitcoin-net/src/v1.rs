@@ -368,7 +368,10 @@ mod v1_bounds {
         let magic = Magic::from(bitcoin::Network::Signet);
         let max = u32::try_from(MAX_PROTOCOL_MESSAGE_LENGTH).unwrap();
         let reader = reader_with_len(max);
-        assert_eq!(reader.check_head(magic).unwrap(), MAX_PROTOCOL_MESSAGE_LENGTH);
+        assert_eq!(
+            reader.check_head(magic).unwrap(),
+            MAX_PROTOCOL_MESSAGE_LENGTH
+        );
         let over = reader_with_len(max.saturating_add(1));
         assert!(matches!(
             over.check_head(magic),
@@ -394,7 +397,10 @@ mod v1_bounds {
             before,
             "a frame under 64KiB stays on the caller"
         );
-        writer.write_contents(long_ping(V1_OFFLOAD_LEN)).await.unwrap();
+        writer
+            .write_contents(long_ping(V1_OFFLOAD_LEN))
+            .await
+            .unwrap();
         assert_eq!(V1_OFFLOAD_FRAMES.load(Ordering::SeqCst), before + 1);
     }
 }

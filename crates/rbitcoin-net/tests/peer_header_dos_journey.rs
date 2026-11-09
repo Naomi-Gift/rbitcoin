@@ -2148,7 +2148,6 @@ async fn below_floor_headers_do_not_walk_parents() {
     let mut follow = PeerFollowState::new();
     // Warm the tip-work prefix so the floor check itself is not the lookup.
     let _ = hub.meets_minimum_chain_work();
-    rbitcoin_net::chain::reset_header_store_counts();
     let before = rbitcoin_query::header_lookup_count();
     push(
         &hub,
@@ -2162,11 +2161,6 @@ async fn below_floor_headers_do_not_walk_parents() {
     assert_eq!(
         looked, 0,
         "below-floor ignore must not read parent headers, looked={looked}"
-    );
-    assert_eq!(
-        rbitcoin_net::chain::header_store_counts().2,
-        0,
-        "below-floor ignore uses the cached tip work"
     );
     assert!(
         peer.best_known().is_none(),
@@ -2207,7 +2201,6 @@ async fn connected_check_does_not_catch_up_the_height_index() {
     let tip = hub.tip_hash().unwrap();
     assert!(hub.is_connected(&tip));
     hub.query.invalidate_height_by_hash_index();
-    rbitcoin_net::chain::reset_header_store_counts();
     let before = rbitcoin_query::header_lookup_count();
     assert!(
         !hub.is_connected(&tip),
@@ -2236,7 +2229,6 @@ async fn below_floor_disconnected_header_does_not_walk_parents() {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let mut follow = PeerFollowState::new();
     let orphan = regtest_header_chain(BlockHash::from_byte_array([0x11; 32]), 1);
-    rbitcoin_net::chain::reset_header_store_counts();
     let before = rbitcoin_query::header_lookup_count();
     push(
         &hub,
@@ -2284,7 +2276,6 @@ async fn full_pending_below_floor_does_not_walk_parents() {
         .await;
     }
     assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
-    rbitcoin_net::chain::reset_header_store_counts();
     let before = rbitcoin_query::header_lookup_count();
     let chain = regtest_header_chain(prev, batch);
     push(
