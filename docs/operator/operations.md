@@ -678,6 +678,8 @@ Do **not** wipe `store/` for mempool slot/full/schema errors.
   overlays to fill. `--onion` alone keeps IPv4 and IPv6 reachable and
   dialed direct, as in Core; `--only-net onion` adds only onion seeds.
   `--proxy` takes the SOCKS addr-fetch path above and adds no fixed seeds.
+  As in Core, it asks no seed with `--connect` or on a custom signet.
+  Regtest has no seed in this node, so start-up does not wait for one.
 - **Outbound diversity:** live IBD and tip-follow peers prefer unused
   **netgroups**. With a Core `ip_asn.dat` (DecodeAsmap format) the group is
   **ASN**; without a file it is IPv4 `/16` or IPv6 `/32`. Place Core’s map at
