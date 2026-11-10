@@ -2254,6 +2254,91 @@ async fn earlier_block_does_not_replace_best_known() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// An equal-work fork is stored, then dropped from the pending map when the
+/// body loses the tie. Its work must still count, or the next short low-work
+/// headers message drops the outbound peer.
+#[tokio::test]
+async fn equal_work_fork_keeps_its_work_after_pending_drop() {
+    use bitcoin::p2p::message_blockdata::Inventory;
+    use rbitcoin_net::peers::PeerConnType;
+    use std::sync::atomic::Ordering;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ibd-equal-work");
+    let mut floor = [0u8; 32];
+    floor[30] = 0x10;
+    hub.set_minimum_chain_work(Some(floor));
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(4, op_true(), vec![]).unwrap();
+    let met = hub.chain_work().unwrap().to_be_bytes();
+    hub.set_minimum_chain_work(Some(met));
+    let tip_time = u64::from(hub.tip_header().unwrap().time);
+    hub.clock
+        .set_mock(i64::try_from(tip_time + hub.max_tip_age_secs() + 1).unwrap());
+    assert!(hub.in_ibd(), "a stale tip stays in initial block download");
+    let tip = hub.tip_hash().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer_as(&peers, 18513, 93, PeerConnType::OutboundFullRelay);
+    peer.note_best_known(tip);
+    let parent = header_at(&hub, 3).block_hash();
+    let fork = regtest_header_chain(parent, 1);
+    let fork_hash = fork[0].block_hash();
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(fork),
+    )
+    .await;
+    assert_eq!(
+        peer.best_known(),
+        Some(fork_hash),
+        "an equal-work fork becomes best known"
+    );
+    assert!(
+        !peer.stop.load(Ordering::SeqCst),
+        "the equal-work fork itself stays connected"
+    );
+    follow.pending_headers.remove(&fork_hash);
+    let early = hub
+        .query
+        .reconstruct_block_at_height(Height(1))
+        .unwrap();
+    on_inv(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &[Inventory::Block(early.block_hash())],
+    )
+    .unwrap();
+    assert_eq!(
+        peer.best_known(),
+        Some(fork_hash),
+        "a lower block does not replace an equal-work fork after it leaves pending"
+    );
+    let low = regtest_header_chain(header_at(&hub, 0).block_hash(), 1);
+    rbitcoin_log::capture_logs(true);
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(low),
+    )
+    .await;
+    assert!(
+        !peer.stop.load(Ordering::SeqCst),
+        "a short low-work headers message keeps the peer"
+    );
+    assert!(!logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn full_headers_page_is_not_an_insufficient_work_disconnect() {
     use rbitcoin_net::codec::MAX_HEADERS_RESULTS;

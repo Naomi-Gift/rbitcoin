@@ -5317,11 +5317,15 @@ fn hash_meets_work_floor(
     hub: &ChainHub,
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     hash: BlockHash,
+    remembered: Option<bitcoin::Work>,
 ) -> bool {
     let Some(min) = hub.min_chain_work_floor() else {
         return false;
     };
-    match pending_path_work(hub, pending, hash) {
+    // The pending map and the tip index can both forget a side header.
+    // The work measured when we stored the hash still counts.
+    let work = pending_path_work(hub, pending, hash).or(remembered);
+    match work {
         Some(work) => work.to_be_bytes() >= min,
         None => false,
     }
@@ -5334,16 +5338,17 @@ fn best_known_moves_forward(
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     current: Option<BlockHash>,
     next: BlockHash,
-) -> bool {
-    let Some(next_work) = pending_path_work(hub, pending, next) else {
-        return false;
-    };
+    remembered_old: Option<bitcoin::Work>,
+) -> Option<bitcoin::Work> {
+    let next_work = pending_path_work(hub, pending, next)?;
     let Some(old) = current else {
-        return true;
+        return Some(next_work);
     };
-    match pending_path_work(hub, pending, old) {
-        Some(old_work) => next_work >= old_work,
-        None => true,
+    let old_work = pending_path_work(hub, pending, old).or(remembered_old);
+    match old_work {
+        Some(old_work) if next_work >= old_work => Some(next_work),
+        Some(_) => None,
+        None => Some(next_work),
     }
 }
 
@@ -5356,8 +5361,10 @@ fn note_advanced_best_known(
     let Some(s) = session else {
         return;
     };
-    if best_known_moves_forward(hub, pending, s.best_known(), hash) {
-        s.note_best_known(hash);
+    if let Some(work) =
+        best_known_moves_forward(hub, pending, s.best_known(), hash, s.best_known_work())
+    {
+        s.note_best_known_with_work(hash, work);
     }
 }
 
@@ -5372,8 +5379,10 @@ fn apply_headers(
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
-    // Read before this message. The disconnect compares that hash.
+    // Read before this message. The disconnect compares that hash and the
+    // work saved with it, which outlives the pending map.
     let prior_best = session.and_then(|s| s.best_known());
+    let prior_work = session.and_then(|s| s.best_known_work());
     for hash in apply.from_peer {
         if let Some(s) = session {
             s.note_block_from_peer(hash);
@@ -5400,7 +5409,9 @@ fn apply_headers(
     }
     if let Some(s) = session.filter(|s| {
         let prior_meets = apply.peer_below_floor
-            && prior_best.is_some_and(|h| hash_meets_work_floor(hub, &follow.pending_headers, h));
+            && prior_best.is_some_and(|h| {
+                hash_meets_work_floor(hub, &follow.pending_headers, h, prior_work)
+            });
         outbound_insufficient_work_disconnect(
             hub.in_ibd(),
             apply.headers_len,
