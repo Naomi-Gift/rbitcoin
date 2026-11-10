@@ -451,15 +451,10 @@ pub fn tx_merkleblock_proof_sync(st: AppState, txid_hex: String) -> Response {
     if !ids.iter().any(|t| t == &txid) {
         return not_found();
     }
-    let mut header = match st.query.wire_header_at_height(Height(height)) {
+    let header = match st.query.wire_header_at_height(Height(height)) {
         Ok(h) => h,
         Err(e) => return store_err(e),
     };
-    // The proof commits to this txid list. A connected block's header root is
-    // that hash. Stamp it from the list so a placeholder fixture root does not
-    // fail the proof, without a second txid read or a discarded merkle branch.
-    header.merkle_root =
-        bitcoin::TxMerkleNode::from_byte_array(rbitcoin_store::merkle_root_from_txids(&ids));
     let txids: Vec<bitcoin::Txid> = ids
         .iter()
         .copied()
