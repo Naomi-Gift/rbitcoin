@@ -2827,6 +2827,28 @@ pub fn peer_can_head(st: &IbdWorkState, id: usize, above: u32) -> bool {
     })
 }
 
+/// Timed-out peers sort last. A peer with no body yet sorts after one who has
+/// delivered. Both header picks use this key.
+fn header_peer_rank_key(
+    st: &IbdWorkState,
+    slot: &super::peer_io::PeerSlot,
+) -> (bool, u8, u64, usize) {
+    match header_ttfb(slot) {
+        Some(ttfb) => (
+            st.header_walk.header_timeout_peers.contains(&slot.id),
+            0u8,
+            ttfb,
+            slot.id,
+        ),
+        None => (
+            st.header_walk.header_timeout_peers.contains(&slot.id),
+            1u8,
+            0,
+            slot.id,
+        ),
+    }
+}
+
 /// A live peer when nobody's connect-time height is above the stored path.
 /// Peers still on the walk come first.
 #[doc(hidden)]
@@ -2840,20 +2862,7 @@ pub fn pick_any_header_peer(st: &IbdWorkState, skip: Option<usize>) -> Option<us
             if !quiet_ok && st.header_walk.walk_quiet.contains(&slot.id) {
                 continue;
             }
-            let key = match header_ttfb(slot) {
-                Some(ttfb) => (
-                    st.header_walk.header_timeout_peers.contains(&slot.id),
-                    0u8,
-                    ttfb,
-                    slot.id,
-                ),
-                None => (
-                    st.header_walk.header_timeout_peers.contains(&slot.id),
-                    1u8,
-                    0,
-                    slot.id,
-                ),
-            };
+            let key = header_peer_rank_key(st, slot);
             if best.is_none_or(|cur| key < cur) {
                 best = Some(key);
             }
@@ -2880,20 +2889,7 @@ pub fn pick_header_peer(st: &IbdWorkState, above: u32, skip: Option<usize>) -> O
         if !peer_can_head(st, slot.id, above) || skip == Some(slot.id) {
             continue;
         }
-        let key = match header_ttfb(slot) {
-            Some(ttfb) => (
-                st.header_walk.header_timeout_peers.contains(&slot.id),
-                0u8,
-                ttfb,
-                slot.id,
-            ),
-            None => (
-                st.header_walk.header_timeout_peers.contains(&slot.id),
-                1u8,
-                0,
-                slot.id,
-            ),
-        };
+        let key = header_peer_rank_key(st, slot);
         if best.is_none_or(|cur| key < cur) {
             best = Some(key);
         }
