@@ -358,7 +358,7 @@ pub fn on_headers_batch(
         }
         stored.push(hdr);
     }
-    super::header_walk::note_stored_candidate(st, hub, &stored);
+    super::header_walk::note_stored_candidate(st, hub, peer, &stored, headers.len());
     added
 }
 
@@ -677,8 +677,15 @@ pub fn plan_header_batch(
             mark.outer_len,
         );
     }
+    let clock_refused = st.header_walk.clock_refused;
+    // Failed proof disconnects in `plan_header_reply`. This mark is the
+    // low-work miss, so a proof failure must not take it. Headers that do
+    // not connect still have a target, and those are stored.
+    let bad_pow = headers
+        .iter()
+        .any(|hdr| hdr.validate_pow(hdr.target()).is_err());
     let plan = plan_header_reply(st, hub, peer, headers);
-    if matches!(plan, HeaderPlan::Done) {
+    if matches!(plan, HeaderPlan::Done) && !clock_refused && !bad_pow {
         finish_mark(st, hub, peer, &mark);
     }
     (mark, plan)
@@ -691,6 +698,23 @@ pub fn plan_header_reply(
     peer: usize,
     headers: Vec<bitcoin::block::Header>,
 ) -> HeaderPlan {
+    // Failed proof is not a low-work miss. Drop the sender and the ask so
+    // the next live peer can walk. Leaving the ask in flight blocks that peer.
+    if headers
+        .iter()
+        .any(|hdr| hdr.validate_pow(hdr.target()).is_err())
+    {
+        let _ = super::header_walk::take_header_ask(st, peer);
+        super::header_walk::forget_walk_peer(st, peer);
+        super::header_walk::punish_header_peer(st, peer);
+        return HeaderPlan::Done;
+    }
+    if st.header_walk.clock_refused {
+        if st.header_walk.probe_open != Some(peer) {
+            let _ = super::header_walk::take_header_ask(st, peer);
+        }
+        return HeaderPlan::Done;
+    }
     // A batch that crossed this peer's open probe leaves that ask in flight.
     let ask = if st.header_walk.probe_open == Some(peer) {
         super::header_walk::HeaderAsk::Unsolicited
@@ -709,22 +733,34 @@ pub fn plan_header_reply(
             HeaderPlan::Done
         };
     }
-    if super::header_walk::refuse_invalid_batch(st, peer, &headers) {
+    if super::header_walk::short_below_floor(st, hub, &headers) {
         return HeaderPlan::Done;
     }
-    let class = super::header_walk::classify(st, hub, ask, &headers);
+    let linked = super::header_walk::pow_linked(&headers);
+    super::header_walk::note_header_witness(st, hub, peer, ask, &headers, linked);
+    if super::header_walk::refuse_invalid_linked(st, peer, &headers, linked) {
+        return HeaderPlan::Done;
+    }
+    let class = super::header_walk::classify_linked(st, hub, ask, &headers, linked);
     let mut headers = headers;
     let keep = match class {
         super::header_walk::HeaderClass::WalkAbsorb => {
             let before = super::header_walk::candidate_tip(st);
-            if super::header_walk::absorb_lookahead(st, hub, peer, ask, &headers)
-                && super::header_walk::candidate_tip(st) == before
-            {
+            let absorbed = super::header_walk::absorb_lookahead(st, hub, peer, ask, &headers);
+            let extended = super::header_walk::candidate_tip(st) != before;
+            // At the soft cap the checkpoint is the record. Under it, the
+            // confirm window still stores the headers.
+            if absorbed && (!extended || st.ordered.len() >= ORDERED_HEADERS_SOFT_CAP) {
                 return HeaderPlan::Done;
             }
             headers.len()
         }
-        super::header_walk::HeaderClass::WalkStore => headers.len(),
+        super::header_walk::HeaderClass::WalkStore => {
+            if super::header_walk::store_would_pass_length(st, headers.len()) {
+                return HeaderPlan::Done;
+            }
+            headers.len()
+        }
         super::header_walk::HeaderClass::Stray => {
             let before = super::header_walk::candidate_tip(st);
             if super::header_walk::suppress_competing_chain(st, hub, peer, &headers)
@@ -961,6 +997,15 @@ fn answer_probe(
     if st.header_walk.probe_open != Some(peer) {
         return false;
     }
+    // A failed target is not this peer's chain. Consuming it would leave
+    // them connected and queue them as the next challenge. The reply path
+    // drops that peer.
+    if headers
+        .iter()
+        .any(|hdr| hdr.validate_pow(hdr.target()).is_err())
+    {
+        return false;
+    }
     let tip = hub.tip_height().unwrap_or(0);
     let top = st.header_walk.probe_top;
     if let Some(first) = headers.first() {
@@ -992,6 +1037,17 @@ fn answer_probe(
     if !headers.is_empty() {
         note_announcement(st, peer);
         note_peer_headers(st, hub, peer, headers);
+        if !st.header_walk.proven {
+            let linked = super::header_walk::pow_linked(headers);
+            super::header_walk::note_header_witness(
+                st,
+                hub,
+                peer,
+                super::header_walk::HeaderAsk::InWindow,
+                headers,
+                linked,
+            );
+        }
         // A header this node has not seen: the peer's chain leaves this one
         // or runs past the path. The walk asks it, as after a block inv.
         let last = headers[headers.len() - 1].block_hash();
@@ -1199,12 +1255,27 @@ pub fn take_confirm_events(
     let mut deferred = Vec::new();
     while let Ok(ev) = rx.try_recv() {
         match ev {
-            super::confirm::ConfirmEvent::Accepted { hash } => {
+            super::confirm::ConfirmEvent::Accepted {
+                hash,
+                height,
+                wire_bytes,
+            } => {
                 *last_progress = Instant::now();
                 st.confirm_stuck_since = None;
                 remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
                 st.body.mark_archived(hash);
                 let tip = hub.tip_height().unwrap_or(0);
+                // The write recorded this height. Do not look it up: a fork
+                // promotion can drop `hash_height` first, and a header read
+                // here runs while the coordinator holds `shared`. A rewind
+                // already marked this drain stale, so a height above the new
+                // tip is the chain that was left and must not be charged.
+                if st.confirm_quiesce == super::state::ConfirmQuiesce::Live || height <= tip {
+                    super::header_walk::note_unproven_class_a(st, height, wire_bytes);
+                    if let Some(f) = feed {
+                        f.release_lead_reserve(height);
+                    }
+                }
                 archive_write_next.store(tip.saturating_add(1), Ordering::Relaxed);
                 st.max_ready_height = st.max_ready_height.max(tip);
                 max_ready_shared.store(st.max_ready_height, Ordering::Relaxed);
@@ -1239,11 +1310,13 @@ pub fn take_confirm_events(
             }
         }
     }
-    if st.confirm_quiesce {
-        if let Some(f) = feed {
-            f.clear();
+    let quiesce = std::mem::replace(&mut st.confirm_quiesce, super::state::ConfirmQuiesce::Live);
+    if let Some(f) = feed {
+        match quiesce {
+            super::state::ConfirmQuiesce::Refund => f.clear(hub.tip_height().unwrap_or(0)),
+            super::state::ConfirmQuiesce::Plan => f.drop_plan(),
+            super::state::ConfirmQuiesce::Live => {}
         }
-        st.confirm_quiesce = false;
     }
     deferred
 }

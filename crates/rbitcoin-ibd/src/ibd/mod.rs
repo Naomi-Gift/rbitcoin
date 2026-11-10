@@ -244,6 +244,12 @@ fn release_archived_clears<'a>(
     st_guard
 }
 
+/// Height cap and remaining Class A bytes for the next confirm claim.
+fn install_unproven_confirm_bounds(st: &state::IbdWorkState, feed: &confirm::ConfirmFeed) {
+    let bounds = header_walk::unproven_offer_bounds(st);
+    feed.install_unproven_bounds(bounds.height_limit, bounds.lead_from, bounds.bytes_left);
+}
+
 /// Drive confirm events the way the coordinator loop does.
 #[doc(hidden)]
 pub fn apply_confirm_events_for_test(
@@ -789,6 +795,7 @@ pub async fn ibd_cancellable(
         Arc::clone(&accepted),
         Arc::clone(&loop_stats),
     );
+    install_unproven_confirm_bounds(&st, confirm_feed.as_ref());
     offer_confirm_ready(
         &confirm_feed,
         &st.height_to_hash,
@@ -855,7 +862,7 @@ pub async fn ibd_cancellable(
             {
                 let st = &mut *st_guard;
                 if hub.tip_height() < tip_before_confirm {
-                    confirm_feed.clear();
+                    confirm_feed.clear(hub.tip_height().unwrap_or(0));
                 }
                 if let Some(msg) = st.halt.take() {
                     warn!("ibd: engine fault halt: {msg}");
@@ -917,7 +924,7 @@ pub async fn ibd_cancellable(
                     tip_rate_opt,
                 );
                 if hub.tip_height() < tip_before_assign {
-                    confirm_feed.clear();
+                    confirm_feed.clear(hub.tip_height().unwrap_or(0));
                 }
                 sample_peer_rates(&mut st_guard.slots, peer_io::ibd_mono_ms());
                 cadence.mark_assign(now_cadence);
@@ -925,6 +932,7 @@ pub async fn ibd_cancellable(
 
             {
                 let st = &mut *st_guard;
+                install_unproven_confirm_bounds(st, confirm_feed.as_ref());
                 offer_confirm_ready(
                     &confirm_feed,
                     &st.height_to_hash,
@@ -1299,6 +1307,7 @@ pub async fn ibd_cancellable(
             // fork / bogus `version.start_height`). See `ibd_caught_up`.
             let tip_h = hub.tip_height().unwrap_or(0);
             if ibd_caught_up(st, tip_h) {
+                install_unproven_confirm_bounds(st, confirm_feed.as_ref());
                 offer_confirm_ready(
                     &confirm_feed,
                     &st.height_to_hash,
@@ -1396,6 +1405,7 @@ pub async fn ibd_cancellable(
                 let mut st_guard = HeldShared::lock(&shared);
                 {
                     let st = &mut *st_guard;
+                    install_unproven_confirm_bounds(st, confirm_feed.as_ref());
                     offer_confirm_ready(
                         &confirm_feed,
                         &st.height_to_hash,

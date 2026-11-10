@@ -180,6 +180,13 @@ impl LoadAheadState {
     }
 }
 
+/// Height cap, match, and byte allowance last written into the feed.
+struct InstalledLead {
+    height_limit: Option<u32>,
+    lead_from: u32,
+    bytes_left: Option<u64>,
+}
+
 /// Shared feed of tip-extension **readiness** for the dedicated confirm engine.
 ///
 /// **Sole intake:** peer/rehydrate enqueues wire into the **body queue**, then
@@ -205,6 +212,19 @@ pub struct ConfirmFeed {
     /// Lone consensus-invalid bodies that were not offered back. Assign must
     /// not getdata them before the IBD thread applies the verdict.
     dropped_bodies: std::sync::Mutex<std::collections::HashSet<BlockHash>>,
+    /// `height_limit` is `Some`. Offer reads this and skips the mutex once
+    /// the lead has lifted.
+    height_capped: AtomicBool,
+    /// `lead_bytes_left` is `Some`. Accept skips the reserve lock when this
+    /// is clear. Written under `inner` before that lock is released.
+    byte_capped: AtomicBool,
+    /// Last `(height_limit, lead_from, bytes_left)` passed to
+    /// [`Self::set_unproven_bounds`]. Offer compares this and skips `inner`
+    /// when the triple is unchanged and no reservation has moved.
+    lead_bounds: std::sync::Mutex<Option<InstalledLead>>,
+    /// A reservation was taken, released, or cleared since the last install.
+    /// The next identical allowance still has to recompute the remainder.
+    lead_bounds_dirty: AtomicBool,
 }
 
 pub struct ConfirmFeedInner {
@@ -214,6 +234,19 @@ pub struct ConfirmFeedInner {
     pub inflight: std::collections::HashSet<u32>,
     /// Height → lookup epoch when load claimed it (survives `Self::clear`).
     pub claimed_epoch: HashMap<u32, u64>,
+    /// Highest height [`offer_confirm_ready`] may note. `None` is no lead cap.
+    pub height_limit: Option<u32>,
+    /// Heights at or below this are the matched chain. They do not spend the lead.
+    pub lead_from: u32,
+    /// Class A bytes still allowed above `lead_from`. `None` is no byte cap.
+    /// Lookup selection lowers this as it claims bodies. A new allowance
+    /// subtracts wire still reserved above the match, including when the
+    /// match did not move.
+    pub lead_bytes_left: Option<u64>,
+    /// Wire lookup has reserved above the match, by height.
+    /// Cleared when that height is accepted or the match moves to or past it.
+    /// [`ConfirmFeed::clear`] drops only heights above the confirmed tip.
+    pub lead_reserved: std::collections::BTreeMap<u32, u64>,
 }
 
 impl Default for ConfirmFeed {
@@ -229,6 +262,10 @@ impl ConfirmFeed {
                 ready: std::collections::BTreeMap::new(),
                 inflight: std::collections::HashSet::new(),
                 claimed_epoch: HashMap::new(),
+                height_limit: None,
+                lead_from: 0,
+                lead_bytes_left: None,
+                lead_reserved: std::collections::BTreeMap::new(),
             }),
             cv: std::sync::Condvar::new(),
             stop: AtomicBool::new(false),
@@ -236,6 +273,10 @@ impl ConfirmFeed {
             force_single_until: AtomicU32::new(u32::MAX),
             hold_until_ms: AtomicU64::new(0),
             dropped_bodies: std::sync::Mutex::new(std::collections::HashSet::new()),
+            height_capped: AtomicBool::new(false),
+            byte_capped: AtomicBool::new(false),
+            lead_bounds: std::sync::Mutex::new(None),
+            lead_bounds_dirty: AtomicBool::new(false),
         }
     }
 
@@ -253,6 +294,98 @@ impl ConfirmFeed {
     /// The IBD thread has applied the verdict.
     pub fn release_dropped_body(&self, hash: &BlockHash) {
         self.dropped_bodies.lock().unwrap().remove(hash);
+    }
+
+    /// Install the unproven lead. `bytes_left` is the walk's allowance above
+    /// `lead_from`. Reservations still held are subtracted, so a block lookup
+    /// already claimed is not claimed again, and a rewind that drops Class A
+    /// restores the new allowance. `bytes_left == None` lifts the byte cap.
+    pub fn set_unproven_bounds(
+        &self,
+        height_limit: Option<u32>,
+        lead_from: u32,
+        bytes_left: Option<u64>,
+    ) {
+        let mut g = self.inner.lock().unwrap();
+        let moved = lead_from != g.lead_from;
+        g.height_limit = height_limit;
+        g.lead_from = lead_from;
+        if moved {
+            g.lead_reserved.retain(|&h, _| h > lead_from);
+        }
+        g.lead_bytes_left = match bytes_left {
+            None => {
+                g.lead_reserved.clear();
+                None
+            }
+            Some(n) => {
+                let pending = g
+                    .lead_reserved
+                    .values()
+                    .fold(0u64, |acc, b| acc.saturating_add(*b));
+                Some(n.saturating_sub(pending))
+            }
+        };
+        self.height_capped
+            .store(g.height_limit.is_some(), Ordering::Release);
+        self.byte_capped
+            .store(g.lead_bytes_left.is_some(), Ordering::Release);
+        *self.lead_bounds.lock().unwrap() = Some(InstalledLead {
+            height_limit,
+            lead_from,
+            bytes_left,
+        });
+        self.lead_bounds_dirty.store(false, Ordering::Release);
+    }
+
+    /// Install the next unproven lead. A repeat of the lifted lead does not
+    /// lock the feed. `None` means no cap, so the skip runs only once both
+    /// caps are already clear. The same height cap, match, and allowance
+    /// also skip, until a reservation is taken, released, or cleared.
+    pub fn install_unproven_bounds(
+        &self,
+        height_limit: Option<u32>,
+        lead_from: u32,
+        bytes_left: Option<u64>,
+    ) {
+        if height_limit.is_none()
+            && bytes_left.is_none()
+            && !self.height_capped.load(Ordering::Acquire)
+            && !self.byte_capped.load(Ordering::Acquire)
+        {
+            return;
+        }
+        if !self.lead_bounds_dirty.load(Ordering::Acquire) {
+            let snap = self.lead_bounds.lock().unwrap();
+            if snap.as_ref().is_some_and(|saved| {
+                saved.height_limit == height_limit
+                    && saved.lead_from == lead_from
+                    && saved.bytes_left == bytes_left
+            }) {
+                return;
+            }
+        }
+        self.set_unproven_bounds(height_limit, lead_from, bytes_left);
+    }
+
+    /// The block at `height` was accepted. Its reservation must not be
+    /// subtracted again when a later match refreshes the remainder.
+    /// No byte cap means there is nothing reserved.
+    pub fn release_lead_reserve(&self, height: u32) {
+        if !self.byte_capped.load(Ordering::Acquire) {
+            return;
+        }
+        let mut g = self.inner.lock().unwrap();
+        if g.lead_bytes_left.is_none() {
+            return;
+        }
+        if g.lead_reserved.remove(&height).is_some() {
+            self.lead_bounds_dirty.store(true, Ordering::Release);
+        }
+    }
+
+    fn unproven_lead_active(&self) -> bool {
+        self.height_capped.load(Ordering::Acquire) || self.byte_capped.load(Ordering::Acquire)
     }
 
     /// Lookup waits `for_` before it selects a body again.
@@ -358,16 +491,51 @@ impl ConfirmFeed {
         self.cv.notify_one();
     }
 
+    /// Drop ready and inflight and bump the epoch. The lead stays reserved.
+    /// A header-walk rewind uses this: the confirmed tip did not move, and
+    /// giving the bytes back lets lookup spend them while the old write
+    /// still commits.
+    pub fn drop_plan(&self) {
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.ready.clear();
+            g.inflight.clear();
+        }
+        self.publish_cleared_plan();
+    }
+
     /// Drop ready + inflight so a rewind cannot commit a stale plan.
     ///
     /// Bumps [`Self::epoch`] so load/scripts/write still holding a pre-rewind
     /// batch (not in `ready`/`inflight`) will drop it. `claimed_epoch` is kept
     /// so those in-channel batches can see they are stale.
-    pub fn clear(&self) {
+    ///
+    /// Reservations above `confirmed_tip` go back to the byte remainder. A
+    /// height at or below that tip stays reserved: its Accepted event may
+    /// still be waiting, and refunding it lets the next lookup spend those
+    /// bytes again. Call this when the confirmed tip moved, not when only
+    /// the header walk did.
+    pub fn clear(&self, confirmed_tip: u32) {
         let mut g = self.inner.lock().unwrap();
         g.ready.clear();
         g.inflight.clear();
+        let refund = g
+            .lead_reserved
+            .iter()
+            .filter(|(&h, _)| h > confirmed_tip)
+            .fold(0u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
+        g.lead_reserved.retain(|&h, _| h <= confirmed_tip);
+        if let Some(left) = g.lead_bytes_left.as_mut() {
+            *left = left.saturating_add(refund);
+        }
+        if refund > 0 {
+            self.lead_bounds_dirty.store(true, Ordering::Release);
+        }
         drop(g);
+        self.publish_cleared_plan();
+    }
+
+    fn publish_cleared_plan(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.force_single_until.store(u32::MAX, Ordering::Release);
         self.cv.notify_all();
@@ -800,7 +968,7 @@ pub fn load_fail_rewind_wave(
     let prepared = prepare_offer_back(hub, wave[usize::from(drop_head)..].iter().copied());
     lookup_ahead.clear_all(hub);
     feed.finish(std::iter::once(first_h));
-    feed.clear();
+    feed.clear(hub.tip_height().unwrap_or(0));
     // After `clear` (which drops isolation) and before the re-offer, so
     // lookup cannot rebuild the same wave.
     if wave.len() > 1 && !fault {
@@ -925,9 +1093,23 @@ impl RejectParent {
     }
 }
 
+/// Wire size of one confirmed block. A merged write must report each block,
+/// not an even split of the batch, or a match inside the batch refunds the
+/// wrong height.
+#[doc(hidden)]
+pub fn accepted_block_wire(sizes: &[u64], index: usize) -> u64 {
+    sizes.get(index).copied().unwrap_or(0)
+}
+
 pub enum ConfirmEvent {
-    /// Tip advanced; hash is the confirmed block.
-    Accepted { hash: BlockHash },
+    /// Tip advanced. `height` is the block that was written. The coordinator
+    /// must not look that up in `hash_height`: a fork promotion can remove
+    /// the entry before this event is read.
+    Accepted {
+        hash: BlockHash,
+        height: u32,
+        wire_bytes: u64,
+    },
     /// Height is the attempted confirm height (for operator logs).
     Reject {
         height: u32,
@@ -2175,6 +2357,11 @@ pub fn spawn_confirm_engine(
                     .iter()
                     .map(|&(h, raw)| (h, BlockHash::from_byte_array(raw)))
                     .collect();
+                let wire_sizes: Vec<u64> = batch
+                    .wire_blocks()
+                    .iter()
+                    .map(|b| b.total_size() as u64)
+                    .collect();
                 // Same lock as a block connect. The chain tip must not move
                 // while the relay-on purge is choosing the tip it stripped.
                 let mp_hold = hub_wb.mempool().cloned();
@@ -2187,7 +2374,7 @@ pub fn spawn_confirm_engine(
                             warn!("ibd: confirm write note tip: {e}");
                         }
                         let t_deq = Instant::now();
-                        for (height, raw) in &heights_hashes {
+                        for (index, (height, raw)) in heights_hashes.iter().enumerate() {
                             let hash = BlockHash::from_byte_array(*raw);
                             if let Err(e) = hub_wb.query.block_queue_dequeue_height(*height) {
                                 rbitcoin_log::debug!(
@@ -2198,8 +2385,13 @@ pub fn spawn_confirm_engine(
                                 .confirm_blocks
                                 .fetch_add(1, Ordering::Relaxed);
                             accepted_wb.fetch_add(1, Ordering::SeqCst);
+                            let share = accepted_block_wire(&wire_sizes, index);
                             if event_tx_wb
-                                .send(ConfirmEvent::Accepted { hash })
+                                .send(ConfirmEvent::Accepted {
+                                    hash,
+                                    height: *height,
+                                    wire_bytes: share,
+                                })
                                 .is_err()
                             {
                                 feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
@@ -2263,7 +2455,7 @@ pub fn spawn_confirm_engine(
                                         ) {
                                             warn!("ibd: confirm write note tip: {e}");
                                         }
-                                        for (h, raw) in &heights_hashes {
+                                        for (index, (h, raw)) in heights_hashes.iter().enumerate() {
                                             let ha = BlockHash::from_byte_array(*raw);
                                             if let Err(e) =
                                                 hub_wb.query.block_queue_dequeue_height(*h)
@@ -2276,8 +2468,13 @@ pub fn spawn_confirm_engine(
                                                 .confirm_blocks
                                                 .fetch_add(1, Ordering::Relaxed);
                                             accepted_wb.fetch_add(1, Ordering::SeqCst);
+                                            let share = accepted_block_wire(&wire_sizes, index);
                                             if event_tx_wb
-                                                .send(ConfirmEvent::Accepted { hash: ha })
+                                                .send(ConfirmEvent::Accepted {
+                                                    hash: ha,
+                                                    height: *h,
+                                                    wire_bytes: share,
+                                                })
                                                 .is_err()
                                             {
                                                 feed_wb.finish(
@@ -2332,14 +2529,18 @@ pub fn spawn_confirm_engine(
                             debug!(
                                 "ibd: confirm write skip already-committed @{height} ({msg})"
                             );
-                            for (_, raw) in &heights_hashes {
+                            for (index, (ht, raw)) in heights_hashes.iter().enumerate() {
                                 let h = BlockHash::from_byte_array(*raw);
                                 if hub_wb.has_block(&h) {
                                     loop_stats_wb
                                         .confirm_blocks
                                         .fetch_add(1, Ordering::Relaxed);
                                     accepted_wb.fetch_add(1, Ordering::SeqCst);
-                                    let _ = event_tx_wb.send(ConfirmEvent::Accepted { hash: h });
+                                    let _ = event_tx_wb.send(ConfirmEvent::Accepted {
+                                        hash: h,
+                                        height: *ht,
+                                        wire_bytes: accepted_block_wire(&wire_sizes, index),
+                                    });
                                 }
                             }
                             feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
@@ -3026,9 +3227,22 @@ pub fn spawn_confirm_engine(
                 let max_inputs = (remaining as u32)
                     .saturating_mul(confirm_batch_max_inputs())
                     .min(rbitcoin_query::BQ_RESOLVE_WAVE_MAX_INPUTS);
-                let wave_h = hub
-                    .query
-                    .block_queue_unresolved_heights(path_lo, &skip, max_blocks);
+                let mut lens = Vec::new();
+                let charge = feed.unproven_lead_active();
+                let wave_h = hub.query.block_queue_unresolved_heights(
+                    path_lo,
+                    &skip,
+                    max_blocks,
+                    charge.then_some(&mut lens),
+                );
+                // A cap that appears during the queue walk still applies. No
+                // copied size means a byte charge stops instead of overspending.
+                // Both caps clear leaves the wave as the queue returned it.
+                let wave_h = if charge || feed.unproven_lead_active() {
+                    take_unproven_lead(&feed, charge.then_some(lens.as_slice()), wave_h)
+                } else {
+                    wave_h
+                };
                 confirm_thr_stats::add_lookup_other(&stats, t_sel.elapsed());
                 if hub.query.lookup_taken_gen() != taken_gen {
                     continue;
@@ -3229,6 +3443,11 @@ pub fn offer_confirm_ready(
     max_ready_height: &mut u32,
     max_ready_shared: &AtomicU32,
 ) -> u32 {
+    let height_limit = if feed.height_capped.load(Ordering::Acquire) {
+        feed.inner.lock().unwrap().height_limit
+    } else {
+        None
+    };
     let expect = match hub.tip_height() {
         None => 0u32,
         Some(t) => t.saturating_add(1),
@@ -3236,6 +3455,9 @@ pub fn offer_confirm_ready(
     let limit = expect.saturating_add(OFFER_AHEAD);
     let mut noted = 0u32;
     for ht in expect..=limit {
+        if height_limit.is_some_and(|cap| ht > cap) {
+            break;
+        }
         let Some(hash) = height_to_hash.occupant(ht) else {
             break;
         };
@@ -3272,6 +3494,57 @@ pub fn offer_confirm_ready(
         noted += 1;
     }
     noted
+}
+
+/// Heights lookup may claim. Above the matched height, a body spends
+/// `lead_bytes_left` once. A height already reserved is claimed again without
+/// a second charge. `wires` is each height's charge, copied with the
+/// unresolved-heights walk. A missing charge stops the run while a byte cap
+/// is set, so an unsized body cannot pass the budget. Both caps empty returns
+/// `heights` unchanged.
+#[doc(hidden)]
+pub fn take_unproven_lead(
+    feed: &ConfirmFeed,
+    wires: Option<&[u64]>,
+    heights: Vec<u32>,
+) -> Vec<u32> {
+    let mut g = feed.inner.lock().unwrap();
+    if g.height_limit.is_none() && g.lead_bytes_left.is_none() {
+        drop(g);
+        return heights;
+    }
+    let mut out = Vec::with_capacity(heights.len());
+    let mut bytes_left = g.lead_bytes_left;
+    let mut reserved = Vec::new();
+    for (i, ht) in heights.into_iter().enumerate() {
+        if g.height_limit.is_some_and(|cap| ht > cap) {
+            break;
+        }
+        if let Some(left) =
+            bytes_left.filter(|_| ht > g.lead_from && !g.lead_reserved.contains_key(&ht))
+        {
+            let Some(wire) = wires.and_then(|w| w.get(i)).copied() else {
+                break;
+            };
+            if wire > left {
+                break;
+            }
+            bytes_left = Some(left - wire);
+            reserved.push((ht, wire));
+        }
+        out.push(ht);
+    }
+    if g.lead_bytes_left.is_some() {
+        let changed = g.lead_bytes_left != bytes_left || !reserved.is_empty();
+        g.lead_bytes_left = bytes_left;
+        for (ht, wire) in reserved {
+            g.lead_reserved.insert(ht, wire);
+        }
+        if changed {
+            feed.lead_bounds_dirty.store(true, Ordering::Release);
+        }
+    }
+    out
 }
 
 #[cfg(debug_assertions)]

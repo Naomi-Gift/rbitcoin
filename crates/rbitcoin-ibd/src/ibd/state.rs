@@ -147,6 +147,19 @@ pub struct ConfirmedLocatorTail {
     pub entries: Vec<(u32, BlockHash)>,
 }
 
+/// Why the next confirm drain drops in-channel plans.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ConfirmQuiesce {
+    #[default]
+    /// Confirm is keeping up with the tip.
+    Live,
+    /// The header walk rewound. The confirmed tip did not move, so the lead
+    /// stays reserved.
+    Plan,
+    /// The confirmed tip moved. Reservations above it go back to the lead.
+    Refund,
+}
+
 /// Core mutable state for the IBD event loop.
 pub struct IbdWorkState {
     pub slots: Vec<PeerSlot>,
@@ -205,7 +218,9 @@ pub struct IbdWorkState {
     /// First time confirm rejected without tip progress (download gate timer).
     pub confirm_stuck_since: Option<Instant>,
     /// Set by header-work rewind/plant so the main loop can drop in-channel plans.
-    pub confirm_quiesce: bool,
+    /// [`ConfirmQuiesce::Plan`] keeps the lead reserved. [`ConfirmQuiesce::Refund`]
+    /// is a confirmed rewind.
+    pub confirm_quiesce: ConfirmQuiesce,
     /// Repeated Cascade at the same tip for the same hash → escalate to halt.
     pub cascade_at: Option<(BlockHash, [u8; 32], u8)>,
     /// Tip-child BadPrev retries. Another block's soft reject does not clear this.
@@ -259,6 +274,18 @@ pub fn enqueue_header_cmd(st: &mut IbdWorkState, cmd: HeaderCmd) {
 }
 
 impl IbdWorkState {
+    /// Header walk rewound. A confirmed rewind already recorded keeps its refund.
+    pub fn quiesce_plan(&mut self) {
+        if self.confirm_quiesce != ConfirmQuiesce::Refund {
+            self.confirm_quiesce = ConfirmQuiesce::Plan;
+        }
+    }
+
+    /// Confirmed tip moved. The next drain returns reservations above that tip.
+    pub fn quiesce_refund(&mut self) {
+        self.confirm_quiesce = ConfirmQuiesce::Refund;
+    }
+
     pub fn new(slots: Vec<PeerSlot>, tip_hash: Option<BlockHash>, tip_height: Option<u32>) -> Self {
         let mut known_headers = HashSet::new();
         let mut hash_height = HashMap::new();
@@ -308,7 +335,7 @@ impl IbdWorkState {
             engine_fault_seen: HashSet::new(),
             halt: None,
             confirm_stuck_since: None,
-            confirm_quiesce: false,
+            confirm_quiesce: ConfirmQuiesce::Live,
             cascade_at: None,
             tip_child_bad_prev: None,
             intake_stop: u64::MAX,
