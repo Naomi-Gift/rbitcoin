@@ -48,9 +48,8 @@ Most full nodes center a **UTXO set + block files** (Bitcoin Core). Most Electru
 backends are **external indexers** of another node. rbitcoin does neither:
 **no UTXO set** (relational archive), **Electrum + txindex in-process**.
 
-- Store size is the dated census in [`SCHEMA.md`](./SCHEMA.md). `--sh-index` costs are in [`OPERATOR.md`](./OPERATOR.md)
-- **Under ~30 h** IBD on a laptop-class host with **`--milestone 0`**
-- **Modest RAM** during sync — no multi‑GiB `dbcache` pause
+- Store size is the dated census in [`SCHEMA.md`](./SCHEMA.md). `--sh-index` costs are in [`docs/operator/storage.md`](./docs/operator/storage.md).
+- One measured mainnet catch-up is in [`docs/operator/mainnet.md`](./docs/operator/mainnet.md).
 - **Pure-Rust** consensus/scripts (**no** `libbitcoinconsensus`)
 - **Reproducible static musl** for ordinary Linux hosts
 
@@ -102,7 +101,7 @@ Actions run workspace/coverage gates — [`AGENTS.md`](./AGENTS.md).
 
 Pinned **nixpkgs + Cargo.lock** musl static binaries. Commands and
 byte-identity: [`docs/reproducible-builds.md`](./docs/reproducible-builds.md).
-Day-to-day flags: [`OPERATOR.md`](./OPERATOR.md). Mainnet:
+Day-to-day flags: [`docs/operator/`](./docs/operator/). The task index is [`OPERATOR.md`](./OPERATOR.md). Mainnet:
 [`docs/operator/mainnet.md`](./docs/operator/mainnet.md).
 
 Do **not** use `cargo build --release` inside `nix-shell` / `nix develop` as the

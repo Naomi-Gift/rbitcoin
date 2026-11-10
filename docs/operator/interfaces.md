@@ -293,6 +293,14 @@ is no plaintext mode.
 `sv2 TP on ADDR (authority pubkey KEY)`. KEY is in the SRI `key-utils`
 base58check form (`9b…`); configure it as the TP authority public key in the
 client. No templates are sent while the node is in IBD.
+The template time is `next_block_mintime`: above the tip median, with the
+BIP94 and BIP54 floors applied on every network. On testnet3 and testnet4,
+`SetNewPrevHash` carries nBits for that previous hash and `NewTemplate` has
+no bits field. A solution whose time rolls past the previous block by two
+target spacings needs the minimum-difficulty bits. Those bits are inside
+the header hash, so the session drops the solution before `accept_block`
+(`submit_solution_past_the_min_diff_gap_is_dropped`). Mainnet and signet
+bits depend only on the previous hash.
 At most 8 sessions run at once. A connection that has not finished the
 Noise handshake and `SetupConnection` and sent its first
 `CoinbaseOutputConstraints` within 10 s is closed; after that a client may
