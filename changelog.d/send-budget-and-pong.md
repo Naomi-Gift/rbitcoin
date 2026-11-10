@@ -18,3 +18,9 @@ Fixed
   have arrived. Solicited block bytes of 64 KiB since the last progress
   stamp keep that peer. Relative-slow zero-throughput sampling uses the
   same delta. A peer that sends no socket bytes stays the quiet case.
+- **A proved header walk does not rewrite `header.adopt` on every short
+  batch.** The in-memory tip still advances, and each reply stays a
+  checkpoint so a lighter fork can be seen. The file is written when the
+  walk first proves the floor and when the tip is 2,000 headers past the
+  last saved checkpoint. Promoting a competing chain writes that chain's
+  tip. An unproved walk still does not rewrite the file.

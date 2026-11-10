@@ -132,6 +132,9 @@ pub struct HeaderWalk {
     pub emptied: HashSet<usize>,
     /// Checkpoint work has reached the milestone floor.
     pub proven: bool,
+    /// Tip height last written to `header.adopt`. Short proved batches move
+    /// the in-memory tip past this without rewriting the file.
+    pub last_adopt_height: Option<u32>,
     /// Stored header hashes from this peer that are not on the download path.
     pub off_path: std::collections::HashMap<usize, HashSet<BlockHash>>,
     /// The caught-up line has already been logged. The status thread keeps
@@ -1639,9 +1642,16 @@ pub fn extend_challenger(
 
 #[doc(hidden)]
 pub fn promote_challenger(st: &mut IbdWorkState, hub: &ChainHub) {
-    let Some(ch) = st.header_walk.challenger.take() else {
+    let Some(mut ch) = st.header_walk.challenger.take() else {
         return;
     };
+    if ch
+        .checkpoints
+        .last()
+        .is_none_or(|c| c.height < ch.tip.height)
+    {
+        ch.checkpoints.push(checkpoint_at(&ch.tip));
+    }
     forget_milestone_below(st, hub, ch.fork_height);
     st.header_walk
         .checkpoints
@@ -2669,6 +2679,7 @@ fn extend_connected(
     if st.header_walk.tip.hash == Some(start) {
         return false;
     }
+    let was_proven = st.header_walk.proven;
     let supplier = peer.and_then(|id| peer_net(st, id));
     st.header_walk
         .checkpoints
@@ -2679,8 +2690,41 @@ fn extend_connected(
     st.header_walk.emptied.clear();
     st.header_walk.restored_unproved = false;
     publish_work(st, hub);
-    save_adopt(st, hub);
+    if adopt_checkpoint_due(
+        st.header_walk.proven,
+        was_proven,
+        st.header_walk.last_adopt_height,
+        st.header_walk.tip_height(),
+        headers.len(),
+    ) {
+        save_adopt(st, hub);
+    }
     true
+}
+
+/// Whether this batch should rewrite `header.adopt`.
+///
+/// An unproved walk returns true and [`save_adopt`] writes nothing. The
+/// batch that first proves the floor writes. A later proved batch writes
+/// when the tip is a full headers window past the last saved checkpoint, or
+/// this batch is itself a full window. In-memory checkpoints stay per reply.
+#[doc(hidden)]
+pub fn adopt_checkpoint_due(
+    proven: bool,
+    was_proven: bool,
+    last_height: Option<u32>,
+    tip_height: u32,
+    batch_len: usize,
+) -> bool {
+    if !proven || !was_proven {
+        return true;
+    }
+    let window = rbitcoin_net::codec::MAX_HEADERS_RESULTS;
+    let gap = match last_height {
+        Some(h) => tip_height.saturating_sub(h),
+        None => u32::MAX,
+    };
+    gap >= window as u32 || batch_len >= window
 }
 
 #[doc(hidden)]
@@ -3811,7 +3855,7 @@ pub fn on_confirmed_rewind(st: &mut IbdWorkState, hub: &ChainHub, lca_h: u32) {
 }
 
 #[doc(hidden)]
-pub fn save_adopt(st: &IbdWorkState, hub: &ChainHub) {
+pub fn save_adopt(st: &mut IbdWorkState, hub: &ChainHub) {
     if !st.header_walk.origin || !st.header_walk.proven {
         return;
     }
@@ -3863,8 +3907,8 @@ pub fn save_adopt(st: &IbdWorkState, hub: &ChainHub) {
     write_diff(&mut buf, &st.header_walk.base_diff);
     let path = adopt_path(hub);
     let tmp = path.with_extension("tmp");
-    if std::fs::write(&tmp, &buf).is_ok() {
-        let _ = std::fs::rename(&tmp, &path);
+    if std::fs::write(&tmp, &buf).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
+        st.header_walk.last_adopt_height = Some(st.header_walk.tip_height());
     }
 }
 
@@ -4006,6 +4050,9 @@ pub fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
         }
     }
     publish_work(st, hub);
+    if st.header_walk.proven {
+        st.header_walk.last_adopt_height = Some(st.header_walk.tip_height());
+    }
     rebase_unproved_base(st, hub);
     st.header_walk.restored_unproved = !st.header_walk.proven;
     if arm_walk_bounds(st, hub) {
@@ -4124,6 +4171,7 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         invalid_tip_order: std::collections::VecDeque::new(),
         emptied: HashSet::new(),
         proven: false,
+        last_adopt_height: None,
         off_path: std::collections::HashMap::new(),
         #[cfg(debug_assertions)]
         announced_done: false,
