@@ -1031,6 +1031,99 @@ fn prior_zero_survives_a_reject_the_body_lacks() {
 }
 
 #[test]
+fn strong_sibling_survives_a_reject_the_body_lacks() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let strong = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let stale = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    let reject = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, stale)]).unwrap();
+    log.commit_open(6, 12288, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(5).unwrap();
+    let zero_slots = [(16, stale)];
+    let zero_body = body_with(&zero_slots);
+    log.commit_open(5, 12288, &zero_body, |_| Ok(false))
+        .unwrap();
+    assert_eq!(log.slot(16), Some([0u8; 8]));
+    log.note_slots(&[(4096, strong), (8192, reject)]).unwrap();
+    log.commit_open(5, 12288, &zero_body, |_| Ok(true)).unwrap();
+    assert_eq!(log.slot(4096), Some(strong));
+    assert_eq!(log.slot(8192), Some(reject));
+    log.hold_fold_above(2).unwrap();
+    log.commit_open(2, 12288, &zero_body, |meta| Ok(meta[0] == 1))
+        .unwrap();
+    assert!(
+        d.join(SPEND_PAGES_COMMIT_NAME).exists(),
+        "a best-chain page must keep the commit when another page is rejected"
+    );
+    assert_eq!(log.slot(4096), Some(strong));
+    assert_eq!(log.slot(16), Some([0u8; 8]));
+    assert_ne!(log.slot(8192), Some(reject));
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(4096), Some(strong));
+    assert_eq!(loaded.slot(16), Some([0u8; 8]));
+    assert_ne!(loaded.slot(8192), Some(reject));
+    drop(loaded);
+    let mut wrote_strong = false;
+    let mut wrote_reject = false;
+    log.fold_into(
+        |_off, image| {
+            if image.windows(8).any(|w| w == strong) {
+                wrote_strong = true;
+            }
+            if image.windows(8).any(|w| w == reject) {
+                wrote_reject = true;
+            }
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(wrote_strong, "fold must write the best-chain sibling");
+    assert!(!wrote_reject, "fold must not write the rejected page");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn strong_sibling_survives_a_reject_already_on_the_body() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let strong = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let stale = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, stale), (4096, strong)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let planted = [(16, stale)];
+    let read = body_with(&planted);
+    log.commit_open(4, 8192, &read, |meta| Ok(meta[0] == 1))
+        .unwrap();
+    assert_eq!(
+        log.slot(4096),
+        Some(strong),
+        "a best-chain page must stay when the rejected page is cleared"
+    );
+    assert_eq!(log.slot(16), Some([0u8; 8]));
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(4096), Some(strong));
+    assert_eq!(loaded.slot(16), Some([0u8; 8]));
+    let mut wrote_stale = false;
+    loaded
+        .fold_into(
+            |_off, image| {
+                if image.windows(8).any(|w| w == stale) {
+                    wrote_stale = true;
+                }
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    assert!(!wrote_stale);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn hold_ignores_a_commit_at_or_below_the_tip() {
     let d = dir();
     let log = SpendPageLog::create(&d);

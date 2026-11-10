@@ -442,7 +442,7 @@ impl SpendPageLog {
         let Some(snap) = self.snapshot_commit() else {
             self.scrub_open_notes(&mut keep)?;
             let pages = compose_kept_pages(&mut read_page, published, &[], &clears, &stored)?;
-            return self.settle_deferred_clear(height, pages, deferred);
+            return self.settle_deferred_clear(height, pages, deferred, &clears);
         };
         if snap.froze {
             self.pace.notify_room();
@@ -480,6 +480,8 @@ impl SpendPageLog {
 
     /// Publish a clearing image, or drop a rejected generation the body does not hold.
     ///
+    /// A page this checkpoint did not reject stays named. Deleting the file, or
+    /// keeping only a zero page, would serve that best-chain spend as unspent.
     /// The commit file stays in place until this returns. A `read_page` error
     /// never reaches here, so a restart still loads the old image.
     fn settle_deferred_clear(
@@ -487,39 +489,25 @@ impl SpendPageLog {
         height: u32,
         pages: PageImages,
         deferred: bool,
+        clears: &[BodyClear],
     ) -> Result<(), StoreError> {
-        if pages.is_empty() {
-            if !deferred {
-                return Ok(());
-            }
-            let zeros = self.committed_zero_images();
-            if zeros.is_empty() {
+        let fresh: HashSet<u64> = pages.iter().map(|(off, _)| *off).collect();
+        let cleared: HashSet<u64> = clears.iter().map(|clear| clear.page_off).collect();
+        let carried = if deferred {
+            self.carry_untouched(&fresh, &cleared)
+        } else {
+            Vec::new()
+        };
+        if pages.is_empty() && carried.is_empty() {
+            if deferred {
                 self.drop_rejected_generation();
-                return Ok(());
             }
-            // The rejected metas are not on the body. A page that is already
-            // zeros still has to fold, or the body keeps the old spend.
-            self.store_pending(
-                height,
-                zeros,
-                Vec::new(),
-                Vec::new(),
-                &[],
-                PublishHold::Clear,
-            )?;
-            self.forget_held_directory();
             return Ok(());
         }
         let hold = if deferred {
             PublishHold::Clear
         } else {
             PublishHold::Sample
-        };
-        let carried = if deferred {
-            let fresh: HashSet<u64> = pages.iter().map(|(off, _)| *off).collect();
-            self.carry_zero_pages(&fresh)
-        } else {
-            Vec::new()
         };
         self.store_pending(height, pages, Vec::new(), Vec::new(), &carried, hold)?;
         if deferred {
@@ -565,23 +553,16 @@ impl SpendPageLog {
             .collect()
     }
 
-    fn committed_zero_images(&self) -> PageImages {
-        let g = self.lock();
-        let mut pages: PageImages = g
-            .committed
-            .iter()
-            .filter(|(off, page)| !image_has_spend(**off, &page.image))
-            .map(|(off, page)| (*off, Arc::clone(&page.image)))
-            .collect();
-        pages.sort_by_key(|(off, _)| *off);
-        pages
-    }
-
-    fn carry_zero_pages(&self, fresh: &HashSet<u64>) -> Vec<(u64, CommittedPage)> {
+    /// Committed pages this checkpoint did not recompose and did not reject.
+    fn carry_untouched(
+        &self,
+        fresh: &HashSet<u64>,
+        cleared: &HashSet<u64>,
+    ) -> Vec<(u64, CommittedPage)> {
         let g = self.lock();
         let mut out = Vec::new();
         for (off, page) in &g.committed {
-            if fresh.contains(off) || image_has_spend(*off, &page.image) {
+            if fresh.contains(off) || cleared.contains(off) {
                 continue;
             }
             out.push((

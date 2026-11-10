@@ -27,7 +27,9 @@ Fixed
   disconnect instead of being deleted. A zero already stored on that page
   stays in the next image when a new note lands on it, when the page
   still has a best-chain slot, and when this checkpoint rejects a
-  different slot on that page.
+  different slot on that page. A different page whose slots are all
+  still best-chain stays named when this checkpoint rejects one page,
+  including beside a zero page that is kept.
   A missing or short `spend.pages` file beside a
   commit that names bytes refuses to open. The next confirm insert waits at
   2,000,000 open edges. A 1 GiB log asks for one extra checkpoint. Neither is a
