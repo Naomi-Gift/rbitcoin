@@ -132,7 +132,7 @@ catalogs, or 16-layout Class A with creates is **refused**.
 |--------|--------|
 | Loc | One loc pair per create; `seqsigwit` is the fat stem (cold) and does not force `txout` splits. `tx.head` rolls at OA 80% slots only. |
 | `strong_tx` | Always L2. **`confirmed`** and **`header_txs_*`** stay in RAM up to 256 MiB, then fd. |
-| `RWF_DONTCACHE` | **Not used.** Annotate pwrites hit `spent.body` only; evicting those pages does not protect `txout`, and the next block wants the same spent pages. |
+| `RWF_DONTCACHE` | **Not used.** The live tail page and the cooled fold still write `spent.body`. A full historical page is a directory insert, not a pwrite. Evicting spent pages does not protect `txout`, and the next block wants the same spent pages. |
 
 ### New script kinds without a wipe
 
@@ -230,6 +230,7 @@ itself changed.
     seqsigwit.window/                # prune window: one {height}.bin per kept height. The only witness payload while seqsigwit.prune exists
     seqsigwit.reloc                  # optional: append-only files live under --datadir-cold/store
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
+    spend.pages / spend.pages.commit                       # derived historical page log; not a schema bump
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
     txstat.body / txstat.ovf / txstat.blk            # 8 B/create ULEB econ + per-header tails (schema 25)
@@ -608,6 +609,8 @@ the new `meta` or an unknown kind). See [Schema 17 freeze](#schema-17-freeze).
 
 Best-chain spentness also requires `is_confirmed_strong(spender)` (annotations may outlive reorgs).
 A Class A append fills the slot for a spend in the same write. When the write holds more than one spender of a vout (a double spend that write rejects), it names the first in chain order, the lowest fk. A rejected write keeps that append for the retry.
+
+`spend.pages` and `spend.pages.commit` are derived, same durability class as the marker, and are not a `SCHEMA_VERSION` bump. Absent means no unsealed historical page. `spend.pages` holds 4 KiB-aligned images. `spend.pages.commit` names the snapshot height, generation, committed byte length, and the page list. A short generation, or a record past that length, is not served. The checkpoint appends one image per dirty full page and syncs the commit before `spend_durable` advances. Fold copies a generation onto `spent.body` only after a later checkpoint left it quiet, then deletes both files once nothing committed remains. The live tail page is not in this log.
 
 ### Multi-spender overflow (`spent.ovf`)
 

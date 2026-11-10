@@ -566,8 +566,8 @@ pub fn cold_group_edges(cold: &mut Vec<(Fk, u32, Fk, u32)>, writes: &[SpentAbsWr
 
 /// Pure-write annotate: `known[i]` is structural `(field, flags)` for `abs_edges[i]`.
 ///
-/// Sorts by abs, then page-RMW on `spent.body` (pread page → poke 8 B slots →
-/// pwrite page). Returns OOB edges as cold (caller must hard-fail).
+/// A full historical page is a directory insert. The live tail page is still
+/// one `spent.body` write. Returns OOB edges as cold (caller must hard-fail).
 pub fn put_spend_batch_by_abs_meta_known(
     txs: &TxTable,
     spenders: &SpenderTable,

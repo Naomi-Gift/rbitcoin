@@ -110,7 +110,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [104](./104-body-read-cap.md) | high | A body read is capped before it allocates | fixed | `body_read_above_the_cap_is_refused`, `index_read_above_the_cap_is_refused` |
 | [105](./105-scripthash-page-cycle.md) | high | Scripthash page walks stop on a cycle | fixed | `scripthash_page_cycle_is_corrupt`, `scripthash_page_free_cycle_is_corrupt`, `scripthash_page_free_revisit_is_corrupt` |
 | [106](./106-historical-bitrot.md) | medium | Historical body bit-rot is an accepted reindex | accepted | none |
-| [107](./107-torn-spend-page.md) | medium | A torn spend page below the durable marker stays | accepted | none |
+| [107](./107-torn-spend-page.md) | medium | A torn spend page below the durable marker stays | fixed | `historical_page_stays_unwritten_until_spend_checkpoint` |
 | [108](./108-bobberb-store-index.md) | — | Bobberb store-integrity index | accepted | — |
 | [109](./109-filter-send-budget.md) | medium | Filter replies and compact blocks under-counted the send budget | fixed | `filter_and_compact_block_replies_charge_their_consensus_payload` |
 | [110](./110-getcfilters-budget.md) | medium | `getcfilters` kept queueing after the send budget | fixed | `getcfilters_stops_after_the_filter_that_crosses_the_send_budget`, `getcfcheckpt_returns_a_header_every_thousand_heights` |
