@@ -1862,6 +1862,7 @@ impl Store {
         self.txs.sync_replay_data()?;
         self.spenders.sync_data_only()?;
         self.store_spend_marker(tip, tip, gen)?;
+        self.spindle_wait();
         self.txs.fold_committed_spend_pages()?;
         Ok(t.elapsed().as_nanos() as u64)
     }
@@ -2099,6 +2100,7 @@ impl Store {
             return Ok(());
         };
         self.store_spend_marker(height, height, gen)?;
+        self.spindle_wait();
         self.txs.fold_committed_spend_pages()
     }
 

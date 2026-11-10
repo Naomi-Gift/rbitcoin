@@ -439,7 +439,8 @@ fn write_phase_inner(
         }
 
         let spend_ann_ns = {
-            let _gate = hold_spindle(query);
+            // Historical slots are a directory insert. The tail page is one
+            // append, not a random sweep, so this does not take the spindle.
             spindle_mark("ann-begin");
             let ns = post_commit(query, &slots)?;
             spindle_mark("ann-end");
@@ -569,7 +570,6 @@ pub fn finish_post_commit_hashes(
     };
 
     let annotate_res = {
-        let _gate = hold_spindle(query);
         spindle_mark("ann-begin");
         let res = (|| -> Result<(), ConfirmError> {
             if !query.spend_index_enabled() {

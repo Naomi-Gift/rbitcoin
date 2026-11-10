@@ -3565,7 +3565,8 @@ fn assert_spindle_schedule(trace: &[&str], hdd: bool, expect_class_a: bool) {
             "hold" => depth += 1,
             "release" => depth -= 1,
             "head" | "join" => assert_eq!(depth, 0, "{trace:?}"),
-            "class-a" | "ann-begin" | "ann-end" if hdd => assert!(depth > 0, "{trace:?}"),
+            "class-a" if hdd => assert!(depth > 0, "{trace:?}"),
+            "ann-begin" | "ann-end" => assert_eq!(depth, 0, "{trace:?}"),
             _ => {}
         }
         assert!(depth >= 0, "{trace:?}");

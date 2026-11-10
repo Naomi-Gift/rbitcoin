@@ -445,21 +445,36 @@ impl SpendPageLog {
             if g.fold_held {
                 return Ok(());
             }
-            g.committed
+            let mut quiet: Vec<(u64, Arc<[u8]>)> = g
+                .committed
                 .iter()
                 .filter(|(off, _)| !g.open.contains_key(*off))
                 .map(|(off, page)| (*off, Arc::clone(&page.image)))
-                .collect()
+                .collect();
+            quiet.sort_by_key(|(off, _)| *off);
+            quiet
         };
         if quiet.is_empty() {
             return Ok(());
         }
-        for (off, image) in &quiet {
-            write_page(*off, image)?;
+        let mut wrote: Vec<(u64, Arc<[u8]>)> = Vec::new();
+        for (off, image) in quiet {
+            let still_quiet = {
+                let g = self.lock();
+                !g.open.contains_key(&off)
+            };
+            if !still_quiet {
+                continue;
+            }
+            write_page(off, &image)?;
+            wrote.push((off, image));
+        }
+        if wrote.is_empty() {
+            return Ok(());
         }
         sync()?;
         let mut g = self.lock();
-        for (off, _) in &quiet {
+        for (off, _) in &wrote {
             if !g.open.contains_key(off) {
                 g.committed.remove(off);
             }
@@ -677,6 +692,33 @@ mod tests {
         .unwrap();
         assert_eq!(writes, 0);
         assert_eq!(log.slot(16), Some(slot));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn fold_skips_a_page_dirtied_while_an_earlier_page_is_copied() {
+        let d = dir();
+        let log = SpendPageLog::create(&d);
+        let slot = [6u8, 1, 2, 3, 4, 5, 6, 7];
+        let later = [7u8, 1, 2, 3, 4, 5, 6, 7];
+        log.note_slots(&[(16, slot), (4096, slot)]).unwrap();
+        log.commit_open(2, 8192, zeros, |_| Ok(true)).unwrap();
+        let mut wrote = Vec::new();
+        log.fold_into(
+            |off, image| {
+                wrote.push(off);
+                if off == 0 {
+                    log.note_slots(&[(4096 + 8, later)])?;
+                }
+                let _ = image;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(wrote, vec![0]);
+        assert_eq!(log.slot(4096 + 8), Some(later));
+        assert_eq!(log.slot(4096), Some(slot));
         let _ = std::fs::remove_dir_all(&d);
     }
 }
