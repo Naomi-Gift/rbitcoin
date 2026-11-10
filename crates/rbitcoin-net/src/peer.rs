@@ -5163,10 +5163,7 @@ fn evict_pending_for_room(
     prev: BlockHash,
     headers: &[bitcoin::block::Header],
 ) {
-    let incoming = headers
-        .iter()
-        .filter(|hdr| !pending.contains_key(&hdr.block_hash()))
-        .count();
+    let incoming = incoming_header_count(pending, headers);
     if !pending_over_cap(pending, incoming) {
         return;
     }
@@ -5311,6 +5308,48 @@ fn disconnected_pending(
         .collect()
 }
 
+/// Distinct hashes in `headers` that are not already in `pending`.
+/// One header repeated for a whole message takes one slot.
+fn incoming_header_count(
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    headers: &[bitcoin::block::Header],
+) -> usize {
+    let mut seen = HashSet::new();
+    headers
+        .iter()
+        .filter(|hdr| {
+            let hash = hdr.block_hash();
+            !pending.contains_key(&hash) && seen.insert(hash)
+        })
+        .count()
+}
+
+fn queue_batch_admits(apply: &mut HeadersApply, headers: &[bitcoin::block::Header]) {
+    let mut seen = HashSet::new();
+    for hdr in headers {
+        let hash = hdr.block_hash();
+        if seen.insert(hash) {
+            apply.admits.push((hash, *hdr));
+        }
+    }
+}
+
+/// Headers in this message that `persist_pending_header_path` actually wrote.
+/// A sibling that is not on the walk from the last header stays out.
+fn queue_stored_header_admits(
+    apply: &mut HeadersApply,
+    hub: &ChainHub,
+    headers: &[bitcoin::block::Header],
+) {
+    let mut seen = HashSet::new();
+    for hdr in headers {
+        let hash = hdr.block_hash();
+        if seen.insert(hash) && header_is_stored(hub, &hash) {
+            apply.admits.push((hash, *hdr));
+        }
+    }
+}
+
 fn incoming_header_work(
     hub: &ChainHub,
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
@@ -5452,10 +5491,7 @@ fn classify_headers(
         // not a continuation of any chain we hold.
         let connecting = prev != BlockHash::all_zeros()
             && header_announcement_connects(hub, pending_before, prev);
-        let incoming = headers
-            .iter()
-            .filter(|hdr| !pending.contains_key(&hdr.block_hash()))
-            .count();
+        let incoming = incoming_header_count(&pending, headers);
         let mut staged_evicts = Vec::new();
         if connecting && pending.len().saturating_add(incoming) > MAX_PENDING_HEADERS {
             // Claimed proof of work includes the chain pow limit. Evictions
@@ -5482,9 +5518,11 @@ fn classify_headers(
             apply.from_peer.push(hash);
             apply.best_known.push(hash);
             admit_pending_header(&mut pending, hash, *hdr);
-            apply.admits.push((hash, *hdr));
         }
         if !connecting {
+            // These headers are not sent to the store. A later parent can
+            // still join them.
+            queue_batch_admits(&mut apply, headers);
             if n < MAX_HEADERS_RESULTS {
                 apply.getheaders = Some(headers_sync_locator(hub, None));
             }
@@ -5497,6 +5535,7 @@ fn classify_headers(
             let work_cmp = announced_work_cmp(hub, &pending, last);
             let our_tip = hub.tip_height().unwrap_or(0);
             if announced_tip_is_hopeless(our_tip, announced_h, work_cmp) && !noban {
+                queue_batch_admits(&mut apply, headers);
                 apply.disconnect = Some((announced_h, our_tip));
                 return apply;
             }
@@ -5507,8 +5546,11 @@ fn classify_headers(
                         && !header_is_stored(hub, &last);
                     stored = persist_pending_header_path(hub, &pending, last);
                     apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
+                    queue_stored_header_admits(&mut apply, hub, headers);
                     apply.sync_height = Some(announced_h);
                 } else {
+                    // Below the floor this path does not touch the store.
+                    queue_batch_admits(&mut apply, headers);
                     apply.ignore_height = Some(announced_h);
                     ignored_below_floor = true;
                 }
@@ -5521,25 +5563,30 @@ fn classify_headers(
                     work_cmp == Some(std::cmp::Ordering::Greater) && !header_is_stored(hub, &last);
                 stored = persist_pending_header_path(hub, &pending, last);
                 apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
+                queue_stored_header_admits(&mut apply, hub, headers);
                 apply.sync_height = Some(announced_h);
-                let keep = connecting_header_path(hub, &pending, last);
-                let mut requested = requested_before.clone();
-                release_asks_off_path(hub, &mut requested, &keep);
-                apply.drop_asks = requested_before
-                    .iter()
-                    .copied()
-                    .filter(|h| !requested.contains(h))
-                    .collect();
-                let mut want = fetchable_header_path_bodies(
-                    hub,
-                    &pending,
-                    last,
-                    &PendingBlocks::new(),
-                    &requested,
-                );
-                want.retain(|h| !have_bodies.contains(h) && !requested.contains(h));
-                want.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested.len()));
-                apply.want_bodies = want;
+                // Asks follow the stored walk only. A rejected header must
+                // not drop an in-flight body or start a new one.
+                if stored {
+                    let keep = connecting_header_path(hub, &pending, last);
+                    let mut requested = requested_before.clone();
+                    release_asks_off_path(hub, &mut requested, &keep);
+                    apply.drop_asks = requested_before
+                        .iter()
+                        .copied()
+                        .filter(|h| !requested.contains(h))
+                        .collect();
+                    let mut want = fetchable_header_path_bodies(
+                        hub,
+                        &pending,
+                        last,
+                        &PendingBlocks::new(),
+                        &requested,
+                    );
+                    want.retain(|h| !have_bodies.contains(h) && !requested.contains(h));
+                    want.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested.len()));
+                    apply.want_bodies = want;
+                }
             }
             if stored {
                 apply.evicts = staged_evicts;
