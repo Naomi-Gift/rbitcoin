@@ -457,7 +457,6 @@ impl Store {
         } else {
             std::fs::create_dir_all(&path).map_err(|e| StoreError::io(&path, e))?;
         }
-        write_meta(&path)?;
         let seqsigwit_dir = resolve_seqsigwit_dir(&layout)?;
         let opts = layout.open_opts();
         let txs = TxTable::create_with_head_layout_seqsigwit(&path, &seqsigwit_dir, head, opts)?;
@@ -465,7 +464,7 @@ impl Store {
             write_seqsigwit_reloc(&path)?;
         }
         let cold_path = layout.is_split().then_some(seqsigwit_dir);
-        Ok(Self {
+        let store = Self {
             headers: HeaderTable::create_with_scale(&path, layout.head_scale)?,
             txs,
             spenders: SpenderTable::create(&path)?,
@@ -482,10 +481,13 @@ impl Store {
             spend_marker: std::sync::Mutex::new(()),
             spindle: Spindle::new(),
             datadir_bytes_cache: std::sync::Mutex::new(None),
-            path,
+            path: path.clone(),
             cold_path,
             head_scale: layout.head_scale,
-        })
+        };
+        // Commit point. A kill before this rename-less write leaves no meta.
+        write_meta(&path)?;
+        Ok(store)
     }
 
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
@@ -568,10 +570,31 @@ impl Store {
     }
 
     pub fn open_or_create_layout(layout: StoreLayout) -> Result<Self, StoreError> {
-        if layout.dir.join("meta").exists() {
-            Self::open_layout(layout)
-        } else {
-            Self::create_layout(layout)
+        let dir = layout.dir.clone();
+        if !dir.join("meta").exists() {
+            if creation_has_chain(&dir) {
+                return Err(StoreError::Corrupt("store meta missing"));
+            }
+            if store_dir_has_child(&dir) {
+                rbitcoin_log::warn!(
+                    "store: replacing incomplete first creation at {} (no meta)",
+                    dir.display()
+                );
+                clear_store_children(&dir)?;
+            }
+            return Self::create_layout(layout);
+        }
+        match Self::open_layout(layout.clone()) {
+            Ok(store) => Ok(store),
+            Err(err) if !creation_has_chain(&dir) && replaces_incomplete_first_creation(&err) => {
+                rbitcoin_log::warn!(
+                    "store: replacing incomplete first creation at {} ({err})",
+                    dir.display()
+                );
+                clear_store_children(&dir)?;
+                Self::create_layout(layout)
+            }
+            Err(err) => Err(err),
         }
     }
 
@@ -2166,6 +2189,87 @@ impl Store {
         self.scripthash.flush_async()?;
         rbitcoin_log::info!("store: shutdown flush done elapsed={:?}", t0.elapsed());
         Ok(())
+    }
+}
+
+fn store_dir_has_child(dir: &Path) -> bool {
+    std::fs::read_dir(dir)
+        .ok()
+        .and_then(|mut rd| rd.next())
+        .is_some()
+}
+
+fn clear_store_children(dir: &Path) -> Result<(), StoreError> {
+    let rd = match std::fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(StoreError::io(dir, e)),
+    };
+    for ent in rd {
+        let ent = ent.map_err(|e| StoreError::io(dir, e))?;
+        let path = ent.path();
+        if path.is_dir() {
+            std::fs::remove_dir_all(&path).map_err(|e| StoreError::io(&path, e))?;
+        } else {
+            std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
+        }
+    }
+    Ok(())
+}
+
+fn published_rows(
+    path: &Path,
+    kind: rbitcoin_primitives::TableKind,
+    header: u64,
+    stride: u64,
+) -> u64 {
+    if stride == 0 || !path.is_file() {
+        return 0;
+    }
+    let Ok(file) = crate::file::TableFile::open(path, kind) else {
+        return 0;
+    };
+    let len = file.logical_len();
+    if len <= header {
+        return 0;
+    }
+    (len - header) / stride
+}
+
+fn creation_has_chain(dir: &Path) -> bool {
+    published_rows(
+        &dir.join("txid.body"),
+        rbitcoin_primitives::TableKind::TxidBody,
+        crate::txid_body::TXID_BODY_HEADER,
+        crate::txid_body::TXID_ENTRY_LEN,
+    ) > 0
+        || published_rows(
+            &dir.join("header.body"),
+            rbitcoin_primitives::TableKind::Header,
+            crate::file::FILE_HEADER_LEN as u64,
+            crate::header_table::HEADER_RECORD_LEN as u64,
+        ) > 0
+        || published_rows(
+            &dir.join("confirmed.body"),
+            rbitcoin_primitives::TableKind::Confirmed,
+            crate::file::FILE_HEADER_LEN as u64,
+            8,
+        ) > 0
+}
+
+fn incomplete_create_corrupt(msg: &str) -> bool {
+    !(msg.starts_with("index refuses")
+        || msg.contains("store.secret")
+        || msg == PRE22_WIPE
+        || msg.contains("pre-schema-15"))
+}
+
+fn replaces_incomplete_first_creation(err: &StoreError) -> bool {
+    match err {
+        StoreError::Io { .. } | StoreError::BadMagic | StoreError::BadKind { .. } => true,
+        StoreError::Layout(msg) => msg.contains("scripthash body layout mixed or incomplete"),
+        StoreError::Corrupt(msg) => incomplete_create_corrupt(msg),
+        _ => false,
     }
 }
 

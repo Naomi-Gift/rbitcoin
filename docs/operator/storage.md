@@ -191,7 +191,7 @@ to start over unless you intend a full Class A collect
 | Complete head, no marks, no extract | Soft-migrate: write `.packed`. Missing `include_hwm` is set from the create count. |
 | Kill-9 mid pack | Unfinished shard is redone. Open follows [`docs/crash-recovery.md`](../crash-recovery.md). |
 | Write-behind IO error (disk full) | The process exits non-zero after the shutdown flush. Restart the same datadir; write-behind continues. |
-| Corrupt SH (leftover live OA, mixed body, refuse line) | Wipe `store/scripthash*` only, keep Class A, rematerialize with `--sh-index`. |
+| Corrupt SH (mixed body, refuse line) | Wipe `store/scripthash*` only, keep Class A, rematerialize with `--sh-index`. Leftover live OA is removed on open. |
 
 Electrum waits until SH is tip-ready. Do **not** `rm -rf store/` for an SH
 abort. Force-rebuild sticky env (`RBITCOIN_SH_FORCE_REBUILD`) must never redo

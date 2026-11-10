@@ -2292,3 +2292,174 @@ fn get_tx_outputs_at_past_end_read_still_rejects_a_corrupt_row() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn shard_mphf_val(head: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    let mut mphf = None;
+    let mut val = None;
+    for ent in std::fs::read_dir(head).unwrap() {
+        let p = ent.unwrap().path();
+        match p.extension().and_then(|e| e.to_str()) {
+            Some("mphf") => mphf = Some(p),
+            Some("val") => val = Some(p),
+            _ => {}
+        }
+    }
+    (
+        mphf.expect("packed shard mphf"),
+        val.expect("packed shard val"),
+    )
+}
+
+fn empty_header() -> HeaderRecord {
+    HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x1d00ffff,
+        nonce: 1,
+        merkle_root: [1u8; 32],
+        hash: [2u8; 32],
+        size: 0,
+        weight: 0,
+    }
+}
+
+#[test]
+fn kill_first_start_interrupted_creation_reopens_empty_chain() {
+    let torn = tmp();
+    std::fs::create_dir_all(&torn).unwrap();
+    let mut meta = STORE_MAGIC.to_vec();
+    meta.extend_from_slice(&SCHEMA_VERSION.to_le_bytes());
+    std::fs::write(torn.join("meta"), &meta).unwrap();
+    std::fs::create_dir_all(torn.join("scripthash.body")).unwrap();
+    std::fs::write(torn.join("scripthash.body").join("00"), b"torn").unwrap();
+    let s = Store::open_or_create_tiny(&torn).unwrap();
+    assert_eq!(s.header_count(), 0);
+    assert!(s.tip_height().is_none());
+    let hdr = empty_header();
+    let hfk = s.put_header(&hdr).unwrap();
+    s.flush().unwrap();
+    drop(s);
+    let s = Store::open_or_create_tiny(&torn).unwrap();
+    assert_eq!(s.headers.get(hfk).unwrap().hash, hdr.hash);
+    assert!(s.tip_height().is_none());
+    drop(s);
+    let _ = std::fs::remove_dir_all(&torn);
+
+    let mid = tmp();
+    {
+        let s = Store::create_tiny(&mid).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::remove_file(mid.join("confirmed.body")).unwrap();
+    let s = Store::open_or_create_tiny(&mid).unwrap();
+    assert!(s.tip_height().is_none());
+    assert_eq!(s.header_count(), 0);
+    drop(s);
+    let s = Store::open_or_create_tiny(&mid).unwrap();
+    assert!(s.tip_height().is_none());
+    drop(s);
+    let _ = std::fs::remove_dir_all(&mid);
+
+    let ingest = tmp();
+    {
+        let s = Store::create_tiny(&ingest).unwrap();
+        s.flush().unwrap();
+    }
+    let ingest_path = ingest.join("scripthash.ovf").join("ingest");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&ingest_path)
+        .unwrap()
+        .set_len(8)
+        .unwrap();
+    let s = Store::open_or_create_tiny(&ingest).unwrap();
+    assert!(s.tip_height().is_none());
+    drop(s);
+    Store::open_or_create_tiny(&ingest).unwrap();
+    let _ = std::fs::remove_dir_all(&ingest);
+}
+
+#[test]
+fn kill_first_start_leftover_oa_without_flag_opens_and_with_flag_materializes() {
+    let dir = tmp();
+    let txid = [10u8; 32];
+    let script = vec![0x51];
+    let fk = {
+        let s = Store::create_tiny(&dir).unwrap();
+        let item = coinbase_item(txid, vec![OutputRecord::unspent(50, script.clone())]);
+        let fks = s
+            .put_tx_full_batch_indexed(std::slice::from_ref(&item), true)
+            .unwrap();
+        s.flush().unwrap();
+        fks[0]
+    };
+    let txid_bytes = std::fs::read(dir.join("txid.body")).unwrap();
+    std::fs::write(dir.join("scripthash.head"), b"leftover-oa").unwrap();
+    std::fs::write(dir.join("scripthash.ovf").join("000000"), b"not-shsr").unwrap();
+
+    let s = Store::open_or_create_tiny(&dir).unwrap();
+    assert_eq!(std::fs::read(dir.join("txid.body")).unwrap(), txid_bytes);
+    assert_eq!(s.get_tx_full(fk).unwrap().0.txid, txid);
+    assert!(dir.join("scripthash.body").is_dir());
+    assert!(!dir.join("scripthash.head").exists());
+    assert!(!dir.join("scripthash.ovf").join("000000").exists());
+    drop(s);
+    let s = Store::open_or_create_tiny(&dir).unwrap();
+    assert_eq!(s.get_tx_full(fk).unwrap().0.txid, txid);
+    assert_eq!(std::fs::read(dir.join("txid.body")).unwrap(), txid_bytes);
+
+    rbitcoin_store::materialize_sh_unsorted_from_class_a(&s, 1, 1, None).unwrap();
+    let sh = rbitcoin_store::script_hash(&script);
+    assert!(!s.scripthash.entries(&sh).unwrap().is_empty());
+    assert_eq!(std::fs::read(dir.join("txid.body")).unwrap(), txid_bytes);
+    s.flush().unwrap();
+    drop(s);
+    let s = Store::open_or_create_tiny(&dir).unwrap();
+    assert_eq!(s.get_tx_full(fk).unwrap().0.txid, txid);
+    assert_eq!(std::fs::read(dir.join("txid.body")).unwrap(), txid_bytes);
+    assert!(!s.scripthash.entries(&sh).unwrap().is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn kill_first_start_finished_index_survives_reopen() {
+    let dir = tmp();
+    let txid = [11u8; 32];
+    let script = vec![0x52];
+    let fk = {
+        let s = Store::create_tiny(&dir).unwrap();
+        let item = coinbase_item(txid, vec![OutputRecord::unspent(50, script.clone())]);
+        let fks = s
+            .put_tx_full_batch_indexed(std::slice::from_ref(&item), true)
+            .unwrap();
+        s.flush().unwrap();
+        rbitcoin_store::materialize_sh_unsorted_from_class_a(&s, 1, 1, None).unwrap();
+        assert!(s.scripthash.has_durable_index());
+        s.flush().unwrap();
+        fks[0]
+    };
+    let txid_bytes = std::fs::read(dir.join("txid.body")).unwrap();
+    let head = dir.join("scripthash.head");
+    let (mphf_path, val_path) = shard_mphf_val(&head);
+    let mphf = std::fs::read(&mphf_path).unwrap();
+    let val = std::fs::read(&val_path).unwrap();
+    std::fs::write(dir.join("scripthash.ovf").join("000001"), b"not-shsr").unwrap();
+
+    let s = Store::open_or_create_tiny(&dir).unwrap();
+    assert_eq!(std::fs::read(dir.join("txid.body")).unwrap(), txid_bytes);
+    assert_eq!(std::fs::read(&mphf_path).unwrap(), mphf);
+    assert_eq!(std::fs::read(&val_path).unwrap(), val);
+    assert!(!dir.join("scripthash.ovf").join("000001").exists());
+    assert_eq!(s.get_tx_full(fk).unwrap().0.txid, txid);
+    assert!(s.scripthash.has_durable_index());
+    let sh = rbitcoin_store::script_hash(&script);
+    assert!(!s.scripthash.entries(&sh).unwrap().is_empty());
+    drop(s);
+    let s = Store::open_or_create_tiny(&dir).unwrap();
+    assert_eq!(std::fs::read(dir.join("txid.body")).unwrap(), txid_bytes);
+    assert_eq!(std::fs::read(&mphf_path).unwrap(), mphf);
+    assert_eq!(std::fs::read(&val_path).unwrap(), val);
+    assert_eq!(s.get_tx_full(fk).unwrap().0.txid, txid);
+    let _ = std::fs::remove_dir_all(&dir);
+}
