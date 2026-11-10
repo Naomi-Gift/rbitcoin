@@ -101,17 +101,9 @@ There is **no** global “pause queries during confirm write.” Tip-as-commit +
 
 ### Confirmed-tx readers: pin + retry (not a lock)
 
-Wallet APIs (Electrum / Esplora) must not mix two chain prefixes in one
-response, and they must tell the client **which tip hash** the body belongs
-to. Yuval brought the A-B-A hole to our attention (same height, different
-block, silent status). The shape we ship follows
-[mempool/mempool#6584](https://github.com/mempool/mempool/issues/6584)
-(HTTP tip-hash header on every response) and the Electrum 1.7
-`chaintip` discussion in
-[spesmilo/electrum-protocol#2](https://github.com/spesmilo/electrum-protocol/pull/2)
-(added, then reverted in
-[#17](https://github.com/spesmilo/electrum-protocol/pull/17) because ElectrumX
-cannot pin bitcoind RPC — we can).
+A wallet response must not mix two chain prefixes. It names the tip hash
+the body belongs to. A same-height replace leaves `txid:height` unchanged.
+This node pins the published tip.
 
 | Rule | Detail |
 |------|--------|

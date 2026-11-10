@@ -23,7 +23,7 @@ admission) and optional **Esplora-compatible REST** for the same role (history,
 UTXO, broadcast, block/tx fetch by id). Optional **Core-class JSON-RPC subset**
 (see [`docs/rpc.md`](./docs/rpc.md)) — not full Core wallet / mining parity.
 **Scripthash index (`--sh-index`) defaults off**. Electrum/Esplora **start without it**; address/scripthash methods fail closed (`scripthash index disabled`). Txid/outpoint/block/broadcast/fees work. Which wallets use that surface: [`docs/wallets.md`](./docs/wallets.md). Lightning chain sources: [`docs/lightning.md`](./docs/lightning.md).
-On/off costs and start/IBD/tip behavior: [`OPERATOR.md`](./OPERATOR.md)
+On/off costs and start/IBD/tip behavior: [`docs/operator/storage.md`](./docs/operator/storage.md)
 (Scripthash index). Disable later leaves SH files on disk; follow does not
 wait on SH materialize.
 
@@ -226,45 +226,41 @@ request/response reads one height and stops. Sparrow’s Silent Payments
 path talks Frigate `blockchain.silentpayments.subscribe` (scan key on
 the server, RAM-only for the session). That RPC is implemented on the
 tweak index (or naive height walk). `tweaks.subscribe` remains the Cake
-client-local scan.
-| DoS floor | always on | max conn / line / idle / subs / broadcast hex (`ServeLimits`); public bind OK behind proxy |
+client-local scan. Connection, line, idle, subscription, and broadcast-hex
+caps are the DoS table in
+[`docs/operator/interfaces.md`](docs/operator/interfaces.md).
 
 ### Chain view (confirmed-tx snapshot token)
 
-Yuval pointed out that Electrum status and Esplora list envelopes are
-**A-B-A**: a same-height reorg can leave `txid:height` (and a height-keyed
-join cache) unchanged while merkle proofs and confirming block hashes
-moved. We researched
-[mempool/mempool#6584](https://github.com/mempool/mempool/issues/6584)
-(tnull: stamp chain tip **hash** on every API response header so sequential
-fetches detect tip movement, including A-B-A) and
+A same-height reorg can leave an Electrum status of `txid:height`, and a
+height-keyed join cache, unchanged while the merkle proof and the confirming
+block hash move. Esplora stamps the published tip hash on each response.
+Electrum adds `chain_tip` beside `result`. The pin and the retry are
+[`docs/concurrency.md`](docs/concurrency.md#confirmed-tx-readers-pin--retry-not-a-lock).
+The HTTP header follows
+[mempool/mempool#6584](https://github.com/mempool/mempool/issues/6584).
+Electrum 1.7 discussed `chaintip` in
 [spesmilo/electrum-protocol#2](https://github.com/spesmilo/electrum-protocol/pull/2)
-(1.7 `chaintip` on `scriptpubkey.*`, reverted in
-[#17](https://github.com/spesmilo/electrum-protocol/pull/17) because ElectrumX
-is bitcoind middleware and cannot pin). rbitcoin owns Query+store, so we pin
-the published tip and retry if it disconnects
-([`docs/concurrency.md`](docs/concurrency.md#confirmed-tx-readers-pin--retry-not-a-lock)).
+and reverted it in
+[#17](https://github.com/spesmilo/electrum-protocol/pull/17).
 
 | Surface | Token | Body |
 |---------|--------|------|
 | Esplora HTTP | `X-Bitcoin-Chain-Tip` + `X-Bitcoin-Chain-Tip-Height` | Unchanged JSON. Client: if two sequential fetches disagree on the hash, drop the batch and restart. |
 | Electrum TCP | JSON-RPC extra members `chain_tip` / `chain_tip_height` next to `result` (ping/version omit). `server.features.chain_tip`. | `result` shape unchanged. Status preimage stays the protocol's `txid:height:`; a same-height replace shows in `chain_tip`, not in the status. Notification `params` stay `[scripthash, status]`. |
 
-We stamp **tip**, not only the last relevant history tx hash (empty history
-and list envelopes still need a token).
+The stamp is the published tip. An empty history and a list envelope carry
+it too.
 
-**As-of (buried ancestor):** thanks again to Yuval — the same A-B-A /
-bind-confirmations-to-a-chain work implies “wallet as of this block”
-while that block is still on the best chain. Esplora `?asof=<hash>` and
-Electrum trailing `asof:<hash>` (after official positional args) join
-under `pin_chain_view_at`. Stamp is that hash. If the asof block leaves
-the tip chain: **404** / `asof not on chain` (no retry onto another
-block at the same height). We still do **not** serve a disconnected fork
-hash.
+**As-of.** A client can ask for the chain as of a block that is still on
+the best chain. Esplora `?asof=<hash>` and an Electrum trailing
+`asof:<hash>`, after the official positional arguments, join under
+`pin_chain_view_at`. The stamp is that hash. If the block leaves the tip
+chain the answer is **404** or `asof not on chain`. The node does not
+retry onto another block at the same height. It does not serve a
+disconnected fork hash.
 
-Electrum clients that want as-of add a trailing `asof:<blockhash>`
-argument to a method that takes it, on any negotiated protocol. A 1.6
-connection keeps its 1.6 shapes. `server.version(name, "1.4.2-asof")` (or a
+A 1.6 connection keeps its 1.6 shapes. `server.version(name, "1.4.2-asof")` (or a
 `[min, max]` range containing that string) is still accepted for clients
 that negotiate it, and pins that connection to 1.4.x shapes.
 `server.features.protocol_max` stays `"1.6"`. As-of discovery is

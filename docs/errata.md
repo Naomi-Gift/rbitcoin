@@ -34,17 +34,9 @@ be this case.
 
 ## Retired confirm dual paths
 
-These names are gone. A missed fact the pipeline promised is still
+A missed fact the pipeline promised is
 `StoreError::Corrupt("invariant: …")` ([`invariants.md`](./invariants.md)).
-Do not treat the list as a set of identifiers to police:
+The old dual-path names are gone.
 
-- Soft spentness recovery for a wrong or missing pin identity.
-- Unpinned wire-corrected `create_fk` spentness.
-- Load-stage `txid.body` identity fill after lookup promised the stamp.
-- `ColdPinMode` Allow/Forbid cold denserels on load (load is range outs only).
-- Denserels-as-spender-abs (schema 22 abs is `spent` loc off + `8×vout` only).
-- `AssembleMode::Full` / `validate_block_connect` (confirm is optimistic
-  assemble, then `structural_validate_spends`).
-- `archive_plan_batch_from_store` and production `Query` turning TxApply into
-  a dummy `Block`. `tx_apply_to_tx`, `connect_block`, and
-  `commit_class_a_only` are `rbitcoin_query::testutil::FixtureChain` only.
+`tx_apply_to_tx`, `connect_block`, and `commit_class_a_only` exist only on
+`rbitcoin_query::testutil::FixtureChain`.

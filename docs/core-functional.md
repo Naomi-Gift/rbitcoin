@@ -370,7 +370,7 @@ return to the IBD window) so it can attach when the other tank appears.
 That is the right shape for this one-block example, not for a genesis
 mainnet sync. A non-zero tip that has not finished catch-up stays in IBD.
 Relay stays off while tip work is below `--min-chain-work`. The operator
-note is in [`OPERATOR.md`](../OPERATOR.md).
+note is in [`docs/operator/operations.md`](./operator/operations.md).
 
 ### CI example (label `warnet`)
 

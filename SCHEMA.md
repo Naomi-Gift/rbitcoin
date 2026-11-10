@@ -923,4 +923,5 @@ Hot pin+annotate working set: **txout + spent + create.loc + txid + tx.head**
 | [`docs/concurrency.md`](./docs/concurrency.md) | Writer ownership, IBD vs tip |
 | [`docs/invariants.md`](docs/invariants.md) | Confirm stage IO / leftover union |
 | [`docs/crash-recovery.md`](./docs/crash-recovery.md) | Kill safety, reorg, segmented head seal |
-| [`OPERATOR.md`](./OPERATOR.md) | Datadir ops, env knobs |
+| [`docs/operator/storage.md`](./docs/operator/storage.md) | Schema open and store flags |
+| [`docs/env-knobs.md`](./docs/env-knobs.md) | Residual `RBITCOIN_*` |

@@ -14,7 +14,7 @@ Occupied **0.6.x** stores refuse
 (wipe and sync again). Schema 24 and 25 open in place and rewrite to 26.
 A published 0.8 directory is already schema 26. The runbook is
 [`docs/operator/mainnet.md`](./docs/operator/mainnet.md). Day-to-day flags
-are [`OPERATOR.md`](./OPERATOR.md).
+are [`docs/operator/`](./docs/operator/).
 
 `--trust-peer` stores and serves a chain rbitcoin considers invalid. Do not
 point a wallet at that node unless you accept that peer. The fault list is
@@ -63,23 +63,24 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   mitigations are intentional operator surface: max inbound sessions
   (`--max-inbound`, default 200; peers that relay transactions hold at
   most half), per-session message/byte
-  rate windows, misbehavior score disconnect. Peer AEAD is the
-  `chacha20-poly1305` 0.1 that `bip324` 0.11 links. That is current
-  `rust-bitcoin/bip324` master, not a local pin. `noise_sv2` already uses
-  the renamed `chacha20poly1305` crate. No version bump until upstream
-  publishes one.
+  rate windows, misbehavior score disconnect. Peer AEAD is
+  `chacha20-poly1305` 0.1, which crates.io `bip324` 0.11 links
+  (`Cargo.toml`). `noise_sv2` uses the renamed `chacha20poly1305` crate.
+  No version bump until upstream publishes one.
 - **Electrum and Esplora:** plain TCP/HTTP; TLS is an operator reverse-proxy
   concern. Wallet clients and electrs HTTP (except address-prefix)
   ([`COMPAT.md`](./COMPAT.md)).
-  The node is **internet-facing capable**: application DoS limits
-  (`ServeLimits` — REST in-flight semaphore, request size, idle timeout, plus
-  Electrum scripthash-sub / broadcast-hex caps) are **always enforced**, not
-  only when bound to localhost. The REST cap is concurrent requests, not an
-  accepted-socket cap. Excess connections and oversize
-  lines/bodies fail closed without hanging accept. Esplora is
+  Application DoS limits apply on every bind, including a public address.
+  The caps are request size, idle timeout, Electrum scripthash subscriptions,
+  and broadcast hex length (`ServeLimits`). Electrum rejects a connection
+  past the cap at accept. Esplora's cap is requests in flight. A request
+  that finds the cap full waits. That wait counts against the request
+  timeout and the answer is then 408 (`admit_connection`,
+  `TimeoutLayer`). The numbers are
+  [`docs/operator/interfaces.md`](docs/operator/interfaces.md). Esplora is
   opt-in (`--esplora-listen`). Internal electrs HTTP (`/internal/*`) is unix
   listen only, not the public TCP bind. Edge TLS, multi-tenant metering, and API keys
-  are still out of process (see [`OPERATOR.md`](./OPERATOR.md)).
+  are still out of process (see [`docs/operator/interfaces.md`](./docs/operator/interfaces.md)).
 - **Health listener:** `--health-listen` is opt-in, read-only, and
   unauthenticated (`/healthz`, `/readyz`, `/progress`, and `/metrics` with
   `--metrics`). It binds before the store opens. Requests carry no body and

@@ -150,7 +150,7 @@ Clean smoke:
 | `--regtest-pow-bits BITS` | `regtest_pow_bits=` | unset — regtest only; compact bits in hex (`0x1f7fffff`, `0x` optional). Without retargeting, a block at height >= 1 must carry them in place of `0x207fffff`, except a retarget height, which keeps the parent's bits (including the pow limit), and a block more than 2 × spacing after its parent (block 1 on a real clock), which may still use the pow-limit bits. That sets the difficulty of a chain still at the pow limit: a chain already carrying harder bits keeps them, with or without the flag and whatever its value, so a new value needs a fresh chain. With `--regtest-block-time` or `--regtest-retarget-interval`, heights 1 through the first retarget height must carry them, on a new chain or an existing one, and later heights retarget; none of those exceptions applies. `generatetoaddress` returns an error when the target does not fit one nonce span. Refused on other networks, and for zero, negative or overflowing bits and bits not harder than the limit |
 | `--regtest-block-time SECS` | `regtest_block_time=` | unset — regtest only. Turns on mainnet retargeting toward one block per SECS (600 when only the interval is set). Clears regtest's no-retarget and min-difficulty rules. Heights 1 through the first retarget height carry `--regtest-pow-bits`, or the ceiling bits when unset. A retarget holds the measured timespan between a quarter of SECS × interval, rounded down, and four times it (Core's arithmetic; a timespan that is not a multiple of 4 can rise more than 4x, 7x at 7 seconds), and stays between the floor, the smallest target whose hardest step stays above zero, and the ceiling, the largest target whose product with four timespans fits 256 bits. Refused for 0, on other networks, for SECS × interval under 4 seconds or past `u32::MAX`, and with `--regtest-pow-bits` easier than the ceiling or harder than the floor. Turned on over an existing chain, it applies to new blocks; stored blocks are not checked again. Heights through the first retarget height expect the start bits, whatever bits the chain carries; above it, a block keeps its parent's bits until the next retarget height, which brings them between the floor and the ceiling |
 | `--regtest-retarget-interval N` | `regtest_retarget_interval=` | unset — regtest only. Blocks per retarget period (2016 when only the block time is set); at least 2. Also turns retargeting on |
-| `--min-chain-work HEX` | `min_chain_work=` | Core's `nMinimumChainWork` on mainnet, testnet3, and testnet4; unset on signet and regtest — densify/relay work floor |
+| `--min-chain-work HEX` | `min_chain_work=` | Core's `nMinimumChainWork` on mainnet, testnet3, and testnet4. Unset on signet and regtest. This is the densify and relay work floor. During initial block download, a `headers` message shorter than 2,000 that ends an outbound full-relay or block-relay peer's chain under the floor disconnects that peer (`outbound_insufficient_work_disconnect`). A full 2,000-header page does not. A later shorter fork does not drop a peer whose stored best-known header already meets the floor. Inbound peers, `--connect`, and `--trust-peer` stay. An `inv`, `block`, or `cmpctblock` does not replace that best-known header with less work or with unknown work. The work measured for the header is kept after it leaves the pending map (`best_known_moves_forward`) |
 | `--check-blocks N` | `check_blocks=` | 6; `0` / negative = whole chain |
 | `--ua-comment STR` | `ua_comment=` | empty — BIP14 subversion |
 | `--max-run-secs N` | `max_run_secs=` | unset — process exit after N seconds |
@@ -170,7 +170,12 @@ mempool_size_mb=100
 (system `tor`, not Arti). DNS seeds are not resolved locally on that path —
 pass `--connect ADDR` (or reuse a `peers` file). A `--connect` or `addnode`
 hostname goes to the proxy by name (SOCKS5 address type 3), so the proxy, not
-the OS resolver, looks it up. `--proxy-randomize` (default
+the OS resolver, looks it up. That name is the session key (`NetAddr::Name`).
+`disconnectnode` takes the `addr` string `getpeerinfo` lists for the peer.
+The process holds 1,024 distinct proxied names (`NameId::intern`). A further
+name is refused: `too many distinct proxied host names this run; restart the node to dial a new one`.
+A lookup of a name that was never dialed does not take a slot (`NameId::get`).
+`--proxy-randomize` (default
 on) uses a fresh SOCKS username per peer so Tor isolates circuits.
 `--proxy` or `--onion` also turns on **isolated local-tx broadcast**, unless `--trust-peer` is set (that session is the only announcement path):
 `sendrawtransaction`, Electrum `transaction.broadcast`, and Esplora
@@ -251,7 +256,8 @@ Cookie path differs by distro; pass `--tor-control-cookie` rather than globbing.
 
 `--i2p-sam [HOST:PORT]` talks to **system i2pd** SAM v3 (not SOCKS, not Arti).
 Omit ADDR for `127.0.0.1:7656`. Failed HELLO / `SESSION CREATE` is a start
-error. Unset: I2P rows may still load from `peers` v2 but are not dialed.
+error. `session_create_line` does not set tunnel length. The router default
+applies. A stock i2pd uses three hops. Unset: I2P rows may still load from `peers` v2 but are not dialed.
 `--only-net i2p` without `--i2p-sam` is a start error. `--i2p-accept-incoming`
 creates a persistent local destination (`{datadir}/i2p/p2p.priv`, 0600) and
 `STREAM FORWARD`s to the P2P bind. `--electrum-i2p` and `--esplora-i2p` give
@@ -275,9 +281,7 @@ cjdns daemon in-process and no TUN in CI. NixOS: `cjdns.reachable`;
 
 `--datadir` holds the node root (`store/`, `mempool/`, `peers`, `rpc.token`, `rpc.sock`). After a listener binds, `{datadir}/run/{health,electrum,esplora,rpc}.addr` is that socket (the kernel port when the configured port is 0).
 Omit `--datadir-cold` and the append-only files live there too. Set it to put
-those files on another volume. The confirm pin path does not read them. At the
-2026-08-13 census that is `seqsigwit.body` + `seqsigwit.loc` (~486 GiB + loc),
-`txstat.*` (~11 GiB), and `input.*` (~29 GiB). Optional `blockfilter.*` and
+those files on another volume. The confirm pin path does not read them. The files are `seqsigwit.body`, `seqsigwit.loc`, `txstat.*`, and `input.*`. Sizes are the dated census in [`SCHEMA.md`](../../SCHEMA.md). Optional `blockfilter.*` and
 `sp_tweaks.*` are created on that same volume when the indexes are enabled.
 Reconstruct / `getrawtransaction` / block serve read `seqsigwit` and `input`.
 Fee history and `getblockstats` read `txstat`. Filter and tweak serve read
@@ -365,6 +369,7 @@ Core functional tests still grep `UpdateTip: …` via the debug.log map
 | `p2p: received tx` | TRACE | One inbound tx |
 | `p2p: headers sync` | INFO | Headers path that meets min-work (or a noban peer) |
 | `p2p: ignore low-work headers` | INFO | Headers announcement below `--min-chain-work` |
+| `outbound peer headers chain has insufficient work` | INFO | Outbound full-relay or block-relay peer dropped during initial block download. The `headers` message ended that peer's chain under `--min-chain-work` |
 | `p2p: header … missing pow proof` | INFO | Unrequested header without anti-DoS POW |
 | `p2p: accept dropped … (prev not found)` | INFO | Unrequested block whose parent is unknown |
 | `p2p: initial getheaders` | INFO | First getheaders after connect |
@@ -428,8 +433,9 @@ block requests`. Either way it stays connected and still serves headers.
 WARN
 `ibd: peer[…] relative-slow` is a quarter-median outlier (cluster gate keeps a
 uniformly slow pack). Every IBD disconnect (stall, relative-slow, a second
-missed header ask, off-path headers, an undecodable or mutated block) hands
-that peer's block getdata back to densify when it drops the peer. Slow or constrained uplinks: [Slow / constrained uplink
+missed header ask, off-path headers, an undecodable or mutated block, or an
+outbound headers chain under `--min-chain-work`) hands
+that peer's block getdata back to densify when it drops the peer (`apply_peer_dead`). Slow or constrained uplinks: [Slow / constrained uplink
 (IBD)](#slow--constrained-uplink-ibd).
 
 **Create pins:** pipeline-local only (`batch_pin` / `BatchParents`). No process pin FIFO. Header plans via ConfirmParentCache. Just-confirmed **identity + full create outs** stay on in-flight until a later lookup wave snapshots drain+fence past the pack height and load finishes that wave's last in-flight read. Class A commit drops the decoded block and leaves the outputs. Not a coins cache.
