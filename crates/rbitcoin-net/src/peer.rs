@@ -5504,6 +5504,9 @@ pub async fn on_headers(
 ) -> Result<(), NetError> {
     let _ = session.is_some_and(|s| s.take_awaiting_headers());
     let noban = session.is_some_and(|s| s.session_noban());
+    let announced_unknown = headers
+        .iter()
+        .any(|hdr| !hub.already_have(hdr.block_hash()));
     let pending = follow.pending_headers.clone();
     let requested = follow.requested_blocks.clone();
     let have_bodies: HashSet<BlockHash> = follow.pending_blocks.keys().copied().collect();
@@ -5512,7 +5515,14 @@ pub async fn on_headers(
         classify_headers(hub, &headers, &pending, &requested, &have_bodies, noban)
     })
     .await?;
-    apply_headers(apply, hub, out_tx, follow, session)
+    let accepted = !apply.misbehave;
+    apply_headers(apply, hub, out_tx, follow, session)?;
+    if accepted && announced_unknown {
+        if let Some(s) = session {
+            s.note_last_block_announcement();
+        }
+    }
+    Ok(())
 }
 
 pub async fn on_block(
@@ -5726,6 +5736,11 @@ pub async fn on_cmpctblock(
     let hash = hsi.header.block_hash();
     if on_cmpctblock_reject_early(hub, follow, session, &hsi, hash)? {
         return Ok(());
+    }
+    if !hub.already_have(hash) {
+        if let Some(s) = session {
+            s.note_last_block_announcement();
+        }
     }
     if hsi.header.prev_blockhash.to_byte_array() != [0u8; 32]
         && !hub.knows_header(&hsi.header.prev_blockhash)

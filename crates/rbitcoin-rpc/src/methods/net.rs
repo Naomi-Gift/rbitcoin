@@ -118,6 +118,7 @@ pub fn peerinfo_json(chain: Option<&rbitcoin_net::ChainHub>, p: rbitcoin_net::Pe
         "bip152_hb_to": p.bip152_hb_to,
         "bip152_hb_from": p.bip152_hb_from,
         "last_block": p.last_block,
+        "last_block_announcement": p.last_block_announcement,
         "last_transaction": p.last_transaction,
         "minfeefilter": sat_btc_json(p.minfeefilter_sat_kvb as i64),
         "bytesrecv": p.bytesrecv,
