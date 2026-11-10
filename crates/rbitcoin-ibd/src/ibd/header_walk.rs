@@ -187,6 +187,9 @@ pub struct HeaderWalk {
     /// Class A wire accepted above the matched height, keyed by block height.
     /// A later match drops heights at or below the new line.
     pub lead_class_a: BTreeMap<u32, u64>,
+    /// This process loaded an unproved `header.adopt`. The first headers ask
+    /// drops it when stored headers already continue past that tip. Not written.
+    restored_unproved: bool,
 }
 
 /// One in-flight header ask on one lane. Not written to `header.adopt`.
@@ -2564,7 +2567,9 @@ pub fn note_stored_candidate(
     if headers[0].prev_blockhash != tip || st.header_walk.dead_ends.contains(&tip) {
         return;
     }
-    let _ = extend_tip(st, hub, headers, Some(peer));
+    // The short-batch gate already ran on the reply. The store may have kept
+    // only a prefix, and that prefix is still the walk.
+    let _ = extend_connected(st, hub, headers, Some(peer));
 }
 
 /// A batch shorter than a full window whose work, after the batch, is still
@@ -2625,6 +2630,20 @@ pub fn extend_tip(
     if short_below_floor(st, hub, headers) {
         return false;
     }
+    extend_connected(st, hub, headers, peer)
+}
+
+/// Record `headers` on the candidate. The caller already decided this batch
+/// is allowed to extend, including a stored prefix of a full reply.
+fn extend_connected(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    headers: &[Header],
+    peer: Option<usize>,
+) -> bool {
+    if headers.is_empty() || !pow_linked(headers) {
+        return false;
+    }
     if over_length(st, headers.len()) {
         st.header_walk.length_exceeded = true;
         return false;
@@ -2651,6 +2670,7 @@ pub fn extend_tip(
         stamp_supplier(&mut st.header_walk.checkpoints, supplier);
     }
     st.header_walk.emptied.clear();
+    st.header_walk.restored_unproved = false;
     publish_work(st, hub);
     save_adopt(st, hub);
     true
@@ -3009,6 +3029,19 @@ pub fn send_getheaders(
 ) -> Result<bool, rbitcoin_net::error::NetError> {
     ensure_origin(st, hub);
     super::path::append_stored_headers(st, hub);
+    // An older binary saved this tip and then stored more headers without
+    // rewriting the file. The next height is already indexed, so the ask
+    // would never go out. Start again from the stored path.
+    if st.header_walk.restored_unproved {
+        let behind = !st.header_walk.proven && super::path::walk_successor_indexed(st, hub);
+        st.header_walk.restored_unproved = false;
+        if behind {
+            forget_adopt(hub);
+            st.header_walk = HeaderWalk::default();
+            ensure_origin(st, hub);
+            super::path::append_stored_headers(st, hub);
+        }
+    }
     let owed = probe_or_challenge_owed(st);
     if !owed && super::path::walk_successor_indexed(st, hub) {
         release_lane(&mut st.header_walk.walk);
@@ -3971,6 +4004,7 @@ pub fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
     }
     publish_work(st, hub);
     rebase_unproved_base(st, hub);
+    st.header_walk.restored_unproved = !st.header_walk.proven;
     if arm_walk_bounds(st, hub) {
         st.header_walk.clock_refused = false;
     } else if !st.header_walk.clock_logged {
@@ -4110,6 +4144,7 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         length_exceeded: false,
         witness_height: None,
         lead_class_a: BTreeMap::new(),
+        restored_unproved: false,
     })
 }
 

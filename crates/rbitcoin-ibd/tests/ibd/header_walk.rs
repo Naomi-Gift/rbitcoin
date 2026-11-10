@@ -6394,6 +6394,37 @@ fn headers_after(parent: Header, n: u32, salt: u32) -> Vec<Header> {
     out
 }
 
+/// A full window whose second header proves an easier target than the
+/// chain expects. The proof is valid. The difficulty is not. Later headers
+/// follow the new hash so the batch still links.
+fn full_reply_with_easy_second(parent: Header, salt: u32) -> Vec<Header> {
+    let n = rbitcoin_net::codec::MAX_HEADERS_RESULTS as u32;
+    let mut batch = headers_after(parent, n, salt);
+    let mut easy = batch[1];
+    easy.bits = CompactTarget::from_consensus(0x210fffff);
+    easy.nonce = 0;
+    rbitcoin_consensus::grind_regtest_pow(&mut easy);
+    batch[1] = easy;
+    let mut prev = easy;
+    for (i, slot) in batch.iter_mut().enumerate().skip(2) {
+        let mut hdr = Header {
+            version: bitcoin::block::Version::from_consensus(4),
+            prev_blockhash: prev.block_hash(),
+            merkle_root: TxMerkleNode::from_byte_array([(salt + i as u32) as u8; 32]),
+            time: parent
+                .time
+                .saturating_add(i as u32 + 1)
+                .saturating_add(salt),
+            bits: CompactTarget::from_consensus(0x207fffff),
+            nonce: salt + i as u32,
+        };
+        rbitcoin_consensus::grind_regtest_pow(&mut hdr);
+        prev = hdr;
+        *slot = hdr;
+    }
+    batch
+}
+
 struct ResetClock;
 impl Drop for ResetClock {
     fn drop(&mut self) {
@@ -6558,6 +6589,43 @@ fn a_short_batch_above_the_floor_still_retires_the_peer() {
     apply(&mut st, &hub, 0, vec![stray]);
     assert!(st.header_walk.walk_quiet.contains(&0));
     assert_ne!(st.header_walk.reserved, Some(0));
+}
+
+/// A full reply below the floor stores the headers that pass context. The
+/// walk follows that prefix. A later header with the wrong difficulty does
+/// not leave the walk behind the header that was stored.
+#[test]
+fn a_full_reply_prefix_does_not_leave_an_unproved_stall() {
+    let (_dir, hub, mut st, gen) = opened("unproven-stored-prefix", true);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let first = headers_after(gen, rbitcoin_net::codec::MAX_HEADERS_RESULTS as u32, 11);
+    let parent = *first.last().unwrap();
+    apply(&mut st, &hub, 0, first);
+    assert_eq!(st.header_walk.tip_height(), 2_000);
+    assert!(st.slots[0].alive);
+    let before = hub.query.store().header_count();
+    let second = full_reply_with_easy_second(parent, 12);
+    let kept = second[0].block_hash();
+    apply(&mut st, &hub, 0, second);
+    assert!(
+        st.slots[0].alive,
+        "wrong difficulty on a later header does not drop the peer"
+    );
+    assert_eq!(
+        hub.query.store().header_count(),
+        before + 1,
+        "the store keeps the one header that passed context"
+    );
+    assert_eq!(
+        st.header_walk.tip_hash(),
+        Some(kept),
+        "the stored prefix moves the walk"
+    );
+    assert_eq!(st.header_walk.tip_height(), 2_001);
+    assert!(
+        send_getheaders(&mut st, &hub).unwrap(),
+        "the next header is not already stored, so the walk can ask"
+    );
 }
 
 #[test]
@@ -7377,6 +7445,49 @@ fn an_old_adopt_at_or_behind_the_confirmed_tip_is_not_installed() {
     ensure_origin(&mut restarted, &hub);
     assert_eq!(restarted.header_walk.tip_height(), confirmed);
     assert_eq!(restarted.header_walk.base_height, confirmed);
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// An old unproved file whose tip is already behind headers on disk must not
+/// stay the walk. The next ask would see that successor and never go out.
+#[test]
+fn an_old_adopt_behind_the_store_does_not_leave_an_unproved_stall() {
+    let (dir, hub, mut st, gen) = opened("unproven-legacy-behind-store", true);
+    let stored = headers_after(gen, rbitcoin_net::codec::MAX_HEADERS_RESULTS as u32, 15);
+    hub.ensure_headers_batch(&stored).unwrap();
+    let stored_tip = stored.len() as u32;
+    st.header_walk.base_height = 0;
+    st.header_walk.base_hash = Some(gen.block_hash());
+    st.header_walk.tip.height = 2;
+    st.header_walk.tip.hash = Some(gen.block_hash());
+    st.header_walk.checkpoints.push(Checkpoint {
+        hash: gen.block_hash(),
+        height: 2,
+        height_wide: 2,
+        work: st.header_walk.tip_work(),
+        header: Some(gen),
+        times: vec![gen.time],
+        diff: DiffSnap::default(),
+        supplied_by: None,
+    });
+    st.header_walk.proven = true;
+    save_adopt(&st, &hub);
+    let (s0, rx0) = slot(0);
+    std::mem::forget(rx0);
+    let mut restarted = IbdWorkState::new(vec![s0], hub.tip_hash(), Some(0));
+    assert!(restore_adopt(&mut restarted, &hub));
+    rbitcoin_ibd::ibd::path::seed_work_path_from_store(&mut restarted, &hub);
+    let asked = send_getheaders(&mut restarted, &hub).unwrap();
+    assert_eq!(
+        restarted.header_walk.tip_height(),
+        stored_tip,
+        "headers already stored past the saved tip are the walk"
+    );
+    assert!(
+        asked,
+        "the walk asks past the stored headers instead of stopping"
+    );
+    assert!(!restarted.header_walk.proven);
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
