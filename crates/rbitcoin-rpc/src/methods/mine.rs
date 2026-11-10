@@ -202,7 +202,6 @@ pub fn generate_with_mempool(
     // only. Any other listing is removed when the block that contains it is
     // accepted, including while relay is off, and before a later block of this
     // call is mined. A refusal before that block leaves the pool as it was.
-    // The pool read for a maintained listing happens under `generate_lock`.
     let chain = ctx
         .chain
         .as_ref()
@@ -227,8 +226,6 @@ pub async fn generate_with_mempool_async(
     if nblocks == 0 {
         return Ok(hashes_json(&[]));
     }
-    // Same catch-up rule as the sync path. Selection of a maintained pool
-    // waits on `generate_lock` so two calls cannot copy one transaction.
     let mined = if matches!(ctx.pool_listing(), PoolListing::Downloading) {
         chain
             .generate_to_script_for_rpc_async(nblocks, script, Vec::new(), true)
