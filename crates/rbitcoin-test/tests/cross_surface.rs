@@ -2582,7 +2582,10 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         one >= 1_000,
         "esplora target 1 below the paid decade: {estimates}"
     );
-    let expect = |target: u32| if target == 1 { one } else { floor };
+    // Electrum target 0 is the 1-block horizon, like 1.
+    let expect = |target: u32| if target <= 1 { one } else { floor };
+    // The max-weight admits fill flow, so smart target 1 stays the warm
+    // 1-block quote (`smart_fee_target_one_is_two_until_flow_is_warm`).
     for target in [1u32, 2, 6, 144, 504, 1008] {
         let sat_vb = estimates[target.to_string()]
             .as_f64()
@@ -2594,7 +2597,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         );
     }
     let mut warm_el = TcpStream::connect(electrum_addr).await.unwrap();
-    for (id, target) in [(50u64, 1u32), (51, 2), (52, 6), (53, 144)] {
+    for (id, target) in [(50u64, 1u32), (51, 2), (52, 6), (53, 144), (54, 0)] {
         let est = electrum_rpc(&mut warm_el, id, "blockchain.estimatefee", json!([target])).await;
         let btc = est["result"]
             .as_f64()
