@@ -84,7 +84,6 @@ struct PendingInstall {
 
 struct CommitSnapshot {
     pages: Vec<(u64, OpenPage)>,
-    carried: Vec<(u64, CommittedPage)>,
     froze: bool,
 }
 
@@ -382,7 +381,8 @@ impl SpendPageLog {
     /// snapshot is copied stay in `open` for the next generation.
     ///
     /// A second generation appends. It does not replace bytes an older commit
-    /// still names, unless this generation recomposes that page.
+    /// still names, unless this generation recomposes that page. A page whose
+    /// new notes are all rejected still names that older image.
     #[doc(hidden)]
     pub fn prepare_commit<F, K>(
         &self,
@@ -417,7 +417,11 @@ impl SpendPageLog {
         }
         let pages = compose_kept_pages(&mut read_page, published, &kept)?;
         self.scrub_open_notes(&mut keep)?;
-        self.store_pending(height, pages, rejected, kept, &snap.carried)
+        let carried = {
+            let g = self.lock();
+            carried_pages(&g.committed, &kept)
+        };
+        self.store_pending(height, pages, rejected, kept, &carried)
     }
 
     /// Publish the composed generation into the directory.
@@ -590,10 +594,8 @@ impl SpendPageLog {
             })
             .collect();
         fold_open_into_snapshot(&mut pages, &g.open, &g.committed);
-        let carried = carried_pages(&g.committed, &pages);
         Some(CommitSnapshot {
             pages,
-            carried,
             froze: !reuse,
         })
     }
@@ -968,13 +970,18 @@ fn overlay_slots(dst: &mut PageSlots, src: &[(u16, [u8; SLOT])]) {
     }
 }
 
+/// Name a committed page this generation does not recompose.
+///
+/// `keep` can reject every new note on a page. The sealed slots stay in the
+/// previous image. Leaving that page out of the new commit drops them before
+/// fold copies the body.
 fn carried_pages(
     committed: &HashMap<u64, CommittedPage>,
-    pages: &[(u64, OpenPage)],
+    kept: &[(u64, OpenPage)],
 ) -> Vec<(u64, CommittedPage)> {
     let mut out = Vec::new();
     for (off, page) in committed {
-        if pages.iter().any(|(got, _)| got == off) {
+        if kept.iter().any(|(got, _)| got == off) {
             continue;
         }
         out.push((

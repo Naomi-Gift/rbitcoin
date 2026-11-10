@@ -9,7 +9,8 @@ Fixed
   quiet. A retry of a failed compose writes the frozen pages and every note
   taken after that freeze into the replacement commit, including a newer slot
   on a page the previous commit sealed and a page a disconnect put back in
-  the open directory. Folding the first page does not rewrite the file header, and it does
+  the open directory. A page whose new notes are no longer best-chain still
+  names that sealed image. Folding the first page does not rewrite the file header, and it does
   not publish a shorter `spent.body` end while confirm is still appending. The
   body copy does not hold the utxo view. A missing or short `spend.pages` file beside a
   commit that names bytes refuses to open. The next confirm insert waits at

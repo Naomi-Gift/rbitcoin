@@ -408,6 +408,27 @@ fn retry_after_hold_keeps_the_exploded_page() {
 }
 
 #[test]
+fn rejected_reopen_keeps_the_sealed_page() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let sealed = [5u8, 1, 2, 3, 4, 5, 6, 7];
+    let undone = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    let other = [6u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, sealed)]).unwrap();
+    log.commit_open(4, 16384, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(24, undone), (4096, other)]).unwrap();
+    log.commit_open(5, 16384, zeros, |slot| Ok(slot[0] != 4))
+        .unwrap();
+    assert_eq!(log.slot(16), Some(sealed));
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(sealed));
+    assert_eq!(loaded.slot(24), Some([0u8; 8]));
+    assert_eq!(loaded.slot(4096), Some(other));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn retry_merges_a_later_note_on_the_frozen_page() {
     let d = dir();
     let log = SpendPageLog::create(&d);
