@@ -722,6 +722,8 @@ static STAGE_PARKED: AtomicBool = AtomicBool::new(false);
 #[test]
 fn second_stage_keeps_the_first_publisher_wake() {
     let phase = Arc::new(AtomicUsize::new(0));
+    let a_id = Arc::new(Mutex::new(None));
+    let b_id = Arc::new(Mutex::new(None));
     let a_registered = Arc::new(AtomicBool::new(false));
     let b_registered = Arc::new(AtomicBool::new(false));
     let release_b = Arc::new(AtomicBool::new(false));
@@ -729,6 +731,7 @@ fn second_stage_keeps_the_first_publisher_wake() {
     let wakes = Arc::new(AtomicUsize::new(0));
 
     let phase_a = Arc::clone(&phase);
+    let a_id_slot = Arc::clone(&a_id);
     let a_flag = Arc::clone(&a_registered);
     let b_flag_for_a = Arc::clone(&b_registered);
     let wakes_a = Arc::clone(&wakes);
@@ -740,6 +743,7 @@ fn second_stage_keeps_the_first_publisher_wake() {
             }
         }
         set_script_publisher(Some(thread::current()));
+        *a_id_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(thread::current().id());
         let _clear = Clear;
         a_flag.store(true, Ordering::Release);
         note_script_progress();
@@ -781,6 +785,7 @@ fn second_stage_keeps_the_first_publisher_wake() {
     });
 
     let b_flag = Arc::clone(&b_registered);
+    let b_id_slot = Arc::clone(&b_id);
     let start_b = Arc::clone(&a_registered);
     let release = Arc::clone(&release_b);
     let cleared = Arc::clone(&b_cleared);
@@ -795,6 +800,7 @@ fn second_stage_keeps_the_first_publisher_wake() {
             start_b.load(Ordering::Acquire)
         });
         set_script_publisher(Some(thread::current()));
+        *b_id_slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(thread::current().id());
         let _clear = Clear;
         b_flag.store(true, Ordering::Release);
         note_script_progress();
@@ -826,9 +832,72 @@ fn second_stage_keeps_the_first_publisher_wake() {
     wait_until("second stage did not clear", || {
         b_cleared.load(Ordering::Acquire)
     });
+    let publishers: Vec<_> = PUBLISHERS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .map(|t| t.id())
+        .collect();
+    assert!(
+        publishers.contains(&a_id.lock().unwrap().expect("stage a id")),
+        "clearing the second stage dropped the first"
+    );
+    assert!(
+        !publishers.contains(&b_id.lock().unwrap().expect("stage b id")),
+        "clearing the second stage kept it"
+    );
     drive(2);
     a.join().expect("stage a");
     b.join().expect("stage b");
+}
+
+#[test]
+fn fg_has_unclaimed_while_a_chunk_remains() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let n = worker_spawn_count();
+    let occupy = OccupyGate::occupy_n(n.saturating_sub(1));
+    let arm = DelayClaimArm::arm();
+    let wave = thread::spawn(|| {
+        start_for_each_owned_chunk((0..64u32).collect(), ok_u32, 1)
+            .unwrap()
+            .expect("wave")
+            .finish()
+    });
+    wait_until("claimer did not enter the claim delay", || {
+        DELAY_CLAIM_ENTERED.load(Ordering::SeqCst) != 0
+    });
+    assert!(fg_has_unclaimed());
+    arm.go();
+    wave.join().expect("join").expect("wave ok");
+    occupy.release();
+}
+
+#[test]
+fn warn_fault_without_keep_fails_the_wave() {
+    fn warn(_: &u32) -> Result<(), ConsensusError> {
+        Err(ConsensusError::BadTx("not final"))
+    }
+    let err = start_for_each_owned((0..2u32).collect(), warn)
+        .unwrap()
+        .expect("wave")
+        .finish();
+    assert!(
+        err.is_err(),
+        "a warn fault is a failure when keep_faults is off"
+    );
+}
+
+#[test]
+fn park_delay_waits_until_go() {
+    let arm = DelayParkArm::arm();
+    let entered = thread::spawn(maybe_delay_park);
+    wait_until("park delay was not entered", || {
+        DELAY_PARK_ENTERED.load(Ordering::SeqCst) != 0
+    });
+    thread::sleep(Duration::from_millis(50));
+    assert!(!entered.is_finished(), "park delay returned before go");
+    arm.go();
+    entered.join().expect("park delay");
 }
 
 static CPU_ORDER: Mutex<Vec<u8>> = Mutex::new(Vec::new());

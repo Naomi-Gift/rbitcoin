@@ -261,6 +261,50 @@ fn regtest_pow_bits_overlay_is_regtest_only_and_bounded() {
     for bad in ["", "0x", "zz", "0x123456789", "-1"] {
         assert!(ChainParams::parse_regtest_pow_bits(bad).is_err(), "{bad}");
     }
+    assert_eq!(ChainParams::parse_regtest_pow_bits("0x1"), Ok(1));
+}
+
+/// SetCompact's overflow and sign checks are not the same reject as "easier
+/// than the pow limit". The boundary values sit on one side of each compare.
+#[test]
+fn regtest_pow_bits_names_overflow_separately_from_the_pow_limit() {
+    let err = |bits: u32| {
+        let mut p = ChainParams::regtest();
+        p.apply_regtest_pow_bits(bits).unwrap_err().to_string()
+    };
+    let not_harder = "regtest_pow_bits is not harder than the regtest pow limit";
+    let overflows = "regtest_pow_bits is negative or overflows";
+    let ok = |bits: u32| {
+        let mut p = ChainParams::regtest();
+        p.apply_regtest_pow_bits(bits)
+            .expect("harder than the pow limit");
+    };
+    // Exponent 34, mantissa 1: 2^248, under the regtest limit. `exp > 34`
+    // becoming `>=` calls this an overflow.
+    ok(0x2200_0001);
+    // Exponent 33, mantissa 256: still under the limit. `exp > 33` becoming
+    // `==` or `>=` calls this an overflow.
+    ok(0x2100_0100);
+    // Exponent 33, mantissa 0xffff is above the regtest limit and is not an
+    // overflow. `mantissa > u16::MAX` becoming `>=` calls it an overflow.
+    assert_eq!(err(0x2100_ffff), not_harder);
+    assert_eq!(err(0x2300_0001), overflows);
+    assert_eq!(err(0x2200_00ff), not_harder);
+    assert_eq!(err(0x2101_0000), overflows);
+    assert_eq!(err(0x2200_0100), overflows);
+    assert_eq!(err(0x2080_0000), "regtest_pow_bits target is zero");
+}
+
+#[test]
+fn regtest_retarget_ceiling_is_all_ones_over_four_timespans() {
+    let mut params = ChainParams::regtest();
+    params.apply_regtest_retarget(1, 4).unwrap();
+    let mut ceiling = [0xffu8; 32];
+    ceiling[0] = 0x0f;
+    assert_eq!(
+        params.regtest_retarget.unwrap().ceiling.to_be_bytes(),
+        ceiling
+    );
 }
 
 /// Core `CTestNet4Params`: genesis, buried heights at 1, BIP30 on at every

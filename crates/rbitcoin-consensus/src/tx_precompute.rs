@@ -498,7 +498,7 @@ pub fn flag_zero_tx(tx: &Transaction, wire: &[u8]) -> bool {
 
 #[doc(hidden)]
 pub fn witness_wire<'a>(tx: &Transaction, wire: &'a [u8]) -> Option<WitnessWire<'a>> {
-    if !uses_segwit_serialization(tx) || flag_zero_wire(wire) {
+    if !uses_segwit_serialization(tx) {
         return None;
     }
     if wire.get(4..6) != Some(&[0, 1]) {
@@ -596,9 +596,6 @@ pub fn hash_wire_sighash(
     for input in &tx.input {
         let n = input.base_size();
         let body = spans.vin.get(at..at.checked_add(n)?)?;
-        if body.len() < OUTPOINT_LEN + SEQUENCE_LEN {
-            return None;
-        }
         txid_eng.input(body);
         sha_prev.input(&body[..OUTPOINT_LEN]);
         sha_seq.input(&body[body.len() - SEQUENCE_LEN..]);

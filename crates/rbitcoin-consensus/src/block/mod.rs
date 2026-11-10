@@ -1478,7 +1478,7 @@ pub mod facts;
 pub use facts::{
     add_fee, add_sigops, add_value_in, fee_from_values, fee_sat, fee_with_waived_coinbase,
     header_gap_on_chain, median_or_bad_header, reject_assemble_block_shape, reject_batch_starts_at,
-    reject_bits, reject_carried_header_hash, reject_confirm_batch, reject_csv_create_height,
+    reject_carried_header_hash, reject_confirm_batch, reject_csv_create_height,
     reject_duplicate_input, reject_empty_confirm_batch, reject_genesis_coinbase_spend,
     reject_non_final, reject_prev_link, reject_prevout_spent, reject_same_block_create,
     reject_sequence_locks, reject_spend_cursor, reject_tx_without_inputs,

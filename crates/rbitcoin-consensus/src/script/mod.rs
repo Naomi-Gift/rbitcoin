@@ -755,7 +755,7 @@ pub mod crypto {
         if output_type == SIGHASH_ALL {
             eng.input(&pre.sha_outputs);
         }
-        eng.input(&[(ext_flag << 1) | u8::from(annex_hash.is_some())]);
+        eng.input(&[(ext_flag << 1) + u8::from(annex_hash.is_some())]);
         if anyone_can_pay {
             txin.previous_output
                 .consensus_encode(&mut eng)

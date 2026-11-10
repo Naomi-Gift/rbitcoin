@@ -471,7 +471,7 @@ impl ChainParams {
         let ceiling = retarget_ceiling(timespan);
         let floor = retarget_floor(timespan);
         let start_bits = match self.regtest_pow_bits_overlay {
-            Some(bits) if Target::from_compact(bits) > ceiling => {
+            Some(bits) if Target::from_compact(bits) >= ceiling => {
                 return Err("regtest_pow_bits is easier than the regtest retarget ceiling");
             }
             Some(bits) if Target::from_compact(bits) < floor => {
@@ -499,9 +499,6 @@ impl ChainParams {
             .strip_prefix("0x")
             .or_else(|| spec.strip_prefix("0X"))
             .unwrap_or(spec);
-        if hex.is_empty() || hex.len() > 8 {
-            return Err("invalid compact bits (hex, up to 8 digits)");
-        }
         u32::from_str_radix(hex, 16).map_err(|_| "invalid compact bits (hex, up to 8 digits)")
     }
 
@@ -639,7 +636,7 @@ fn retarget_ceiling(timespan: u64) -> Target {
     let mut bytes = [0u8; 32];
     let mut rem = 0u128;
     for byte in &mut bytes {
-        rem = (rem << 8) | u128::from(u8::MAX);
+        rem = (rem << 8) + u128::from(u8::MAX);
         // rem < divisor * 256 here, so the quotient fits a byte.
         *byte = u8::try_from(rem / divisor).unwrap_or(u8::MAX);
         rem %= divisor;
