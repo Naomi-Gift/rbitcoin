@@ -1078,7 +1078,7 @@ fn spawn_dispatch(
         } else {
             None
         };
-        tokio::task::spawn_blocking(move || {
+        let joined = tokio::task::spawn_blocking(move || {
             let _permit = permit;
             let _g = BlockingRegion::enter();
             let t0 = Instant::now();
@@ -1086,8 +1086,8 @@ fn spawn_dispatch(
                 dispatch_off_worker(&q, &cfg, &p, mp.as_deref(), &method, &params, work);
             (r, work, view, t0.elapsed())
         })
-        .await
-        .unwrap_or_else(|e| panic!("electrum dispatch join: {e}"))
+        .await;
+        rbitcoin_net::finish_join(joined, "electrum dispatch join")
     })
 }
 

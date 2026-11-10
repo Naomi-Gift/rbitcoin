@@ -51,5 +51,9 @@ libc = "0.2"
 name = "suite"
 path = "tests/suite.rs"
 
+[[test]]
+name = "finish_join"
+path = "tests/finish_join.rs"
+
 [lints]
 workspace = true
