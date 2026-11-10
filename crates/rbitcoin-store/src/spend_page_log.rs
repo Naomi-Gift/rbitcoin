@@ -438,7 +438,8 @@ impl SpendPageLog {
             let g = self.lock();
             g.fold_held && !g.committed.is_empty()
         };
-        let Some(snap) = self.snapshot_commit() else {
+        let from_body: HashSet<u64> = clears.iter().map(|clear| clear.page_off).collect();
+        let Some(snap) = self.snapshot_commit(&from_body) else {
             self.scrub_open_notes(&mut keep)?;
             let pages = compose_kept_pages(&mut read_page, published, &[], &clears)?;
             return self.settle_deferred_clear(height, pages, deferred);
@@ -666,8 +667,8 @@ impl SpendPageLog {
     /// commit file and the committed images where they were. When a page
     /// still has a rejected slot, live slots are copied into `open` and the
     /// old image stays until that compose's rename returns. A zero image is
-    /// folded. An image whose slots are all still best-chain is republished
-    /// in this checkpoint, not folded.
+    /// folded. An image whose slots are all still best-chain stays in
+    /// `committed` and is republished from that image, not from the body.
     fn explode_held<K>(&self, keep: &mut K) -> Result<Vec<BodyClear>, StoreError>
     where
         K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
@@ -721,7 +722,7 @@ impl SpendPageLog {
     /// The freeze is a swap. Confirm notes the next generation into `open`
     /// while this one is composed. A leftover frozen map stays put, and the
     /// edges those later notes added stay counted.
-    fn snapshot_commit(&self) -> Option<CommitSnapshot> {
+    fn snapshot_commit(&self, from_body: &HashSet<u64>) -> Option<CommitSnapshot> {
         let mut g = self.lock();
         g.holding_filter = false;
         let reuse = !g.frozen.is_empty();
@@ -751,7 +752,7 @@ impl SpendPageLog {
                 )
             })
             .collect();
-        fold_open_into_snapshot(&mut pages, &g.open, &g.committed);
+        fold_open_into_snapshot(&mut pages, &g.open, &g.committed, from_body);
         merge_later(&mut g, reset_edges);
         Some(CommitSnapshot {
             pages,
@@ -1126,6 +1127,7 @@ fn fold_open_into_snapshot(
     pages: &mut SnapshotPages,
     open: &HashMap<u64, OpenPage>,
     committed: &HashMap<u64, CommittedPage>,
+    from_body: &HashSet<u64>,
 ) {
     let mut index: HashMap<u64, usize> = HashMap::new();
     for (i, (off, _)) in pages.iter().enumerate() {
@@ -1148,6 +1150,14 @@ fn fold_open_into_snapshot(
     for (off, page) in pages.iter_mut() {
         if !committed.contains_key(off) {
             page.base = None;
+        } else if page.base.is_none() && !from_body.contains(off) {
+            // A note taken while the filter ran has no base. The stored
+            // image, including a zero that fold has not written, is the
+            // page. A page in `from_body` still holds a rejected slot, so
+            // compose has to read the body and zero that slot.
+            if let Some(stored) = committed.get(off) {
+                page.base = Some(Arc::clone(&stored.image));
+            }
         }
     }
 }
@@ -1404,10 +1414,10 @@ fn body_fold_span(page_off: u64, image: &[u8]) -> (u64, &[u8]) {
 ///
 /// A pure-zero image is folded: the file stays, and nothing is rebuilt from
 /// the body. An image that still has a spend, and no rejected slot, moves
-/// those slots into `open` and leaves the directory so this checkpoint
-/// republishes them. Zero sibling pages stay. A rejected slot leaves the old
-/// image in `committed` and clears `base` on that page so compose reads the
-/// body. A frozen note on the same page keeps the live slots.
+/// those slots into `open` but stays in `committed`. Compose copies that
+/// image, so a zero on the page is kept, and this checkpoint does not fold
+/// it. A rejected slot leaves the old image in place and clears `base` so
+/// compose reads the body. A frozen note on the same page keeps the live slots.
 fn apply_held_explode(
     g: &mut Inner,
     held: &[(u64, Arc<[u8]>)],
@@ -1431,7 +1441,6 @@ fn apply_held_explode(
                 park_open_slots(g, page_off, slots);
             }
         }
-        g.committed.retain(|off, _| !spend_offs.contains(off));
         return Vec::new();
     }
     let cleared_offs: HashSet<u64> = cleared.iter().map(|clear| clear.page_off).collect();

@@ -839,6 +839,98 @@ fn rejected_clear_survives_a_lower_checkpoint() {
 }
 
 #[test]
+fn stored_zero_survives_a_note_during_the_hold() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let stale = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    let strong = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let fresh = [8u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, stale)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let planted = [(16, stale)];
+    let read = body_with(&planted);
+    log.commit_open(4, 8192, &read, |_| Ok(false)).unwrap();
+    assert_eq!(log.slot(16), Some([0u8; 8]));
+    log.note_slots(&[(4096, strong)]).unwrap();
+    log.commit_open(4, 8192, &read, |_| Ok(true)).unwrap();
+    assert_eq!(log.slot(4096), Some(strong));
+    log.hold_fold_above(2).unwrap();
+    let mut noted = false;
+    log.commit_open(2, 8192, &read, |meta| {
+        if !noted {
+            noted = true;
+            log.note_slots(&[(24, fresh)]).unwrap();
+        }
+        let _ = meta;
+        Ok(true)
+    })
+    .unwrap();
+    assert!(noted);
+    log.commit_open(2, 8192, &read, |_| Ok(true)).unwrap();
+    assert_eq!(log.slot(24), Some(fresh));
+    assert_eq!(
+        log.slot(16),
+        Some([0u8; 8]),
+        "a note on a zero page must not bring the rejected spend back"
+    );
+    log.commit_open(2, 8192, &read, |_| Ok(true)).unwrap();
+    let mut wrote_stale = false;
+    log.fold_into(
+        |_off, image| {
+            if image.windows(8).any(|w| w == stale) {
+                wrote_stale = true;
+            }
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(
+        !wrote_stale,
+        "fold must not write the rejected spend the zero image cleared"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn stored_zero_survives_a_strong_slot() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let strong = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let stale = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, strong), (24, stale)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let planted = [(24, stale)];
+    let read = body_with(&planted);
+    log.commit_open(4, 8192, &read, |meta| Ok(meta[0] == 1))
+        .unwrap();
+    assert_eq!(log.slot(16), Some(strong));
+    assert_eq!(log.slot(24), Some([0u8; 8]));
+    log.hold_fold_above(2).unwrap();
+    log.commit_open(2, 8192, &read, |_| Ok(true)).unwrap();
+    assert_eq!(log.slot(16), Some(strong));
+    assert_eq!(
+        log.slot(24),
+        Some([0u8; 8]),
+        "a strong slot must not rebuild the page from the body"
+    );
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, image| {
+            writes += 1;
+            assert!(!image.windows(8).any(|w| w == stale));
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(writes, 0, "this checkpoint must not fold the held page");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn hold_ignores_a_commit_at_or_below_the_tip() {
     let d = dir();
     let log = SpendPageLog::create(&d);
