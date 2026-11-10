@@ -8,10 +8,11 @@ use crate::methods::{RpcContext, RpcRegtest};
 use axum::body::Bytes;
 use axum::extract::{DefaultBodyLimit, FromRequest, Request, State};
 use axum::http::{header, HeaderMap, StatusCode};
-use axum::middleware::{from_fn_with_state, Next};
+use axum::middleware::{from_fn, from_fn_with_state, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
+use hyper::body::{Body as HttpBody, Frame, SizeHint};
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
@@ -20,6 +21,11 @@ use hyper_util::service::TowerToHyperService;
 pub const RPC_MAX_HTTP_BODY: usize = 32 * 1024 * 1024;
 /// Unauthenticated REST body cap. REST does not use [`RPC_MAX_HTTP_BODY`].
 pub const REST_MAX_HTTP_BODY: usize = 2 * 1024 * 1024;
+/// Most of a body no handler read, such as a 401's, that is read and dropped
+/// before the answer. A larger one is answered at once and the connection
+/// closes.
+#[doc(hidden)]
+pub const UNREAD_BODY_MAX: usize = 64 * 1024;
 /// Core `-rpcworkqueue`. Omitted or `0` is this finite queue.
 pub const DEFAULT_RPC_WORK_QUEUE: usize = 16;
 /// Accept cap, copied from the Electrum public listener. Not a knob.
@@ -385,6 +391,7 @@ pub fn rpc_app(state: AppState) -> Router {
                 .layer(DefaultBodyLimit::max(REST_MAX_HTTP_BODY)),
         )
         .layer(from_fn_with_state(state.clone(), reject_unauthorized))
+        .layer(from_fn(read_unread_body))
         .with_state(state)
 }
 
@@ -692,6 +699,107 @@ async fn read_http_body(req: Request) -> Result<Bytes, Response> {
         Err(_) => {
             Err((StatusCode::REQUEST_TIMEOUT, [(header::CONNECTION, "close")]).into_response())
         }
+    }
+}
+
+/// Read whatever request body no handler read before the answer goes out.
+/// Closing with request bytes unread makes the kernel send RST, and the client
+/// reads ECONNRESET instead of the 401, 404, or 405. The read keeps no bytes.
+/// It stops at [`UNREAD_BODY_MAX`] and at [`RPC_READ_TIMEOUT`], so a refused
+/// client can make the node read only a small body. A larger body, or one a
+/// handler stopped reading, is answered at once and the connection closes.
+/// A client waiting on `Expect: 100-continue` is left to skip its upload, and
+/// the connection closes.
+async fn read_unread_body(req: Request, next: Next) -> Response {
+    let deadline = tokio::time::Instant::now() + RPC_READ_TIMEOUT;
+    let expects_continue = req
+        .headers()
+        .get(header::EXPECT)
+        .is_some_and(|v| v.as_bytes().eq_ignore_ascii_case(b"100-continue"));
+    let (parts, body) = req.into_parts();
+    let unread = Arc::new(std::sync::Mutex::new(UnreadBody {
+        body: Some(body),
+        polled: false,
+        ended: false,
+    }));
+    let tracked = axum::body::Body::new(TrackedBody(Arc::clone(&unread)));
+    let response = next.run(Request::from_parts(parts, tracked)).await;
+    let left = std::mem::take(&mut *unread.lock().unwrap_or_else(|e| e.into_inner()));
+    let Some(mut body) = left.body else {
+        return response;
+    };
+    if left.ended {
+        return response;
+    }
+    if expects_continue || left.polled || body.size_hint().lower() > UNREAD_BODY_MAX as u64 {
+        return closing(response);
+    }
+    let read_rest = async {
+        let mut read = 0usize;
+        while let Some(Ok(frame)) =
+            std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
+        {
+            read += frame.data_ref().map_or(0, Bytes::len);
+            if read > UNREAD_BODY_MAX {
+                return false;
+            }
+        }
+        true
+    };
+    match tokio::time::timeout_at(deadline, read_rest).await {
+        Ok(true) | Err(_) => response,
+        Ok(false) => closing(response),
+    }
+}
+
+fn closing(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CONNECTION,
+        header::HeaderValue::from_static("close"),
+    );
+    response
+}
+
+/// The request body a handler sees through [`TrackedBody`]: whether it read
+/// any of it or all of it, and the rest for [`read_unread_body`].
+#[derive(Default)]
+struct UnreadBody {
+    body: Option<axum::body::Body>,
+    polled: bool,
+    ended: bool,
+}
+
+struct TrackedBody(Arc<std::sync::Mutex<UnreadBody>>);
+
+impl HttpBody for TrackedBody {
+    type Data = Bytes;
+    type Error = axum::Error;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<Frame<Bytes>, axum::Error>>> {
+        let mut unread = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        unread.polled = true;
+        let Some(body) = unread.body.as_mut() else {
+            return std::task::Poll::Ready(None);
+        };
+        let frame = std::task::ready!(std::pin::Pin::new(body).poll_frame(cx));
+        unread.ended = frame.is_none();
+        std::task::Poll::Ready(frame)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        let unread = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        unread.body.as_ref().is_none_or(HttpBody::is_end_stream)
+    }
+
+    fn size_hint(&self) -> SizeHint {
+        let unread = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        unread
+            .body
+            .as_ref()
+            .map_or_else(|| SizeHint::with_exact(0), HttpBody::size_hint)
     }
 }
 
