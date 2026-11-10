@@ -572,7 +572,7 @@ impl Store {
     pub fn open_or_create_layout(layout: StoreLayout) -> Result<Self, StoreError> {
         let dir = layout.dir.clone();
         if !dir.join("meta").exists() {
-            if creation_has_chain(&dir) {
+            if creation_has_chain(&layout) {
                 return Err(StoreError::Corrupt("store meta missing"));
             }
             if incomplete_creation_files(&layout) {
@@ -586,7 +586,9 @@ impl Store {
         }
         match Self::open_layout(layout.clone()) {
             Ok(store) => Ok(store),
-            Err(err) if !creation_has_chain(&dir) && replaces_incomplete_first_creation(&err) => {
+            Err(err)
+                if !creation_has_chain(&layout) && replaces_incomplete_first_creation(&err) =>
+            {
                 rbitcoin_log::warn!(
                     "store: replacing incomplete first creation at {} ({err})",
                     dir.display()
@@ -2230,44 +2232,56 @@ fn clear_store_children(dir: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn published_rows(
-    path: &Path,
-    kind: rbitcoin_primitives::TableKind,
-    header: u64,
-    stride: u64,
-) -> u64 {
-    if stride == 0 || !path.is_file() {
-        return 0;
+fn file_has_payload(path: &Path, kind: rbitcoin_primitives::TableKind, header: u64) -> bool {
+    if !path.is_file() {
+        return false;
     }
-    let Ok(file) = crate::file::TableFile::open(path, kind) else {
-        return 0;
-    };
-    let len = file.logical_len();
-    if len <= header {
-        return 0;
+    match crate::file::TableFile::open(path, kind) {
+        Ok(file) => file.logical_len() > header,
+        // A torn file this open cannot parse still counts once it is past one
+        // page. Empty-create slack is smaller than that.
+        Err(_) => std::fs::metadata(path)
+            .map(|meta| meta.len() > 4096)
+            .unwrap_or(false),
     }
-    (len - header) / stride
 }
 
-fn creation_has_chain(dir: &Path) -> bool {
-    published_rows(
+fn dir_has_chain_payload(dir: &Path) -> bool {
+    let header = crate::file::FILE_HEADER_LEN as u64;
+    file_has_payload(
         &dir.join("txid.body"),
         rbitcoin_primitives::TableKind::TxidBody,
         crate::txid_body::TXID_BODY_HEADER,
-        crate::txid_body::TXID_ENTRY_LEN,
-    ) > 0
-        || published_rows(
-            &dir.join("header.body"),
-            rbitcoin_primitives::TableKind::Header,
-            crate::file::FILE_HEADER_LEN as u64,
-            crate::header_table::HEADER_RECORD_LEN as u64,
-        ) > 0
-        || published_rows(
-            &dir.join("confirmed.body"),
-            rbitcoin_primitives::TableKind::Confirmed,
-            crate::file::FILE_HEADER_LEN as u64,
-            8,
-        ) > 0
+    ) || file_has_payload(
+        &dir.join("txout.body"),
+        rbitcoin_primitives::TableKind::TxOut,
+        header,
+    ) || file_has_payload(
+        &dir.join("header.body"),
+        rbitcoin_primitives::TableKind::Header,
+        header,
+    ) || file_has_payload(
+        &dir.join("confirmed.body"),
+        rbitcoin_primitives::TableKind::Confirmed,
+        header,
+    ) || file_has_payload(
+        &dir.join("seqsigwit.body"),
+        rbitcoin_primitives::TableKind::SeqSigWit,
+        header,
+    ) || file_has_payload(
+        &dir.join("spent.body"),
+        rbitcoin_primitives::TableKind::Spent,
+        header,
+    ) || file_has_payload(
+        &dir.join("input.body"),
+        rbitcoin_primitives::TableKind::Input,
+        header,
+    )
+}
+
+fn creation_has_chain(layout: &StoreLayout) -> bool {
+    dir_has_chain_payload(&layout.dir)
+        || (layout.is_split() && dir_has_chain_payload(layout.seqsigwit_dir()))
 }
 
 fn incomplete_create_corrupt(msg: &str) -> bool {
@@ -2279,7 +2293,11 @@ fn incomplete_create_corrupt(msg: &str) -> bool {
 
 fn replaces_incomplete_first_creation(err: &StoreError) -> bool {
     match err {
-        StoreError::Io { .. } | StoreError::BadMagic | StoreError::BadKind { .. } => true,
+        StoreError::Io { source, .. } => matches!(
+            source.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
+        ),
+        StoreError::BadMagic | StoreError::BadKind { .. } => true,
         StoreError::Layout(msg) => msg.contains("scripthash body layout mixed or incomplete"),
         StoreError::Corrupt(msg) => incomplete_create_corrupt(msg),
         _ => false,

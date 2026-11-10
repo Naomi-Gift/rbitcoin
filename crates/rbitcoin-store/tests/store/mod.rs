@@ -2396,6 +2396,111 @@ fn kill_first_start_interrupted_creation_reopens_empty_chain() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// A finished empty store whose table is unreadable is not an incomplete
+/// create. Replacing it would delete `store.secret`.
+#[cfg(unix)]
+#[test]
+fn kill_first_start_unreadable_empty_store_is_not_replaced() {
+    use std::os::unix::fs::PermissionsExt;
+    let locked = tmp();
+    {
+        let s = Store::create_tiny(&locked).unwrap();
+        s.flush().unwrap();
+    }
+    let confirmed = locked.join("confirmed.body");
+    let secret = locked.join("store.secret");
+    assert!(secret.is_file());
+    std::fs::set_permissions(&confirmed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    match Store::open_or_create_tiny(&locked) {
+        Err(StoreError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Ok(_) => panic!("permission denied must not replace the datadir"),
+        Err(other) => panic!("permission denied must not replace the datadir: {other}"),
+    }
+    assert!(locked.join("meta").is_file());
+    assert!(secret.is_file());
+    assert!(confirmed.is_file());
+    std::fs::set_permissions(&confirmed, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let _ = std::fs::remove_dir_all(&locked);
+}
+
+/// Hot meta and hot chain bodies are gone. The cold directory already holds
+/// a prior chain, so that cold store stays.
+#[test]
+fn kill_first_start_cold_chain_without_hot_meta_is_kept() {
+    let chained = tmp();
+    let hot_chain = chained.join("hot");
+    let cold_chain = chained.join("cold");
+    let layout = StoreLayout::tiny(&hot_chain).with_cold_dir(&cold_chain);
+    {
+        let s = Store::create_layout(layout.clone()).unwrap();
+        let item = coinbase_item([12u8; 32], vec![OutputRecord::unspent(50, vec![0x53])]);
+        s.put_tx_full_batch_indexed(std::slice::from_ref(&item), false)
+            .unwrap();
+        s.flush().unwrap();
+    }
+    let seq_path = cold_chain.join("seqsigwit.body");
+    let seq_bytes = std::fs::read(&seq_path).unwrap();
+    assert!(
+        seq_bytes.len() > rbitcoin_store::file::FILE_HEADER_LEN,
+        "the cold chain must already hold seqsigwit payload"
+    );
+    std::fs::remove_file(hot_chain.join("meta")).unwrap();
+    for name in [
+        "txid.body",
+        "txout.body",
+        "header.body",
+        "confirmed.body",
+        "spent.body",
+    ] {
+        let path = hot_chain.join(name);
+        if path.exists() {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    match Store::open_or_create_layout(layout) {
+        Err(StoreError::Corrupt("store meta missing")) => {}
+        Ok(_) => panic!("a cold chain with no hot meta must stay closed"),
+        Err(other) => panic!("a cold chain with no hot meta stays closed: {other}"),
+    }
+    assert_eq!(std::fs::read(&seq_path).unwrap(), seq_bytes);
+    assert!(hot_chain.join("store.secret").is_file());
+    let _ = std::fs::remove_dir_all(&chained);
+}
+
+/// `txid.body` fails to open, but `txout.body` already has a create.
+#[test]
+fn kill_first_start_torn_txid_keeps_txout() {
+    let torn_txid = tmp();
+    {
+        let s = Store::create_tiny(&torn_txid).unwrap();
+        let item = coinbase_item([13u8; 32], vec![OutputRecord::unspent(50, vec![0x54])]);
+        s.put_tx_full_batch_indexed(std::slice::from_ref(&item), false)
+            .unwrap();
+        s.flush().unwrap();
+    }
+    let txout_path = torn_txid.join("txout.body");
+    let txout_bytes = std::fs::read(&txout_path).unwrap();
+    let txid_path = torn_txid.join("txid.body");
+    let mut txid_bytes = std::fs::read(&txid_path).unwrap();
+    txid_bytes[..4].copy_from_slice(b"XXXX");
+    std::fs::write(&txid_path, &txid_bytes).unwrap();
+    let opened = Store::open_or_create_tiny(&torn_txid);
+    assert_eq!(
+        std::fs::read(&txout_path).unwrap(),
+        txout_bytes,
+        "a torn txid must not delete the published txout body"
+    );
+    assert_eq!(std::fs::read(&txid_path).unwrap(), txid_bytes);
+    assert!(torn_txid.join("meta").is_file());
+    assert!(torn_txid.join("store.secret").is_file());
+    assert!(
+        opened.is_err(),
+        "a torn txid beside a published txout is not a fresh empty chain"
+    );
+    let _ = std::fs::remove_dir_all(&torn_txid);
+}
+
 #[test]
 fn kill_first_start_leftover_oa_without_flag_opens_and_with_flag_materializes() {
     let dir = tmp();
