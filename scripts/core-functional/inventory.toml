@@ -1033,9 +1033,7 @@ status = "run"
 
 [[test]]
 name = "rpc_packages.py"
-status = "skip"
-reason = "rpc-dialect"
-analog = "follow-up #1486: submitpackage other-wtxid (bitcoin/bitcoin#35893)"
+status = "run"
 
 [[test]]
 name = "rpc_preciousblock.py"

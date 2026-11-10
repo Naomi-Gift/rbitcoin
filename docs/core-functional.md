@@ -83,8 +83,7 @@ coinbase from `/tx/:txid`, genesis coinbase omitted). It does not expand
 descriptors. `rpc_scantxoutset.py` and `rpc_signrawtransactionwithkey.py`
 are inventory skips. The node implements neither `scantxoutset` nor
 `gettxoutsetinfo`. `rpc_packages.py` uses the package-dialect shim (same
-honesty as `WAIT_TIP_IDLE`). It is skip until `submitpackage` reports
-`other-wtxid` (#1486).
+honesty as `WAIT_TIP_IDLE`).
 
 ## When a script is red
 
