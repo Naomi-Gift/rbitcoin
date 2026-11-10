@@ -21,6 +21,10 @@ use tokio::sync::{mpsc, watch, Notify};
 /// the next inbound request from that peer waits until the writer drains.
 pub const PEER_SEND_BUDGET: usize = 4 * 1024 * 1024;
 
+/// Core `HEADERS_RESPONSE_TIME`: after this long without a reply, a new
+/// getheaders may go out to the same peer.
+pub const HEADERS_RESPONSE_TIME_SECS: u64 = 120;
+
 /// Queued-byte estimate. Headers are 81 wire bytes, inv-like rows are 36,
 /// legacy addr rows are 30. Encoded block bodies use their buffer length.
 pub fn outbound_msg_bytes(msg: &NetworkMessage) -> usize {
@@ -409,8 +413,9 @@ pub struct LivePeer {
     pub sync_started: AtomicBool,
     /// Unix seconds when initial headers sync times out (`0` = none).
     pub headers_sync_timeout: AtomicU64,
-    /// Waiting for a headers reply to our getheaders (no BIP130 cap).
-    pub awaiting_headers: AtomicBool,
+    /// Hub-clock seconds our last marked getheaders went out (`0` = none
+    /// in flight). Core `m_last_getheaders_timestamp`.
+    pub getheaders_sent_at: AtomicU64,
     /// Wtxids we INV'd to this peer. GetData for a live mempool tx is
     /// answered only if announced here or the tx is reorg-servable.
     pub announced_wtx: Mutex<CappedSet<Wtxid>>,
@@ -1019,15 +1024,20 @@ impl LivePeer {
     }
 
     pub fn note_awaiting_headers(&self) {
-        self.awaiting_headers.store(true, Ordering::Relaxed);
+        self.getheaders_sent_at
+            .store(self.clock_now().max(1), Ordering::Relaxed);
     }
 
+    /// A getheaders is in flight and younger than [`HEADERS_RESPONSE_TIME_SECS`].
     pub fn is_awaiting_headers(&self) -> bool {
-        self.awaiting_headers.load(Ordering::Relaxed)
+        let sent = self.getheaders_sent_at.load(Ordering::Relaxed);
+        sent != 0 && self.clock_now().saturating_sub(sent) <= HEADERS_RESPONSE_TIME_SECS
     }
 
     pub fn take_awaiting_headers(&self) -> bool {
-        self.awaiting_headers.swap(false, Ordering::Relaxed)
+        let awaiting = self.is_awaiting_headers();
+        self.getheaders_sent_at.store(0, Ordering::Relaxed);
+        awaiting
     }
 
     pub fn note_announced_wtx(&self, wtxid: Wtxid) {
@@ -3237,7 +3247,7 @@ impl PeerHub {
             inv_asked_headers: AtomicBool::new(false),
             sync_started: AtomicBool::new(false),
             headers_sync_timeout: AtomicU64::new(0),
-            awaiting_headers: AtomicBool::new(false),
+            getheaders_sent_at: AtomicU64::new(0),
             announced_wtx: Mutex::new(CappedSet::new()),
             taken_cmpct: Mutex::new(Vec::new()),
             last_inv_sequence: AtomicU64::new(1),

@@ -5148,6 +5148,9 @@ struct HeadersApply {
     peer_below_floor: bool,
     /// The last header was new, accepted, connected, and beats our tip work.
     stamp_block_announcement: bool,
+    /// Empty or connecting: a reply to our getheaders. Core never counts an
+    /// unconnecting message, so its rate limit holds.
+    answers_getheaders: bool,
 }
 
 fn classify_headers(
@@ -5174,6 +5177,7 @@ fn classify_headers(
         headers_len: n,
         peer_below_floor: false,
         stamp_block_announcement: false,
+        answers_getheaders: n == 0,
     };
     let mut ignored_below_floor = false;
     if n == 0 {
@@ -5191,6 +5195,10 @@ fn classify_headers(
         let last = headers[n - 1].block_hash();
         apply.ignore_height = Some(pending_announced_height(&pending, last));
         ignored_below_floor = true;
+        // RAM only: a low-work sync continuation joins genesis or our tip
+        // through pending headers.
+        let (join, _) = pending_walk(pending_before, headers[0].prev_blockhash);
+        apply.answers_getheaders = is_genesis_hash(&join) || hub.tip_hash() == Some(join);
     } else if let Some(first) = headers.first() {
         let prev = first.prev_blockhash;
         if hub.is_block_invalid(&prev)
@@ -5205,6 +5213,7 @@ fn classify_headers(
             return apply;
         }
         let connecting = header_announcement_connects(hub, pending_before, prev);
+        apply.answers_getheaders = connecting;
         for hdr in headers.iter().take(n) {
             let hash = hdr.block_hash();
             apply.from_peer.push(hash);
@@ -5386,6 +5395,9 @@ fn apply_headers(
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
+    if apply.answers_getheaders {
+        let _ = session.is_some_and(|s| s.take_awaiting_headers());
+    }
     if apply.misbehave {
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
@@ -5513,7 +5525,6 @@ pub async fn on_headers(
     session: Option<&crate::peers::LivePeer>,
     headers: &[bitcoin::block::Header],
 ) -> Result<(), NetError> {
-    let _ = session.is_some_and(|s| s.take_awaiting_headers());
     let noban = session.is_some_and(|s| s.session_noban());
     let pending = follow.pending_headers.clone();
     let requested = follow.requested_blocks.clone();
