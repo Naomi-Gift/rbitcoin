@@ -739,3 +739,207 @@ fn addrv2_flood_is_rate_limited_before_addrman() {
         );
     }
 }
+
+fn regtest_child(parent: &bitcoin::block::Header, tag: u8) -> bitcoin::block::Header {
+    let mut header = *parent;
+    header.prev_blockhash = parent.block_hash();
+    header.merkle_root = bitcoin::TxMerkleNode::from_byte_array([tag; 32]);
+    header.time = parent.time.saturating_add(600);
+    header.bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
+    header.nonce = 0;
+    rbitcoin_consensus::grind_regtest_pow(&mut header);
+    header
+}
+
+fn pending_keys(follow: &PeerFollowState) -> HashSet<BlockHash> {
+    follow.pending_headers.keys().copied().collect()
+}
+
+/// At `MAX_PENDING_HEADERS`, a header the store will not keep must not drop
+/// a non-connecting header or a fork that loses to the tip. A header the
+/// store accepts still drops a losing fork and keeps one with more work.
+#[tokio::test]
+async fn cap_evicts_only_after_the_store_accepts() {
+    use bitcoin::block::Header;
+    use std::cmp::Ordering;
+
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-store");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(200, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let tip = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(200))
+        .unwrap();
+    let genesis = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(0))
+        .unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = hostile_ver(bind);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+
+    let mut above_limit = tip;
+    above_limit.prev_blockhash = tip.block_hash();
+    above_limit.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x11; 32]);
+    above_limit.time = tip.time.saturating_add(600);
+    above_limit.bits = bitcoin::CompactTarget::from_consensus(0x217f_ffff);
+    above_limit.nonce = 0;
+    assert!(
+        above_limit.validate_pow(above_limit.target()).is_ok(),
+        "a target above the pow limit still meets its own bits"
+    );
+    assert!(
+        !hub.header_claimed_pow_ok(&above_limit),
+        "pow limit rejects this target"
+    );
+
+    let mut bad_diff = tip;
+    bad_diff.prev_blockhash = tip.block_hash();
+    bad_diff.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x22; 32]);
+    bad_diff.time = tip.time.saturating_add(600);
+    bad_diff.bits = bitcoin::CompactTarget::from_consensus(0x207f_fffe);
+    bad_diff.nonce = 0;
+    rbitcoin_consensus::grind_regtest_pow(&mut bad_diff);
+    assert!(hub.header_claimed_pow_ok(&bad_diff));
+    let bad_diff_hash = bad_diff.block_hash();
+
+    let peer = peers.register(
+        bind,
+        bind,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let mut follow = PeerFollowState::new();
+    let junk = Header {
+        version: bitcoin::block::Version::TWO,
+        prev_blockhash: BlockHash::from_byte_array([0x99; 32]),
+        merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+        time: 0,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        nonce: 0,
+    };
+    for batch in 0..4u32 {
+        let headers: Vec<Header> = (0..2_000u32)
+            .map(|i| {
+                let mut header = junk;
+                header.nonce = batch * 2_000 + i;
+                header
+            })
+            .collect();
+        on_headers(&hub, &out_tx, &mut follow, Some(&peer), &headers)
+            .await
+            .unwrap();
+    }
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    let junk_hash = *follow.pending_headers.keys().next().unwrap();
+    for rejected in [&above_limit, &bad_diff] {
+        let before = pending_keys(&follow);
+        on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[*rejected])
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_keys(&follow),
+            before,
+            "a header the store rejects does not evict non-connecting headers"
+        );
+    }
+    assert!(follow.pending_headers.contains_key(&junk_hash));
+    assert!(hub
+        .query
+        .get_header_by_hash(&bad_diff_hash.to_byte_array())
+        .unwrap()
+        .is_none());
+
+    let parent = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(199))
+        .unwrap();
+    let heavier_a = regtest_child(&parent, 0xa1);
+    let heavier_b = regtest_child(&heavier_a, 0xa2);
+    let heavier_tip = heavier_b.block_hash();
+    let mut follow = PeerFollowState::new();
+    let peer = peers.register(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445),
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445),
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    on_headers(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+        &[heavier_a, heavier_b],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        announced_work_cmp(&hub, &follow.pending_headers, heavier_tip),
+        Some(Ordering::Greater)
+    );
+    let losers: Vec<Header> = (0..MAX_PENDING_HEADERS as u32 - 2)
+        .map(|n| {
+            let mut header = genesis;
+            header.prev_blockhash = genesis.block_hash();
+            let mut merkle = [0u8; 32];
+            merkle[..4].copy_from_slice(&n.to_le_bytes());
+            header.merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle);
+            header.time = genesis.time.saturating_add(600);
+            header.bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
+            header.nonce = 0;
+            rbitcoin_consensus::grind_regtest_pow(&mut header);
+            header
+        })
+        .collect();
+    let loser_hash = losers[0].block_hash();
+    let loser_hashes: HashSet<BlockHash> = losers.iter().map(|header| header.block_hash()).collect();
+    for chunk in losers.chunks(2_000) {
+        on_headers(&hub, &out_tx, &mut follow, Some(&peer), chunk)
+            .await
+            .unwrap();
+    }
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    assert_eq!(
+        announced_work_cmp(&hub, &follow.pending_headers, loser_hash),
+        Some(Ordering::Less)
+    );
+    for rejected in [&above_limit, &bad_diff] {
+        let before = pending_keys(&follow);
+        on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[*rejected])
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_keys(&follow),
+            before,
+            "a header the store rejects does not evict a losing fork"
+        );
+    }
+    assert!(follow.pending_headers.contains_key(&heavier_tip));
+    assert!(follow.pending_headers.contains_key(&loser_hash));
+
+    let accepted = regtest_child(&tip, 0xb1);
+    let accepted_hash = accepted.block_hash();
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[accepted])
+        .await
+        .unwrap();
+    assert!(follow.pending_headers.contains_key(&accepted_hash));
+    assert!(follow.pending_headers.contains_key(&heavier_tip));
+    let dropped = loser_hashes
+        .iter()
+        .filter(|hash| !follow.pending_headers.contains_key(*hash))
+        .count();
+    assert_eq!(
+        dropped, 1,
+        "an accepted header drops one fork with less work"
+    );
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    assert!(hub
+        .query
+        .get_header_by_hash(&accepted_hash.to_byte_array())
+        .unwrap()
+        .is_some());
+}

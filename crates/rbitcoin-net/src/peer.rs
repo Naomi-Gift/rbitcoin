@@ -5271,14 +5271,6 @@ fn pending_root(
     root
 }
 
-/// The header's hash meets the target its own `bits` claim. This does not
-/// check that `bits` is the right difficulty for its height; that happens
-/// when the header path is persisted. Delete this if the crate already has
-/// a `header_claimed_pow_ok` and import that one instead.
-fn header_claimed_pow_ok(hdr: &bitcoin::block::Header) -> bool {
-    hdr.validate_pow(hdr.target()).is_ok()
-}
-
 fn classify_headers(
     hub: &ChainHub,
     headers: &[bitcoin::block::Header],
@@ -5342,27 +5334,22 @@ fn classify_headers(
             .iter()
             .filter(|hdr| !pending.contains_key(&hdr.block_hash()))
             .count();
+        let mut staged_evicts = Vec::new();
         if connecting && pending.len().saturating_add(incoming) > MAX_PENDING_HEADERS {
-            // A batch may displace pending headers only once its own claimed
-            // proof of work checks. One that fails is refused: nothing is
-            // evicted or admitted. Batches that fit under the cap are not
-            // checked here; this gate is about eviction only.
-            if !headers.iter().take(n).all(header_claimed_pow_ok) {
+            // Claimed proof of work includes the chain pow limit. Evictions
+            // stay staged until the store accepts the batch.
+            if !headers
+                .iter()
+                .take(n)
+                .all(|hdr| hub.header_claimed_pow_ok(hdr))
+            {
                 return apply;
             }
-            // Make room without discarding a fork that could beat this batch.
-            // First drop pending headers whose path does not reach a header we
-            // store; then drop connected forks whose tip loses on chain work to
-            // our active tip. A connected fork that does not lose is never
-            // evicted, and neither is the new batch's own ancestor path.
             evict_pending_for_room(hub, &mut pending, prev, incoming);
             if pending.len().saturating_add(incoming) > MAX_PENDING_HEADERS {
-                // Still no room without evicting a competitive fork: refuse
-                // this batch. Nothing is evicted, best-known does not move, and
-                // no next page is requested.
                 return apply;
             }
-            apply.evicts = pending_before
+            staged_evicts = pending_before
                 .keys()
                 .filter(|hash| !pending.contains_key(*hash))
                 .copied()
@@ -5391,11 +5378,12 @@ fn classify_headers(
                 apply.disconnect = Some((announced_h, our_tip));
                 return apply;
             }
+            let mut stored = false;
             if !header_path_meets_minwork(hub, &pending, last) {
                 if noban {
                     let should_stamp = work_cmp == Some(std::cmp::Ordering::Greater)
                         && !header_is_stored(hub, &last);
-                    persist_pending_header_path(hub, &pending, last);
+                    stored = persist_pending_header_path(hub, &pending, last);
                     apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
                     apply.sync_height = Some(announced_h);
                 } else {
@@ -5409,7 +5397,7 @@ fn classify_headers(
                 // that path must not touch the header store or walk parents.
                 let should_stamp =
                     work_cmp == Some(std::cmp::Ordering::Greater) && !header_is_stored(hub, &last);
-                persist_pending_header_path(hub, &pending, last);
+                stored = persist_pending_header_path(hub, &pending, last);
                 apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
                 apply.sync_height = Some(announced_h);
                 let keep = connecting_header_path(hub, &pending, last);
@@ -5430,6 +5418,9 @@ fn classify_headers(
                 want.retain(|h| !have_bodies.contains(h) && !requested.contains(h));
                 want.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested.len()));
                 apply.want_bodies = want;
+            }
+            if stored {
+                apply.evicts = staged_evicts;
             }
         }
     }
@@ -7203,12 +7194,14 @@ pub fn announced_headers_height(
 /// Persist `tip`'s pending path oldest-first so `ensure_header` has parents.
 /// Store the pending headers from `tip` back to the last stored one. Headers
 /// already stored were checked when they were written.
+///
+/// `false` when a chunk is rejected. Chunks already written in this call stay.
 #[doc(hidden)]
 pub fn persist_pending_header_path(
     hub: &ChainHub,
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     tip: BlockHash,
-) {
+) -> bool {
     let mut path = Vec::new();
     let mut h = tip;
     for _ in 0..PENDING_WALK_LIMIT {
@@ -7229,9 +7222,10 @@ pub fn persist_pending_header_path(
     // full below-floor chain (thousands of headers) is quadratic.
     for chunk in path.chunks(MAX_HEADERS_RESULTS) {
         if hub.ensure_headers_batch(chunk).is_err() {
-            break;
+            return false;
         }
     }
+    true
 }
 
 #[doc(hidden)]
