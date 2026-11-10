@@ -2,10 +2,11 @@ Fixed
 
 - **A torn historical spend page below `spend_durable` stays spent while `spend.pages.commit` exists.**
   Confirm records every published slot, including the short tail, in a directory
-  and does not write that `spent.body` slot. Schema 27: a binary that does not
-  read the log refuses the datadir. The spend checkpoint appends the page image
-  before it advances
-  the marker, and the next checkpoint folds a generation the previous one left
+  and does not write that `spent.body` slot. Schema stays 27. A binary from
+  before this log opens the datadir and reads `spent.body`, so a slot that is
+  not folded yet looks unspent. The spend checkpoint rewrites `spend.pages`
+  to the images still named before it advances the marker, and the next
+  checkpoint folds a generation the previous one left
   quiet. A retry of a failed compose writes the frozen pages and every note
   taken after that freeze into the replacement commit, including a newer slot
   on a page the previous commit sealed and a page a disconnect put back in
@@ -30,7 +31,12 @@ Fixed
   different slot on that page. A different page whose slots are all
   still best-chain stays named when this checkpoint rejects one page,
   including beside a zero page that is kept.
-  A missing or short `spend.pages` file beside a
-  commit that names bytes refuses to open. The next confirm insert waits at
-  2,000,000 open edges. A 1 GiB log asks for one extra checkpoint. Neither is a
+  A missing or short image file beside a
+  commit that names bytes refuses to open, including a record past the
+  committed length. A committed image shorter than the page does not answer
+  for a later slot, and the next compose copies that body tail instead of
+  padding zeros. Startup replay does not wait on the edge cap when no sync
+  thread is bound, and a confirm batch does not wait while it holds the utxo
+  view. The next confirm insert waits at 2,000,000 open edges. A 1 GiB log
+  asks for one extra checkpoint, not another on every later batch. Neither is a
   knob.

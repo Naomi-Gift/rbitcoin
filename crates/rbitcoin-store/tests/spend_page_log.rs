@@ -1,7 +1,7 @@
 use rbitcoin_store::error::StoreError;
 use rbitcoin_store::spend_page_log::{
-    pace_after_checkpoint, spend_checkpoint_early, SpendPageLog, LOG_IMAGE_CAP, OPEN_EDGE_CAP,
-    SPEND_PAGES_COMMIT_NAME, SPEND_PAGES_NAME,
+    pace_after_checkpoint, spend_checkpoint_early, spend_note_arms, SpendPageLog, LOG_IMAGE_CAP,
+    OPEN_EDGE_CAP, SPEND_PAGES_COMMIT_NAME, SPEND_PAGES_NAME,
 };
 use std::path::PathBuf;
 
@@ -30,6 +30,14 @@ fn image_cap_schedules_one_followup_and_the_edge_cap_stays_due() {
         (true, true)
     );
     assert_eq!(pace_after_checkpoint(0, 0, true), (false, false));
+    assert!(spend_note_arms(0, LOG_IMAGE_CAP, false));
+    assert!(!spend_note_arms(0, LOG_IMAGE_CAP, true));
+    assert!(spend_note_arms(OPEN_EDGE_CAP, LOG_IMAGE_CAP, true));
+    assert!(!spend_note_arms(
+        OPEN_EDGE_CAP - 1,
+        LOG_IMAGE_CAP - 1,
+        false
+    ));
 }
 
 fn zeros(off: u64, len: usize) -> Result<Vec<u8>, StoreError> {
@@ -67,8 +75,119 @@ fn record_past_committed_length_is_not_served() {
     let mut buf = std::fs::read(&path).unwrap();
     buf[16..24].copy_from_slice(&8u64.to_le_bytes());
     std::fs::write(&path, &buf).unwrap();
+    match SpendPageLog::load(&d) {
+        Err(err) => assert!(matches!(
+            err,
+            StoreError::Corrupt("spend page commit names bytes past the committed length")
+        )),
+        Ok(_) => panic!("load served a commit record past the committed length"),
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn short_tail_does_not_hide_a_later_body_slot() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let early = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    let later = [8u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, early)]).unwrap();
+    log.commit_open(1, 100, zeros, |_| Ok(true)).unwrap();
+    assert_eq!(log.slot(16), Some(early));
+    assert_eq!(
+        log.slot(200),
+        None,
+        "a committed tail shorter than the page leaves the later slot on the body"
+    );
+    let mut body = vec![0u8; 4096];
+    body[200..208].copy_from_slice(&later);
+    log.note_slots(&[(24, early)]).unwrap();
+    assert_eq!(
+        log.slot(200),
+        None,
+        "an open note does not hide slots past its short base"
+    );
+    log.commit_open(2, 4096, |_off, len| Ok(body[..len].to_vec()), |_| Ok(true))
+        .unwrap();
+    let file = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
+    assert_eq!(&file[200..208], &later, "compose copies the body tail");
+    assert_eq!(log.slot(200), Some(later));
+    log.commit_open(3, 4096, |_off, len| Ok(body[..len].to_vec()), |_| Ok(true))
+        .unwrap();
+    let mut folded = None;
+    log.fold_into(
+        |off, image| {
+            folded = Some((off, image.to_vec()));
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    let (off, image) = folded.expect("the extended page folds");
+    assert_eq!(off, 16);
+    assert_eq!(
+        &image[184..192],
+        &later,
+        "fold writes the body tail, not zeros"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn checkpoint_rewrites_the_log_down_to_pages_still_named() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot), (4096, slot)]).unwrap();
+    log.commit_open(2, 8192, zeros, |_| Ok(true)).unwrap();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(4096 + 8, slot)]).unwrap();
+    let mut wrote = Vec::new();
+    log.fold_into(
+        |off, _image| {
+            wrote.push(off);
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(wrote, vec![16]);
+    log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+    let file = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
+    assert_eq!(file.len(), 4096, "a folded page is not left in the log");
+    assert_eq!(&file[..8], &slot);
+    assert_eq!(&file[8..16], &slot);
+    assert_eq!(log.slot(16), None);
+    assert_eq!(log.slot(4096), Some(slot));
+    assert_eq!(log.slot(4104), Some(slot));
     let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(4096), Some(slot));
+    assert_eq!(loaded.slot(4104), Some(slot));
     assert_eq!(loaded.slot(16), None);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn reload_prefers_a_generation_file_over_a_stale_pages_file() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    let pages = d.join(SPEND_PAGES_NAME);
+    let image = std::fs::read(&pages).unwrap();
+    let commit = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    let generation = u32::from_le_bytes(commit[12..16].try_into().unwrap());
+    let gen_path = d.join(format!("{SPEND_PAGES_NAME}.{generation}"));
+    std::fs::write(&gen_path, &image).unwrap();
+    std::fs::write(&pages, vec![0u8; image.len()]).unwrap();
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(slot));
+    std::fs::write(&gen_path, [0u8; 1]).unwrap();
+    match SpendPageLog::load(&d) {
+        Err(err) => assert!(matches!(err, StoreError::Corrupt("spend.pages short"))),
+        Ok(_) => panic!("a short generation file fell back to spend.pages"),
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -214,7 +333,7 @@ fn hold_during_compose_is_not_folded() {
 }
 
 #[test]
-fn open_edge_cap_blocks_the_next_insert_until_commit() {
+fn open_edge_cap_waits_only_after_the_sync_thread_is_bound() {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -236,6 +355,18 @@ fn open_edge_cap_blocks_the_next_insert_until_commit() {
     if !batch.is_empty() {
         log.note_slots(&batch).unwrap();
     }
+    let started = Instant::now();
+    log.note_slots(&[(n * 8, slot)]).unwrap();
+    log.wait_open_edge_room();
+    let unbound = started.elapsed();
+    assert!(
+        unbound < Duration::from_millis(500),
+        "replay must not wait for a sync thread that is not running, waited {unbound:?}"
+    );
+    log.bind_sync_wake(Arc::new((
+        std::sync::Mutex::new(false),
+        std::sync::Condvar::new(),
+    )));
     let published = 3907 * 4096;
     let log2 = Arc::clone(&log);
     let gate = Arc::new(AtomicBool::new(false));
@@ -249,12 +380,12 @@ fn open_edge_cap_blocks_the_next_insert_until_commit() {
     });
     gate.store(true, Ordering::Release);
     let started = Instant::now();
-    log.note_slots(&[(n * 8, slot)]).unwrap();
+    log.wait_open_edge_room();
     let waited = started.elapsed();
     worker.join().unwrap();
     assert!(
         waited >= Duration::from_millis(60),
-        "insert at the open-edge cap must wait for a checkpoint, waited {waited:?}"
+        "the next batch waits for a checkpoint once the sync thread is bound, waited {waited:?}"
     );
     assert_eq!(log.slot(n * 8), Some(slot));
     let _ = std::fs::remove_dir_all(&d);
