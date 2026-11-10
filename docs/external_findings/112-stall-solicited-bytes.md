@@ -2,7 +2,7 @@
 
 **Severity:** medium
 **Status:** fixed
-**Found by:** private report, 2026-11-10
+**Found by:** @MrHodl, 2026-11-10
 
 An IBD peer with block getdata on the wire could avoid a withholding
 disconnect by sending pings or headers. The check counted every socket

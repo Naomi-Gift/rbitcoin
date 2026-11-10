@@ -2,7 +2,7 @@
 
 **Severity:** medium
 **Status:** fixed
-**Found by:** private report, 2026-11-10
+**Found by:** @MrHodl, 2026-11-10
 
 The send-budget gate ran once, before the handler. `getcfilters` could
 then queue every filter in the request, each one past the cap.

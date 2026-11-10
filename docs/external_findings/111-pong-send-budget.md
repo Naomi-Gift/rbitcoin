@@ -2,7 +2,7 @@
 
 **Severity:** medium
 **Status:** fixed
-**Found by:** private report, 2026-11-10
+**Found by:** @MrHodl, 2026-11-10
 
 Every tip-follow ping queued a pong that the send budget did not count.
 The writer then subtracted that size anyway, so the counter could fall

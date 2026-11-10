@@ -2,7 +2,7 @@
 
 **Severity:** medium
 **Status:** fixed
-**Found by:** private report, 2026-11-10
+**Found by:** @MrHodl, 2026-11-10
 
 After the header walk proved minimum chain work, every connecting reply
 rewrote `header.adopt`, including one-header batches. The file holds every

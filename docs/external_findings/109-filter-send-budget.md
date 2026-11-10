@@ -2,7 +2,7 @@
 
 **Severity:** medium
 **Status:** fixed
-**Found by:** private report, 2026-11-10
+**Found by:** @MrHodl, 2026-11-10
 
 `cfilter`, `cfheaders`, and `cfcheckpt` took the 64-byte fallback.
 `cmpctblock` took a fixed 1,024 bytes. A peer with the block-filter index
