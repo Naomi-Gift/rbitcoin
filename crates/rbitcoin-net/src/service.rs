@@ -481,8 +481,13 @@ impl Drop for P2PNode {
     }
 }
 
+/// Only a failed `bind` is [`NetError::Bind`]; Core gives the socket and
+/// `listen` calls their own InitError text.
 fn bind_p2p(addr: SocketAddr) -> Result<tokio::net::TcpListener, NetError> {
-    crate::listen::bind_tcp(addr).map_err(|source| NetError::Bind { addr, source })
+    crate::listen::bind_tcp_step(addr).map_err(|(step, source)| match step {
+        crate::listen::ListenStep::Bind => NetError::Bind { addr, source },
+        _ => NetError::Io(source),
+    })
 }
 
 #[doc(hidden)]

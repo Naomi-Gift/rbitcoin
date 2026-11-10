@@ -1041,6 +1041,27 @@ async fn held_p2p_port_is_the_core_bind_init_error() {
     assert_eq!(err.to_string(), want);
 }
 
+/// Any other bind failure is Core's second bind InitError, with the OS text as
+/// `NetworkErrorString` gives it: no Rust `(os error N)` suffix. 192.0.2.1
+/// (TEST-NET-1) is never a local address, so `bind` fails without root.
+#[tokio::test]
+async fn unassignable_p2p_address_is_the_core_bind_error_text() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let addr: std::net::SocketAddr = "192.0.2.1:0".parse().unwrap();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-unassignable-p2p-{nanos}"));
+    let cfg = tiny_regtest(&dir).with_p2p_listen(addr);
+    let err = run_p2p(cfg).await.expect_err("unassignable address");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(err, rbitcoin_node::NodeError::Init(_)), "{err:?}");
+    let msg = err.to_string();
+    let head = format!("Error: Unable to bind to {addr} on this computer (bind returned error ");
+    assert!(msg.starts_with(&head) && msg.ends_with(')'), "{msg}");
+    assert!(!msg.contains("os error"), "{msg}");
+}
+
 /// `--proxy --only-net onion` reaches no clearnet seed, so the fixed onion
 /// seeds are the only way to a first peer. The node dials one through SOCKS.
 #[tokio::test]

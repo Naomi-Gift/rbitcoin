@@ -10,19 +10,35 @@ const BACKLOG: u32 = 128;
 
 /// Bind and listen on `addr`. Must run inside a tokio runtime.
 pub fn bind_tcp(addr: SocketAddr) -> io::Result<TcpListener> {
+    bind_tcp_step(addr).map_err(|(_, e)| e)
+}
+
+/// The [`bind_tcp`] call that failed. Core names a failed `bind` apart from
+/// the socket, option, and `listen` calls around it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ListenStep {
+    Socket,
+    Bind,
+    Listen,
+}
+
+/// [`bind_tcp`], with the call that failed.
+pub fn bind_tcp_step(addr: SocketAddr) -> Result<TcpListener, (ListenStep, io::Error)> {
+    let at = |step| move |e| (step, e);
     let socket = match addr {
-        SocketAddr::V4(_) => TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => TcpSocket::new_v6()?,
-    };
+        SocketAddr::V4(_) => TcpSocket::new_v4(),
+        SocketAddr::V6(_) => TcpSocket::new_v6(),
+    }
+    .map_err(at(ListenStep::Socket))?;
     // Windows SO_REUSEADDR lets another process bind the port and take its
     // connections; claim it outright (Core #36169, #36305).
     #[cfg(windows)]
-    set_exclusive_addr_use(&socket)?;
+    set_exclusive_addr_use(&socket).map_err(at(ListenStep::Socket))?;
     // Rebind a port still in TIME_WAIT after a restart.
     #[cfg(not(windows))]
-    socket.set_reuseaddr(true)?;
-    socket.bind(addr)?;
-    socket.listen(BACKLOG)
+    socket.set_reuseaddr(true).map_err(at(ListenStep::Socket))?;
+    socket.bind(addr).map_err(at(ListenStep::Bind))?;
+    socket.listen(BACKLOG).map_err(at(ListenStep::Listen))
 }
 
 #[cfg(windows)]

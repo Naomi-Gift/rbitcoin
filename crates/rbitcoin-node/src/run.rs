@@ -400,8 +400,21 @@ fn p2p_start_err(what: &str, e: rbitcoin_net::NetError) -> NodeError {
         ));
     }
     NodeError::Init(format!(
-        "Unable to bind to {addr} on this computer (bind returned error {source})"
+        "Unable to bind to {addr} on this computer (bind returned error {})",
+        os_error_text(&source)
     ))
+}
+
+/// Core's `NetworkErrorString`: the OS text without Rust's `(os error N)`.
+fn os_error_text(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match e.raw_os_error() {
+        Some(n) => text
+            .strip_suffix(&format!(" (os error {n})"))
+            .unwrap_or(&text)
+            .to_owned(),
+        None => text,
+    }
 }
 
 /// Long-running P2P (+ optional Electrum): seed resolve, catch-up, persistent follow, progress logs.
