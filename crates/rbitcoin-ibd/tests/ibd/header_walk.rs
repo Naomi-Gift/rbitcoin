@@ -58,6 +58,34 @@ fn a_short_header_with_no_target_is_not_a_low_work_batch() {
     );
 }
 
+/// A header that fails its own target must not keep the walk. The next ask
+/// goes to the other live peer, and this peer is not retired as low work.
+#[test]
+fn a_header_that_fails_its_target_lets_the_next_peer_walk() {
+    let (_dir, hub, mut st, gen) = opened("unproven-bad-pow-next-peer", true);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    assert_eq!(st.header_walk.reserved, Some(0));
+    let before = hub.query.store().header_count();
+    let hdr = Header {
+        version: bitcoin::block::Version::from_consensus(4),
+        prev_blockhash: gen.block_hash(),
+        merkle_root: TxMerkleNode::from_byte_array([9; 32]),
+        time: gen.time.saturating_add(1),
+        bits: CompactTarget::from_consensus(0),
+        nonce: 1,
+    };
+    apply(&mut st, &hub, 0, vec![hdr]);
+    assert_eq!(hub.query.store().header_count(), before);
+    assert!(
+        !st.header_walk.walk_quiet.contains(&0),
+        "bad proof is not the short low-work miss"
+    );
+    assert!(!st.slots[0].alive, "a failed target drops the sender");
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    assert_eq!(st.header_walk.reserved, Some(1));
+    assert_eq!(st.header_walk.walk.peer, Some(1));
+}
+
 #[test]
 fn pow_linked_accepts_a_chain_and_rejects_a_bad_link_or_pow() {
     let a = mine(BlockHash::from_byte_array([0; 32]), 1);

@@ -678,9 +678,9 @@ pub fn plan_header_batch(
         );
     }
     let clock_refused = st.header_walk.clock_refused;
-    // A header that fails its own target is not a short low-work batch.
-    // Retiring the peer here would punish a proof failure. Headers that do
-    // not connect to each other still have a target, and those are stored.
+    // Failed proof disconnects in `plan_header_reply`. This mark is the
+    // low-work miss, so a proof failure must not take it. Headers that do
+    // not connect still have a target, and those are stored.
     let bad_pow = headers
         .iter()
         .any(|hdr| hdr.validate_pow(hdr.target()).is_err());
@@ -698,6 +698,17 @@ pub fn plan_header_reply(
     peer: usize,
     headers: Vec<bitcoin::block::Header>,
 ) -> HeaderPlan {
+    // Failed proof is not a low-work miss. Drop the sender and the ask so
+    // the next live peer can walk. Leaving the ask in flight blocks that peer.
+    if headers
+        .iter()
+        .any(|hdr| hdr.validate_pow(hdr.target()).is_err())
+    {
+        let _ = super::header_walk::take_header_ask(st, peer);
+        super::header_walk::forget_walk_peer(st, peer);
+        super::header_walk::punish_header_peer(st, peer);
+        return HeaderPlan::Done;
+    }
     if st.header_walk.clock_refused {
         if st.header_walk.probe_open != Some(peer) {
             let _ = super::header_walk::take_header_ask(st, peer);
@@ -721,15 +732,6 @@ pub fn plan_header_reply(
         } else {
             HeaderPlan::Done
         };
-    }
-    // Bad proof is not a short low-work batch. Returning `Done` from that
-    // check would retire the peer. The caller skips the miss mark. A batch
-    // whose headers do not connect is a different case and is still stored.
-    if headers
-        .iter()
-        .any(|hdr| hdr.validate_pow(hdr.target()).is_err())
-    {
-        return HeaderPlan::Done;
     }
     if super::header_walk::short_below_floor(st, hub, &headers) {
         return HeaderPlan::Done;
