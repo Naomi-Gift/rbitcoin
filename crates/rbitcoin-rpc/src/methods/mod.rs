@@ -212,7 +212,13 @@ pub fn parse_hash32_display(hex: &str) -> Result<[u8; 32], Value> {
 /// to the coins view, and its txindex skips height 0. The coin is never
 /// unspent and the tx is not an ordinary transaction.
 pub fn genesis_coinbase_txid(ctx: &RpcContext) -> [u8; 32] {
-    rbitcoin_consensus::ChainParams::for_network(ctx.network).genesis_coinbase_txid
+    if let Some(txid) = ctx.query.genesis_coinbase_txid.get() {
+        return *txid;
+    }
+    use bitcoin::hashes::Hash;
+    bitcoin::blockdata::constants::genesis_block(rpc_btc_network(ctx.network)).txdata[0]
+        .compute_txid()
+        .to_byte_array()
 }
 
 mod asm;

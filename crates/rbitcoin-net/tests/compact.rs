@@ -232,7 +232,11 @@ fn store_merkle_matches_check_merkle_root() {
 fn empty_txdata_is_not_a_block() {
     let header = dummy_header();
     assert_eq!(header.merkle_root.to_byte_array(), [0u8; 32]);
-    let err = finish_reconstructed(header, Vec::new()).expect_err("empty body");
+    let err = finish_with_txids(header, Vec::new(), &[]).expect_err("empty body");
+    assert!(err.is_empty(), "getdata the hash, got {err:?}");
+    let cb = coinbase();
+    let one = sealed_block(vec![cb]);
+    let err = finish_with_txids(one.header, one.txdata, &[]).expect_err("short txid list");
     assert!(err.is_empty(), "getdata the hash, got {err:?}");
 }
 
@@ -242,7 +246,12 @@ fn repeated_pair_with_matching_root_is_not_a_block() {
     let block = sealed_block(vec![cb.clone(), cb]);
     assert!(block.check_merkle_root());
     assert!(block_txid_merkle(&block.txdata).expect("pair").1);
-    let err = finish_reconstructed(block.header, block.txdata).expect_err("mutated pair");
+    let ids: Vec<[u8; 32]> = block
+        .txdata
+        .iter()
+        .map(|tx| tx.compute_txid().to_byte_array())
+        .collect();
+    let err = finish_with_txids(block.header, block.txdata, &ids).expect_err("mutated pair");
     assert!(err.is_empty(), "getdata the hash, got {err:?}");
 }
 

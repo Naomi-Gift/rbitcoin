@@ -61,6 +61,17 @@ fn open_ctx(dir: &TempDir) -> RpcContext {
     }
 }
 
+#[test]
+fn genesis_coinbase_txid_reads_the_query_once_set() {
+    let dir = TempDir::labeled("rpc-genesis-cb").expect("temp dir");
+    let ctx = open_ctx(&dir);
+    let network = rbitcoin_consensus::ChainParams::regtest().genesis_coinbase_txid;
+    assert_eq!(genesis_coinbase_txid(&ctx), network);
+    let marked = [0x11; 32];
+    ctx.query.set_genesis_coinbase_txid(marked);
+    assert_eq!(genesis_coinbase_txid(&ctx), marked);
+}
+
 /// Genesis plus empty blocks `1..=102` (genesis time + 600s). `collect_coinbases`
 /// does not change those block bytes, so the height-102 mempool tests share one pad.
 struct Empty102Pad {

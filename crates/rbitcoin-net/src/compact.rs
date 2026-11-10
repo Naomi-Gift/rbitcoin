@@ -250,6 +250,8 @@ pub fn missing_request(block_hash: BlockHash, missing: &[u64]) -> BlockTransacti
 
 /// Overlay `blocktxn` onto a first-pass [`CmpctPartial`].
 ///
+/// Takes `slots` and `txids`. `missing` stays. A later call sees empty slots.
+///
 /// `txn.transactions` is 1:1 with `partial.missing` (absolute indexes, request
 /// order). Already-filled slots are kept; the live short-id map is not consulted.
 /// Completes only when the filled txs merkle to `hsi.header`.
@@ -325,18 +327,9 @@ pub fn block_txid_merkle(txdata: &[Transaction]) -> Option<([u8; 32], bool)> {
     Some(rbitcoin_store::merkle_root_mutated(&leaves))
 }
 
-/// BIP152: filled slots must merkle to the compact header and not be a
-/// Core `IsBlockMutated` body (empty → getdata).
-#[doc(hidden)]
-pub fn finish_reconstructed(header: Header, txdata: Vec<Transaction>) -> Result<Block, Vec<u64>> {
-    let Some((root, mutated)) = block_txid_merkle(&txdata) else {
-        return Err(Vec::new());
-    };
-    finish_checked(header, txdata, root, mutated)
-}
-
 /// Merkle check from txids already hashed while the slots were filled.
-fn finish_with_txids(
+#[doc(hidden)]
+pub fn finish_with_txids(
     header: Header,
     txdata: Vec<Transaction>,
     leaves: &[[u8; 32]],
