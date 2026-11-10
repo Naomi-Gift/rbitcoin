@@ -170,10 +170,13 @@ pub fn reconstruct<T: Borrow<Transaction>>(
     let total = hsi.short_ids.len() + hsi.prefilled_txs.len();
 
     let mut slots: Vec<Option<Transaction>> = vec![None; total];
+    let mut txid_at: Vec<Option<[u8; 32]>> = vec![None; total];
     let mut prefilled_set = std::collections::HashSet::new();
     let mut placed: std::collections::HashSet<bitcoin::Txid> = std::collections::HashSet::new();
     for (abs, tx) in prefilled_absolute_indexes(hsi) {
-        placed.insert(tx.compute_txid());
+        let txid = tx.compute_txid();
+        placed.insert(txid);
+        txid_at[abs] = Some(txid.to_byte_array());
         slots[abs] = Some(tx.clone());
         prefilled_set.insert(abs);
     }
@@ -199,6 +202,7 @@ pub fn reconstruct<T: Borrow<Transaction>>(
                     missing.push(abs as u64);
                     continue;
                 }
+                txid_at[abs] = Some(txid.to_byte_array());
                 *slot = Some(cands[0].borrow().clone());
             }
             // One candidate fills the slot. Every other count, including a
@@ -212,14 +216,18 @@ pub fn reconstruct<T: Borrow<Transaction>>(
     }
 
     let mut txdata = Vec::with_capacity(total);
-    for slot in slots {
-        match slot {
-            Some(tx) => txdata.push(tx),
-            None => return Reconstruct::Fail,
+    let mut leaves = Vec::with_capacity(total);
+    for (slot, leaf) in slots.into_iter().zip(txid_at) {
+        match (slot, leaf) {
+            (Some(tx), Some(id)) => {
+                txdata.push(tx);
+                leaves.push(id);
+            }
+            _ => return Reconstruct::Fail,
         }
     }
 
-    match finish_reconstructed(hsi.header, txdata) {
+    match finish_with_txids(hsi.header, txdata, &leaves) {
         Ok(block) => Reconstruct::Block(block),
         Err(_) => Reconstruct::Fail,
     }
@@ -300,6 +308,28 @@ pub fn finish_reconstructed(header: Header, txdata: Vec<Transaction>) -> Result<
     let Some((root, mutated)) = block_txid_merkle(&txdata) else {
         return Err(Vec::new());
     };
+    finish_checked(header, txdata, root, mutated)
+}
+
+/// Merkle check from txids already hashed while the slots were filled.
+fn finish_with_txids(
+    header: Header,
+    txdata: Vec<Transaction>,
+    leaves: &[[u8; 32]],
+) -> Result<Block, Vec<u64>> {
+    if leaves.len() != txdata.len() || leaves.is_empty() {
+        return Err(Vec::new());
+    }
+    let (root, mutated) = rbitcoin_store::merkle_root_mutated(leaves);
+    finish_checked(header, txdata, root, mutated)
+}
+
+fn finish_checked(
+    header: Header,
+    txdata: Vec<Transaction>,
+    root: [u8; 32],
+    mutated: bool,
+) -> Result<Block, Vec<u64>> {
     let block = Block { header, txdata };
     if root != block.header.merkle_root.to_byte_array()
         || mutated
