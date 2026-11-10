@@ -356,7 +356,7 @@ fn raw_tx_block(ctx: &RpcContext, hash: [u8; 32]) -> Result<RawTxBlock, Value> {
 
 fn fk_in_block(ctx: &RpcContext, fks: &[Fk], want: &[u8; 32]) -> Result<Option<Fk>, Value> {
     let misc = |e: rbitcoin_query::QueryError| rpc_error(ERR_MISC, e.to_string());
-    if let Some((fk, _)) = ctx.query.get_tx_by_txid(want).map_err(misc)? {
+    if let Some(fk) = ctx.query.tx_fk_by_txid(want).map_err(misc)? {
         if fks.contains(&fk) {
             return Ok(Some(fk));
         }
@@ -530,6 +530,7 @@ pub(crate) fn insert_vin_prevouts(obj: &mut Value, prevouts: &[Value]) {
 fn finish_verbose_tx(
     ctx: &RpcContext,
     tx: &Transaction,
+    txid: &[u8; 32],
     fk: Fk,
     block: Option<Fk>,
     verbosity: u32,
@@ -539,12 +540,12 @@ fn finish_verbose_tx(
     if verbosity >= 2 {
         if let Some((fee, prevouts)) = raw_tx_prevouts(ctx, tx, fk, block, UndoRead::Prevouts)? {
             extra.insert("fee".into(), sat_btc_json(fee));
-            let mut obj = tx_to_json(tx, Some(Value::Object(extra)), net);
+            let mut obj = tx_to_json(tx, Some(txid), Some(Value::Object(extra)), net);
             insert_vin_prevouts(&mut obj, &prevouts);
             return Ok(obj);
         }
     }
-    Ok(tx_to_json(tx, Some(Value::Object(extra)), net))
+    Ok(tx_to_json(tx, Some(txid), Some(Value::Object(extra)), net))
 }
 
 fn getrawtransaction_in_block(
@@ -581,7 +582,7 @@ fn getrawtransaction_in_block(
     } else {
         extra.insert("confirmations".into(), json!(0));
     }
-    finish_verbose_tx(ctx, &tx, fk, Some(block.header_fk), verbosity, extra)
+    finish_verbose_tx(ctx, &tx, &want, fk, Some(block.header_fk), verbosity, extra)
 }
 
 pub(crate) enum RawTxHit {
@@ -606,9 +607,9 @@ pub(crate) fn locate_raw_tx(ctx: &RpcContext, want: [u8; 32]) -> Result<RawTxHit
             return Ok(RawTxHit::Mempool(tx));
         }
     }
-    let (fk, _) = ctx
+    let fk = ctx
         .query
-        .get_tx_by_txid(&want)
+        .tx_fk_by_txid(&want)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
         .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, RAW_TX_NOT_FOUND))?;
     let tx = ctx
@@ -648,7 +649,12 @@ pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, 
             {
                 extra["vsize_adjusted"] = json!(rbitcoin_consensus::policy::vbytes_ceil(weight));
             }
-            Ok(tx_to_json(&tx, Some(extra), rpc_btc_network(ctx.network)))
+            Ok(tx_to_json(
+                &tx,
+                Some(&want),
+                Some(extra),
+                rpc_btc_network(ctx.network),
+            ))
         }
         RawTxHit::Chain { tx, fk } => {
             if verbosity == 0 {
@@ -668,7 +674,7 @@ pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, 
                 extra.insert("blocktime".into(), json!(header.timestamp));
                 extra.insert("time".into(), json!(header.timestamp));
             }
-            finish_verbose_tx(ctx, &tx, fk, None, verbosity, extra)
+            finish_verbose_tx(ctx, &tx, &want, fk, None, verbosity, extra)
         }
     }
 }
@@ -2552,7 +2558,7 @@ pub fn getorphantxs(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
         let weight = s.tx.weight().to_wu();
         let mut row = json!({
             "txid": hash_hex_display(&s.tx.compute_txid().to_byte_array()),
-            "wtxid": hash_hex_display(&s.tx.compute_wtxid().to_byte_array()),
+            "wtxid": hash_hex_display(bitcoin::hashes::sha256d::Hash::hash(&raw).as_byte_array()),
             "bytes": raw.len(),
             "vsize": s.tx.vsize(),
             "vsize_bip141": s.tx.vsize(),
@@ -2560,7 +2566,7 @@ pub fn getorphantxs(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
             "from": s.announcers,
         });
         if verbosity == 2 {
-            row["hex"] = json!(serialize_hex(&s.tx));
+            row["hex"] = json!(rbitcoin_primitives::hex_encode(&raw));
         }
         out.push(row);
     }

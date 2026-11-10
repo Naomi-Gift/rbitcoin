@@ -2075,8 +2075,18 @@ pub fn decode_package_tx_hex(hex: &str) -> Result<Transaction, Value> {
     })
 }
 
-pub fn tx_to_json(tx: &Transaction, extra: Option<Value>, network: BtcNetwork) -> Value {
-    let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
+pub fn tx_to_json(
+    tx: &Transaction,
+    txid: Option<&[u8; 32]>,
+    extra: Option<Value>,
+    network: BtcNetwork,
+) -> Value {
+    let raw = bitcoin::consensus::encode::serialize(tx);
+    let txid_bytes = match txid {
+        Some(id) => *id,
+        None => tx.compute_txid().to_byte_array(),
+    };
+    let txid_hex = hash_hex_display(&txid_bytes);
     let mut vin = Vec::new();
     for (i, inp) in tx.input.iter().enumerate() {
         let mut row = if tx.is_coinbase() {
@@ -2121,16 +2131,16 @@ pub fn tx_to_json(tx: &Transaction, extra: Option<Value>, network: BtcNetwork) -
         }));
     }
     let mut obj = json!({
-        "txid": txid,
-        "hash": hash_hex_display(&tx.compute_wtxid().to_byte_array()),
+        "txid": txid_hex,
+        "hash": hash_hex_display(bitcoin::hashes::sha256d::Hash::hash(&raw).as_byte_array()),
         "version": tx.version.0,
-        "size": tx.total_size(),
+        "size": raw.len(),
         "vsize": tx.vsize(),
         "weight": tx.weight().to_wu(),
         "locktime": tx.lock_time.to_consensus_u32(),
         "vin": vin,
         "vout": vout,
-        "hex": serialize_hex(tx),
+        "hex": rbitcoin_primitives::hex_encode(&raw),
     });
     if let Some(Value::Object(m)) = extra {
         if let Some(o) = obj.as_object_mut() {

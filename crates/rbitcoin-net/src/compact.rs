@@ -255,7 +255,7 @@ pub fn missing_request(block_hash: BlockHash, missing: &[u64]) -> BlockTransacti
 /// Completes only when the filled txs merkle to `hsi.header`.
 pub fn apply_block_transactions(
     hsi: &HeaderAndShortIds,
-    partial: &CmpctPartial,
+    partial: &mut CmpctPartial,
     txn: &BlockTransactions,
 ) -> Result<Block, Vec<u64>> {
     if txn.transactions.len() != partial.missing.len() {
@@ -268,8 +268,8 @@ pub fn apply_block_transactions(
         return Err(Vec::new());
     }
 
-    let mut slots = partial.slots.clone();
-    let mut leaves = partial.txids.clone();
+    let mut slots = std::mem::take(&mut partial.slots);
+    let mut leaves = std::mem::take(&mut partial.txids);
     let mut placed = HashSet::new();
     for (slot, leaf) in slots.iter().zip(leaves.iter()) {
         match (slot.is_some(), leaf) {

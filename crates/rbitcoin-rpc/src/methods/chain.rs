@@ -880,9 +880,9 @@ pub fn getblock_tx_json(
                 None => None,
             };
             let Some((fee, prevouts)) = row else {
-                return Ok(tx_to_json(tx, None, net));
+                return Ok(tx_to_json(tx, None, None, net));
             };
-            let mut obj = tx_to_json(tx, Some(json!({ "fee": sat_btc_json(fee) })), net);
+            let mut obj = tx_to_json(tx, None, Some(json!({ "fee": sat_btc_json(fee) })), net);
             if verbosity >= 3 {
                 insert_vin_prevouts(&mut obj, &prevouts);
             }

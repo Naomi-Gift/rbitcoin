@@ -2738,7 +2738,7 @@ pub fn dispatch_pinned(
                 .and_then(|a| a.get(1))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if let Some((fk, _rec)) = query.get_tx_by_txid(&txid).map_err(|e| e.to_string())? {
+            if let Some(fk) = query.tx_fk_by_txid(&txid).map_err(|e| e.to_string())? {
                 let confirmed_ok = if is_asof {
                     let view = pinned.ok_or_else(|| "asof not on chain".to_string())?;
                     query

@@ -3566,10 +3566,10 @@ pub fn queue_due_tx_invs(
 #[doc(hidden)]
 #[allow(clippy::result_unit_err)] // a short blocktxn is (); the caller scores the peer
 pub fn apply_cmpct_blocktxn(
-    pc: &PendingCmpct,
+    pc: &mut PendingCmpct,
     bt: &BlockTransactions,
 ) -> Result<(Block, Option<crate::compact::CmpctFillSets>), ()> {
-    crate::compact::apply_block_transactions(&pc.hsi, &pc.partial, bt)
+    crate::compact::apply_block_transactions(&pc.hsi, &mut pc.partial, bt)
         .map(|block| (block, pc.fill.clone()))
         .map_err(|_| ())
 }
@@ -6542,11 +6542,11 @@ pub async fn on_blocktxn(
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
-    let Some(pc) = follow.pending_cmpct.remove(&hash) else {
+    let Some(mut pc) = follow.pending_cmpct.remove(&hash) else {
         follow.ban_score = follow.ban_score.saturating_add(5);
         return Ok(());
     };
-    match apply_cmpct_blocktxn(&pc, bt) {
+    match apply_cmpct_blocktxn(&mut pc, bt) {
         Ok((block, fill)) => {
             on_blocktxn_got_block(hub, out_tx, follow, session, &pc, hash, block, fill).await
         }
