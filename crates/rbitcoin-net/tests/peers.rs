@@ -1489,6 +1489,54 @@ fn outbound_full_relay_ids_skips_inbound_and_noban() {
     );
 }
 
+/// Core's `GetFullOutboundConnCount` counts every outbound full-relay
+/// session. Catch-up sessions are not hub rows, so catch-up reports its
+/// count and the hub adds it. Inbound, block-relay, and `noban` do not
+/// change that sum.
+#[test]
+fn full_outbound_count_adds_catch_up_sessions() {
+    let hub = PeerHub::new();
+    let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let b = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2);
+    let c = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 3);
+    assert_eq!(hub.full_outbound_count(), 0);
+    let _in = hub.register(a, a, &ver("/rbitcoin:0.1.0/"), true, PeerConnType::Inbound);
+    let _out = hub.register(
+        b,
+        b,
+        &ver("/rbitcoin:0.1.0/"),
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let _br = hub.register(
+        c,
+        c,
+        &ver("/rbitcoin:0.1.0/"),
+        false,
+        PeerConnType::BlockRelay,
+    );
+    // Core `GetFullOutboundConnCount` counts only `fSuccessfullyConnected`.
+    let d = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4);
+    let _connecting = hub.register_connecting_net(
+        d,
+        rbitcoin_net::NetAddr::from_socket(d),
+        d,
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    assert_eq!(
+        hub.full_outbound_count(),
+        1,
+        "VERSION not done: not counted"
+    );
+    hub.set_catch_up_full_outbound(2);
+    assert_eq!(hub.full_outbound_count(), 3);
+    hub.set_noban(true);
+    assert_eq!(hub.full_outbound_count(), 3, "noban sessions still count");
+    hub.set_catch_up_full_outbound(0);
+    assert_eq!(hub.full_outbound_count(), 1);
+}
+
 fn fill_addrman(n: usize) -> rbitcoin_net::seeds::AddrMan {
     let mut am = rbitcoin_net::seeds::AddrMan::new();
     for i in 0..n {

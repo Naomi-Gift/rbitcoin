@@ -1868,6 +1868,79 @@ async fn proxy_seed_wait_ends_on_a_learned_reply_shutdown_or_deadline() {
     assert!(book.is_none(), "shutdown ends the wait with no book");
 }
 
+/// Core's `ThreadDNSAddressSeed`: an empty book asks the DNS seeds at
+/// once. A known book waits 11 s (5 min past 1,000 rows, rechecked every
+/// 11 s) and skips the seeds once two outbound full-relay peers are up.
+/// Short of that, the seeds are asked after the wait.
+///
+/// The clock is paused, so the waits are not wall time.
+#[tokio::test(start_paused = true)]
+async fn dns_seeds_wait_for_known_peers_first() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let seed: SocketAddr = "1.2.3.4:8333".parse().unwrap();
+    let asked = Arc::new(AtomicUsize::new(0));
+    let resolver = |asked: &Arc<AtomicUsize>| {
+        let asked = Arc::clone(asked);
+        move || {
+            asked.fetch_add(1, Ordering::SeqCst);
+            vec![seed]
+        }
+    };
+    let sd = Shutdown::new();
+    assert_eq!(DNSSEEDS_DELAY_FEW_PEERS, Duration::from_secs(11));
+    assert_eq!(DNSSEEDS_DELAY_MANY_PEERS, Duration::from_secs(300));
+
+    // Empty book: no wait.
+    let t0 = tokio::time::Instant::now();
+    let got = dns_seeds_when_needed(0, || 0, &sd, resolver(&asked)).await;
+    assert_eq!(got, Some(vec![seed]));
+    assert_eq!(t0.elapsed(), Duration::ZERO);
+    assert_eq!(asked.swap(0, Ordering::SeqCst), 1);
+
+    // Known book with two outbound peers up: the seeds are not asked.
+    let t0 = tokio::time::Instant::now();
+    let got = dns_seeds_when_needed(50, || 2, &sd, resolver(&asked)).await;
+    assert_eq!(got, None);
+    assert_eq!(t0.elapsed(), DNSSEEDS_DELAY_FEW_PEERS);
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+
+    // Known book, one peer up: the seeds are asked after the wait.
+    let t0 = tokio::time::Instant::now();
+    let got = dns_seeds_when_needed(50, || 1, &sd, resolver(&asked)).await;
+    assert_eq!(got, Some(vec![seed]));
+    assert_eq!(t0.elapsed(), DNSSEEDS_DELAY_FEW_PEERS);
+    assert_eq!(asked.swap(0, Ordering::SeqCst), 1);
+
+    // A large book waits longer and stops at the first check with peers up.
+    let t0 = tokio::time::Instant::now();
+    let up_at = t0 + 2 * DNSSEEDS_DELAY_FEW_PEERS;
+    let outbound = move || usize::from(tokio::time::Instant::now() >= up_at) * 2;
+    let got = dns_seeds_when_needed(
+        DNSSEEDS_DELAY_PEER_THRESHOLD,
+        outbound,
+        &sd,
+        resolver(&asked),
+    )
+    .await;
+    assert_eq!(got, None);
+    assert_eq!(t0.elapsed(), 2 * DNSSEEDS_DELAY_FEW_PEERS);
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+
+    let t0 = tokio::time::Instant::now();
+    let got =
+        dns_seeds_when_needed(DNSSEEDS_DELAY_PEER_THRESHOLD, || 0, &sd, resolver(&asked)).await;
+    assert_eq!(got, Some(vec![seed]));
+    assert_eq!(t0.elapsed(), DNSSEEDS_DELAY_MANY_PEERS);
+    assert_eq!(asked.swap(0, Ordering::SeqCst), 1);
+
+    // Shutdown during the wait: nothing is asked.
+    sd.request();
+    let got = dns_seeds_when_needed(50, || 0, &sd, resolver(&asked)).await;
+    assert_eq!(got, None);
+    assert_eq!(asked.load(Ordering::SeqCst), 0);
+}
+
 /// `--esplora-max-inflight` reaches the listener: with a limit of one, a
 /// request whose body never arrives makes the next request wait.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

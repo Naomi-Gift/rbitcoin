@@ -200,6 +200,73 @@ async fn ibd_redial_keeps_dialing_until_a_peer_or_cancel() {
     let _ = std::fs::remove_dir_all(&peer_dir);
 }
 
+/// A row added to the shared book after catch-up starts (the deferred DNS
+/// seeds) is dialled on the next sweep and kept when catch-up flushes the
+/// book. While that session is live the hub counts it as outbound full
+/// relay, and the count drops to 0 when catch-up ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ibd_dials_a_row_added_to_the_shared_book_mid_catch_up() {
+    let seed_dir = tmp_dir("seed-late-row");
+    let peer_dir = tmp_dir("peer-late-row");
+    let seed = start_node(&seed_dir).await;
+    seed_chain(&seed, 2);
+    let peer = start_node(&peer_dir).await;
+    let dead = rbitcoin_net::NetAddr::Ip("127.0.0.1:1".parse().unwrap());
+    let late = rbitcoin_net::NetAddr::Ip(seed.local_addr);
+    let mut book = rbitcoin_net::AddrMan::new();
+    book.add_addr(dead);
+    let shared = Arc::new(std::sync::Mutex::new(book));
+    let mut cfg = IbdConfig::for_test();
+    cfg.target_peers = 1;
+    cfg.connect_timeout = Duration::from_millis(300);
+    cfg.initial_dial_waves = 1;
+    cfg.peerless = rbitcoin_ibd::Peerless::Redial {
+        cap: Duration::from_millis(100),
+    };
+    cfg.peers = Some(Arc::clone(&shared));
+
+    let clock = Arc::clone(&peer.hub.clock);
+    let add_to = Arc::clone(&shared);
+    tokio::spawn(async move {
+        while clock.connection_attempt_at() == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        add_to.lock().unwrap().add_addr(late);
+    });
+    let done = Arc::new(AtomicBool::new(false));
+    let max_out = {
+        let (hub, done) = (Arc::clone(&peer.peers), Arc::clone(&done));
+        std::thread::spawn(move || {
+            let mut max = 0;
+            while !done.load(Ordering::SeqCst) {
+                max = max.max(hub.full_outbound_count());
+                std::thread::sleep(Duration::from_micros(100));
+            }
+            max
+        })
+    };
+    let synced = tokio::time::timeout(
+        Duration::from_secs(20),
+        rbitcoin_ibd::sync(&peer, &[dead], cfg),
+    )
+    .await
+    .expect("the next sweep reaches the late row");
+    done.store(true, Ordering::SeqCst);
+    assert!(synced.is_ok(), "{synced:?}");
+    assert_eq!(peer.tip_height(), Some(2));
+    assert_eq!(max_out.join().unwrap(), 1, "the catch-up session counted");
+    assert_eq!(peer.peers.full_outbound_count(), 0);
+    assert!(
+        shared.lock().unwrap().entry_of(&late).is_some(),
+        "flush keeps it"
+    );
+
+    seed.shutdown().await;
+    peer.shutdown().await;
+    let _ = std::fs::remove_dir_all(&seed_dir);
+    let _ = std::fs::remove_dir_all(&peer_dir);
+}
+
 fn logs_from_sync() -> impl Fn() -> Vec<String> {
     rbitcoin_log::capture_logs(true);
     || {
