@@ -4088,11 +4088,20 @@ impl PeerHub {
         self.catch_up_full_outbound.store(n, Ordering::Relaxed);
     }
 
-    /// Core `GetFullOutboundConnCount`: live outbound full-relay sessions,
-    /// catch-up's included. Not `noban`-gated.
+    /// Core `GetFullOutboundConnCount`: outbound full-relay sessions past
+    /// VERSION (`fSuccessfullyConnected`), catch-up's included. A row still
+    /// in the handshake does not count. Not `noban`-gated.
     pub fn full_outbound_count(&self) -> usize {
-        self.live_outbound_full_relay_nets().len()
-            + self.catch_up_full_outbound.load(Ordering::Relaxed)
+        let hub = self
+            .live_peers()
+            .into_iter()
+            .filter(|p| {
+                p.conn_type == PeerConnType::OutboundFullRelay
+                    && !p.inbound
+                    && p.handshake_complete()
+            })
+            .count();
+        hub + self.catch_up_full_outbound.load(Ordering::Relaxed)
     }
 
     /// Live outbound full-relay addrs (not `noban`-gated) for diversity occupied.

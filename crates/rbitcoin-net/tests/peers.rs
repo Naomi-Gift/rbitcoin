@@ -1515,7 +1515,20 @@ fn full_outbound_count_adds_catch_up_sessions() {
         false,
         PeerConnType::BlockRelay,
     );
-    assert_eq!(hub.full_outbound_count(), 1);
+    // Core `GetFullOutboundConnCount` counts only `fSuccessfullyConnected`.
+    let d = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4);
+    let _connecting = hub.register_connecting_net(
+        d,
+        rbitcoin_net::NetAddr::from_socket(d),
+        d,
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    assert_eq!(
+        hub.full_outbound_count(),
+        1,
+        "VERSION not done: not counted"
+    );
     hub.set_catch_up_full_outbound(2);
     assert_eq!(hub.full_outbound_count(), 3);
     hub.set_noban(true);
