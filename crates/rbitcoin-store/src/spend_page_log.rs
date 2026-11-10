@@ -354,6 +354,8 @@ impl SpendPageLog {
     /// no base image. `keep` drops a slot that is no longer best-chain so a
     /// later fold does not write it. An empty open set leaves an existing
     /// commit in place, unless a held snapshot has to be filtered first.
+    /// A frozen snapshot left by a failed compose is retried. Notes taken
+    /// after that failure stay in `open` and do not replace it.
     ///
     /// A second generation appends. It does not replace bytes an older commit
     /// still names.
@@ -377,18 +379,23 @@ impl SpendPageLog {
         }
         let _clear_compose = ClearCompose(self);
         self.explode_held(&mut keep)?;
-        let (snapshot, carried) = {
+        let (snapshot, carried, froze) = {
             let mut g = self.lock();
-            if g.open.is_empty() {
-                if g.frozen.is_empty() && !g.fold_held {
+            let reuse = !g.frozen.is_empty();
+            if !reuse && g.open.is_empty() {
+                if !g.fold_held {
                     g.cool_through = g.generation;
                 }
                 return Ok(());
             }
             // Freeze is a swap, not a clone of the live map. Confirm notes the
             // next generation into `open` while this snapshot is composed.
-            g.frozen = std::mem::take(&mut g.open);
-            g.open_edges = 0;
+            // A leftover frozen map is that snapshot: do not drop it for a
+            // newer open set, and do not zero the edges those notes added.
+            if !reuse {
+                g.frozen = std::mem::take(&mut g.open);
+                g.open_edges = 0;
+            }
             let snapshot: Vec<(u64, OpenPage)> = g
                 .frozen
                 .iter()
@@ -417,9 +424,11 @@ impl SpendPageLog {
                     )
                 })
                 .collect();
-            (snapshot, carried)
+            (snapshot, carried, !reuse)
         };
-        self.pace.notify_room();
+        if froze {
+            self.pace.notify_room();
+        }
         let mut kept: Vec<(u64, OpenPage)> = Vec::new();
         let mut rejected: Vec<u64> = Vec::new();
         for (page_off, mut page) in snapshot {
@@ -1253,6 +1262,49 @@ mod tests {
         .unwrap();
         assert_eq!(writes, 0, "the abandoned spend is not copied later");
         assert_eq!(log.slot(16), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn failed_compose_retries_the_frozen_page() {
+        let d = dir();
+        let log = SpendPageLog::create(&d);
+        let first = [3u8, 1, 2, 3, 4, 5, 6, 7];
+        let second = [4u8, 1, 2, 3, 4, 5, 6, 7];
+        log.note_slots(&[(16, first)]).unwrap();
+        let err = log
+            .commit_open(
+                4,
+                8192,
+                |_off, _len| Err(StoreError::Corrupt("boom")),
+                |_| Ok(true),
+            )
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt("boom")));
+        assert_eq!(log.slot(16), Some(first));
+        assert!(!d.join(SPEND_PAGES_COMMIT_NAME).exists());
+        log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+        let retried = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
+        assert_eq!(&retried[16..24], &first);
+        assert_eq!(log.slot(16), Some(first));
+        let _ = std::fs::remove_dir_all(&d);
+        let d = dir();
+        let log = SpendPageLog::create(&d);
+        log.note_slots(&[(16, first)]).unwrap();
+        log.commit_open(
+            4,
+            8192,
+            |_off, _len| Err(StoreError::Corrupt("boom")),
+            |_| Ok(true),
+        )
+        .unwrap_err();
+        log.note_slots(&[(4096, second)]).unwrap();
+        log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+        assert_eq!(log.slot(16), Some(first));
+        assert_eq!(log.slot(4096), Some(second));
+        let file = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
+        assert_eq!(file.len(), 4096);
+        assert_eq!(&file[16..24], &first);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
