@@ -596,8 +596,9 @@ async fn minchainwork_while_tip_is_short(
     );
 }
 
-/// One header with real PoW harder than regtest still outworks a short tip.
-async fn shorter_higher_work_still_fetches(
+/// Harder claimed work than the tip is still `bad-diffbits` on regtest.
+/// The body is not fetched and the header is not held.
+async fn shorter_higher_work_rejected_by_the_store_is_not_fetched(
     hub: &rbitcoin_net::chain::ChainHub,
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
 ) {
@@ -633,10 +634,13 @@ async fn shorter_higher_work_still_fetches(
         NetworkMessage::Headers(vec![hard]),
     )
     .await;
-    assert_eq!(
-        asked_blocks(&mut out_rx),
-        vec![hash],
-        "a shorter higher-work header is fetched"
+    assert!(
+        asked_blocks(&mut out_rx).is_empty(),
+        "a header the store rejects for bad-diffbits is not fetched"
+    );
+    assert!(
+        !follow.pending_headers.contains_key(&hash),
+        "a header the store rejects is not pending"
     );
 }
 
@@ -1923,7 +1927,7 @@ async fn peer_header_dos_and_self_announce() {
     hub.generate_to_script(5, op_true(), vec![]).unwrap();
     assert_eq!(hub.tip_height(), Some(5));
     header_getdata_decisions(&hub, &peers).await;
-    shorter_higher_work_still_fetches(&hub, &peers).await;
+    shorter_higher_work_rejected_by_the_store_is_not_fetched(&hub, &peers).await;
 
     mine_across_the_work_floor(&hub);
     hub.set_minimum_chain_work(None);
@@ -2305,9 +2309,15 @@ async fn equal_work_fork_keeps_its_work_after_pending_drop() {
     let peers = rbitcoin_net::peers::PeerHub::new();
     let peer = live_peer_as(&peers, 18513, 93, PeerConnType::OutboundFullRelay);
     peer.note_best_known(tip);
-    let parent = header_at(&hub, 3).block_hash();
-    let fork = regtest_header_chain(parent, 1);
-    let fork_hash = fork[0].block_hash();
+    let parent_hdr = header_at(&hub, 3);
+    let mut fork_hdr = parent_hdr;
+    fork_hdr.prev_blockhash = parent_hdr.block_hash();
+    fork_hdr.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x44; 32]);
+    fork_hdr.time = parent_hdr.time.saturating_add(600);
+    fork_hdr.bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
+    fork_hdr.nonce = 0;
+    rbitcoin_consensus::grind_regtest_pow(&mut fork_hdr);
+    let fork_hash = fork_hdr.block_hash();
     let (out_tx, _rx) = mpsc::unbounded_channel();
     let mut follow = PeerFollowState::new();
     push(
@@ -2315,9 +2325,16 @@ async fn equal_work_fork_keeps_its_work_after_pending_drop() {
         &out_tx,
         &mut follow,
         Some(peer.as_ref()),
-        NetworkMessage::Headers(fork),
+        NetworkMessage::Headers(vec![fork_hdr]),
     )
     .await;
+    assert!(
+        hub.query
+            .get_header_by_hash(&fork_hash.to_byte_array())
+            .unwrap()
+            .is_some(),
+        "the equal-work fork is stored"
+    );
     assert_eq!(
         peer.best_known(),
         Some(fork_hash),
@@ -2345,7 +2362,15 @@ async fn equal_work_fork_keeps_its_work_after_pending_drop() {
         Some(fork_hash),
         "a lower block does not replace an equal-work fork after it leaves pending"
     );
-    let low = regtest_header_chain(header_at(&hub, 0).block_hash(), 1);
+    let low_parent = header_at(&hub, 2);
+    let mut low_hdr = low_parent;
+    low_hdr.prev_blockhash = low_parent.block_hash();
+    low_hdr.merkle_root = bitcoin::TxMerkleNode::from_byte_array([0x45; 32]);
+    low_hdr.time = low_parent.time.saturating_add(600);
+    low_hdr.bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
+    low_hdr.nonce = 0;
+    rbitcoin_consensus::grind_regtest_pow(&mut low_hdr);
+    let low = vec![low_hdr];
     rbitcoin_log::capture_logs(true);
     push(
         &hub,

@@ -5133,6 +5133,7 @@ struct HeadersApply {
     from_peer: Vec<BlockHash>,
     best_known: Vec<BlockHash>,
     admits: Vec<(BlockHash, bitcoin::block::Header)>,
+    evicts: Vec<BlockHash>,
     misbehave: bool,
     /// `(announced height, our tip)` when the peer is a stale fork.
     disconnect: Option<(u32, u32)>,
@@ -5152,6 +5153,344 @@ struct HeadersApply {
     /// unconnecting message, so its rate limit holds.
     answers_getheaders: bool,
 }
+/// Drop pending headers until `slots` new headers fit under [`MAX_PENDING_HEADERS`].
+///
+/// `slots` is how many headers this call would newly store. A header that
+/// fails claimed proof of work goes first, then one whose path does not reach
+/// a stored header, then a connected fork with less work than `headers`, then
+/// one with the same work. Stop once those slots fit. Ancestors of `prev`
+/// stay. A fork with more work stays. A fork whose work cannot be scored
+/// stays, and so does every connected fork when `headers` cannot.
+fn evict_pending_for_room(
+    hub: &ChainHub,
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    prev: BlockHash,
+    headers: &[bitcoin::block::Header],
+    slots: usize,
+) {
+    if !pending_over_cap(pending, slots) {
+        return;
+    }
+    let protected = pending_ancestors(pending, prev);
+    let failed_pow: Vec<BlockHash> = pending
+        .iter()
+        .filter(|(hash, hdr)| !protected.contains(*hash) && !hub.header_claimed_pow_ok(hdr))
+        .map(|(hash, _)| *hash)
+        .collect();
+    drop_hashes_until_fit(pending, slots, failed_pow);
+    if !pending_over_cap(pending, slots) {
+        return;
+    }
+    let failed_forks: Vec<BlockHash> = pending_tips(pending)
+        .into_iter()
+        .filter(|tip| pending_path_fails_claimed_pow(hub, pending, *tip))
+        .collect();
+    drop_tips_until_fit(pending, &protected, slots, &failed_forks);
+    if !pending_over_cap(pending, slots) {
+        return;
+    }
+    drop_hashes_until_fit(
+        pending,
+        slots,
+        disconnected_pending(hub, pending, &protected),
+    );
+    let Some(incoming_work) = incoming_header_work(hub, pending, headers) else {
+        return;
+    };
+    evict_forks_with_work(
+        hub,
+        pending,
+        &protected,
+        slots,
+        incoming_work,
+        std::cmp::Ordering::Less,
+    );
+    evict_forks_with_work(
+        hub,
+        pending,
+        &protected,
+        slots,
+        incoming_work,
+        std::cmp::Ordering::Equal,
+    );
+}
+
+fn pending_over_cap(pending: &HashMap<BlockHash, bitcoin::block::Header>, incoming: usize) -> bool {
+    pending.len().saturating_add(incoming) > MAX_PENDING_HEADERS
+}
+
+fn drop_hashes_until_fit(
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    incoming: usize,
+    hashes: impl IntoIterator<Item = BlockHash>,
+) {
+    for hash in hashes {
+        if !pending_over_cap(pending, incoming) {
+            return;
+        }
+        pending.remove(&hash);
+    }
+}
+
+fn drop_tips_until_fit(
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    protected: &HashSet<BlockHash>,
+    incoming: usize,
+    tips: &[BlockHash],
+) {
+    for &tip in tips {
+        let mut hash = tip;
+        loop {
+            if !pending_over_cap(pending, incoming) {
+                return;
+            }
+            if protected.contains(&hash) {
+                break;
+            }
+            let Some(parent) = pending.get(&hash).map(|hdr| hdr.prev_blockhash) else {
+                break;
+            };
+            pending.remove(&hash);
+            hash = parent;
+        }
+    }
+}
+
+fn pending_tips(pending: &HashMap<BlockHash, bitcoin::block::Header>) -> Vec<BlockHash> {
+    let has_child: HashSet<BlockHash> = pending.values().map(|hdr| hdr.prev_blockhash).collect();
+    pending
+        .keys()
+        .copied()
+        .filter(|hash| !has_child.contains(hash))
+        .collect()
+}
+
+fn pending_path_fails_claimed_pow(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+) -> bool {
+    let mut hash = tip;
+    for _ in 0..PENDING_WALK_LIMIT {
+        if hub.is_connected(&hash) {
+            return false;
+        }
+        let Some(hdr) = pending.get(&hash).copied().or_else(|| hub.header_of(&hash)) else {
+            return false;
+        };
+        if !hub.header_claimed_pow_ok(&hdr) {
+            return true;
+        }
+        hash = hdr.prev_blockhash;
+        if hash.to_byte_array() == [0u8; 32] {
+            return false;
+        }
+    }
+    false
+}
+
+fn disconnected_pending(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    protected: &HashSet<BlockHash>,
+) -> Vec<BlockHash> {
+    let no_pending = HashMap::new();
+    let mut root_of: HashMap<BlockHash, BlockHash> = HashMap::new();
+    let mut root_connects: HashMap<BlockHash, bool> = HashMap::new();
+    let hashes: Vec<BlockHash> = pending.keys().copied().collect();
+    for &hash in &hashes {
+        let root = pending_root(pending, hash, &mut root_of);
+        root_connects.entry(root).or_insert_with(|| {
+            let parent = pending[&root].prev_blockhash;
+            parent != BlockHash::all_zeros()
+                && header_announcement_connects(hub, &no_pending, parent)
+        });
+    }
+    hashes
+        .into_iter()
+        .filter(|hash| !protected.contains(hash) && !root_connects[&root_of[hash]])
+        .collect()
+}
+
+/// Pending slots this message needs. A header this call would write, and
+/// that is not already in `pending`, takes one. A repeat takes one. A header
+/// the store already has, or that is not on the walk from the last hash,
+/// takes none.
+fn newly_stored_slot_count(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    headers: &[bitcoin::block::Header],
+) -> usize {
+    let Some(last) = headers.last() else {
+        return 0;
+    };
+    let mut batch = HashMap::with_capacity(headers.len());
+    for hdr in headers {
+        batch.insert(hdr.block_hash(), *hdr);
+    }
+    // The message overwrites a hash already in `pending`, matching the admit
+    // that runs before the store walk.
+    unstored_header_path(hub, last.block_hash(), |hash| {
+        batch
+            .get(&hash)
+            .copied()
+            .or_else(|| pending.get(&hash).copied())
+    })
+    .into_iter()
+    .filter(|hdr| !pending.contains_key(&hdr.block_hash()))
+    .count()
+}
+
+fn queue_batch_admits(apply: &mut HeadersApply, headers: &[bitcoin::block::Header]) {
+    let mut seen = HashSet::new();
+    for hdr in headers {
+        let hash = hdr.block_hash();
+        if seen.insert(hash) {
+            apply.admits.push((hash, *hdr));
+        }
+    }
+}
+
+/// Headers in this message that `persist_pending_header_path` actually wrote.
+/// A sibling that is not on the walk from the last header stays out.
+fn queue_stored_header_admits(
+    apply: &mut HeadersApply,
+    hub: &ChainHub,
+    headers: &[bitcoin::block::Header],
+) {
+    let mut seen = HashSet::new();
+    for hdr in headers {
+        let hash = hdr.block_hash();
+        if seen.insert(hash) && header_is_stored(hub, &hash) {
+            apply.admits.push((hash, *hdr));
+        }
+    }
+}
+
+/// Persist the walk from `last`, then admit only the headers the store kept.
+fn note_stored_header_path(
+    hub: &ChainHub,
+    apply: &mut HeadersApply,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    headers: &[bitcoin::block::Header],
+    last: BlockHash,
+    work_cmp: Option<std::cmp::Ordering>,
+    announced_h: u32,
+) -> bool {
+    let should_stamp =
+        work_cmp == Some(std::cmp::Ordering::Greater) && !header_is_stored(hub, &last);
+    let stored = persist_pending_header_path(hub, pending, last);
+    apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
+    queue_stored_header_admits(apply, hub, headers);
+    apply.sync_height = Some(announced_h);
+    stored
+}
+
+/// Drop in-flight asks that left the stored walk, and ask for bodies on it.
+fn retarget_stored_header_asks(
+    hub: &ChainHub,
+    apply: &mut HeadersApply,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    last: BlockHash,
+    requested_before: &HashSet<BlockHash>,
+    have_bodies: &HashSet<BlockHash>,
+) {
+    let keep = connecting_header_path(hub, pending, last);
+    let mut requested = requested_before.clone();
+    release_asks_off_path(hub, &mut requested, &keep);
+    apply.drop_asks = requested_before
+        .iter()
+        .copied()
+        .filter(|h| !requested.contains(h))
+        .collect();
+    let mut want =
+        fetchable_header_path_bodies(hub, pending, last, &PendingBlocks::new(), &requested);
+    want.retain(|h| !have_bodies.contains(h) && !requested.contains(h));
+    want.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested.len()));
+    apply.want_bodies = want;
+}
+
+fn incoming_header_work(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    headers: &[bitcoin::block::Header],
+) -> Option<bitcoin::Work> {
+    let last = headers.last()?;
+    let mut with_batch = pending.clone();
+    for hdr in headers {
+        with_batch.insert(hdr.block_hash(), *hdr);
+    }
+    work_of_header_path(hub, &with_batch, last.block_hash())
+}
+
+fn evict_forks_with_work(
+    hub: &ChainHub,
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    protected: &HashSet<BlockHash>,
+    incoming: usize,
+    incoming_work: bitcoin::Work,
+    want: std::cmp::Ordering,
+) {
+    if !pending_over_cap(pending, incoming) {
+        return;
+    }
+    let mut keep = protected.clone();
+    let mut victims = Vec::new();
+    for tip in pending_tips(pending) {
+        if pending_path_fails_claimed_pow(hub, pending, tip) {
+            continue;
+        }
+        match work_of_header_path(hub, pending, tip) {
+            Some(work) if work.cmp(&incoming_work) == want => victims.push(tip),
+            _ => keep.extend(pending_ancestors(pending, tip)),
+        }
+    }
+    drop_tips_until_fit(pending, &keep, incoming, &victims);
+}
+
+/// `start` and its ancestors that are in `pending`, walking at most
+/// `PENDING_WALK_LIMIT` steps. Reads only the pending map.
+fn pending_ancestors(
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    start: BlockHash,
+) -> HashSet<BlockHash> {
+    let mut out = HashSet::new();
+    let mut h = start;
+    for _ in 0..PENDING_WALK_LIMIT {
+        let Some(hdr) = pending.get(&h) else {
+            break;
+        };
+        out.insert(h);
+        h = hdr.prev_blockhash;
+    }
+    out
+}
+
+/// The oldest pending ancestor of `hash` (whose parent is not pending),
+/// memoised in `root_of`. Bounded by `PENDING_WALK_LIMIT`.
+fn pending_root(
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    hash: BlockHash,
+    root_of: &mut HashMap<BlockHash, BlockHash>,
+) -> BlockHash {
+    let mut path = Vec::new();
+    let mut h = hash;
+    let root = loop {
+        if let Some(r) = root_of.get(&h) {
+            break *r;
+        }
+        path.push(h);
+        let parent = pending[&h].prev_blockhash;
+        if !pending.contains_key(&parent) || path.len() >= PENDING_WALK_LIMIT {
+            break h;
+        }
+        h = parent;
+    };
+    for p in path {
+        root_of.insert(p, root);
+    }
+    root
+}
 
 fn classify_headers(
     hub: &ChainHub,
@@ -5167,6 +5506,7 @@ fn classify_headers(
         from_peer: Vec::new(),
         best_known: Vec::new(),
         admits: Vec::new(),
+        evicts: Vec::new(),
         misbehave: false,
         disconnect: None,
         sync_height: None,
@@ -5182,7 +5522,7 @@ fn classify_headers(
     let mut ignored_below_floor = false;
     if n == 0 {
         // Empty headers is a failed getheaders response, not an announcement.
-    } else if n > 0 && !noban && headers_are_below_floor(hub, pending_before, headers) {
+    } else if !noban && headers_are_below_floor(hub, pending_before, headers) {
         // Work stays under the floor from the pending headers alone. Do not
         // read parent headers, do not move this peer's best-known tip, and
         // do not ask for the next page of a batch we refused.
@@ -5212,16 +5552,45 @@ fn classify_headers(
             apply.misbehave = true;
             return apply;
         }
-        let connecting = header_announcement_connects(hub, pending_before, prev);
+        // The all-zero hash is only genesis's parent. A header claiming it is
+        // not a continuation of any chain we hold.
+        let connecting = prev != BlockHash::all_zeros()
+            && header_announcement_connects(hub, pending_before, prev);
         apply.answers_getheaders = connecting;
+        let slots = newly_stored_slot_count(hub, &pending, headers);
+        let mut staged_evicts = Vec::new();
+        if connecting && pending.len().saturating_add(slots) > MAX_PENDING_HEADERS {
+            // Claimed proof of work includes the chain pow limit. Evictions
+            // stay staged until the store accepts the batch.
+            if !headers
+                .iter()
+                .take(n)
+                .all(|hdr| hub.header_claimed_pow_ok(hdr))
+            {
+                return apply;
+            }
+            evict_pending_for_room(hub, &mut pending, prev, headers, slots);
+            if pending.len().saturating_add(slots) > MAX_PENDING_HEADERS {
+                return apply;
+            }
+            staged_evicts = pending_before
+                .keys()
+                .filter(|hash| !pending.contains_key(*hash))
+                .copied()
+                .collect();
+        }
         for hdr in headers.iter().take(n) {
             let hash = hdr.block_hash();
             apply.from_peer.push(hash);
             apply.best_known.push(hash);
-            admit_pending_header(&mut pending, hash, *hdr);
-            apply.admits.push((hash, *hdr));
+            // The real map caps in `apply_headers`. This clone has to hold the
+            // whole message so the store walk can see the last header.
+            pending.insert(hash, *hdr);
         }
         if !connecting {
+            // These headers are not sent to the store. A later parent can
+            // still join them.
+            queue_batch_admits(&mut apply, headers);
             if n < MAX_HEADERS_RESULTS {
                 apply.getheaders = Some(headers_sync_locator(hub, None));
             }
@@ -5234,17 +5603,25 @@ fn classify_headers(
             let work_cmp = announced_work_cmp(hub, &pending, last);
             let our_tip = hub.tip_height().unwrap_or(0);
             if announced_tip_is_hopeless(our_tip, announced_h, work_cmp) && !noban {
+                queue_batch_admits(&mut apply, headers);
                 apply.disconnect = Some((announced_h, our_tip));
                 return apply;
             }
+            let mut stored = false;
             if !header_path_meets_minwork(hub, &pending, last) {
                 if noban {
-                    let should_stamp = work_cmp == Some(std::cmp::Ordering::Greater)
-                        && !header_is_stored(hub, &last);
-                    persist_pending_header_path(hub, &pending, last);
-                    apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
-                    apply.sync_height = Some(announced_h);
+                    stored = note_stored_header_path(
+                        hub,
+                        &mut apply,
+                        &pending,
+                        headers,
+                        last,
+                        work_cmp,
+                        announced_h,
+                    );
                 } else {
+                    // Below the floor this path does not touch the store.
+                    queue_batch_admits(&mut apply, headers);
                     apply.ignore_height = Some(announced_h);
                     ignored_below_floor = true;
                 }
@@ -5253,29 +5630,30 @@ fn classify_headers(
             } else {
                 // This check is deliberately after the below-floor early path:
                 // that path must not touch the header store or walk parents.
-                let should_stamp =
-                    work_cmp == Some(std::cmp::Ordering::Greater) && !header_is_stored(hub, &last);
-                persist_pending_header_path(hub, &pending, last);
-                apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
-                apply.sync_height = Some(announced_h);
-                let keep = connecting_header_path(hub, &pending, last);
-                let mut requested = requested_before.clone();
-                release_asks_off_path(hub, &mut requested, &keep);
-                apply.drop_asks = requested_before
-                    .iter()
-                    .copied()
-                    .filter(|h| !requested.contains(h))
-                    .collect();
-                let mut want = fetchable_header_path_bodies(
+                stored = note_stored_header_path(
                     hub,
+                    &mut apply,
                     &pending,
+                    headers,
                     last,
-                    &PendingBlocks::new(),
-                    &requested,
+                    work_cmp,
+                    announced_h,
                 );
-                want.retain(|h| !have_bodies.contains(h) && !requested.contains(h));
-                want.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested.len()));
-                apply.want_bodies = want;
+                // Asks follow the stored walk only. A rejected header must
+                // not drop an in-flight body or start a new one.
+                if stored {
+                    retarget_stored_header_asks(
+                        hub,
+                        &mut apply,
+                        &pending,
+                        last,
+                        requested_before,
+                        have_bodies,
+                    );
+                }
+            }
+            if stored {
+                apply.evicts = staged_evicts;
             }
         }
     }
@@ -5406,6 +5784,9 @@ fn apply_headers(
     // work saved with it, which outlives the pending map.
     let prior_best = session.and_then(|s| s.best_known());
     let prior_work = session.and_then(|s| s.best_known_work());
+    for hash in apply.evicts {
+        follow.pending_headers.remove(&hash);
+    }
     for hash in apply.from_peer {
         if let Some(s) = session {
             s.note_block_from_peer(hash);
@@ -7045,38 +7426,52 @@ pub fn announced_headers_height(
     hub.header_height(&join).unwrap_or(0).saturating_add(steps)
 }
 
-/// Persist `tip`'s pending path oldest-first so `ensure_header` has parents.
-/// Store the pending headers from `tip` back to the last stored one. Headers
-/// already stored were checked when they were written.
-#[doc(hidden)]
-pub fn persist_pending_header_path(
+/// Headers on the walk from `tip` that are not in the store yet, oldest first.
+/// The walk stops at a stored header. That header is not included.
+fn unstored_header_path(
     hub: &ChainHub,
-    pending: &HashMap<BlockHash, bitcoin::block::Header>,
     tip: BlockHash,
-) {
+    mut lookup: impl FnMut(BlockHash) -> Option<bitcoin::block::Header>,
+) -> Vec<bitcoin::block::Header> {
     let mut path = Vec::new();
     let mut h = tip;
     for _ in 0..PENDING_WALK_LIMIT {
-        let Some(hdr) = pending.get(&h) else {
+        let Some(hdr) = lookup(h) else {
             break;
         };
         if header_is_stored(hub, &h) {
             break;
         }
-        path.push(*hdr);
+        path.push(hdr);
         h = hdr.prev_blockhash;
         if is_genesis_hash(&h) {
             break;
         }
     }
     path.reverse();
+    path
+}
+
+/// Persist `tip`'s pending path oldest-first so `ensure_header` has parents.
+/// Store the pending headers from `tip` back to the last stored one. Headers
+/// already stored were checked when they were written.
+///
+/// `false` when a chunk is rejected. Chunks already written in this call stay.
+#[doc(hidden)]
+pub fn persist_pending_header_path(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+) -> bool {
+    let path = unstored_header_path(hub, tip, |hash| pending.get(&hash).copied());
     // One store batch. Per-header ensure walks parent heights to genesis, so a
     // full below-floor chain (thousands of headers) is quadratic.
     for chunk in path.chunks(MAX_HEADERS_RESULTS) {
         if hub.ensure_headers_batch(chunk).is_err() {
-            break;
+            return false;
         }
     }
+    true
 }
 
 #[doc(hidden)]

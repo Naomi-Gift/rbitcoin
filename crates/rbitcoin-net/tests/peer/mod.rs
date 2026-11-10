@@ -2246,7 +2246,7 @@ fn handle_peer_frame_control_and_inv_paths() {
             .query
             .wire_header_at_height(rbitcoin_primitives::Height(0))
             .unwrap();
-        // Synthesize a child-looking header (not valid pow; just exercises map).
+        // A child of genesis that misses its proof of work is not inserted.
         use bitcoin::block::{Header, Version};
         use bitcoin::{CompactTarget, TxMerkleNode};
         let child = Header {
@@ -2266,8 +2266,11 @@ fn handle_peer_frame_control_and_inv_paths() {
         )
         .await
         .unwrap();
-        assert!(follow.pending_headers.contains_key(&child.block_hash()));
-        let _ = out_rx.try_recv(); // GetData
+        assert!(
+            !follow.pending_headers.contains_key(&child.block_hash()),
+            "a header the store rejects is not pending"
+        );
+        let _ = out_rx.try_recv();
 
         // GetData for known tip block (cache miss → reconstruct).
         let tip = hub.tip_hash().unwrap();
