@@ -296,10 +296,12 @@ pub fn tx(ctx: &RpcContext, fmt: RestFmt, txid: &str) -> Result<RestReply, RestR
             &format!("{txid} not found"),
         )
     })?;
-    let raw = rbitcoin_primitives::hex_decode(hex)
-        .map_err(|_| err(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "tx hex"))?;
     match wire {
-        RestWire::Bin => Ok(bin_body(raw)),
+        RestWire::Bin => {
+            let raw = rbitcoin_primitives::hex_decode(hex)
+                .map_err(|_| err(axum::http::StatusCode::INTERNAL_SERVER_ERROR, "tx hex"))?;
+            Ok(bin_body(raw))
+        }
         RestWire::Hex => Ok(hex_body(hex)),
     }
 }
