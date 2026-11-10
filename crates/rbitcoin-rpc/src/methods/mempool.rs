@@ -1352,6 +1352,63 @@ pub fn testmempoolaccept_package_precheck(
     None
 }
 
+fn tma_ids(tx: &Transaction) -> (String, String) {
+    (
+        hash_hex_display(&tx.compute_txid().to_byte_array()),
+        hash_hex_display(&tx.compute_wtxid().to_byte_array()),
+    )
+}
+
+fn tma_reject(txid: &str, wtxid: &str, reason: &str) -> Value {
+    json!({
+        "txid": txid,
+        "wtxid": wtxid,
+        "allowed": false,
+        "reject-reason": reason,
+    })
+}
+
+fn tma_bip125(txid: &str, wtxid: &str) -> Value {
+    json!({
+        "txid": txid,
+        "wtxid": wtxid,
+        "allowed": false,
+        "reject-reason": "bip125-replacement-disallowed",
+        "reject-details": "bip125-replacement-disallowed",
+    })
+}
+
+/// One `testmempoolaccept` allowed or `max-fee-exceeded` row.
+fn tma_from_accept(
+    tx: &Transaction,
+    txid: &str,
+    wtxid: &str,
+    fee_sat: u64,
+    weight: u64,
+    max_feerate: u64,
+) -> Value {
+    if fee_exceeds_max(fee_sat, weight, max_feerate) {
+        return tma_reject(txid, wtxid, "max-fee-exceeded");
+    }
+    json!({
+        "txid": txid,
+        "wtxid": wtxid,
+        "allowed": true,
+        "vsize": rbitcoin_consensus::policy::vbytes_ceil(weight),
+        "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(weight),
+        "vsize_bip141": tx.vsize(),
+        "fees": accept_fees_json(fee_sat, weight, wtxid),
+    })
+}
+
+fn tma_from_err(tx: &Transaction, txid: &str, wtxid: &str, e: &impl std::fmt::Display) -> Value {
+    let mut row = tma_reject(txid, wtxid, &accept_reject_reason(e));
+    if let Some(details) = accept_reject_details(e, tx) {
+        row["reject-details"] = json!(details);
+    }
+    row
+}
+
 #[doc(hidden)]
 pub fn testmempoolaccept_package_rows(
     mp: &MempoolHub,
@@ -1361,15 +1418,9 @@ pub fn testmempoolaccept_package_rows(
     let mut added = Vec::new();
     let mut out = Vec::new();
     for tx in decoded {
-        let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
-        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        let (txid, wtxid) = tma_ids(tx);
         if rpc_tx_version_nonstandard(tx) {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "version",
-            }));
+            out.push(tma_reject(&txid, &wtxid, "version"));
             continue;
         }
         if tx
@@ -1377,49 +1428,22 @@ pub fn testmempoolaccept_package_rows(
             .iter()
             .any(|i| mp.spending_txid(&i.previous_output).is_some())
         {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "bip125-replacement-disallowed",
-                "reject-details": "bip125-replacement-disallowed",
-            }));
+            out.push(tma_bip125(&txid, &wtxid));
             continue;
         }
         match mp.accept_test_package_member(tx) {
             Ok(r) => {
                 added.push(r.txid);
-                if fee_exceeds_max(r.fee_sat, r.weight, max_feerate) {
-                    out.push(json!({
-                        "txid": txid,
-                        "wtxid": wtxid,
-                        "allowed": false,
-                        "reject-reason": "max-fee-exceeded",
-                    }));
-                } else {
-                    out.push(json!({
-                        "txid": txid,
-                        "wtxid": wtxid,
-                        "allowed": true,
-                        "vsize": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                        "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                        "vsize_bip141": tx.vsize(),
-                        "fees": accept_fees_json(r.fee_sat, r.weight, &wtxid),
-                    }));
-                }
+                out.push(tma_from_accept(
+                    tx,
+                    &txid,
+                    &wtxid,
+                    r.fee_sat,
+                    r.weight,
+                    max_feerate,
+                ));
             }
-            Err(e) => {
-                let mut row = json!({
-                    "txid": txid,
-                    "wtxid": wtxid,
-                    "allowed": false,
-                    "reject-reason": accept_reject_reason(&e),
-                });
-                if let Some(details) = accept_reject_details(&e, tx) {
-                    row["reject-details"] = json!(details);
-                }
-                out.push(row);
-            }
+            Err(e) => out.push(tma_from_err(tx, &txid, &wtxid, &e)),
         }
     }
     if !added.is_empty() {
@@ -1437,59 +1461,25 @@ pub fn testmempoolaccept_single_rows(
 ) -> Result<Value, Value> {
     let mut out = Vec::new();
     for tx in decoded {
-        let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
-        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        let (txid, wtxid) = tma_ids(&tx);
         if tx_confirmed_on_active_chain(ctx, &tx)? {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "txn-already-known",
-            }));
+            out.push(tma_reject(&txid, &wtxid, "txn-already-known"));
             continue;
         }
         if rpc_tx_version_nonstandard(&tx) {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "version",
-            }));
+            out.push(tma_reject(&txid, &wtxid, "version"));
             continue;
         }
         match mp.test_accept(&tx) {
-            Ok(r) => {
-                if fee_exceeds_max(r.fee_sat, r.weight, max_feerate) {
-                    out.push(json!({
-                        "txid": txid,
-                        "wtxid": wtxid,
-                        "allowed": false,
-                        "reject-reason": "max-fee-exceeded",
-                    }));
-                    continue;
-                }
-                out.push(json!({
-                    "txid": txid,
-                    "wtxid": wtxid,
-                    "allowed": true,
-                    "vsize": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                    "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                    "vsize_bip141": tx.vsize(),
-                    "fees": accept_fees_json(r.fee_sat, r.weight, &wtxid),
-                }));
-            }
-            Err(e) => {
-                let mut row = json!({
-                    "txid": txid,
-                    "wtxid": wtxid,
-                    "allowed": false,
-                    "reject-reason": accept_reject_reason(&e),
-                });
-                if let Some(details) = accept_reject_details(&e, &tx) {
-                    row["reject-details"] = json!(details);
-                }
-                out.push(row);
-            }
+            Ok(r) => out.push(tma_from_accept(
+                &tx,
+                &txid,
+                &wtxid,
+                r.fee_sat,
+                r.weight,
+                max_feerate,
+            )),
+            Err(e) => out.push(tma_from_err(&tx, &txid, &wtxid, &e)),
         }
     }
     Ok(json!(out))
@@ -1518,15 +1508,9 @@ async fn testmempoolaccept_package_rows_work(
     let mut added = Vec::new();
     let mut out = Vec::new();
     for tx in decoded {
-        let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
-        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        let (txid, wtxid) = tma_ids(&tx);
         if rpc_tx_version_nonstandard(&tx) {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "version",
-            }));
+            out.push(tma_reject(&txid, &wtxid, "version"));
             continue;
         }
         let mp_s = Arc::clone(mp);
@@ -1538,49 +1522,22 @@ async fn testmempoolaccept_package_rows_work(
         })
         .await;
         if spending {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "bip125-replacement-disallowed",
-                "reject-details": "bip125-replacement-disallowed",
-            }));
+            out.push(tma_bip125(&txid, &wtxid));
             continue;
         }
         match mp.accept_test_package_member_async(tx.clone()).await {
             Ok(r) => {
                 added.push(r.txid);
-                if fee_exceeds_max(r.fee_sat, r.weight, max_feerate) {
-                    out.push(json!({
-                        "txid": txid,
-                        "wtxid": wtxid,
-                        "allowed": false,
-                        "reject-reason": "max-fee-exceeded",
-                    }));
-                } else {
-                    out.push(json!({
-                        "txid": txid,
-                        "wtxid": wtxid,
-                        "allowed": true,
-                        "vsize": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                        "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                        "vsize_bip141": tx.vsize(),
-                        "fees": accept_fees_json(r.fee_sat, r.weight, &wtxid),
-                    }));
-                }
+                out.push(tma_from_accept(
+                    &tx,
+                    &txid,
+                    &wtxid,
+                    r.fee_sat,
+                    r.weight,
+                    max_feerate,
+                ));
             }
-            Err(e) => {
-                let mut row = json!({
-                    "txid": txid,
-                    "wtxid": wtxid,
-                    "allowed": false,
-                    "reject-reason": accept_reject_reason(&e),
-                });
-                if let Some(details) = accept_reject_details(&e, &tx) {
-                    row["reject-details"] = json!(details);
-                }
-                out.push(row);
-            }
+            Err(e) => out.push(tma_from_err(&tx, &txid, &wtxid, &e)),
         }
     }
     if !added.is_empty() {
@@ -1597,64 +1554,30 @@ async fn testmempoolaccept_single_rows_async(
 ) -> Result<Value, Value> {
     let mut out = Vec::new();
     for tx in decoded {
-        let txid = hash_hex_display(&tx.compute_txid().to_byte_array());
-        let wtxid = hash_hex_display(&tx.compute_wtxid().to_byte_array());
+        let (txid, wtxid) = tma_ids(&tx);
         let ctx_c = Arc::clone(ctx);
         let tx_c = tx.clone();
         let known =
             rbitcoin_net::off_pool_budgeted(move || tx_confirmed_on_active_chain(&ctx_c, &tx_c))
                 .await?;
         if known {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "txn-already-known",
-            }));
+            out.push(tma_reject(&txid, &wtxid, "txn-already-known"));
             continue;
         }
         if rpc_tx_version_nonstandard(&tx) {
-            out.push(json!({
-                "txid": txid,
-                "wtxid": wtxid,
-                "allowed": false,
-                "reject-reason": "version",
-            }));
+            out.push(tma_reject(&txid, &wtxid, "version"));
             continue;
         }
         match mp.test_accept_async(tx.clone()).await {
-            Ok(r) => {
-                if fee_exceeds_max(r.fee_sat, r.weight, max_feerate) {
-                    out.push(json!({
-                        "txid": txid,
-                        "wtxid": wtxid,
-                        "allowed": false,
-                        "reject-reason": "max-fee-exceeded",
-                    }));
-                    continue;
-                }
-                out.push(json!({
-                    "txid": txid,
-                    "wtxid": wtxid,
-                    "allowed": true,
-                    "vsize": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                    "vsize_adjusted": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
-                    "vsize_bip141": tx.vsize(),
-                    "fees": accept_fees_json(r.fee_sat, r.weight, &wtxid),
-                }));
-            }
-            Err(e) => {
-                let mut row = json!({
-                    "txid": txid,
-                    "wtxid": wtxid,
-                    "allowed": false,
-                    "reject-reason": accept_reject_reason(&e),
-                });
-                if let Some(details) = accept_reject_details(&e, &tx) {
-                    row["reject-details"] = json!(details);
-                }
-                out.push(row);
-            }
+            Ok(r) => out.push(tma_from_accept(
+                &tx,
+                &txid,
+                &wtxid,
+                r.fee_sat,
+                r.weight,
+                max_feerate,
+            )),
+            Err(e) => out.push(tma_from_err(&tx, &txid, &wtxid, &e)),
         }
     }
     Ok(json!(out))
