@@ -2714,12 +2714,15 @@ async fn connected_check_does_not_catch_up_the_height_index() {
 
 /// A header that does not connect through pending headers is still ignored
 /// while our chain is under the floor. Summing that path used to give up
-/// and read parent headers.
+/// and read parent headers. A header on an earlier best-chain block answers
+/// our getheaders, and the height index tells us so without a header read.
 #[tokio::test]
 async fn below_floor_disconnected_header_does_not_walk_parents() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("below-floor-disc");
     let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
     hub.ensure_genesis().unwrap();
+    hub.generate_to_script(2, op_true(), vec![]).unwrap();
+    let tip_parent = hub.tip_header().unwrap().prev_blockhash;
     hub.set_minimum_chain_work(Some(work_floor(0xff)));
     assert!(!hub.meets_minimum_chain_work());
     let peers = rbitcoin_net::peers::PeerHub::new();
@@ -2747,6 +2750,25 @@ async fn below_floor_disconnected_header_does_not_walk_parents() {
     assert!(
         peer.is_awaiting_headers(),
         "an unconnecting header does not answer our getheaders"
+    );
+    let fork = regtest_header_chain(tip_parent, 1);
+    let before = rbitcoin_query::header_lookup_count();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(fork),
+    )
+    .await;
+    let looked = rbitcoin_query::header_lookup_count().saturating_sub(before);
+    assert_eq!(
+        looked, 0,
+        "a below-floor header on the tip's parent must not read the store, looked={looked}"
+    );
+    assert!(
+        !peer.is_awaiting_headers(),
+        "a header on an earlier best-chain block answers our getheaders"
     );
     let _ = std::fs::remove_dir_all(dir);
 }

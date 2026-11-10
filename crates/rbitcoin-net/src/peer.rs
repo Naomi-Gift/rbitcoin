@@ -5195,10 +5195,10 @@ fn classify_headers(
         let last = headers[n - 1].block_hash();
         apply.ignore_height = Some(pending_announced_height(&pending, last));
         ignored_below_floor = true;
-        // RAM only: a low-work sync continuation joins genesis or our tip
-        // through pending headers.
+        // No header reads: the batch answers our getheaders when its pending
+        // path joins a best-chain block (Core: parent in the block index).
         let (join, _) = pending_walk(pending_before, headers[0].prev_blockhash);
-        apply.answers_getheaders = is_genesis_hash(&join) || hub.tip_hash() == Some(join);
+        apply.answers_getheaders = is_genesis_hash(&join) || hub.is_connected(&join);
     } else if let Some(first) = headers.first() {
         let prev = first.prev_blockhash;
         if hub.is_block_invalid(&prev)

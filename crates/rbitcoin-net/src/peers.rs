@@ -1030,14 +1030,21 @@ impl LivePeer {
 
     /// A getheaders is in flight and younger than [`HEADERS_RESPONSE_TIME_SECS`].
     pub fn is_awaiting_headers(&self) -> bool {
-        let sent = self.getheaders_sent_at.load(Ordering::Relaxed);
-        sent != 0 && self.clock_now().saturating_sub(sent) <= HEADERS_RESPONSE_TIME_SECS
+        self.getheaders_in_flight(self.getheaders_sent_at.load(Ordering::Relaxed))
     }
 
+    /// Clears the send time this call read. A getheaders noted after that
+    /// read (the headers-sync timeout runs from other sessions) keeps its time.
     pub fn take_awaiting_headers(&self) -> bool {
-        let awaiting = self.is_awaiting_headers();
-        self.getheaders_sent_at.store(0, Ordering::Relaxed);
-        awaiting
+        let sent = self.getheaders_sent_at.load(Ordering::Relaxed);
+        let _ =
+            self.getheaders_sent_at
+                .compare_exchange(sent, 0, Ordering::Relaxed, Ordering::Relaxed);
+        self.getheaders_in_flight(sent)
+    }
+
+    fn getheaders_in_flight(&self, sent: u64) -> bool {
+        sent != 0 && self.clock_now().saturating_sub(sent) <= HEADERS_RESPONSE_TIME_SECS
     }
 
     pub fn note_announced_wtx(&self, wtxid: Wtxid) {
