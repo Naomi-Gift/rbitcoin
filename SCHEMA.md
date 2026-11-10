@@ -764,10 +764,11 @@ pages if `n ≥ 257`). One write per key. No half-empty 4 KiB.
   except via rematerialize.
 - Lookup: **ingest OA → L0 SHSR newest→oldest (fuse) → L1 MPHF (fuse) →
   main MPHF+val (tags)**. A leftover live OA or schema-17 `SHSR` at
-  `scripthash.head` when no packed main shard is present, and non-`SHSR`
-  six-digit `ovf/NNNNNN`, are removed on open. A packed main index stays.
-  `--sh-index` materializes the head that was removed.
-  A key has **exactly one** home.
+  `scripthash.head` when no packed main shard is present, and a readable
+  non-`SHSR` six-digit `ovf/NNNNNN`, are removed on open. A segment this
+  open cannot read stays. The next seal takes the id after the highest
+  six-digit name. A packed main index stays. `--sh-index` materializes the
+  head that was removed. A key has **exactly one** home.
 
 At ~2.5×10⁵ new unique scripts/day, first L1 is ~2.3 years after rematerialize
 and the frozen-L1 warning is ~4.7 years. That is not a calendar guarantee.

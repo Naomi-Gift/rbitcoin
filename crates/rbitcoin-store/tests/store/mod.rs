@@ -2468,6 +2468,96 @@ fn kill_first_start_cold_chain_without_hot_meta_is_kept() {
     let _ = std::fs::remove_dir_all(&chained);
 }
 
+/// Every chain body fails to open, and each file is still one small create.
+/// Bytes past the header are the chain. Open must not replace the directory.
+#[test]
+fn kill_first_start_torn_small_chain_bodies_stay() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        let item = coinbase_item([14u8; 32], vec![OutputRecord::unspent(50, vec![0x55])]);
+        s.put_tx_full_batch_indexed(std::slice::from_ref(&item), false)
+            .unwrap();
+        s.flush().unwrap();
+    }
+    let header_len = rbitcoin_store::file::FILE_HEADER_LEN;
+    let names = [
+        "txid.body",
+        "txout.body",
+        "header.body",
+        "confirmed.body",
+        "seqsigwit.body",
+        "spent.body",
+        "input.body",
+    ];
+    let mut saw_payload = false;
+    let mut snapshots = Vec::new();
+    for name in names {
+        let path = dir.join(name);
+        if !path.is_file() {
+            continue;
+        }
+        let mut bytes = std::fs::read(&path).unwrap();
+        assert!(
+            bytes.len() <= 4096,
+            "{name} is {} bytes; this pin is the small torn body",
+            bytes.len()
+        );
+        let header = if name == "txid.body" { 32 } else { header_len };
+        if bytes.len() > header && bytes[header..].iter().any(|b| *b != 0) {
+            saw_payload = true;
+        }
+        assert!(bytes.len() >= 4, "{name} has no magic to tear");
+        bytes[..4].copy_from_slice(b"XXXX");
+        std::fs::write(&path, &bytes).unwrap();
+        snapshots.push((path, bytes));
+    }
+    assert!(
+        saw_payload,
+        "one published create must leave a non-zero byte past a chain header"
+    );
+    match Store::open_or_create_tiny(&dir) {
+        Err(_) => {}
+        Ok(_) => panic!("torn chain bodies must not reopen as an empty store"),
+    }
+    for (path, bytes) in &snapshots {
+        assert_eq!(
+            std::fs::read(path).unwrap(),
+            *bytes,
+            "{} was replaced",
+            path.display()
+        );
+    }
+    assert!(dir.join("meta").is_file());
+    assert!(dir.join("store.secret").is_file());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Empty-create slack is zeros past the header. A torn magic on that file
+/// is still an incomplete first create.
+#[test]
+fn kill_first_start_torn_empty_txid_still_reopens() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    let txid_path = dir.join("txid.body");
+    let mut bytes = std::fs::read(&txid_path).unwrap();
+    assert!(bytes.len() <= 4096);
+    assert!(bytes.len() > 32);
+    assert!(
+        bytes[32..].iter().all(|b| *b == 0),
+        "an empty txid create is zeros past the header"
+    );
+    bytes[..4].copy_from_slice(b"XXXX");
+    std::fs::write(&txid_path, &bytes).unwrap();
+    let s = Store::open_or_create_tiny(&dir).unwrap();
+    assert_eq!(s.header_count(), 0);
+    drop(s);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// `txid.body` fails to open, but `txout.body` already has a create.
 #[test]
 fn kill_first_start_torn_txid_keeps_txout() {

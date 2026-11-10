@@ -796,6 +796,58 @@ fn leftover_oa_overflow_seg_open_discards_seg() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A sealed segment this open cannot read stays on disk. Open fails.
+#[cfg(unix)]
+#[test]
+fn leftover_oa_unreadable_shsr_segment_stays() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    drop(t);
+    let seg = dir.join("scripthash.ovf").join("000001");
+    std::fs::write(&seg, b"SHSR").unwrap();
+    std::fs::set_permissions(&seg, std::fs::Permissions::from_mode(0o000)).unwrap();
+    match ScriptHashTable::open_tiny(&dir) {
+        Err(StoreError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Ok(_) => panic!("an unreadable ovf segment must not be deleted"),
+        Err(other) => panic!("an unreadable ovf segment must fail the open: {other}"),
+    }
+    std::fs::set_permissions(&seg, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(std::fs::read(&seg).unwrap(), b"SHSR");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Deleting a lower non-`SHSR` name must not make the next seal reuse the
+/// id of a higher sealed segment.
+#[test]
+fn leftover_oa_hole_does_not_reuse_sealed_segment_id() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    drop(t);
+    let ovf = dir.join("scripthash.ovf");
+    std::fs::write(ovf.join("000000"), b"not-shsr").unwrap();
+    let kept = ovf.join("000001");
+    let key = [0x11u8; 16];
+    let val = pack8_bytes(&ShHeadValue::inline_one(Fk(7))).unwrap();
+    drop(rbitcoin_store::scripthash_sorted_head::SortedHead::write(&kept, &[(key, val)]).unwrap());
+    let before = std::fs::read(&kept).unwrap();
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert!(!ovf.join("000000").exists());
+    assert_eq!(std::fs::read(&kept).unwrap(), before);
+    t.ingest_insert_many(&[([0x22u8; 32], ShHeadValue::inline_one(Fk(9)))])
+        .unwrap();
+    t.seal_ingest().unwrap();
+    assert_eq!(
+        std::fs::read(&kept).unwrap(),
+        before,
+        "the next seal truncated the segment this open kept"
+    );
+    let next = std::fs::read(ovf.join("000002")).unwrap();
+    assert_eq!(&next[..4], b"SHSR");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn ingest_batch_update_and_new_keys() {
     let dir = tmp();

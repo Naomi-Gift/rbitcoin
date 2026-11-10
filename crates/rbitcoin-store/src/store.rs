@@ -2238,12 +2238,26 @@ fn file_has_payload(path: &Path, kind: rbitcoin_primitives::TableKind, header: u
     }
     match crate::file::TableFile::open(path, kind) {
         Ok(file) => file.logical_len() > header,
-        // A torn file this open cannot parse still counts once it is past one
-        // page. Empty-create slack is smaller than that.
-        Err(_) => std::fs::metadata(path)
-            .map(|meta| meta.len() > 4096)
-            .unwrap_or(false),
+        Err(_) => unreadable_body_has_payload(path, header),
     }
+}
+
+/// A file this open cannot parse. Zeros past `header` are empty-create slack.
+/// Any other byte, a file past one page, or a body we cannot read is payload.
+fn unreadable_body_has_payload(path: &Path, header: u64) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return true;
+    };
+    if meta.len() > 4096 {
+        return true;
+    }
+    let Ok(bytes) = std::fs::read(path) else {
+        return true;
+    };
+    let start = usize::try_from(header).unwrap_or(usize::MAX);
+    bytes
+        .get(start..)
+        .is_some_and(|tail| tail.iter().any(|b| *b != 0))
 }
 
 fn dir_has_chain_payload(dir: &Path) -> bool {
