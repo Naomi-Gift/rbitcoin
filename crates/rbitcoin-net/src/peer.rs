@@ -5350,6 +5350,49 @@ fn queue_stored_header_admits(
     }
 }
 
+/// Persist the walk from `last`, then admit only the headers the store kept.
+fn note_stored_header_path(
+    hub: &ChainHub,
+    apply: &mut HeadersApply,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    headers: &[bitcoin::block::Header],
+    last: BlockHash,
+    work_cmp: Option<std::cmp::Ordering>,
+    announced_h: u32,
+) -> bool {
+    let should_stamp =
+        work_cmp == Some(std::cmp::Ordering::Greater) && !header_is_stored(hub, &last);
+    let stored = persist_pending_header_path(hub, pending, last);
+    apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
+    queue_stored_header_admits(apply, hub, headers);
+    apply.sync_height = Some(announced_h);
+    stored
+}
+
+/// Drop in-flight asks that left the stored walk, and ask for bodies on it.
+fn retarget_stored_header_asks(
+    hub: &ChainHub,
+    apply: &mut HeadersApply,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    last: BlockHash,
+    requested_before: &HashSet<BlockHash>,
+    have_bodies: &HashSet<BlockHash>,
+) {
+    let keep = connecting_header_path(hub, pending, last);
+    let mut requested = requested_before.clone();
+    release_asks_off_path(hub, &mut requested, &keep);
+    apply.drop_asks = requested_before
+        .iter()
+        .copied()
+        .filter(|h| !requested.contains(h))
+        .collect();
+    let mut want =
+        fetchable_header_path_bodies(hub, pending, last, &PendingBlocks::new(), &requested);
+    want.retain(|h| !have_bodies.contains(h) && !requested.contains(h));
+    want.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested.len()));
+    apply.want_bodies = want;
+}
+
 fn incoming_header_work(
     hub: &ChainHub,
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
@@ -5461,7 +5504,7 @@ fn classify_headers(
     let mut ignored_below_floor = false;
     if n == 0 {
         // Empty headers is a failed getheaders response, not an announcement.
-    } else if n > 0 && !noban && headers_are_below_floor(hub, pending_before, headers) {
+    } else if !noban && headers_are_below_floor(hub, pending_before, headers) {
         // Work stays under the floor from the pending headers alone. Do not
         // read parent headers, do not move this peer's best-known tip, and
         // do not ask for the next page of a batch we refused.
@@ -5542,12 +5585,15 @@ fn classify_headers(
             let mut stored = false;
             if !header_path_meets_minwork(hub, &pending, last) {
                 if noban {
-                    let should_stamp = work_cmp == Some(std::cmp::Ordering::Greater)
-                        && !header_is_stored(hub, &last);
-                    stored = persist_pending_header_path(hub, &pending, last);
-                    apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
-                    queue_stored_header_admits(&mut apply, hub, headers);
-                    apply.sync_height = Some(announced_h);
+                    stored = note_stored_header_path(
+                        hub,
+                        &mut apply,
+                        &pending,
+                        headers,
+                        last,
+                        work_cmp,
+                        announced_h,
+                    );
                 } else {
                     // Below the floor this path does not touch the store.
                     queue_batch_admits(&mut apply, headers);
@@ -5559,33 +5605,26 @@ fn classify_headers(
             } else {
                 // This check is deliberately after the below-floor early path:
                 // that path must not touch the header store or walk parents.
-                let should_stamp =
-                    work_cmp == Some(std::cmp::Ordering::Greater) && !header_is_stored(hub, &last);
-                stored = persist_pending_header_path(hub, &pending, last);
-                apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
-                queue_stored_header_admits(&mut apply, hub, headers);
-                apply.sync_height = Some(announced_h);
+                stored = note_stored_header_path(
+                    hub,
+                    &mut apply,
+                    &pending,
+                    headers,
+                    last,
+                    work_cmp,
+                    announced_h,
+                );
                 // Asks follow the stored walk only. A rejected header must
                 // not drop an in-flight body or start a new one.
                 if stored {
-                    let keep = connecting_header_path(hub, &pending, last);
-                    let mut requested = requested_before.clone();
-                    release_asks_off_path(hub, &mut requested, &keep);
-                    apply.drop_asks = requested_before
-                        .iter()
-                        .copied()
-                        .filter(|h| !requested.contains(h))
-                        .collect();
-                    let mut want = fetchable_header_path_bodies(
+                    retarget_stored_header_asks(
                         hub,
+                        &mut apply,
                         &pending,
                         last,
-                        &PendingBlocks::new(),
-                        &requested,
+                        requested_before,
+                        have_bodies,
                     );
-                    want.retain(|h| !have_bodies.contains(h) && !requested.contains(h));
-                    want.truncate(MAX_SERVE_BLOCKS.saturating_sub(requested.len()));
-                    apply.want_bodies = want;
                 }
             }
             if stored {
