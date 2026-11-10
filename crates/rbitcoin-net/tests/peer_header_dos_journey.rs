@@ -1604,6 +1604,74 @@ fn self_announce_stays_on_the_link_network() {
     );
 }
 
+#[test]
+fn a_down_onion_is_not_advertised_but_stays_our_own() {
+    let onion: rbitcoin_net::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    let i2p = rbitcoin_net::NetAddr::I2p {
+        dest: [0x11; 32],
+        port: 0,
+    };
+    let other_onion: rbitcoin_net::NetAddr =
+        "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:8333"
+            .parse()
+            .unwrap();
+    let loopback_inbound = rbitcoin_net::NetAddr::Ip(SocketAddr::from(([127, 0, 0, 1], 51000)));
+    let out = rbitcoin_net::peers::PeerConnType::OutboundFullRelay;
+    let inbound = rbitcoin_net::peers::PeerConnType::Inbound;
+    let tor_wallet: rbitcoin_net::NetAddr =
+        "3zvhyy5nu2tes4mi2znnie2fl2mv425udfrl6esnuxixpzb56twisrad.onion:50001"
+            .parse()
+            .unwrap();
+    let external_wallet = "duckduckgogg42xjoc72x3sjasowoarfbgcmvfimaftt6twagswzczad.onion";
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    peers.set_p2p_onion(onion.host_str(), onion.port());
+    peers.set_p2p_i2p(i2p);
+    peers.set_tor_wallet_onion(tor_wallet.host_str(), tor_wallet.port());
+    peers.set_wallet_onion(external_wallet.to_string(), 50002);
+    let lists = |peers: &rbitcoin_net::peers::PeerHub, host: String| {
+        peers.rpc_local_addresses().iter().any(|row| row.0 == host)
+    };
+    let lists_onion = |peers: &rbitcoin_net::peers::PeerHub| lists(peers, onion.host_str());
+
+    peers.set_tor_onions_down(true);
+    assert!(
+        self_announce_nets(&overlay_peer(&peers, other_onion, out)).is_empty(),
+        "a down onion is not announced"
+    );
+    assert!(!lists_onion(&peers), "getnetworkinfo leaves out a down onion");
+    assert!(
+        !lists(&peers, tor_wallet.host_str()),
+        "getnetworkinfo leaves out a down wallet onion"
+    );
+    assert!(
+        lists(&peers, external_wallet.to_string()),
+        "an --external-onion is not ours to take down"
+    );
+    assert!(
+        peers.is_own_address(onion),
+        "a down onion is still filtered from address replies"
+    );
+    assert!(
+        peers.is_own_address(tor_wallet),
+        "a down wallet onion is still filtered from address replies"
+    );
+    assert!(
+        self_announce_nets(&overlay_peer(&peers, loopback_inbound, inbound)).is_empty(),
+        "a loopback inbound still cannot tell Tor from I2P, so it gets neither"
+    );
+
+    peers.set_tor_onions_down(false);
+    assert_eq!(
+        self_announce_nets(&overlay_peer(&peers, other_onion, out)),
+        ["onion"]
+    );
+    assert!(lists_onion(&peers));
+    assert!(lists(&peers, tor_wallet.host_str()));
+}
+
 /// An addrv2 session to `net` whose VERSION says it reached us at `seen`.
 fn reporting_peer(
     peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
