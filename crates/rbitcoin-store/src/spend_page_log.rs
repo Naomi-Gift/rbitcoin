@@ -454,11 +454,27 @@ impl SpendPageLog {
             return Ok(());
         }
         self.scrub_open_notes(&mut keep)?;
+        let mut replaced: Vec<u64> = clears.iter().map(|clear| clear.page_off).collect();
+        replaced.extend(kept.iter().map(|(off, _)| *off));
         let carried = {
             let g = self.lock();
-            carried_pages(&g.committed, &kept)
+            let mut carried = carried_pages(&g.committed, &kept);
+            if deferred {
+                let skip: HashSet<u64> = replaced.iter().copied().collect();
+                carried.retain(|(off, _)| !skip.contains(off));
+            }
+            carried
         };
-        self.store_pending(height, pages, rejected, kept, &carried, PublishHold::Sample)
+        let hold = if deferred {
+            PublishHold::Clear
+        } else {
+            PublishHold::Sample
+        };
+        self.store_pending(height, pages, rejected, kept, &carried, hold)?;
+        if deferred {
+            self.release_replaced(&replaced);
+        }
+        Ok(())
     }
 
     /// Publish a clearing image, or drop a rejected generation the body does not hold.
@@ -472,9 +488,25 @@ impl SpendPageLog {
         deferred: bool,
     ) -> Result<(), StoreError> {
         if pages.is_empty() {
-            if deferred {
-                self.drop_rejected_generation();
+            if !deferred {
+                return Ok(());
             }
+            let zeros = self.committed_zero_images();
+            if zeros.is_empty() {
+                self.drop_rejected_generation();
+                return Ok(());
+            }
+            // The rejected metas are not on the body. A page that is already
+            // zeros still has to fold, or the body keeps the old spend.
+            self.store_pending(
+                height,
+                zeros,
+                Vec::new(),
+                Vec::new(),
+                &[],
+                PublishHold::Clear,
+            )?;
+            self.forget_held_directory();
             return Ok(());
         }
         let hold = if deferred {
@@ -482,9 +514,16 @@ impl SpendPageLog {
         } else {
             PublishHold::Sample
         };
-        self.store_pending(height, pages, Vec::new(), Vec::new(), &[], hold)?;
+        let carried = if deferred {
+            let fresh: HashSet<u64> = pages.iter().map(|(off, _)| *off).collect();
+            self.carry_zero_pages(&fresh)
+        } else {
+            Vec::new()
+        };
+        self.store_pending(height, pages, Vec::new(), Vec::new(), &carried, hold)?;
         if deferred {
-            self.forget_held_directory();
+            let keep: Vec<u64> = carried.iter().map(|(off, _)| *off).collect();
+            self.keep_only(&keep);
         }
         Ok(())
     }
@@ -499,6 +538,53 @@ impl SpendPageLog {
     fn drop_rejected_generation(&self) {
         self.forget_held_directory();
         self.delete_generation_files();
+    }
+
+    /// Drop pages this publish replaced. Carried pages stay, so a zero image
+    /// that was not recomposed is still here for the next fold.
+    fn release_replaced(&self, replaced: &[u64]) {
+        let replaced: HashSet<u64> = replaced.iter().copied().collect();
+        let mut g = self.lock();
+        g.committed.retain(|off, _| !replaced.contains(off));
+        g.fold_held = false;
+    }
+
+    fn keep_only(&self, keep: &[u64]) {
+        let keep: HashSet<u64> = keep.iter().copied().collect();
+        let mut g = self.lock();
+        g.committed.retain(|off, _| keep.contains(off));
+        g.fold_held = false;
+    }
+
+    fn committed_zero_images(&self) -> PageImages {
+        let g = self.lock();
+        let mut pages: PageImages = g
+            .committed
+            .iter()
+            .filter(|(off, page)| !image_has_spend(**off, &page.image))
+            .map(|(off, page)| (*off, Arc::clone(&page.image)))
+            .collect();
+        pages.sort_by_key(|(off, _)| *off);
+        pages
+    }
+
+    fn carry_zero_pages(&self, fresh: &HashSet<u64>) -> Vec<(u64, CommittedPage)> {
+        let g = self.lock();
+        let mut out = Vec::new();
+        for (off, page) in &g.committed {
+            if fresh.contains(off) || image_has_spend(*off, &page.image) {
+                continue;
+            }
+            out.push((
+                *off,
+                CommittedPage {
+                    image: Arc::clone(&page.image),
+                    log_off: page.log_off,
+                    generation: page.generation,
+                },
+            ));
+        }
+        out
     }
 
     /// Publish the composed generation into the directory.
@@ -577,10 +663,11 @@ impl SpendPageLog {
     /// A disconnect left this commit above the tip. Do not copy it onto the body.
     ///
     /// `keep` runs before any directory change. A `keep` error leaves the
-    /// commit file and the committed images where they were. Live slots are
-    /// put back into `open` for the next compose. When every slot is rejected
-    /// and nothing else is open, the file stays until compose publishes the
-    /// replacement or finds the body does not hold those slots.
+    /// commit file and the committed images where they were. When a page
+    /// still has a rejected slot, live slots are copied into `open` and the
+    /// old image stays until that compose's rename returns. A zero image is
+    /// folded. An image whose slots are all still best-chain is republished
+    /// in this checkpoint, not folded.
     fn explode_held<K>(&self, keep: &mut K) -> Result<Vec<BodyClear>, StoreError>
     where
         K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
@@ -626,31 +713,7 @@ impl SpendPageLog {
         if !g.fold_held {
             return Ok(Vec::new());
         }
-        // Leave this generation loaded. Compose still has to read the body.
-        if restored.is_empty() && g.open.is_empty() && g.frozen.is_empty() {
-            return Ok(cleared);
-        }
-        g.committed.clear();
-        g.fold_held = false;
-        g.commit_height = None;
-        for (page_off, slots) in restored {
-            if let Some(page) = g.open.get_mut(&page_off) {
-                let mut have: HashSet<u16> = page.slots.iter().map(|(rel, _)| *rel).collect();
-                let mut added = 0u64;
-                for (rel, meta) in slots {
-                    if !have.insert(rel) {
-                        continue;
-                    }
-                    page.slots.push((rel, meta));
-                    added = added.saturating_add(1);
-                }
-                g.open_edges = g.open_edges.saturating_add(added);
-            } else {
-                g.open_edges = g.open_edges.saturating_add(slots.len() as u64);
-                g.open.insert(page_off, OpenPage { slots, base: None });
-            }
-        }
-        Ok(cleared)
+        Ok(apply_held_explode(&mut g, &held, restored, cleared))
     }
 
     /// Freeze a new open set, or reuse the snapshot a failed compose left.
@@ -1056,10 +1119,9 @@ impl Drop for ReleaseLater<'_> {
 
 /// Pull notes taken after a freeze into the snapshot compose will publish.
 ///
-/// A page still in `committed` keeps its base. That image holds slots this
-/// note did not repeat. Explode clears `committed` after copying live slots
-/// into `open`, and the old base still contains slots `keep` rejected, so
-/// those pages are composed from the slot lists and `read_page`.
+/// A restored page has no base, so compose reads the body. The old image
+/// stays in `committed` until the replacement rename returns. A rejected
+/// slot is zeroed only when the body still holds that meta.
 fn fold_open_into_snapshot(
     pages: &mut SnapshotPages,
     open: &HashMap<u64, OpenPage>,
@@ -1336,6 +1398,98 @@ fn body_fold_span(page_off: u64, image: &[u8]) -> (u64, &[u8]) {
         return (skip as u64, &image[skip..]);
     }
     (page_off, image)
+}
+
+/// Decide what a held image does at this checkpoint.
+///
+/// A pure-zero image is folded: the file stays, and nothing is rebuilt from
+/// the body. An image that still has a spend, and no rejected slot, moves
+/// those slots into `open` and leaves the directory so this checkpoint
+/// republishes them. Zero sibling pages stay. A rejected slot leaves the old
+/// image in `committed` and clears `base` on that page so compose reads the
+/// body. A frozen note on the same page keeps the live slots.
+fn apply_held_explode(
+    g: &mut Inner,
+    held: &[(u64, Arc<[u8]>)],
+    restored: Vec<KeptPage>,
+    cleared: Vec<BodyClear>,
+) -> Vec<BodyClear> {
+    if cleared.is_empty() {
+        let spend_offs: HashSet<u64> = held
+            .iter()
+            .filter(|(off, image)| image_has_spend(*off, image))
+            .map(|(off, _)| *off)
+            .collect();
+        if spend_offs.is_empty() {
+            g.fold_held = false;
+            return Vec::new();
+        }
+        g.fold_held = false;
+        g.commit_height = None;
+        for (page_off, slots) in restored {
+            if spend_offs.contains(&page_off) {
+                park_open_slots(g, page_off, slots);
+            }
+        }
+        g.committed.retain(|off, _| !spend_offs.contains(off));
+        return Vec::new();
+    }
+    let cleared_offs: HashSet<u64> = cleared.iter().map(|clear| clear.page_off).collect();
+    for off in &cleared_offs {
+        if let Some(page) = g.open.get_mut(off) {
+            page.base = None;
+        }
+        if let Some(page) = g.frozen.get_mut(off) {
+            page.base = None;
+        }
+    }
+    for (page_off, slots) in restored {
+        if !cleared_offs.contains(&page_off) {
+            continue;
+        }
+        if let Some(page) = g.frozen.get_mut(&page_off) {
+            overlay_missing_slots(page, slots);
+            page.base = None;
+        } else {
+            park_open_slots(g, page_off, slots);
+        }
+    }
+    cleared
+}
+
+/// Copy slots that this page does not already name. A newer note stays.
+fn overlay_missing_slots(page: &mut OpenPage, slots: PageSlots) -> u64 {
+    let mut have: HashSet<u16> = page.slots.iter().map(|(rel, _)| *rel).collect();
+    let mut added = 0u64;
+    for (rel, meta) in slots {
+        if !have.insert(rel) {
+            continue;
+        }
+        page.slots.push((rel, meta));
+        added = added.saturating_add(1);
+    }
+    added
+}
+
+fn park_open_slots(g: &mut Inner, page_off: u64, slots: PageSlots) {
+    if let Some(page) = g.open.get_mut(&page_off) {
+        let added = overlay_missing_slots(page, slots);
+        page.base = None;
+        g.open_edges = g.open_edges.saturating_add(added);
+    } else {
+        g.open_edges = g.open_edges.saturating_add(slots.len() as u64);
+        g.open.insert(page_off, OpenPage { slots, base: None });
+    }
+}
+
+fn image_has_spend(page_off: u64, image: &[u8]) -> bool {
+    let n = image.len() / SLOT;
+    (0..n).any(|rel| {
+        if page_off == 0 && rel < 2 {
+            return false;
+        }
+        slot_from_image(image, rel as u16) != [0u8; SLOT]
+    })
 }
 
 fn slot_from_image(image: &[u8], rel: u16) -> [u8; SLOT] {

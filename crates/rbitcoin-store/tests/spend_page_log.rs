@@ -767,6 +767,78 @@ fn rejected_body_survives_a_failed_clear() {
 }
 
 #[test]
+fn rejected_clear_survives_a_partial_keep_read_error() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let live = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let stale = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, live), (24, stale)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let err = log
+        .commit_open(
+            4,
+            8192,
+            |_off, _len| Err(StoreError::Corrupt("body read failed")),
+            |meta| Ok(meta[0] == 1),
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt("body read failed")));
+    assert!(d.join(SPEND_PAGES_COMMIT_NAME).exists());
+    assert_eq!(log.slot(16), Some(live));
+    assert_eq!(
+        log.slot(24),
+        Some(stale),
+        "a failed clear must keep serving the old image"
+    );
+    let planted = [(24, stale)];
+    let read = body_with(&planted);
+    log.commit_open(4, 8192, &read, |meta| Ok(meta[0] == 1))
+        .unwrap();
+    assert_eq!(log.slot(16), Some(live));
+    assert_ne!(log.slot(24), Some(stale));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn rejected_clear_survives_a_lower_checkpoint() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let stale = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, stale)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let planted = [(16, stale)];
+    let read = body_with(&planted);
+    log.commit_open(4, 8192, &read, |_| Ok(false)).unwrap();
+    assert_eq!(log.slot(16), Some([0u8; 8]));
+    log.hold_fold_above(2).unwrap();
+    log.commit_open(2, 8192, &read, |_| Ok(false)).unwrap();
+    assert!(
+        d.join(SPEND_PAGES_COMMIT_NAME).exists(),
+        "a later checkpoint must not delete the zero image"
+    );
+    assert_eq!(log.slot(16), Some([0u8; 8]));
+    let mut cleared = false;
+    log.fold_into(
+        |off, image| {
+            assert!(!image.windows(8).any(|w| w == stale));
+            if off == 16 && image.len() >= 8 && image[..8] == [0u8; 8] {
+                cleared = true;
+            }
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(
+        cleared,
+        "fold must write the zeros the clear already stored"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn hold_ignores_a_commit_at_or_below_the_tip() {
     let d = dir();
     let log = SpendPageLog::create(&d);
