@@ -5150,21 +5150,22 @@ struct HeadersApply {
     /// The last header was new, accepted, connected, and beats our tip work.
     stamp_block_announcement: bool,
 }
-/// Drop pending headers until `headers` fit under [`MAX_PENDING_HEADERS`].
+/// Drop pending headers until `slots` new headers fit under [`MAX_PENDING_HEADERS`].
 ///
-/// A header that fails claimed proof of work goes first, then one whose path
-/// does not reach a stored header, then a connected fork with less work than
-/// `headers`, then one with the same work. Stop once `headers` fit. Ancestors
-/// of `prev` stay. A fork with more work stays. A fork whose work cannot be
-/// scored stays, and so does every connected fork when `headers` cannot.
+/// `slots` is how many headers this call would newly store. A header that
+/// fails claimed proof of work goes first, then one whose path does not reach
+/// a stored header, then a connected fork with less work than `headers`, then
+/// one with the same work. Stop once those slots fit. Ancestors of `prev`
+/// stay. A fork with more work stays. A fork whose work cannot be scored
+/// stays, and so does every connected fork when `headers` cannot.
 fn evict_pending_for_room(
     hub: &ChainHub,
     pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
     prev: BlockHash,
     headers: &[bitcoin::block::Header],
+    slots: usize,
 ) {
-    let incoming = incoming_header_count(pending, headers);
-    if !pending_over_cap(pending, incoming) {
+    if !pending_over_cap(pending, slots) {
         return;
     }
     let protected = pending_ancestors(pending, prev);
@@ -5173,21 +5174,21 @@ fn evict_pending_for_room(
         .filter(|(hash, hdr)| !protected.contains(*hash) && !hub.header_claimed_pow_ok(hdr))
         .map(|(hash, _)| *hash)
         .collect();
-    drop_hashes_until_fit(pending, incoming, failed_pow);
-    if !pending_over_cap(pending, incoming) {
+    drop_hashes_until_fit(pending, slots, failed_pow);
+    if !pending_over_cap(pending, slots) {
         return;
     }
     let failed_forks: Vec<BlockHash> = pending_tips(pending)
         .into_iter()
         .filter(|tip| pending_path_fails_claimed_pow(hub, pending, *tip))
         .collect();
-    drop_tips_until_fit(pending, &protected, incoming, &failed_forks);
-    if !pending_over_cap(pending, incoming) {
+    drop_tips_until_fit(pending, &protected, slots, &failed_forks);
+    if !pending_over_cap(pending, slots) {
         return;
     }
     drop_hashes_until_fit(
         pending,
-        incoming,
+        slots,
         disconnected_pending(hub, pending, &protected),
     );
     let Some(incoming_work) = incoming_header_work(hub, pending, headers) else {
@@ -5197,7 +5198,7 @@ fn evict_pending_for_room(
         hub,
         pending,
         &protected,
-        incoming,
+        slots,
         incoming_work,
         std::cmp::Ordering::Less,
     );
@@ -5205,7 +5206,7 @@ fn evict_pending_for_room(
         hub,
         pending,
         &protected,
-        incoming,
+        slots,
         incoming_work,
         std::cmp::Ordering::Equal,
     );
@@ -5308,20 +5309,33 @@ fn disconnected_pending(
         .collect()
 }
 
-/// Distinct hashes in `headers` that are not already in `pending`.
-/// One header repeated for a whole message takes one slot.
-fn incoming_header_count(
+/// Pending slots this message needs. A header this call would write, and
+/// that is not already in `pending`, takes one. A repeat takes one. A header
+/// the store already has, or that is not on the walk from the last hash,
+/// takes none.
+fn newly_stored_slot_count(
+    hub: &ChainHub,
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     headers: &[bitcoin::block::Header],
 ) -> usize {
-    let mut seen = HashSet::new();
-    headers
-        .iter()
-        .filter(|hdr| {
-            let hash = hdr.block_hash();
-            !pending.contains_key(&hash) && seen.insert(hash)
-        })
-        .count()
+    let Some(last) = headers.last() else {
+        return 0;
+    };
+    let mut batch = HashMap::with_capacity(headers.len());
+    for hdr in headers {
+        batch.insert(hdr.block_hash(), *hdr);
+    }
+    // The message overwrites a hash already in `pending`, matching the admit
+    // that runs before the store walk.
+    unstored_header_path(hub, last.block_hash(), |hash| {
+        batch
+            .get(&hash)
+            .copied()
+            .or_else(|| pending.get(&hash).copied())
+    })
+    .into_iter()
+    .filter(|hdr| !pending.contains_key(&hdr.block_hash()))
+    .count()
 }
 
 fn queue_batch_admits(apply: &mut HeadersApply, headers: &[bitcoin::block::Header]) {
@@ -5534,9 +5548,9 @@ fn classify_headers(
         // not a continuation of any chain we hold.
         let connecting = prev != BlockHash::all_zeros()
             && header_announcement_connects(hub, pending_before, prev);
-        let incoming = incoming_header_count(&pending, headers);
+        let slots = newly_stored_slot_count(hub, &pending, headers);
         let mut staged_evicts = Vec::new();
-        if connecting && pending.len().saturating_add(incoming) > MAX_PENDING_HEADERS {
+        if connecting && pending.len().saturating_add(slots) > MAX_PENDING_HEADERS {
             // Claimed proof of work includes the chain pow limit. Evictions
             // stay staged until the store accepts the batch.
             if !headers
@@ -5546,8 +5560,8 @@ fn classify_headers(
             {
                 return apply;
             }
-            evict_pending_for_room(hub, &mut pending, prev, headers);
-            if pending.len().saturating_add(incoming) > MAX_PENDING_HEADERS {
+            evict_pending_for_room(hub, &mut pending, prev, headers, slots);
+            if pending.len().saturating_add(slots) > MAX_PENDING_HEADERS {
                 return apply;
             }
             staged_evicts = pending_before
@@ -5560,7 +5574,9 @@ fn classify_headers(
             let hash = hdr.block_hash();
             apply.from_peer.push(hash);
             apply.best_known.push(hash);
-            admit_pending_header(&mut pending, hash, *hdr);
+            // The real map caps in `apply_headers`. This clone has to hold the
+            // whole message so the store walk can see the last header.
+            pending.insert(hash, *hdr);
         }
         if !connecting {
             // These headers are not sent to the store. A later parent can
@@ -7399,6 +7415,32 @@ pub fn announced_headers_height(
     hub.header_height(&join).unwrap_or(0).saturating_add(steps)
 }
 
+/// Headers on the walk from `tip` that are not in the store yet, oldest first.
+/// The walk stops at a stored header. That header is not included.
+fn unstored_header_path(
+    hub: &ChainHub,
+    tip: BlockHash,
+    mut lookup: impl FnMut(BlockHash) -> Option<bitcoin::block::Header>,
+) -> Vec<bitcoin::block::Header> {
+    let mut path = Vec::new();
+    let mut h = tip;
+    for _ in 0..PENDING_WALK_LIMIT {
+        let Some(hdr) = lookup(h) else {
+            break;
+        };
+        if header_is_stored(hub, &h) {
+            break;
+        }
+        path.push(hdr);
+        h = hdr.prev_blockhash;
+        if is_genesis_hash(&h) {
+            break;
+        }
+    }
+    path.reverse();
+    path
+}
+
 /// Persist `tip`'s pending path oldest-first so `ensure_header` has parents.
 /// Store the pending headers from `tip` back to the last stored one. Headers
 /// already stored were checked when they were written.
@@ -7410,22 +7452,7 @@ pub fn persist_pending_header_path(
     pending: &HashMap<BlockHash, bitcoin::block::Header>,
     tip: BlockHash,
 ) -> bool {
-    let mut path = Vec::new();
-    let mut h = tip;
-    for _ in 0..PENDING_WALK_LIMIT {
-        let Some(hdr) = pending.get(&h) else {
-            break;
-        };
-        if header_is_stored(hub, &h) {
-            break;
-        }
-        path.push(*hdr);
-        h = hdr.prev_blockhash;
-        if is_genesis_hash(&h) {
-            break;
-        }
-    }
-    path.reverse();
+    let path = unstored_header_path(hub, tip, |hash| pending.get(&hash).copied());
     // One store batch. Per-header ensure walks parent heights to genesis, so a
     // full below-floor chain (thousands of headers) is quadratic.
     for chunk in path.chunks(MAX_HEADERS_RESULTS) {

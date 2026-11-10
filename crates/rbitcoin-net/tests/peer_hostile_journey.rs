@@ -1405,6 +1405,78 @@ async fn cap_store_kept_headers_skip_an_earlier_hash() {
         .iter()
         .filter(|hash| !follow.pending_headers.contains_key(*hash))
         .count();
-    assert_eq!(dropped, 2, "the batch still frees a slot per new hash");
-    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS - 1);
+    assert_eq!(dropped, 1, "only the stored header takes a slot");
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+}
+
+/// The last header is already in the store, so this call writes nothing.
+/// Proof-of-work headers in front of it must not clear the map.
+#[tokio::test]
+async fn cap_already_stored_tip_frees_no_slot() {
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-stored-tip");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(200, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let tip = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(200))
+        .unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = hostile_ver(bind);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let peer = peers.register(
+        bind,
+        bind,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let mut follow = PeerFollowState::new();
+    let junk = Header {
+        version: bitcoin::block::Version::TWO,
+        prev_blockhash: BlockHash::from_byte_array([0x99; 32]),
+        merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+        time: 0,
+        bits: bitcoin::CompactTarget::from_consensus(0x207f_ffff),
+        nonce: 0,
+    };
+    for batch in 0..4u32 {
+        let headers: Vec<Header> = (0..2_000u32)
+            .map(|i| {
+                let mut header = junk;
+                header.nonce = batch * 2_000 + i;
+                header
+            })
+            .collect();
+        on_headers(&hub, &out_tx, &mut follow, Some(&peer), &headers)
+            .await
+            .unwrap();
+    }
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    let before = pending_keys(&follow);
+    let front: Vec<Header> = (0..2u32).map(|n| pow_child(&tip, 0x70 + n)).collect();
+    let front_hashes: Vec<BlockHash> = front.iter().map(|h| h.block_hash()).collect();
+    let mut message = front;
+    message.push(tip);
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &message)
+        .await
+        .unwrap();
+    for hash in &front_hashes {
+        assert!(
+            !follow.pending_headers.contains_key(hash),
+            "a header in front of the stored tip was admitted"
+        );
+        assert!(hub
+            .query
+            .get_header_by_hash(&hash.to_byte_array())
+            .unwrap()
+            .is_none());
+    }
+    let dropped = before
+        .iter()
+        .filter(|hash| !follow.pending_headers.contains_key(*hash))
+        .count();
+    assert_eq!(dropped, 0, "an already-stored last header frees no slot");
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
 }
