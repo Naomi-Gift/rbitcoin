@@ -398,6 +398,9 @@ pub struct LivePeer {
     last_tip_offered: Mutex<Option<BlockHash>>,
     /// Best connected block this peer advertised.
     pub best_known: Mutex<Option<BlockHash>>,
+    /// Chain work of [`Self::best_known`] when that hash was stored.
+    /// Kept after the header leaves the pending map and is not on our tip.
+    best_known_work: Mutex<Option<bitcoin::Work>>,
     /// Block hashes this peer just sent us — do not announce them back.
     pub recently_from: Mutex<HashSet<BlockHash>>,
     /// We already sent inv-triggered getheaders this session (before sync).
@@ -937,11 +940,36 @@ impl LivePeer {
     }
 
     pub fn note_best_known(&self, hash: BlockHash) {
-        *self.best_known.lock().unwrap_or_else(|e| e.into_inner()) = Some(hash);
+        let mut known = self.best_known.lock().unwrap_or_else(|e| e.into_inner());
+        let mut work = self
+            .best_known_work
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *known = Some(hash);
+        *work = None;
+    }
+
+    /// Store `hash` and the work already measured for it.
+    pub fn note_best_known_with_work(&self, hash: BlockHash, work: bitcoin::Work) {
+        let mut known = self.best_known.lock().unwrap_or_else(|e| e.into_inner());
+        let mut stored = self
+            .best_known_work
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        *known = Some(hash);
+        *stored = Some(work);
     }
 
     pub fn best_known(&self) -> Option<BlockHash> {
         *self.best_known.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Work saved with [`Self::best_known`], if that store measured it.
+    pub fn best_known_work(&self) -> Option<bitcoin::Work> {
+        *self
+            .best_known_work
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     pub fn header_marks(&self) -> (Option<BlockHash>, Option<BlockHash>) {
@@ -3190,6 +3218,7 @@ impl PeerHub {
             best_header_sent: Mutex::new(None),
             last_tip_offered: Mutex::new(None),
             best_known: Mutex::new(None),
+            best_known_work: Mutex::new(None),
             recently_from: Mutex::new(HashSet::new()),
             inv_asked_headers: AtomicBool::new(false),
             sync_started: AtomicBool::new(false),

@@ -4919,8 +4919,8 @@ pub fn on_inv(
             Inventory::Block(h) | Inventory::WitnessBlock(h) => {
                 if let Some(s) = session {
                     s.note_block_from_peer(*h);
-                    s.note_best_known(*h);
                 }
+                note_advanced_best_known(hub, &follow.pending_headers, session, *h);
                 if on_inv_block_needs_headers(hub, follow, session, h) {
                     need_headers = true;
                 }
@@ -5143,6 +5143,9 @@ struct HeadersApply {
     want_bodies: Vec<BlockHash>,
     /// Locator for one follow-up `getheaders`, if the batch still wants a page.
     getheaders: Option<Vec<BlockHash>>,
+    headers_len: usize,
+    /// Best-known header-chain work is under `-minimumchainwork`.
+    peer_below_floor: bool,
 }
 
 fn classify_headers(
@@ -5166,6 +5169,8 @@ fn classify_headers(
         drop_asks: Vec::new(),
         want_bodies: Vec::new(),
         getheaders: None,
+        headers_len: n,
+        peer_below_floor: false,
     };
     let mut ignored_below_floor = false;
     if n == 0 {
@@ -5258,7 +5263,109 @@ fn classify_headers(
         let from = headers.get(n - 1).map(|h| h.block_hash());
         apply.getheaders = Some(headers_sync_locator(hub, from));
     }
+    if n > 0 {
+        if let Some(last) = headers.last() {
+            apply.peer_below_floor = peer_headers_below_floor(hub, &pending, last.block_hash());
+        }
+    }
     apply
+}
+
+/// This headers message ended the peer's chain, and that chain's work is
+/// under `-minimumchainwork`, while we are still in IBD.
+///
+/// Core drops outbound full-relay and block-relay peers there. A full page
+/// can continue, so it is not their tip yet. Inbound and manual peers stay.
+/// `prior_best_meets_floor` is the peer's stored best-known header from
+/// before this message. Core keeps that when the new header has less work.
+#[doc(hidden)]
+pub fn outbound_insufficient_work_disconnect(
+    in_ibd: bool,
+    header_count: usize,
+    conn: crate::peers::PeerConnType,
+    peer_below_floor: bool,
+    prior_best_meets_floor: bool,
+) -> bool {
+    in_ibd
+        && header_count > 0
+        && header_count < MAX_HEADERS_RESULTS
+        && peer_below_floor
+        && !prior_best_meets_floor
+        && matches!(
+            conn,
+            crate::peers::PeerConnType::OutboundFullRelay | crate::peers::PeerConnType::BlockRelay
+        )
+}
+
+fn peer_headers_below_floor(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+) -> bool {
+    let Some(min) = hub.min_chain_work_floor() else {
+        return false;
+    };
+    // Pending work only. `work_of_header_path` reads parent headers, and a
+    // below-floor batch must not.
+    match pending_path_work(hub, pending, tip) {
+        Some(work) => work.to_be_bytes() < min,
+        None => false,
+    }
+}
+
+fn hash_meets_work_floor(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    hash: BlockHash,
+    remembered: Option<bitcoin::Work>,
+) -> bool {
+    let Some(min) = hub.min_chain_work_floor() else {
+        return false;
+    };
+    // The pending map and the tip index can both forget a side header.
+    // The work measured when we stored the hash still counts.
+    let work = pending_path_work(hub, pending, hash).or(remembered);
+    match work {
+        Some(work) => work.to_be_bytes() >= min,
+        None => false,
+    }
+}
+
+/// Core moves `pindexBestKnownBlock` only when the new header's work is
+/// greater or equal. Unknown work does not replace a stored header.
+fn best_known_moves_forward(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    current: Option<BlockHash>,
+    next: BlockHash,
+    remembered_old: Option<bitcoin::Work>,
+) -> Option<bitcoin::Work> {
+    let next_work = pending_path_work(hub, pending, next)?;
+    let Some(old) = current else {
+        return Some(next_work);
+    };
+    let old_work = pending_path_work(hub, pending, old).or(remembered_old);
+    match old_work {
+        Some(old_work) if next_work >= old_work => Some(next_work),
+        Some(_) => None,
+        None => Some(next_work),
+    }
+}
+
+fn note_advanced_best_known(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    session: Option<&crate::peers::LivePeer>,
+    hash: BlockHash,
+) {
+    let Some(s) = session else {
+        return;
+    };
+    if let Some(work) =
+        best_known_moves_forward(hub, pending, s.best_known(), hash, s.best_known_work())
+    {
+        s.note_best_known_with_work(hash, work);
+    }
 }
 
 fn apply_headers(
@@ -5272,18 +5379,20 @@ fn apply_headers(
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
+    // Read before this message. The disconnect compares that hash and the
+    // work saved with it, which outlives the pending map.
+    let prior_best = session.and_then(|s| s.best_known());
+    let prior_work = session.and_then(|s| s.best_known_work());
     for hash in apply.from_peer {
         if let Some(s) = session {
             s.note_block_from_peer(hash);
         }
     }
-    for hash in apply.best_known {
-        if let Some(s) = session {
-            s.note_best_known(hash);
-        }
-    }
     for (hash, hdr) in apply.admits {
         admit_pending_header(&mut follow.pending_headers, hash, hdr);
+    }
+    for hash in apply.best_known {
+        note_advanced_best_known(hub, &follow.pending_headers, session, hash);
     }
     if let Some((announced_h, our_tip)) = apply.disconnect {
         rbitcoin_log::info!("p2p: disconnect stale fork tip announced={announced_h} our={our_tip}");
@@ -5297,6 +5406,26 @@ fn apply_headers(
     }
     if let Some(announced_h) = apply.ignore_height {
         rbitcoin_log::info!("{}", ignoring_low_work_chain_log(announced_h));
+    }
+    if let Some(s) = session.filter(|s| {
+        let prior_meets = apply.peer_below_floor
+            && prior_best.is_some_and(|h| {
+                hash_meets_work_floor(hub, &follow.pending_headers, h, prior_work)
+            });
+        outbound_insufficient_work_disconnect(
+            hub.in_ibd(),
+            apply.headers_len,
+            s.conn_type,
+            apply.peer_below_floor,
+            prior_meets,
+        )
+    }) {
+        rbitcoin_log::info!(
+            "outbound peer headers chain has insufficient work, peer={}",
+            s.id
+        );
+        s.request_disconnect();
+        return Ok(());
     }
     for hash in &apply.drop_asks {
         follow.requested_blocks.remove(hash);
@@ -5415,8 +5544,8 @@ pub async fn on_block(
     }
     if let Some(s) = session {
         s.note_block_from_peer(hash);
-        s.note_best_known(hash);
     }
+    note_advanced_best_known(hub, &follow.pending_headers, session, hash);
     // One frame at a time: the ping behind this body is not read until we
     // return. A duplicate must not take the process-wide tip-accept lane.
     if hub.already_have(hash) {
@@ -5717,8 +5846,8 @@ pub fn on_cmpctblock_reject_early(
     }
     if let Some(s) = session {
         s.note_block_from_peer(hash);
-        s.note_best_known(hash);
     }
+    note_advanced_best_known(hub, &follow.pending_headers, session, hash);
     Ok(false)
 }
 

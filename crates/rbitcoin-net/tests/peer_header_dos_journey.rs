@@ -1923,6 +1923,473 @@ async fn peer_header_dos_and_self_announce() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// During IBD, a headers batch that ends the peer's chain and sits under
+/// `-minimumchainwork` drops outbound full-relay and block-relay peers.
+/// Inbound, manual, feeler, and addr-fetch stay. Equal work on a stale tip
+/// stays in IBD and does not drop the outbound peer.
+#[tokio::test]
+async fn outbound_low_work_headers_disconnect_during_ibd() {
+    use rbitcoin_net::peers::PeerConnType;
+    use std::sync::atomic::Ordering;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ibd-low-work");
+    let mut floor = [0u8; 32];
+    floor[30] = 0x10;
+    // The floor has to be set before the first block lands. Leaving IBD
+    // latches, and a later raise does not enter it again.
+    hub.set_minimum_chain_work(Some(floor));
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(4, op_true(), vec![]).unwrap();
+    assert!(
+        hub.in_ibd(),
+        "a chain under the floor is still in initial block download"
+    );
+    let headers: Vec<_> = (1..=4u32).map(|h| header_at(&hub, h)).collect();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+
+    async fn send(
+        hub: &rbitcoin_net::chain::ChainHub,
+        peers: &std::sync::Arc<rbitcoin_net::peers::PeerHub>,
+        port: u16,
+        nonce: u64,
+        conn: PeerConnType,
+        headers: &[bitcoin::block::Header],
+    ) -> std::sync::Arc<rbitcoin_net::peers::LivePeer> {
+        let peer = live_peer_as(peers, port, nonce, conn);
+        let (out_tx, _rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState::new();
+        push(
+            hub,
+            &out_tx,
+            &mut follow,
+            Some(peer.as_ref()),
+            NetworkMessage::Headers(headers.to_vec()),
+        )
+        .await;
+        peer
+    }
+
+    rbitcoin_log::capture_logs(true);
+    let outbound = send(
+        &hub,
+        &peers,
+        18501,
+        81,
+        PeerConnType::OutboundFullRelay,
+        &headers,
+    )
+    .await;
+    assert!(
+        outbound.stop.load(Ordering::SeqCst),
+        "outbound full-relay with a short low-work chain drops"
+    );
+    assert!(logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+
+    rbitcoin_log::capture_logs(true);
+    let block_only = send(&hub, &peers, 18502, 82, PeerConnType::BlockRelay, &headers).await;
+    assert!(
+        block_only.stop.load(Ordering::SeqCst),
+        "block-relay-only with a short low-work chain drops"
+    );
+    assert!(logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+
+    rbitcoin_log::capture_logs(true);
+    let inbound = send(&hub, &peers, 18503, 83, PeerConnType::Inbound, &headers).await;
+    assert!(
+        !inbound.stop.load(Ordering::SeqCst),
+        "an inbound peer stays"
+    );
+    assert!(!logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+
+    rbitcoin_log::capture_logs(true);
+    let manual = send(&hub, &peers, 18504, 84, PeerConnType::Manual, &headers).await;
+    assert!(!manual.stop.load(Ordering::SeqCst), "a manual peer stays");
+    assert!(!logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+
+    rbitcoin_log::capture_logs(true);
+    let feeler = send(&hub, &peers, 18505, 85, PeerConnType::Feeler, &headers).await;
+    assert!(!feeler.stop.load(Ordering::SeqCst), "a feeler stays");
+    assert!(!logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+
+    rbitcoin_log::capture_logs(true);
+    let addr_fetch = send(&hub, &peers, 18506, 86, PeerConnType::AddrFetch, &headers).await;
+    assert!(
+        !addr_fetch.stop.load(Ordering::SeqCst),
+        "an addr-fetch peer stays"
+    );
+    assert!(!logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+
+    let met = hub.chain_work().unwrap().to_be_bytes();
+    hub.set_minimum_chain_work(Some(met));
+    let tip_time = u64::from(hub.tip_header().unwrap().time);
+    hub.clock
+        .set_mock(i64::try_from(tip_time + hub.max_tip_age_secs() + 1).unwrap());
+    assert!(
+        hub.in_ibd(),
+        "a stale tip stays in initial block download when work meets the floor"
+    );
+    rbitcoin_log::capture_logs(true);
+    let enough = send(
+        &hub,
+        &peers,
+        18507,
+        87,
+        PeerConnType::OutboundFullRelay,
+        &headers,
+    )
+    .await;
+    assert!(
+        !enough.stop.load(Ordering::SeqCst),
+        "an outbound peer at the floor stays"
+    );
+    assert!(!logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Core keeps `pindexBestKnownBlock` at the higher-work header. A later
+/// short fork under the floor must not drop that outbound peer.
+#[tokio::test]
+async fn known_good_chain_survives_a_later_low_work_fork() {
+    use rbitcoin_net::peers::PeerConnType;
+    use std::sync::atomic::Ordering;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ibd-best-known");
+    let mut floor = [0u8; 32];
+    floor[30] = 0x10;
+    hub.set_minimum_chain_work(Some(floor));
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(4, op_true(), vec![]).unwrap();
+    let met = hub.chain_work().unwrap().to_be_bytes();
+    hub.set_minimum_chain_work(Some(met));
+    let tip_time = u64::from(hub.tip_header().unwrap().time);
+    hub.clock
+        .set_mock(i64::try_from(tip_time + hub.max_tip_age_secs() + 1).unwrap());
+    assert!(
+        hub.in_ibd(),
+        "a stale tip stays in initial block download"
+    );
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer_as(&peers, 18511, 91, PeerConnType::OutboundFullRelay);
+    peer.note_best_known(hub.tip_hash().unwrap());
+    let fork = regtest_header_chain(header_at(&hub, 0).block_hash(), 1);
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    rbitcoin_log::capture_logs(true);
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(fork),
+    )
+    .await;
+    assert!(
+        !peer.stop.load(Ordering::SeqCst),
+        "a later low-work fork keeps a peer whose best known meets the floor"
+    );
+    assert!(!logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+    assert_eq!(
+        peer.best_known(),
+        Some(hub.tip_hash().unwrap()),
+        "a low-work fork does not replace a best known header that meets the floor"
+    );
+    let again = regtest_header_chain(header_at(&hub, 0).block_hash(), 1);
+    rbitcoin_log::capture_logs(true);
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(again),
+    )
+    .await;
+    assert!(
+        !peer.stop.load(Ordering::SeqCst),
+        "a second low-work fork keeps the peer"
+    );
+    assert!(!logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+    assert_eq!(peer.best_known(), Some(hub.tip_hash().unwrap()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Inv, block, and compact must not replace a best-known header that has
+/// more work. A later short fork then still keeps the outbound peer.
+#[tokio::test]
+async fn earlier_block_does_not_replace_best_known() {
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::p2p::message_blockdata::Inventory;
+    use rbitcoin_net::peers::PeerConnType;
+    use std::sync::atomic::Ordering;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ibd-best-known-inv");
+    let mut floor = [0u8; 32];
+    floor[30] = 0x10;
+    hub.set_minimum_chain_work(Some(floor));
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(4, op_true(), vec![]).unwrap();
+    let met = hub.chain_work().unwrap().to_be_bytes();
+    hub.set_minimum_chain_work(Some(met));
+    let tip_time = u64::from(hub.tip_header().unwrap().time);
+    hub.clock
+        .set_mock(i64::try_from(tip_time + hub.max_tip_age_secs() + 1).unwrap());
+    assert!(hub.in_ibd(), "a stale tip stays in initial block download");
+    let tip = hub.tip_hash().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer_as(&peers, 18512, 92, PeerConnType::OutboundFullRelay);
+    peer.note_best_known(tip);
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let unknown = BlockHash::from_byte_array([0xab; 32]);
+    on_inv(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &[Inventory::Block(unknown)],
+    )
+    .unwrap();
+    assert_eq!(
+        peer.best_known(),
+        Some(tip),
+        "an unknown inv does not replace a best known header"
+    );
+    let early = hub
+        .query
+        .reconstruct_block_at_height(Height(1))
+        .unwrap();
+    on_inv(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &[Inventory::WitnessBlock(early.block_hash())],
+    )
+    .unwrap();
+    assert_eq!(
+        peer.best_known(),
+        Some(tip),
+        "an earlier block inv does not replace a best known header"
+    );
+    on_block(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &early,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        peer.best_known(),
+        Some(tip),
+        "an earlier block does not replace a best known header"
+    );
+    follow.cmpct_version = 2;
+    let hsi = HeaderAndShortIds::from_block(&early, 1, 2, &[0]).unwrap();
+    on_cmpctblock_reject_early(
+        &hub,
+        &mut follow,
+        Some(peer.as_ref()),
+        &hsi,
+        early.block_hash(),
+    )
+    .unwrap();
+    assert_eq!(
+        peer.best_known(),
+        Some(tip),
+        "an earlier compact block does not replace a best known header"
+    );
+    peer.note_best_known(early.block_hash());
+    let tip_block = hub.query.reconstruct_block_at_height(Height(4)).unwrap();
+    on_block(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &tip_block,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        peer.best_known(),
+        Some(tip),
+        "a higher-work block still becomes best known"
+    );
+    let fork = regtest_header_chain(header_at(&hub, 0).block_hash(), 1);
+    rbitcoin_log::capture_logs(true);
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(fork),
+    )
+    .await;
+    assert!(
+        !peer.stop.load(Ordering::SeqCst),
+        "a short low-work fork keeps the peer after an earlier block"
+    );
+    assert!(!logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// An equal-work fork is stored, then dropped from the pending map when the
+/// body loses the tie. Its work must still count, or the next short low-work
+/// headers message drops the outbound peer.
+#[tokio::test]
+async fn equal_work_fork_keeps_its_work_after_pending_drop() {
+    use bitcoin::p2p::message_blockdata::Inventory;
+    use rbitcoin_net::peers::PeerConnType;
+    use std::sync::atomic::Ordering;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ibd-equal-work");
+    let mut floor = [0u8; 32];
+    floor[30] = 0x10;
+    hub.set_minimum_chain_work(Some(floor));
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(4, op_true(), vec![]).unwrap();
+    let met = hub.chain_work().unwrap().to_be_bytes();
+    hub.set_minimum_chain_work(Some(met));
+    let tip_time = u64::from(hub.tip_header().unwrap().time);
+    hub.clock
+        .set_mock(i64::try_from(tip_time + hub.max_tip_age_secs() + 1).unwrap());
+    assert!(hub.in_ibd(), "a stale tip stays in initial block download");
+    let tip = hub.tip_hash().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer_as(&peers, 18513, 93, PeerConnType::OutboundFullRelay);
+    peer.note_best_known(tip);
+    let parent = header_at(&hub, 3).block_hash();
+    let fork = regtest_header_chain(parent, 1);
+    let fork_hash = fork[0].block_hash();
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(fork),
+    )
+    .await;
+    assert_eq!(
+        peer.best_known(),
+        Some(fork_hash),
+        "an equal-work fork becomes best known"
+    );
+    assert!(
+        !peer.stop.load(Ordering::SeqCst),
+        "the equal-work fork itself stays connected"
+    );
+    follow.pending_headers.remove(&fork_hash);
+    let early = hub
+        .query
+        .reconstruct_block_at_height(Height(1))
+        .unwrap();
+    on_inv(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &[Inventory::Block(early.block_hash())],
+    )
+    .unwrap();
+    assert_eq!(
+        peer.best_known(),
+        Some(fork_hash),
+        "a lower block does not replace an equal-work fork after it leaves pending"
+    );
+    let low = regtest_header_chain(header_at(&hub, 0).block_hash(), 1);
+    rbitcoin_log::capture_logs(true);
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(low),
+    )
+    .await;
+    assert!(
+        !peer.stop.load(Ordering::SeqCst),
+        "a short low-work headers message keeps the peer"
+    );
+    assert!(!logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[test]
+fn full_headers_page_is_not_an_insufficient_work_disconnect() {
+    use rbitcoin_net::codec::MAX_HEADERS_RESULTS;
+    use rbitcoin_net::peers::PeerConnType;
+    assert!(
+        !outbound_insufficient_work_disconnect(
+            true,
+            MAX_HEADERS_RESULTS,
+            PeerConnType::OutboundFullRelay,
+            true,
+            false,
+        ),
+        "a full page is not the peer's tip"
+    );
+    assert!(outbound_insufficient_work_disconnect(
+        true,
+        MAX_HEADERS_RESULTS - 1,
+        PeerConnType::BlockRelay,
+        true,
+        false,
+    ));
+    assert!(!outbound_insufficient_work_disconnect(
+        true,
+        MAX_HEADERS_RESULTS - 1,
+        PeerConnType::OutboundFullRelay,
+        true,
+        true,
+    ));
+    assert!(!outbound_insufficient_work_disconnect(
+        false,
+        1,
+        PeerConnType::OutboundFullRelay,
+        true,
+        false,
+    ));
+    assert!(!outbound_insufficient_work_disconnect(
+        true,
+        1,
+        PeerConnType::Manual,
+        true,
+        false,
+    ));
+    assert!(!outbound_insufficient_work_disconnect(
+        true,
+        0,
+        PeerConnType::OutboundFullRelay,
+        true,
+        false,
+    ));
+}
+
 /// Tip work meets the floor. A bad-proof-of-work compact whose parent is the
 /// tip must not walk the mempool, and it scores like a bad `block`. A valid
 /// compact of the next block still fills from the mempool.
