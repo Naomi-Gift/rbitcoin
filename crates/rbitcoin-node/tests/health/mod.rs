@@ -1,8 +1,12 @@
 use axum::Router;
+use rbitcoin_consensus::ChainParams;
+use rbitcoin_electrum::{run_electrum, ElectrumConfig, TipNotify, LISTEN_DOWN, LISTEN_UP};
 use rbitcoin_log::progress;
 use rbitcoin_node::health::*;
 use rbitcoin_primitives::Network;
+use rbitcoin_query::Query;
 use std::net::SocketAddr;
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -258,19 +262,33 @@ async fn listener_cap_idle_health_is_closed() {
         opened.push(TcpStream::connect(addr).await.expect("connect"));
     }
     tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut held = 0usize;
+    let mut probes = tokio::task::JoinSet::new();
     for mut sock in opened {
-        if tcp_still_open(&mut sock).await {
-            held += 1;
+        probes.spawn(async move {
+            let open = tcp_still_open(&mut sock).await;
+            (sock, open)
+        });
+    }
+    let mut still = Vec::new();
+    while let Some(joined) = probes.join_next().await {
+        let (sock, open) = joined.expect("probe");
+        if open {
+            still.push(sock);
         }
     }
     assert!(
-        held < 80,
-        "health accepted {held} idle connections with no cap"
+        !still.is_empty() && still.len() <= HEALTH_MAX_CONNECTIONS,
+        "health held {} idle connections; cap is {HEALTH_MAX_CONNECTIONS}",
+        still.len()
     );
-
-    let mut idle = TcpStream::connect(addr).await.expect("one idle client");
-    let closed = tokio::time::timeout(Duration::from_secs(8), async {
+    let mut idle = still.pop().expect("accepted idle client");
+    drop(still);
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        tcp_still_open(&mut idle).await,
+        "idle health connection closed before the header timeout"
+    );
+    let closed = tokio::time::timeout(REQUEST_TIMEOUT + Duration::from_secs(2), async {
         let mut buf = [0u8; 8];
         loop {
             match idle.read(&mut buf).await {
@@ -282,26 +300,64 @@ async fn listener_cap_idle_health_is_closed() {
     .await;
     assert!(
         closed.is_ok(),
-        "an idle health connection was still open after 8s"
+        "an idle health connection was still open after the header timeout"
     );
     drop(handle);
 }
 
-/// `/readyz` is not ok while the Electrum accept task has stopped.
+/// `/readyz` is not ok after the Electrum accept task stops on its own.
 #[tokio::test]
 async fn listener_cap_readyz_reports_electrum_down() {
     let status = NodeStatus::new(Network::Regtest, false);
     status.enter(Phase::Following);
-    status.electrum_listen.store(
-        rbitcoin_electrum::LISTEN_DOWN,
-        std::sync::atomic::Ordering::SeqCst,
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-health-electrum-{n}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    let q = Query::open_or_create_tiny(&dir).expect("query");
+    let (tip_tx, _) = tokio::sync::broadcast::channel::<TipNotify>(4);
+    let mut cfg =
+        ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &ChainParams::regtest());
+    cfg.listen_state = Some(Arc::clone(&status.electrum_listen));
+    let mut electrum = run_electrum(cfg, Arc::new(q), ChainParams::regtest(), tip_tx, None)
+        .await
+        .expect("electrum");
+    let health = run_health("127.0.0.1:0".parse().unwrap(), Arc::clone(&status), false)
+        .await
+        .expect("health listen");
+    let marked = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if status.electrum_listen.load(Ordering::SeqCst) == LISTEN_UP {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await;
+    assert!(
+        marked.is_ok(),
+        "electrum accept task never marked the listener up"
     );
-    let addr = serve(router(status, false)).await;
-    let body = get_soon(addr, "/readyz").await;
+    let ready = get_soon(health.local_addr, "/readyz").await;
+    assert!(ready.starts_with("HTTP/1.1 200 OK|ok\n"), "{ready}");
+    let task = electrum.tasks.pop().expect("accept task");
+    task.abort();
+    let _ = task.await;
+    assert_eq!(
+        status.electrum_listen.load(Ordering::SeqCst),
+        LISTEN_DOWN,
+        "accept task stopped without shutdown and left the listener up"
+    );
+    let body = get_soon(health.local_addr, "/readyz").await;
     assert!(
         body.starts_with("HTTP/1.1 503 Service Unavailable|not ready: electrum listener down\n"),
         "{body}"
     );
+    drop(health);
+    drop(electrum);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 async fn tcp_still_open(sock: &mut TcpStream) -> bool {
