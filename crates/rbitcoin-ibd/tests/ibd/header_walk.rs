@@ -33,6 +33,32 @@ fn mine(prev: BlockHash, n: u32) -> Header {
 }
 
 #[test]
+fn a_short_header_with_no_target_is_not_a_low_work_batch() {
+    use rbitcoin_ibd::ibd::events::{plan_header_batch, HeaderPlan};
+
+    let (_dir, hub, mut st, gen) = opened("unproven-zero-bits", true);
+    let before = hub.query.store().header_count();
+    let hdr = Header {
+        version: bitcoin::block::Version::from_consensus(4),
+        prev_blockhash: gen.block_hash(),
+        merkle_root: TxMerkleNode::from_byte_array([9; 32]),
+        time: gen.time.saturating_add(1),
+        bits: CompactTarget::from_consensus(0),
+        nonce: 1,
+    };
+    let (_mark, plan) = plan_header_batch(&mut st, &hub, 0, vec![hdr]);
+    assert_eq!(hub.query.store().header_count(), before);
+    assert!(
+        !matches!(plan, HeaderPlan::Store { .. }),
+        "a header that does not prove its target is not stored"
+    );
+    assert!(
+        !st.header_walk.walk_quiet.contains(&0),
+        "bad proof is not the short low-work miss"
+    );
+}
+
+#[test]
 fn pow_linked_accepts_a_chain_and_rejects_a_bad_link_or_pow() {
     let a = mine(BlockHash::from_byte_array([0; 32]), 1);
     let b = mine(a.block_hash(), 2);
@@ -6675,6 +6701,38 @@ fn a_refused_clock_does_not_store_headers() {
     let _ = dir;
 }
 
+/// The confirmed chain already has the work. A clock that is still too far
+/// behind leaves the walk unproved, and that must not widen the rewind.
+#[test]
+fn a_refused_clock_does_not_widen_rewind_once_the_tip_meets_the_floor() {
+    let _clock = ResetClock;
+    let (dir, mut hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("unproven-clock-met");
+    hub.ensure_genesis().unwrap();
+    hub.milestone = rbitcoin_consensus::Milestone {
+        height: 1_000_000,
+        anchor: Some(rbitcoin_consensus::MilestoneAnchor {
+            hash: BlockHash::from_byte_array([0xab; 32]),
+            min_work_be: [0; 32],
+        }),
+    };
+    let gen = hub.tip_hash().unwrap();
+    let gen_hdr = hub.header_of(&gen).unwrap();
+    set_walk_unix_for_test(Some(
+        u64::from(gen_hdr.time).saturating_sub(WALK_CLOCK_SKEW + 1),
+    ));
+    let (s0, rx0) = slot(0);
+    std::mem::forget(rx0);
+    let mut st = IbdWorkState::new(vec![s0], Some(gen), Some(0));
+    ensure_origin(&mut st, &hub);
+    assert!(st.header_walk.clock_refused);
+    assert!(!st.header_walk.proven);
+    assert_eq!(
+        rewind_depth_cap(&st, &hub),
+        rbitcoin_ibd::ibd::reorg::REWIND_MAX_DEPTH
+    );
+    let _ = dir;
+}
+
 #[test]
 fn an_unproven_height_past_u32_keeps_its_own_checkpoint() {
     let (_dir, hub, mut st, gen) = opened("unproven-wide", false);
@@ -7029,7 +7087,7 @@ fn a_promoted_fork_keeps_the_charge_for_a_block_that_stays() {
         &mut progress,
         Some(&feed),
     );
-    feed.clear();
+    feed.clear(tip);
     assert_eq!(
         st.header_walk.lead_class_a.get(&tip),
         Some(&144),
@@ -7096,9 +7154,9 @@ fn a_second_lookup_does_not_spend_the_lead_twice() {
         vec![1],
         "the first body fits in the remaining lead"
     );
-    // The IBD loop refreshes from confirmed bytes, which are still zero here.
-    // The feed must keep the bytes lookup already reserved.
-    feed.set_unproven_bounds(bounds.height_limit, bounds.lead_from, bounds.bytes_left);
+    // The same allowance is refreshed. Height 1 is still reserved, so the
+    // next body does not get those bytes a second time.
+    feed.set_unproven_bounds(Some(10_000), bounds.lead_from, Some(100));
     let claimed = take_unproven_lead(&feed, Some(&wires), vec![1, 2]);
     assert_eq!(
         claimed,
@@ -7183,6 +7241,80 @@ fn an_old_unproved_adopt_measures_the_lead_from_the_confirmed_tip() {
         unproven_confirm_limit(&restarted),
         Some(UNPROVEN_LEAD_BLOCKS)
     );
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// An older file stored the queue tail as the base. That tail is often below
+/// the blocks already confirmed. The lead still starts at the confirmed tip.
+#[test]
+fn an_old_unproved_adopt_below_the_confirmed_tip_measures_from_that_tip() {
+    let (dir, hub, mut st, gen) = opened("unproven-legacy-base-below", true);
+    let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+    hub.generate_to_script(3, op_true, vec![]).unwrap();
+    let confirmed = hub.tip_height().unwrap();
+    assert_eq!(confirmed, 3);
+    st.header_walk.base_height = 0;
+    st.header_walk.base_hash = Some(gen.block_hash());
+    st.header_walk.tip.height = confirmed + 10;
+    st.header_walk.tip.hash = Some(gen.block_hash());
+    st.header_walk.checkpoints.push(Checkpoint {
+        hash: gen.block_hash(),
+        height: confirmed + 10,
+        height_wide: u64::from(confirmed + 10),
+        work: st.header_walk.tip_work(),
+        header: Some(gen),
+        times: vec![gen.time],
+        diff: DiffSnap::default(),
+        supplied_by: None,
+    });
+    st.header_walk.proven = true;
+    save_adopt(&st, &hub);
+    let mut restarted = IbdWorkState::new(Vec::new(), hub.tip_hash(), Some(confirmed));
+    assert!(restore_adopt(&mut restarted, &hub));
+    assert_eq!(restarted.header_walk.base_height, confirmed);
+    assert!(restarted.header_walk.witness_height.is_none());
+    assert!(!restarted.header_walk.proven);
+    assert_eq!(
+        unproven_confirm_limit(&restarted),
+        Some(confirmed + UNPROVEN_LEAD_BLOCKS)
+    );
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// A saved walk that does not reach past the confirmed tip is not a resume.
+/// Installing it would leave the walk behind headers already stored.
+#[test]
+fn an_old_adopt_at_or_behind_the_confirmed_tip_is_not_installed() {
+    let (dir, hub, mut st, gen) = opened("unproven-legacy-tip-behind", true);
+    let op_true = bitcoin::ScriptBuf::from_bytes(vec![0x51]);
+    hub.generate_to_script(3, op_true, vec![]).unwrap();
+    let confirmed = hub.tip_height().unwrap();
+    assert_eq!(confirmed, 3);
+    st.header_walk.base_height = 0;
+    st.header_walk.base_hash = Some(gen.block_hash());
+    st.header_walk.tip.height = 2;
+    st.header_walk.tip.hash = Some(gen.block_hash());
+    st.header_walk.checkpoints.push(Checkpoint {
+        hash: gen.block_hash(),
+        height: 2,
+        height_wide: 2,
+        work: st.header_walk.tip_work(),
+        header: Some(gen),
+        times: vec![gen.time],
+        diff: DiffSnap::default(),
+        supplied_by: None,
+    });
+    st.header_walk.proven = true;
+    save_adopt(&st, &hub);
+    let mut restarted = IbdWorkState::new(Vec::new(), hub.tip_hash(), Some(confirmed));
+    assert!(
+        !restore_adopt(&mut restarted, &hub),
+        "a saved tip at or behind the confirmed chain is not the walk"
+    );
+    assert!(!restarted.header_walk.origin);
+    ensure_origin(&mut restarted, &hub);
+    assert_eq!(restarted.header_walk.tip_height(), confirmed);
+    assert_eq!(restarted.header_walk.base_height, confirmed);
     let _ = std::fs::remove_dir_all(dir.path());
 }
 

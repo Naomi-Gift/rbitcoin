@@ -225,12 +225,13 @@ pub struct ConfirmFeedInner {
     /// Heights at or below this are the matched chain. They do not spend the lead.
     pub lead_from: u32,
     /// Class A bytes still allowed above `lead_from`. `None` is no byte cap.
-    /// Lookup selection lowers this as it claims bodies. The same match keeps
-    /// the tighter value. A higher match installs the new remainder, minus
-    /// wire still reserved above that match.
+    /// Lookup selection lowers this as it claims bodies. A new allowance
+    /// subtracts wire still reserved above the match, including when the
+    /// match did not move.
     pub lead_bytes_left: Option<u64>,
     /// Wire lookup has reserved above the match, by height.
     /// Cleared when that height is accepted or the match moves to or past it.
+    /// [`ConfirmFeed::clear`] drops only heights above the confirmed tip.
     pub lead_reserved: std::collections::BTreeMap<u32, u64>,
 }
 
@@ -279,10 +280,10 @@ impl ConfirmFeed {
         self.dropped_bodies.lock().unwrap().remove(hash);
     }
 
-    /// Install the unproven lead. The same `lead_from` keeps the smaller byte
-    /// remainder, so bodies lookup already reserved are not claimed again under
-    /// a fresh budget. A different `lead_from` installs `bytes_left`, minus wire
-    /// still reserved above that height. `bytes_left == None` lifts the byte cap.
+    /// Install the unproven lead. `bytes_left` is the walk's allowance above
+    /// `lead_from`. Reservations still held are subtracted, so a block lookup
+    /// already claimed is not claimed again, and a rewind that drops Class A
+    /// restores the new allowance. `bytes_left == None` lifts the byte cap.
     pub fn set_unproven_bounds(
         &self,
         height_limit: Option<u32>,
@@ -301,17 +302,13 @@ impl ConfirmFeed {
                 g.lead_reserved.clear();
                 None
             }
-            Some(n) if moved => {
+            Some(n) => {
                 let pending = g
                     .lead_reserved
                     .values()
                     .fold(0u64, |acc, b| acc.saturating_add(*b));
                 Some(n.saturating_sub(pending))
             }
-            Some(n) => match g.lead_bytes_left {
-                Some(cur) => Some(cur.min(n)),
-                None => Some(n),
-            },
         };
         self.height_capped
             .store(g.height_limit.is_some(), Ordering::Release);
@@ -464,19 +461,24 @@ impl ConfirmFeed {
     /// Bumps [`Self::epoch`] so load/scripts/write still holding a pre-rewind
     /// batch (not in `ready`/`inflight`) will drop it. `claimed_epoch` is kept
     /// so those in-channel batches can see they are stale.
-    pub fn clear(&self) {
+    ///
+    /// Reservations above `confirmed_tip` go back to the byte remainder. A
+    /// height at or below that tip stays reserved: its Accepted event may
+    /// still be waiting, and refunding it lets the next lookup spend those
+    /// bytes again.
+    pub fn clear(&self, confirmed_tip: u32) {
         let mut g = self.inner.lock().unwrap();
         g.ready.clear();
         g.inflight.clear();
-        let pending = g
+        let refund = g
             .lead_reserved
-            .values()
-            .copied()
-            .fold(0, u64::saturating_add);
+            .iter()
+            .filter(|(&h, _)| h > confirmed_tip)
+            .fold(0u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
+        g.lead_reserved.retain(|&h, _| h <= confirmed_tip);
         if let Some(left) = g.lead_bytes_left.as_mut() {
-            *left = left.saturating_add(pending);
+            *left = left.saturating_add(refund);
         }
-        g.lead_reserved.clear();
         drop(g);
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.force_single_until.store(u32::MAX, Ordering::Release);
@@ -910,7 +912,7 @@ pub fn load_fail_rewind_wave(
     let prepared = prepare_offer_back(hub, wave[usize::from(drop_head)..].iter().copied());
     lookup_ahead.clear_all(hub);
     feed.finish(std::iter::once(first_h));
-    feed.clear();
+    feed.clear(hub.tip_height().unwrap_or(0));
     // After `clear` (which drops isolation) and before the re-offer, so
     // lookup cannot rebuild the same wave.
     if wave.len() > 1 && !fault {

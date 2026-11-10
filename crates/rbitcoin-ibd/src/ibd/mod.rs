@@ -818,7 +818,7 @@ pub async fn ibd_cancellable(
             {
                 let st = &mut *st_guard;
                 if hub.tip_height() < tip_before_confirm {
-                    confirm_feed.clear();
+                    confirm_feed.clear(hub.tip_height().unwrap_or(0));
                 }
                 if let Some(msg) = st.halt.take() {
                     warn!("ibd: engine fault halt: {msg}");
@@ -880,7 +880,7 @@ pub async fn ibd_cancellable(
                     tip_rate_opt,
                 );
                 if hub.tip_height() < tip_before_assign {
-                    confirm_feed.clear();
+                    confirm_feed.clear(hub.tip_height().unwrap_or(0));
                 }
                 sample_peer_rates(&mut st_guard.slots, peer_io::ibd_mono_ms());
                 cadence.mark_assign(now_cadence);

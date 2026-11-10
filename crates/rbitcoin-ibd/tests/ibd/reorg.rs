@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 /// A proved walk still stops at [`REWIND_MAX_DEPTH`].
 #[test]
 fn unproved_lead_rewinds_past_1024_and_a_proved_walk_does_not() {
-    let (dir, hub) = tmp_hub();
+    let (dir, mut hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
     let gen = hub.tip_hash().unwrap();
     let mut prev = gen;
@@ -74,13 +74,14 @@ fn unproved_lead_rewinds_past_1024_and_a_proved_walk_does_not() {
         rbitcoin_ibd::ibd::state::IbdWorkState::new(Vec::new(), Some(prev), Some(1_025));
     unproved.header_walk.origin = true;
     unproved.header_walk.proven = false;
+    hub.milestone = floor_just_above(hub.chain_work().unwrap());
     assert_eq!(
         rbitcoin_ibd::ibd::header_walk::rewind_depth_cap(&unproved, &hub),
         rbitcoin_ibd::ibd::header_walk::UNPROVEN_LEAD_BLOCKS
     );
     // The first prepare already disconnected `hub`. Rebuild is the proved hub's
     // twin: a fresh chain checked through `apply_header_rewind`.
-    let (dir_lead, hub_lead) = tmp_hub();
+    let (dir_lead, mut hub_lead) = tmp_hub();
     hub_lead.ensure_genesis().unwrap();
     let gen_c = hub_lead.tip_hash().unwrap();
     let mut prev_c = gen_c;
@@ -101,6 +102,7 @@ fn unproved_lead_rewinds_past_1024_and_a_proved_walk_does_not() {
     );
     lead.header_walk.origin = true;
     lead.header_walk.proven = false;
+    hub_lead.milestone = floor_just_above(hub_lead.chain_work().unwrap());
     assert!(apply_header_rewind(&mut lead, &hub_lead, &[side_c.block_hash()]).unwrap());
     assert_eq!(hub_lead.tip_height(), Some(0));
     assert!(

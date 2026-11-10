@@ -2569,11 +2569,14 @@ pub fn note_stored_candidate(
 
 /// A batch shorter than a full window whose work, after the batch, is still
 /// under the floor. A short batch that itself crosses the floor is kept.
+/// A batch that does not prove its target is not this case: adding that
+/// work overflows, and it is not a reason to retire the peer.
 #[doc(hidden)]
 pub fn short_below_floor(st: &IbdWorkState, hub: &ChainHub, headers: &[Header]) -> bool {
     if !st.header_walk.origin
         || headers.is_empty()
         || headers.len() >= rbitcoin_net::codec::MAX_HEADERS_RESULTS
+        || !pow_linked(headers)
     {
         return false;
     }
@@ -2616,6 +2619,9 @@ pub fn extend_tip(
     headers: &[Header],
     peer: Option<usize>,
 ) -> bool {
+    if headers.is_empty() || !pow_linked(headers) {
+        return false;
+    }
     if short_below_floor(st, hub, headers) {
         return false;
     }
@@ -3931,9 +3937,16 @@ pub fn restore_adopt(st: &mut IbdWorkState, hub: &ChainHub) -> bool {
         renote_stored_path(st, hub);
         return false;
     }
+    // A saved tip that does not reach past the confirmed chain is an old
+    // unproved resume. Installing it pins the walk behind stored headers.
+    let confirmed = hub.tip_height().unwrap_or(0);
+    if parsed.tip.height <= confirmed {
+        renote_stored_path(st, hub);
+        return false;
+    }
     // A saved candidate above the confirmed tip may build on a block marked
     // invalid after it was saved. The walk starts again from the tip.
-    if parsed.tip.height > hub.tip_height().unwrap_or(0) && failure_above(hub, parsed.base_height) {
+    if failure_above(hub, parsed.base_height) {
         rbitcoin_log::info!(
             "ibd: headers resume refused height={}: invalid blocks are stored",
             parsed.tip.height
@@ -4109,7 +4122,9 @@ fn rebase_unproved_base(st: &mut IbdWorkState, hub: &ChainHub) {
     let Some(tip_h) = hub.tip_height() else {
         return;
     };
-    if st.header_walk.base_height <= tip_h {
+    // Above or below: an older file stored the queue tail, which is often
+    // under the blocks already confirmed. The lead is this tip either way.
+    if st.header_walk.base_height == tip_h {
         return;
     }
     let hash = hub.tip_hash();
@@ -4153,9 +4168,9 @@ pub struct UnprovenOfferBounds {
 /// Height and byte bounds for the next confirm offer.
 ///
 /// The height cap is always the matched height plus [`UNPROVEN_LEAD_BLOCKS`].
-/// The byte remainder counts Class A above that height only. The feed keeps
-/// the tighter remainder while the match stays put, and takes this new
-/// remainder when the match moves up.
+/// The byte remainder is the lead minus Class A above that height. The feed
+/// subtracts reservations it still holds, so a rewind that drops Class A
+/// installs this allowance again.
 #[doc(hidden)]
 pub fn unproven_offer_bounds(st: &IbdWorkState) -> UnprovenOfferBounds {
     if !st.header_walk.origin || st.header_walk.proven {
@@ -4261,15 +4276,13 @@ pub fn rewind_depth_cap(st: &IbdWorkState, hub: &ChainHub) -> u32 {
     }
 }
 
-/// True while a rewind would leave the unproved lead. A proved header
-/// candidate does not count: the confirmed chain's own work does.
+/// True while a rewind would leave the unproved lead. The confirmed chain's
+/// own work decides, including when a refused clock has cleared `proven`.
+/// If that work cannot be read, an unproved walk stays wide.
 fn leaving_unproved_lead(st: &IbdWorkState, hub: &ChainHub) -> bool {
-    if !st.header_walk.proven {
-        return true;
-    }
     match hub.chain_work() {
         Ok(work) => below_floor(hub, &work.to_be_bytes()),
-        Err(_) => false,
+        Err(_) => !st.header_walk.proven,
     }
 }
 

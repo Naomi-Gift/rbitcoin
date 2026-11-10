@@ -1301,7 +1301,7 @@ fn thr_stats_all_stages_and_note_wire_prefer() {
         let g = feed.inner.lock().unwrap();
         assert_eq!(g.ready.get(&12).copied(), Some(bh(3)));
     }
-    feed.clear();
+    feed.clear(0);
     {
         let g = feed.inner.lock().unwrap();
         assert!(g.ready.is_empty());
@@ -1342,7 +1342,7 @@ fn confirm_feed_clear_drops_queued_plans() {
         assert_eq!(g.ready.len(), 2);
         assert_eq!(g.inflight.len(), 1);
     }
-    feed.clear();
+    feed.clear(0);
     let (ready, inflight) = feed.size_snap();
     assert_eq!(ready, 0, "rewind must drop ready confirm plans");
     assert_eq!(inflight, 0, "rewind must drop inflight confirm plans");
@@ -1580,7 +1580,7 @@ fn isolate_clears_only_after_original_batch_last_height() {
         107,
         "n=1 consensus reject must not clear isolate"
     );
-    feed_n1.clear();
+    feed_n1.clear(0);
     assert_eq!(
         feed_n1.isolate_until(),
         u32::MAX,
@@ -1596,7 +1596,7 @@ fn plan_epoch_stale_after_clear() {
         g.claimed_epoch.insert(1, feed.epoch());
     }
     assert!(!feed.plan_epoch_stale(1), "claimed at live epoch");
-    feed.clear();
+    feed.clear(0);
     assert!(
         feed.plan_epoch_stale(1),
         "in-channel plan claimed before rewind is stale"
@@ -2877,6 +2877,30 @@ fn a_lower_match_installs_the_new_byte_remainder() {
     assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(1_000));
 }
 
+/// The match did not move. A rewind dropped the spent bytes, so the walk
+/// reports a fresh allowance and confirm may use it.
+#[test]
+fn the_same_match_installs_a_fresh_allowance() {
+    use rbitcoin_ibd::ibd::confirm::take_unproven_lead;
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10_000), 0, Some(100));
+    assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    feed.set_unproven_bounds(Some(10_000), 0, Some(1_000));
+    assert_eq!(
+        feed.inner.lock().unwrap().lead_bytes_left,
+        Some(960),
+        "bytes still reserved come out of the fresh allowance"
+    );
+    feed.release_lead_reserve(1);
+    feed.set_unproven_bounds(Some(10_000), 0, Some(1_000));
+    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(1_000));
+    assert_eq!(
+        take_unproven_lead(&feed, Some(&[100]), vec![2]),
+        vec![2],
+        "the fresh allowance pays for the next block"
+    );
+}
+
 #[test]
 fn clear_returns_bytes_reserved_and_not_yet_accepted() {
     use rbitcoin_ibd::ibd::confirm::take_unproven_lead;
@@ -2885,9 +2909,27 @@ fn clear_returns_bytes_reserved_and_not_yet_accepted() {
     let claimed = take_unproven_lead(&feed, Some(&[40]), vec![1]);
     assert_eq!(claimed, vec![1]);
     assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(60));
-    feed.clear();
+    feed.clear(0);
     assert!(feed.inner.lock().unwrap().lead_reserved.is_empty());
     assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(100));
+}
+
+/// A load failure can clear the feed before Accepted is drained. Bytes for a
+/// block already at the tip stay reserved. Bytes above the tip come back.
+#[test]
+fn clear_refunds_only_heights_above_the_confirmed_tip() {
+    use rbitcoin_ibd::ibd::confirm::take_unproven_lead;
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10), 0, Some(100));
+    assert_eq!(
+        take_unproven_lead(&feed, Some(&[40, 40]), vec![2, 5]),
+        vec![2, 5]
+    );
+    feed.clear(3);
+    let g = feed.inner.lock().unwrap();
+    assert!(g.lead_reserved.contains_key(&2));
+    assert!(!g.lead_reserved.contains_key(&5));
+    assert_eq!(g.lead_bytes_left, Some(60));
 }
 
 #[test]

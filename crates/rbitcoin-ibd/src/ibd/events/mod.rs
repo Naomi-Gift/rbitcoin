@@ -678,8 +678,11 @@ pub fn plan_header_batch(
         );
     }
     let clock_refused = st.header_walk.clock_refused;
+    // An empty reply is not bad proof. A header that fails its target must
+    // not retire the peer the way a short low-work batch does.
+    let linked = headers.is_empty() || super::header_walk::pow_linked(&headers);
     let plan = plan_header_reply(st, hub, peer, headers);
-    if matches!(plan, HeaderPlan::Done) && !clock_refused {
+    if matches!(plan, HeaderPlan::Done) && !clock_refused && linked {
         finish_mark(st, hub, peer, &mark);
     }
     (mark, plan)
@@ -715,6 +718,11 @@ pub fn plan_header_reply(
         } else {
             HeaderPlan::Done
         };
+    }
+    // Bad proof is not a short low-work batch. Returning `Done` from that
+    // check would retire the peer. The caller skips the miss mark.
+    if !super::header_walk::pow_linked(&headers) {
+        return HeaderPlan::Done;
     }
     if super::header_walk::short_below_floor(st, hub, &headers) {
         return HeaderPlan::Done;
@@ -1286,7 +1294,7 @@ pub fn take_confirm_events(
     }
     if st.confirm_quiesce {
         if let Some(f) = feed {
-            f.clear();
+            f.clear(hub.tip_height().unwrap_or(0));
         }
         st.confirm_quiesce = false;
     }
