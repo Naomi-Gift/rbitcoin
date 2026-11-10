@@ -1574,6 +1574,17 @@ impl Store {
     /// commit point). The height fence is rebuilt/extended only from confirmed
     /// header_txs, so leftover strong bits above tip have no fence height and
     /// do not count as best-chain spent.
+    /// A sole-spender slot stays in the page log only while that spender is
+    /// still best-chain. Multi-list slots stay; `is_confirmed_strong` filters
+    /// each list member at read time.
+    fn spend_slot_still_live(&self, meta: &[u8; 8]) -> Result<bool, StoreError> {
+        let (flags, field, _) = crate::tx_table::decode_spent_slot(meta)?;
+        if field.is_null() || flags & crate::compact::output_flags::MULTI_SPENDER != 0 {
+            return Ok(true);
+        }
+        self.is_confirmed_strong(field)
+    }
+
     pub fn is_confirmed_strong(&self, tx_fk: Fk) -> Result<bool, StoreError> {
         let tip = self.confirmed.tip_height().map(|t| t.0);
         self.is_confirmed_strong_at(tx_fk, tip)
@@ -1846,7 +1857,8 @@ impl Store {
         let gen = self
             .spend_reorg_gen
             .load(std::sync::atomic::Ordering::Acquire);
-        self.txs.commit_open_spend_pages(tip)?;
+        self.txs
+            .commit_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
         self.txs.sync_replay_data()?;
         self.spenders.sync_data_only()?;
         self.store_spend_marker(tip, tip, gen)?;
@@ -2062,7 +2074,8 @@ impl Store {
         during_sync: impl FnOnce(&Self),
     ) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
-        self.txs.commit_open_spend_pages(height)?;
+        self.txs
+            .commit_open_spend_pages(height, |meta| self.spend_slot_still_live(meta))?;
         self.txs.sync_replay_data()?;
         self.spenders.sync_data_only()?;
         during_sync(self);
@@ -2120,6 +2133,8 @@ impl Store {
     pub fn clamp_spend_durable(&self) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
         self.spend_reorg_gen.fetch_add(1, Ordering::AcqRel);
+        let tip_now = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
+        self.txs.hold_spend_fold_above(tip_now)?;
         let _ = self
             .spend_snapshot
             .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {

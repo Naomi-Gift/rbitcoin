@@ -2515,14 +2515,26 @@ impl TxTable {
         self.spend_pages.note_slots(slots)
     }
 
-    pub(crate) fn commit_open_spend_pages(&self, height: u32) -> Result<(), StoreError> {
+    pub(crate) fn commit_open_spend_pages<K>(&self, height: u32, keep: K) -> Result<(), StoreError>
+    where
+        K: FnMut(&[u8; OutputRecord::SPENT_SLOT_LEN]) -> Result<bool, StoreError>,
+    {
         let published = self.spent.body_published_len();
-        self.spend_pages.commit_open(height, published, |off, len| {
-            let mut buf = vec![0u8; len];
-            self.spent
-                .read_prefix_at_published(published, off, len as u64, &mut buf)?;
-            Ok(buf)
-        })
+        self.spend_pages.commit_open(
+            height,
+            published,
+            |off, len| {
+                let mut buf = vec![0u8; len];
+                self.spent
+                    .read_prefix_at_published(published, off, len as u64, &mut buf)?;
+                Ok(buf)
+            },
+            keep,
+        )
+    }
+
+    pub(crate) fn hold_spend_fold_above(&self, tip: u32) -> Result<(), StoreError> {
+        self.spend_pages.hold_fold_above(tip)
     }
 
     pub(crate) fn fold_committed_spend_pages(&self) -> Result<(), StoreError> {

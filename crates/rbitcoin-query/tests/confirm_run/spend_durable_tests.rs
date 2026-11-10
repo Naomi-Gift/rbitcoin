@@ -741,6 +741,58 @@ fn historical_page_stays_unwritten_until_spend_checkpoint() {
     let _ = dir;
 }
 
+/// A spend that does not survive disconnect is not folded onto `spent.body`.
+#[test]
+fn disconnected_historical_spend_is_not_folded() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-page-hold");
+    q.set_spend_index(true);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let b1 = mine(tip, tip_time + 600, 1, Vec::new());
+    let c1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+    connect_until(&q, &params, ms, &mut tip, &mut tip_time, maturity + 2);
+
+    let created = pay_many(c1, 512, Amount::from_sat(1_000));
+    let created_id = created.compute_txid();
+    let create_block = mine(tip, tip_time + 600, maturity + 3, vec![created]);
+    accept_and_connect_block(&q, &params, Height(maturity + 3), &create_block, ms).unwrap();
+    tip = create_block.block_hash();
+    tip_time = create_block.header.time;
+
+    let create_fk = q
+        .tx_fk_by_txid(created_id.as_byte_array())
+        .unwrap()
+        .unwrap();
+    let (off, _) = q.store().tx_spent_range(create_fk).unwrap();
+    let abs0 = spent_abs(off, 0);
+    assert!(abs0 < 4096);
+    let store = q.store().path().to_path_buf();
+    let before = read_slot(&store, abs0);
+
+    let h0 = maturity + 4;
+    let s0 = spend_vout(created_id, 0, Amount::from_sat(900));
+    let b0 = mine(tip, tip_time + 600, h0, vec![s0]);
+    accept_and_connect_block(&q, &params, Height(h0), &b0, ms).unwrap();
+    assert!(q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap());
+    q.disconnect_tip().unwrap();
+    assert!(!q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap());
+    q.store().checkpoint_observed_spend().unwrap();
+    assert_eq!(
+        read_slot(&store, abs0),
+        before,
+        "a disconnected historical spend must not be folded onto spent.body"
+    );
+    let _ = dir;
+}
+
 fn connect_until(
     q: &rbitcoin_query::Query,
     params: &ChainParams,
