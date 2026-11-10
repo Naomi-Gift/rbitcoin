@@ -79,9 +79,9 @@ fn eviction_drops_the_newest_in_the_largest_netgroup() {
 
 #[test]
 fn eviction_protects_block_tx_ping_and_netgroup() {
-    // 27 peers. Each protected set is newer than the two unprotected peers,
-    // or sits in a larger netgroup, so dropping any one protect evicts from
-    // that set (Core #36470). Netgroup keeps ids 0 and 1. Longest keeps
+    // 27 peers. Each protected set holds a peer newer than the two
+    // unprotected peers, or sits in a larger netgroup, so dropping any one
+    // protect evicts from that set (Core #36470). Netgroup keeps ids 0 and 1. Longest keeps
     // ids 2..=9.
     let mut cands = vec![cand(0, 500, Some(1.0), 0, 0)];
     for i in 1..=8 {
@@ -92,14 +92,18 @@ fn eviction_protects_block_tx_ping_and_netgroup() {
     }
     cands.push(cand(9, 100, Some(1.0), 0, 0));
     cands.push(cand(10, 101, Some(1.0), 0, 0));
-    for i in 11..=18 {
-        cands.push(cand(i, 200 + i, Some(0.01), 0, 0));
+    // The ping, tx, and block cohorts interleave in `connected_at`, which
+    // runs against each protect key, so a protect sorted by connection time
+    // keeps a different set. Ping id 18 is older than ids 9 and 10, so the
+    // ping cohort is not the newest eight either.
+    for (i, at) in (11..=18).zip([214, 213, 212, 209, 208, 207, 204, 50]) {
+        cands.push(cand(i, at, Some(0.01), 0, 0));
     }
-    for i in 19..=22 {
-        cands.push(cand(i, 300 + i, Some(1.0), 0, 1000 + i));
+    for (i, at) in (19..=22).zip([215, 210, 205, 200]) {
+        cands.push(cand(i, at, Some(1.0), 0, 1000 + i));
     }
-    for i in 23..=26 {
-        cands.push(cand(i, 400 + i, Some(1.0), 1000 + i, 0));
+    for (i, at) in (23..=26).zip([216, 211, 206, 201]) {
+        cands.push(cand(i, at, Some(1.0), 1000 + i, 0));
     }
     assert_eq!(
         select_inbound_eviction(cands),
