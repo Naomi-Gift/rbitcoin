@@ -472,7 +472,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             .as_ref()
             .map(|p| format!(" datadir_cold={}", p.display()))
             .unwrap_or_default(),
-        std::env::var("RBITCOIN_IO").unwrap_or_else(|_| "default".into()),
+        rbitcoin_store::bulk_io::backend_name(),
     );
 
     handle.query.set_trust_peer(config.trust_peer_set());

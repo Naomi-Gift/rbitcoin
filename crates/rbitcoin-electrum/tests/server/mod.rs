@@ -3071,3 +3071,43 @@ async fn client_stop_wakes_without_the_hundred_ms_poll() {
 }
 
 mod surface_tests;
+
+/// Any client can open connections, so connect and disconnect log at DEBUG.
+/// At INFO they let an unauthenticated client fill the operator's log.
+#[tokio::test]
+async fn connect_and_disconnect_log_below_info() {
+    use rbitcoin_log::Level;
+    let (dir, q) = tmp_store();
+    let params = ChainParams::regtest();
+    let (tip_tx, _) = broadcast::channel(4);
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    rbitcoin_log::capture_logs(true);
+    let handle = run_electrum(cfg, Arc::new(q), params, tip_tx, None)
+        .await
+        .expect("listen");
+    let mut stream = TcpStream::connect(handle.local_addr).await.unwrap();
+    let pong = electrum_tcp_rpc(&mut stream, 1, "server.ping", json!([])).await;
+    assert!(pong.get("error").is_none(), "{pong}");
+    drop(stream);
+    let mut logs = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !logs
+        .iter()
+        .any(|(_, m): &(Level, String)| m.starts_with("electrum: disconnect"))
+    {
+        assert!(Instant::now() < deadline, "no disconnect line: {logs:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        logs.extend(rbitcoin_log::take_logs());
+    }
+    rbitcoin_log::capture_logs(false);
+    handle.shutdown().await;
+    let lines: Vec<_> = logs
+        .iter()
+        .filter(|(_, m)| {
+            m.starts_with("electrum: connect") || m.starts_with("electrum: disconnect")
+        })
+        .collect();
+    assert_eq!(lines.len(), 2, "{logs:?}");
+    assert!(lines.iter().all(|(l, _)| *l == Level::Debug), "{lines:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

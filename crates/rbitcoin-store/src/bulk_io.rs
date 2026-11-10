@@ -126,8 +126,13 @@ pub fn parse_io_token() -> Option<IoToken> {
 
 /// Backend [`crate::uring_session::UringSession::try_open`] should open.
 pub fn resolved_session_kind() -> crate::uring_session::SessionKind {
+    session_kind_for(parse_io_token())
+}
+
+#[doc(hidden)]
+pub fn session_kind_for(token: Option<IoToken>) -> crate::uring_session::SessionKind {
     use crate::uring_session::SessionKind;
-    match parse_io_token() {
+    match token {
         Some(IoToken::Pool) => SessionKind::Pool,
         Some(IoToken::Iocp) => SessionKind::Iocp,
         Some(IoToken::Uring) => SessionKind::Uring,
@@ -151,6 +156,20 @@ pub fn default_session_kind() -> crate::uring_session::SessionKind {
     {
         SessionKind::Pool
     }
+}
+
+/// Bulk-IO backend this process uses, for the startup log: the session kind,
+/// or `pread` when no session opens (requested, or io_uring unavailable).
+pub fn backend_name() -> &'static str {
+    backend_name_for(parse_io_token(), io_uring_enabled())
+}
+
+#[doc(hidden)]
+pub fn backend_name_for(token: Option<IoToken>, session_open: bool) -> &'static str {
+    if !session_open {
+        return "pread";
+    }
+    session_kind_for(token).name()
 }
 
 /// Worker count for pread fallback (cached).

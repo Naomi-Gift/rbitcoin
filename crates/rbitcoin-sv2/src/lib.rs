@@ -243,7 +243,7 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
                     continue;
                 }
             };
-            rbitcoin_log::info!("sv2: connect {peer}");
+            rbitcoin_log::debug!("sv2: connect {peer}");
             let chain = Arc::clone(&chain);
             let stats = Arc::clone(&stats_c);
             let flight = Arc::clone(&flight);
@@ -264,8 +264,8 @@ pub async fn run_sv2_tp(config: Sv2TpConfig) -> io::Result<Sv2TpHandle> {
                 )
                 .await
                 {
-                    Ok(()) => rbitcoin_log::info!("sv2: disconnect {peer}"),
-                    Err(e) => rbitcoin_log::info!("sv2: disconnect {peer} ({e})"),
+                    Ok(()) => rbitcoin_log::debug!("sv2: disconnect {peer}"),
+                    Err(e) => rbitcoin_log::debug!("sv2: disconnect {peer} ({e})"),
                 }
             });
             let mut g = sessions_c.lock().unwrap_or_else(|e| e.into_inner());

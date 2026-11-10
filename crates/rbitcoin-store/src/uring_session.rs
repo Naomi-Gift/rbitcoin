@@ -190,6 +190,22 @@ pub enum SessionKind {
     Iocp,
 }
 
+impl SessionKind {
+    /// Engine [`UringSession::try_open_kind`] opens for this kind on this target.
+    pub fn name(self) -> &'static str {
+        match self {
+            #[cfg(target_os = "linux")]
+            SessionKind::Uring => "io_uring",
+            #[cfg(windows)]
+            SessionKind::Uring => "iocp",
+            #[cfg(not(any(target_os = "linux", windows)))]
+            SessionKind::Uring => "pool",
+            SessionKind::Pool => "pool",
+            SessionKind::Iocp => "iocp",
+        }
+    }
+}
+
 /// Held completion session, or standalone (TLS / libc).
 ///
 /// `held` is for machines that already own the thread-local ring. `none` is

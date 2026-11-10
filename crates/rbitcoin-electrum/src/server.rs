@@ -297,7 +297,7 @@ pub async fn run_electrum(
                         drop(stream);
                         continue;
                     };
-                    rbitcoin_log::info!("electrum: connect {peer}");
+                    rbitcoin_log::debug!("electrum: connect {peer}");
                     // Replies, batch slots included, are small writes the
                     // client waits on whole; Nagle would hold them for an ACK.
                     if let Err(e) = stream.set_nodelay(true) {
@@ -313,9 +313,9 @@ pub async fn run_electrum(
                         let _connection_slot = permit;
                         let how = handle_client(stream, peer, q, cfg, p, tip_rx, mp, stop).await;
                         match how {
-                            Ok(()) => rbitcoin_log::info!("electrum: disconnect {peer}"),
+                            Ok(()) => rbitcoin_log::debug!("electrum: disconnect {peer}"),
                             Err(e) => {
-                                rbitcoin_log::info!("electrum: disconnect {peer} ({e})")
+                                rbitcoin_log::debug!("electrum: disconnect {peer} ({e})")
                             }
                         }
                     });

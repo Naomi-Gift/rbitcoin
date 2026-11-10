@@ -403,3 +403,41 @@ async fn out_of_range_timing_refuses_to_start() {
     .expect("out-of-range idle timeout must not start");
     assert_eq!(e.kind(), io::ErrorKind::InvalidInput, "{e}");
 }
+
+/// Any client can open connections, so connect and disconnect log at DEBUG.
+/// At INFO they let an unauthenticated client fill the operator's log.
+#[tokio::test]
+async fn connect_and_disconnect_log_below_info() {
+    use rbitcoin_log::Level;
+    let tc = shared_regtest(0);
+    let chain = Arc::clone(&tc.chain);
+    rbitcoin_log::capture_logs(true);
+    let tp = run_sv2_tp(test_tp_config(chain, [7; 32]))
+        .await
+        .expect("listen");
+    let mut c = TpClient::connect(tp.local_addr, tp.authority_pubkey)
+        .await
+        .expect("handshake");
+    c.setup_connection(TDP, 2, 2, 0).await.unwrap();
+    let f = c.recv().await.expect("setup reply");
+    assert_eq!(f.msg_type, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS);
+    drop(c);
+    let mut logs = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !logs
+        .iter()
+        .any(|(_, m): &(Level, String)| m.starts_with("sv2: disconnect"))
+    {
+        assert!(Instant::now() < deadline, "no disconnect line: {logs:?}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        logs.extend(rbitcoin_log::take_logs());
+    }
+    rbitcoin_log::capture_logs(false);
+    tp.shutdown().await;
+    let lines: Vec<_> = logs
+        .iter()
+        .filter(|(_, m)| m.starts_with("sv2: connect") || m.starts_with("sv2: disconnect"))
+        .collect();
+    assert_eq!(lines.len(), 2, "{logs:?}");
+    assert!(lines.iter().all(|(l, _)| *l == Level::Debug), "{lines:?}");
+}
