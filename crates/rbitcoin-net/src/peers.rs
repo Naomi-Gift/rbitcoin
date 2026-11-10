@@ -1908,6 +1908,9 @@ pub struct PeerHub {
     pub peer_timeout_secs: AtomicU64,
     /// Core `m_peers_downloading_from`: sessions with a block in flight.
     pub peers_downloading_from: AtomicUsize,
+    /// Live outbound full-relay catch-up sessions. Catch-up dials its own
+    /// sessions outside `live`, so it reports their count here.
+    catch_up_full_outbound: AtomicUsize,
     /// Addresses we advertise (`getnetworkinfo.localaddresses`).
     pub external_ips: Mutex<Vec<IpAddr>>,
     pub wallet_onions: Mutex<Vec<(String, u16)>>,
@@ -2134,6 +2137,7 @@ impl PeerHub {
             addr_response_cache: Mutex::new(HashMap::new()),
             peer_timeout_secs: AtomicU64::new(60),
             peers_downloading_from: AtomicUsize::new(0),
+            catch_up_full_outbound: AtomicUsize::new(0),
             external_ips: Mutex::new(Vec::new()),
             wallet_onions: Mutex::new(Vec::new()),
             p2p_onion: Mutex::new(None),
@@ -4077,6 +4081,18 @@ impl PeerHub {
             .collect();
         rows.sort_unstable_by_key(|(id, _)| *id);
         rows
+    }
+
+    /// Catch-up's live outbound full-relay session count (0 when it ends).
+    pub fn set_catch_up_full_outbound(&self, n: usize) {
+        self.catch_up_full_outbound.store(n, Ordering::Relaxed);
+    }
+
+    /// Core `GetFullOutboundConnCount`: live outbound full-relay sessions,
+    /// catch-up's included. Not `noban`-gated.
+    pub fn full_outbound_count(&self) -> usize {
+        self.live_outbound_full_relay_nets().len()
+            + self.catch_up_full_outbound.load(Ordering::Relaxed)
     }
 
     /// Live outbound full-relay addrs (not `noban`-gated) for diversity occupied.

@@ -691,7 +691,13 @@ Do **not** wipe `store/` for mempool slot/full/schema errors.
   the rest). A peer with the `addr` whitelist permission is not limited. Dial ranking omits known-v1
   (`INCOMPATIBLE`) addresses while any better candidate remains. Seed host
   list lives in `dns_seeds()` (`crates/rbitcoin-net/src/seeds.rs`).
-  After the DNS seeds, each reachable network with no address in the book
+  As in Core's `ThreadDNSAddressSeed`, the DNS seeds are asked at start only
+  when the `peers` file left the book empty. With a known book the node dials
+  it first and waits 11 s (5 min once the book has 1,000 rows, checked every
+  11 s). If two outbound full-relay peers, IBD or tip-follow, are up by then,
+  the DNS seeds are skipped; otherwise all of them are asked and the answers
+  join the book. Core asks three at a time and checks again between batches.
+  Next, each reachable network with no address in the book
   gets Core's fixed seeds for it (`crates/rbitcoin-net/seeds/`, from Core's
   `contrib/seeds`; refresh with `scripts/core-fixed-seeds.sh COMMIT`). A
   warm `peers` file or a DNS answer for IPv4 and IPv6 leaves only the empty

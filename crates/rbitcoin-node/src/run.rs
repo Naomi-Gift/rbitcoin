@@ -800,14 +800,22 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         addrman.add_addr(*c);
     }
     let mut proxy_seeds_queued = false;
+    // A known book tries its own peers first. The DNS seeds wait on
+    // `dns_seeds_when_needed` in the background once the book is shared.
+    let known_book = addrman.len();
+    let dns_seeds_deferred = should_resolve_dns_seeds(&config) && known_book > 0;
     if should_resolve_default_seeds(&config) && !shutdown.requested() {
         info!(
             "ibd: resolving DNS/fixed seeds for {}…",
             config.network.as_str()
         );
         let n_before = addrman.len();
-        if should_resolve_dns_seeds(&config) {
-            addrman.inject(rbitcoin_net::resolve_dns_seeds(config.network));
+        if should_resolve_dns_seeds(&config) && !dns_seeds_deferred {
+            let network = config.network;
+            let resolve = move || rbitcoin_net::resolve_dns_seeds(network);
+            if let Some(addrs) = dns_seeds_when_needed(0, || 0, &shutdown, resolve).await {
+                addrman.inject(addrs);
+            }
         }
         let fixed = addrman.add_fixed_seeds(config.network);
         info!(
@@ -830,6 +838,25 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     }
     let shared_peers = std::sync::Arc::new(std::sync::Mutex::new(addrman.clone()));
     node.peers.set_addrman(std::sync::Arc::clone(&shared_peers));
+    if dns_seeds_deferred && !shutdown.requested() {
+        let peers = Arc::clone(&node.peers);
+        let book = Arc::clone(&shared_peers);
+        let sd = Arc::clone(&shutdown);
+        let network = config.network;
+        tokio::spawn(async move {
+            let outbound = || peers.full_outbound_count();
+            let resolve = move || rbitcoin_net::resolve_dns_seeds(network);
+            if let Some(addrs) = dns_seeds_when_needed(known_book, outbound, &sd, resolve).await {
+                let found = addrs.len();
+                let mut book = book.lock().unwrap_or_else(|e| e.into_inner());
+                book.inject(addrs);
+                info!(
+                    "ibd: {found} address(es) found from DNS seeds (book={})",
+                    book.len()
+                );
+            }
+        });
+    }
     if proxy_or_onion_without_trust(&config) {
         let _iso = rbitcoin_net::spawn_isolated_broadcast_loop(
             Arc::clone(&mempool),
@@ -1835,6 +1862,59 @@ pub fn queue_proxy_seed_addrfetch(peers: &Arc<rbitcoin_net::PeerHub>, network: N
         }
     }
     n
+}
+
+/// Core `DNSSEEDS_DELAY_FEW_PEERS`: a known book tries its own peers this
+/// long before the DNS seeds are asked.
+pub const DNSSEEDS_DELAY_FEW_PEERS: Duration = Duration::from_secs(11);
+/// Core `DNSSEEDS_DELAY_MANY_PEERS`: the wait for a book of at least
+/// [`DNSSEEDS_DELAY_PEER_THRESHOLD`] rows, checked every
+/// [`DNSSEEDS_DELAY_FEW_PEERS`].
+pub const DNSSEEDS_DELAY_MANY_PEERS: Duration = Duration::from_secs(5 * 60);
+/// Core `DNSSEEDS_DELAY_PEER_THRESHOLD`.
+pub const DNSSEEDS_DELAY_PEER_THRESHOLD: usize = 1000;
+/// Core `SEED_OUTBOUND_CONNECTION_THRESHOLD`: this many outbound full-relay
+/// peers make the DNS seeds unnecessary.
+pub const SEED_OUTBOUND_CONNECTION_THRESHOLD: usize = 2;
+
+/// Core `ThreadDNSAddressSeed`. An empty book (`book_len == 0`) asks the
+/// DNS seeds at once. A known book waits [`DNSSEEDS_DELAY_FEW_PEERS`], or
+/// [`DNSSEEDS_DELAY_MANY_PEERS`] past the threshold, and returns `None` at
+/// the first check with [`SEED_OUTBOUND_CONNECTION_THRESHOLD`] outbound
+/// peers up. Shutdown returns `None`. Otherwise `resolve` runs on the
+/// blocking pool and its addresses are returned.
+#[doc(hidden)]
+pub async fn dns_seeds_when_needed(
+    book_len: usize,
+    full_outbound: impl Fn() -> usize,
+    shutdown: &Shutdown,
+    resolve: impl FnOnce() -> Vec<SocketAddr> + Send + 'static,
+) -> Option<Vec<SocketAddr>> {
+    if book_len > 0 {
+        let mut left = if book_len >= DNSSEEDS_DELAY_PEER_THRESHOLD {
+            DNSSEEDS_DELAY_MANY_PEERS
+        } else {
+            DNSSEEDS_DELAY_FEW_PEERS
+        };
+        info!("ibd: waiting {}s before querying DNS seeds", left.as_secs());
+        while !left.is_zero() {
+            let step = left.min(DNSSEEDS_DELAY_FEW_PEERS);
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return None,
+                () = tokio::time::sleep(step) => {}
+            }
+            left -= step;
+            if full_outbound() >= SEED_OUTBOUND_CONNECTION_THRESHOLD {
+                info!("ibd: P2P peers available. Skipped DNS seeding.");
+                return None;
+            }
+        }
+    }
+    if shutdown.requested() {
+        return None;
+    }
+    tokio::task::spawn_blocking(resolve).await.ok()
 }
 
 /// A SOCKS seed answer that lost its circuit is not retried by the dial

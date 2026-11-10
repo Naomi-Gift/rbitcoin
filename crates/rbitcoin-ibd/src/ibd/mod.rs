@@ -431,10 +431,14 @@ impl IbdConfig {
 }
 
 /// Local IBD peer book that flushes back into [`IbdConfig::peers`] on drop.
+/// Rows another writer adds to the shared book later (the deferred DNS
+/// seeds) are pulled in before each redial and kept by the flush.
 #[doc(hidden)]
 pub struct PeerBookSession {
     pub book: rbitcoin_net::seeds::AddrMan,
     pub shared: Option<std::sync::Arc<std::sync::Mutex<rbitcoin_net::seeds::AddrMan>>>,
+    /// Shared rows this session has taken. A row it later drops stays out.
+    seen: HashSet<rbitcoin_net::NetAddr>,
 }
 
 impl PeerBookSession {
@@ -448,10 +452,11 @@ impl PeerBookSession {
         } else {
             rbitcoin_net::seeds::AddrMan::new()
         };
+        let seen = book.dial_order().iter().copied().collect();
         for &addr in seed_peers {
             book.add_addr(addr);
         }
-        Self { book, shared }
+        Self { book, shared, seen }
     }
 
     #[doc(hidden)]
@@ -464,11 +469,31 @@ impl PeerBookSession {
         &mut self.book
     }
 
+    /// Add the shared rows this session has not taken yet.
+    #[doc(hidden)]
+    pub fn pull_shared(&mut self) {
+        let Some(ref s) = self.shared else {
+            return;
+        };
+        let shared = s.lock().unwrap_or_else(|e| e.into_inner());
+        for e in shared.entries() {
+            if self.seen.insert(e.addr) {
+                self.book.add_with_flags_addr(e.addr, e.flags);
+            }
+        }
+    }
+
     #[doc(hidden)]
     pub fn flush(&self) {
         if let Some(ref s) = self.shared {
             if let Ok(mut g) = s.lock() {
-                *g = self.book.clone();
+                let mut book = self.book.clone();
+                for e in g.entries() {
+                    if !self.seen.contains(&e.addr) {
+                        book.add_with_flags_addr(e.addr, e.flags);
+                    }
+                }
+                *g = book;
             }
         }
     }
@@ -498,6 +523,14 @@ pub fn publish_status_snap(st: &IbdWorkState, hub: &ChainHub, board: &StatusBoar
     });
 }
 
+/// Live outbound full-relay slots. A `--connect` slot is manual.
+fn full_outbound_slots(slots: &[PeerSlot]) -> usize {
+    slots
+        .iter()
+        .filter(|s| s.alive && s.conn_type == rbitcoin_net::peers::PeerConnType::OutboundFullRelay)
+        .count()
+}
+
 /// Sleep `delay` in short ticks. Returns true as soon as `cancelled` does.
 async fn sleep_unless_cancelled(delay: Duration, cancelled: impl Fn() -> bool) -> bool {
     let until = Instant::now() + delay;
@@ -525,6 +558,15 @@ pub async fn ibd_cancellable(
     impl Drop for IbdModeGuard {
         fn drop(&mut self) {
             self.0.set_ibd_mode(false);
+        }
+    }
+    /// Catch-up's sessions leave the hub's outbound count when it ends.
+    struct FullOutboundGuard(Option<Arc<rbitcoin_net::peers::PeerHub>>);
+    impl Drop for FullOutboundGuard {
+        fn drop(&mut self) {
+            if let Some(p) = self.0.as_ref() {
+                p.set_catch_up_full_outbound(0);
+            }
         }
     }
     hub.query.set_ibd_mode(true);
@@ -583,6 +625,7 @@ pub async fn ibd_cancellable(
     let mut boot_dark = 0u32;
     let initial_slots = loop {
         waves += 1;
+        peer_sess.pull_shared();
         let wave = dial_batch(
             peer_sess.book(),
             initial_dial_n,
@@ -684,6 +727,7 @@ pub async fn ibd_cancellable(
     st.addr_cooldown = boot_cooldown;
     st.addr_strikes = boot_strikes;
     st.perms = perms;
+    let _full_outbound_guard = FullOutboundGuard(st.perms.clone());
     header_walk::restore_adopt(&mut st, hub.as_ref());
     let (header_tx, header_rx) = tokio::sync::mpsc::channel(state::HEADER_CMD_BOUND);
     st.header_cmd = Some(header_tx.clone());
@@ -1115,6 +1159,7 @@ pub async fn ibd_cancellable(
                 && !peer_sess.book().is_empty()
                 && last_redial.elapsed() >= redial_interval
             {
+                peer_sess.pull_shared();
                 let want = redial_want(alive_n, target);
                 let mut already = dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
                 let occupied = alive_dial_addrs(&st.slots);
@@ -1299,6 +1344,9 @@ pub async fn ibd_cancellable(
                 }
             }
             publish_status_snap(st, hub.as_ref(), &status_board);
+            if let Some(p) = st.perms.as_ref() {
+                p.set_catch_up_full_outbound(full_outbound_slots(&st.slots));
+            }
         }
         let tick = tokio::time::sleep(Duration::from_millis(50));
         tokio::pin!(tick);
