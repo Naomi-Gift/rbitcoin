@@ -2767,10 +2767,10 @@ pub fn dispatch_pinned(
                     use bitcoin::hashes::Hash;
                     let tid = bitcoin::Txid::from_byte_array(txid);
                     if let Some(tx) = mp.get_tx(&tid) {
-                        let raw = bitcoin::consensus::serialize(&tx);
                         if verbose {
-                            return Ok(verbose_tx_json(query, &raw, &txid, None, chain.network));
+                            return Ok(verbose_tx_from_tx(query, &tx, &txid, None, chain.network));
                         }
+                        let raw = bitcoin::consensus::serialize(&tx);
                         return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
                     }
                 }
@@ -3187,12 +3187,38 @@ pub fn verbose_tx_json(
     fk: Option<Fk>,
     network: bitcoin::Network,
 ) -> Value {
+    let tx = bitcoin::consensus::deserialize::<bitcoin::Transaction>(raw).ok();
+    verbose_tx_fields(query, raw, tx.as_ref(), txid, fk, network)
+}
+
+/// Mempool `transaction.get` already holds the `Transaction`. Encode the hex
+/// once. Do not parse those bytes back into the same struct.
+#[doc(hidden)]
+pub fn verbose_tx_from_tx(
+    query: &Query,
+    tx: &bitcoin::Transaction,
+    txid: &[u8; 32],
+    fk: Option<Fk>,
+    network: bitcoin::Network,
+) -> Value {
+    let raw = bitcoin::consensus::serialize(tx);
+    verbose_tx_fields(query, &raw, Some(tx), txid, fk, network)
+}
+
+fn verbose_tx_fields(
+    query: &Query,
+    raw: &[u8],
+    tx: Option<&bitcoin::Transaction>,
+    txid: &[u8; 32],
+    fk: Option<Fk>,
+    network: bitcoin::Network,
+) -> Value {
     let mut obj = json!({
         "hex": rbitcoin_primitives::hex_encode(raw),
         "txid": txid_hex(txid),
         "size": raw.len(),
     });
-    if let Ok(tx) = bitcoin::consensus::deserialize::<bitcoin::Transaction>(raw) {
+    if let Some(tx) = tx {
         obj["version"] = json!(tx.version.0);
         obj["locktime"] = json!(tx.lock_time.to_consensus_u32());
         obj["hash"] = json!(hash_hex_rev(&tx.compute_wtxid().to_byte_array()));

@@ -3070,6 +3070,35 @@ async fn client_stop_wakes_without_the_hundred_ms_poll() {
     let _ = dir;
 }
 
+/// Mempool verbose JSON is the wire JSON of the same transaction.
+#[test]
+fn mempool_verbose_tx_matches_serialized_json() {
+    use bitcoin::hashes::Hash;
+    let (_dir, query) = tmp_store();
+    let tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint::null(),
+            script_sig: bitcoin::ScriptBuf::from_bytes(vec![0x01, 0x02]),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::new(),
+        }],
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(50),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let raw = bitcoin::consensus::serialize(&tx);
+    let txid = tx.compute_txid().to_byte_array();
+    let network = bitcoin::Network::Regtest;
+    let from_wire = verbose_tx_json(&query, &raw, &txid, None, network);
+    let from_tx = verbose_tx_from_tx(&query, &tx, &txid, None, network);
+    assert_eq!(from_tx, from_wire);
+    assert_eq!(from_tx["confirmations"], 0);
+    assert_eq!(from_tx["vin"][0]["sequence"], 0xffff_ffffu32);
+}
+
 mod surface_tests;
 
 /// Any client can open connections, so connect and disconnect log at DEBUG.
