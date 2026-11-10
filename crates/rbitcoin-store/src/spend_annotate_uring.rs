@@ -1,9 +1,10 @@
-//! Completion-driven io_uring RMW for Class A spender-meta annotation.
+//! Spender-meta annotation for Class A.
 //!
-//! Unknown meta reads a 4 KiB page, decides sole / multi / promote for every
-//! slot on that page, then writes the page. Known meta pokes prepared 8-byte
-//! slots into the same page RMW. Queue depth stays 128 pages. One in-flight
-//! RMW per page. Falls back to the caller on uring setup failure.
+//! Unknown meta reads a page, decides sole / multi / promote, then pwrites
+//! each changed 8-byte slot. A full historical page is a directory insert.
+//! The live tail page is an 8-byte slot pwrite. A full page image is not
+//! written: a torn page rewrite can zero a neighbor the spend marker already
+//! covers. Queue depth stays 128 pages.
 
 use crate::compact::output_flags;
 use crate::error::StoreError;
@@ -78,8 +79,6 @@ pub fn put_spend_batch_by_abs_meta_uring(
         }
     }
 
-    let body_fd: IoHandle = txs.spent.body_read_fd();
-    let body_path = txs.spent.body_file_path().to_path_buf();
     let body_pub = txs.spent.body_published_len();
 
     let mut cold: Vec<(Fk, u32, Fk, u32)> = Vec::new();
@@ -96,7 +95,7 @@ pub fn put_spend_batch_by_abs_meta_uring(
     }
 
     let groups = group_edges_by_spent_page(&work, body_pub);
-    let extra = annotate_unknown_pages_uring(spenders, &groups, body_fd, &body_path)?;
+    let extra = annotate_unknown_pages_uring(txs, spenders, &groups)?;
     cold.extend(extra);
     Ok(cold)
 }
@@ -162,8 +161,8 @@ pub fn poke_edge_page(
     edges: &[(u64, Fk, u32, Fk, u32)],
     spenders: &SpenderTable,
     cold: &mut Vec<(Fk, u32, Fk, u32)>,
-) -> Result<bool, StoreError> {
-    let mut dirty = false;
+) -> Result<Vec<(u64, [u8; META_LEN])>, StoreError> {
+    let mut wrote = Vec::new();
     for &(abs, cfk, vout, sfk, vin) in edges {
         let i = abs.saturating_sub(off) as usize;
         if i.saturating_add(META_LEN) > buf.len() {
@@ -178,11 +177,18 @@ pub fn poke_edge_page(
             AnnotateOp::Skip => {}
             AnnotateOp::Write(meta) => {
                 buf[i..i + META_LEN].copy_from_slice(&meta);
-                dirty = true;
+                wrote.push((abs, meta));
             }
         }
     }
-    Ok(dirty)
+    Ok(wrote)
+}
+
+fn write_spent_slots(txs: &TxTable, slots: &[(u64, [u8; META_LEN])]) -> Result<(), StoreError> {
+    for (abs, meta) in slots {
+        txs.spent.write_body_pwrite(*abs, meta)?;
+    }
+    Ok(())
 }
 
 pub fn annotate_unknown_pages_pwrite(
@@ -216,9 +222,10 @@ pub fn annotate_unknown_pages_pwrite(
             }
             continue;
         }
-        if poke_edge_page(&mut buf, g.off, &g.edges, spenders, &mut cold)? {
+        let wrote = poke_edge_page(&mut buf, g.off, &g.edges, spenders, &mut cold)?;
+        if !wrote.is_empty() {
             note_spend_write_for_test();
-            if txs.spent.write_body_abs(g.off, &buf).is_err() {
+            if write_spent_slots(txs, &wrote).is_err() {
                 for e in &g.edges {
                     cold.push((e.1, e.2, e.3, e.4));
                 }
@@ -230,19 +237,19 @@ pub fn annotate_unknown_pages_pwrite(
 
 #[doc(hidden)]
 pub fn annotate_unknown_pages_uring(
+    txs: &TxTable,
     spenders: &SpenderTable,
     groups: &[EdgePage],
-    body_fd: IoHandle,
-    body_path: &std::path::Path,
 ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
     if groups.is_empty() {
         return Ok(Vec::new());
     }
+    let body_fd = txs.spent.body_read_fd();
+    let body_path = txs.spent.body_file_path().to_path_buf();
     struct PageSlot {
         group_i: usize,
         phase: Phase,
         buf: Vec<u8>,
-        dirty: bool,
     }
     uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
         session.begin_batch()?;
@@ -275,7 +282,6 @@ pub fn annotate_unknown_pages_uring(
                     group_i: gi,
                     phase: Phase::Reading,
                     buf: vec![0u8; groups[gi].len],
-                    dirty: false,
                 });
                 {
                     let s = slots[slot].as_mut().unwrap();
@@ -332,39 +338,34 @@ pub fn annotate_unknown_pages_uring(
                 match st.phase {
                     Phase::Reading => {
                         let want = st.buf.len();
-                        if let Err(e) = uring_session::require_full_cqe(res, want, body_path) {
+                        if let Err(e) = uring_session::require_full_cqe(res, want, &body_path) {
                             free_slots.push(slot);
                             return Err(e);
                         }
-                        st.dirty = poke_edge_page(
+                        let wrote = poke_edge_page(
                             &mut st.buf,
                             groups[gi].off,
                             &groups[gi].edges,
                             spenders,
                             &mut cold,
                         )?;
-                        if !st.dirty {
+                        if wrote.is_empty() {
                             free_slots.push(slot);
                             continue;
                         }
-                        st.phase = Phase::Writing;
-                        slots[slot] = Some(st);
-                        {
-                            let s = slots[slot].as_mut().unwrap();
-                            let ud = uring_session::pack_ud(
-                                uring_session::KIND_SPEND_PAGE_WRITE,
-                                epoch,
-                                slot as u32,
-                            );
-                            note_spend_write_for_test();
-                            // SAFETY: `s.buf` lives until this page-write wave drains.
-                            unsafe { session.push_pwrite(body_fd, groups[gi].off, &s.buf, ud) }?;
+                        note_spend_write_for_test();
+                        // Slot pwrites, not the page image. A torn page write
+                        // would zero neighbors this read just observed.
+                        if write_spent_slots(txs, &wrote).is_err() {
+                            for e in &groups[gi].edges {
+                                cold.push((e.1, e.2, e.3, e.4));
+                            }
                         }
-                        in_flight += 1;
+                        free_slots.push(slot);
                     }
                     Phase::Writing => {
                         let want = st.buf.len();
-                        if let Err(e) = uring_session::require_full_cqe(res, want, body_path) {
+                        if let Err(e) = uring_session::require_full_cqe(res, want, &body_path) {
                             free_slots.push(slot);
                             return Err(e);
                         }
@@ -539,35 +540,10 @@ pub fn group_writes_by_spent_page(writes: &[SpentAbsWrite], body_pub: u64) -> Ve
     groups
 }
 
-#[doc(hidden)]
-pub fn poke_spent_page(
-    buf: &mut [u8],
-    off: u64,
-    writes: &[SpentAbsWrite],
-) -> Result<(), StoreError> {
-    for &(abs, _, _, _, _, meta) in writes {
-        let i = abs.saturating_sub(off) as usize;
-        if i.saturating_add(META_LEN) > buf.len() {
-            return Err(StoreError::Corrupt(
-                "spend annotate poke outside page window",
-            ));
-        }
-        buf[i..i + META_LEN].copy_from_slice(&meta);
-    }
-    Ok(())
-}
-
-#[doc(hidden)]
-pub fn cold_group_edges(cold: &mut Vec<(Fk, u32, Fk, u32)>, writes: &[SpentAbsWrite]) {
-    for &(_, cfk, vout, sfk, vin, _) in writes {
-        cold.push((cfk, vout, sfk, vin));
-    }
-}
-
 /// Pure-write annotate: `known[i]` is structural `(field, flags)` for `abs_edges[i]`.
 ///
-/// A full historical page is a directory insert. The live tail page is still
-/// one `spent.body` write. Returns OOB edges as cold (caller must hard-fail).
+/// A full historical page is a directory insert. The live tail is an 8-byte
+/// slot pwrite. Returns edges past the published body as cold.
 pub fn put_spend_batch_by_abs_meta_known(
     txs: &TxTable,
     spenders: &SpenderTable,
@@ -615,234 +591,35 @@ pub fn put_spend_batch_by_abs_meta_known(
     Ok(cold)
 }
 
-/// Historical slots land in the page directory. The live tail page stays a
-/// body write, because Class A is still appending that page.
+/// A full historical page is a directory insert. The live tail is an 8-byte
+/// slot pwrite. A slot past the published body is cold.
+///
+/// The tail write does not rewrite the page or the file header. Replay does
+/// not cover a slot once `spend_durable` has passed it, and that slot is not
+/// in the page log.
 fn apply_prepared_spend_writes(
     txs: &TxTable,
     writes: &[SpentAbsWrite],
-    backend: crate::io_backend::WriteIoBackend,
+    _backend: crate::io_backend::WriteIoBackend,
 ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
     let published = txs.spent.body_published_len();
-    let mut tail: Vec<SpentAbsWrite> = Vec::new();
+    let mut cold = Vec::new();
     let mut hist: Vec<(u64, [u8; META_LEN])> = Vec::new();
+    let mut tail: Vec<&SpentAbsWrite> = Vec::new();
     for w in writes {
         if crate::spend_page_log::is_historical(published, w.0) {
             hist.push((w.0, w.5));
+        } else if w.0.saturating_add(META_LEN as u64) <= published {
+            tail.push(w);
         } else {
-            tail.push(*w);
+            cold.push((w.1, w.2, w.3, w.4));
         }
     }
     txs.note_historical_spend_slots(&hist)?;
-    if tail.is_empty() {
-        return Ok(Vec::new());
-    }
-    match backend {
-        crate::io_backend::WriteIoBackend::Uring => {
-            put_spend_batch_pure_write_uring(txs, &tail, Vec::new())
-        }
-        crate::io_backend::WriteIoBackend::Pwrite => {
-            put_spend_batch_pure_write_pwrite(txs, &tail, Vec::new())
-        }
-    }
-}
-
-/// libc page-RMW (pread + pwrite, no ring) for prepared 8-byte metas.
-#[doc(hidden)]
-pub fn put_spend_batch_pure_write_pwrite(
-    txs: &TxTable,
-    writes: &[SpentAbsWrite],
-    mut cold: Vec<(Fk, u32, Fk, u32)>,
-) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
-    let body_pub = txs.spent.body_published_len();
-    let groups = group_writes_by_spent_page(writes, body_pub);
-    for g in &groups {
-        let mut buf = vec![0u8; g.len];
-        if txs
-            .spent
-            .read_prefix_at_published(body_pub, g.off, g.len as u64, &mut buf)
-            .is_err()
-        {
-            cold_group_edges(&mut cold, &g.writes);
-            continue;
-        }
-        poke_spent_page(&mut buf, g.off, &g.writes)?;
-        if txs.spent.write_body_abs(g.off, &buf).is_err() {
-            cold_group_edges(&mut cold, &g.writes);
+    for w in tail {
+        if txs.spent.write_body_pwrite(w.0, &w.5).is_err() {
+            cold.push((w.1, w.2, w.3, w.4));
         }
     }
     Ok(cold)
-}
-
-/// io_uring page-RMW (pread page → poke → pwrite page) for prepared 8-byte metas.
-#[doc(hidden)]
-pub fn put_spend_batch_pure_write_uring(
-    txs: &TxTable,
-    writes: &[SpentAbsWrite],
-    cold: Vec<(Fk, u32, Fk, u32)>,
-) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
-    if writes.is_empty() {
-        return Ok(cold);
-    }
-    let body_pub = txs.spent.body_published_len();
-    let groups = group_writes_by_spent_page(writes, body_pub);
-    if groups.is_empty() {
-        return Ok(cold);
-    }
-    let body_fd: IoHandle = txs.spent.body_read_fd();
-    let body_path = txs.spent.body_file_path().to_path_buf();
-
-    struct PageSlot {
-        group_i: usize,
-        phase: Phase,
-        buf: Vec<u8>,
-    }
-
-    let run = uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
-        session.begin_batch()?;
-        let epoch = session.epoch();
-        let mut pending: VecDeque<usize> = (0..groups.len()).collect();
-        let nslots = MAX_SLOTS.min(groups.len().max(1));
-        let mut free_slots: Vec<usize> = (0..nslots).collect();
-        let mut slots: Vec<Option<PageSlot>> = (0..nslots).map(|_| None).collect();
-        let mut session = session.drain_guard();
-        let mut in_flight = 0usize;
-        let mut cold_local = cold.clone();
-
-        let arm = |session: &mut UringSession,
-                   free_slots: &mut Vec<usize>,
-                   slots: &mut [Option<PageSlot>],
-                   pending: &mut VecDeque<usize>,
-                   groups: &[SpentPageGroup],
-                   in_flight: &mut usize,
-                   body_fd: IoHandle|
-         -> Result<(), StoreError> {
-            while *in_flight < slots.len() && session.free_sq() > 0 && !free_slots.is_empty() {
-                let Some(gi) = pending.pop_front() else {
-                    break;
-                };
-                let Some(slot) = free_slots.pop() else {
-                    pending.push_front(gi);
-                    break;
-                };
-                slots[slot] = Some(PageSlot {
-                    group_i: gi,
-                    phase: Phase::Reading,
-                    buf: vec![0u8; groups[gi].len],
-                });
-                {
-                    let s = slots[slot].as_mut().unwrap();
-                    let ud = uring_session::pack_ud(
-                        uring_session::KIND_SPEND_PAGE_READ,
-                        epoch,
-                        slot as u32,
-                    );
-                    // SAFETY: `s.buf` lives until this page-read wave drains.
-                    unsafe { session.push_pread(body_fd, groups[gi].off, &mut s.buf, ud) }?;
-                }
-                *in_flight += 1;
-            }
-            Ok(())
-        };
-
-        arm(
-            &mut session,
-            &mut free_slots,
-            &mut slots,
-            &mut pending,
-            &groups,
-            &mut in_flight,
-            body_fd,
-        )?;
-        session.sync_submission();
-        let _ = session.submit();
-
-        while in_flight > 0 {
-            let cqes = session.harvest_ready()?;
-            if cqes.is_empty() {
-                session.submit_and_wait_one()?;
-                continue;
-            }
-            for (ud, res) in cqes {
-                let (kind, _ep, slot) = uring_session::unpack_ud(ud);
-                let slot = slot as usize;
-                if slot >= slots.len() {
-                    return Err(StoreError::Corrupt("spend pure-write bad user_data"));
-                }
-                let mut st = slots[slot]
-                    .take()
-                    .ok_or(StoreError::Corrupt("spend pure-write empty slot"))?;
-                let expect = match st.phase {
-                    Phase::Reading => uring_session::KIND_SPEND_PAGE_READ,
-                    Phase::Writing => uring_session::KIND_SPEND_PAGE_WRITE,
-                };
-                if kind != expect {
-                    return Err(StoreError::Corrupt("spend pure-write bad user_data"));
-                }
-                in_flight = in_flight.saturating_sub(1);
-                let gi = st.group_i;
-                match st.phase {
-                    Phase::Reading => {
-                        let want = st.buf.len();
-                        if let Err(e) = uring_session::require_full_cqe(res, want, &body_path) {
-                            free_slots.push(slot);
-                            return Err(e);
-                        }
-                        poke_spent_page(&mut st.buf, groups[gi].off, &groups[gi].writes)?;
-                        st.phase = Phase::Writing;
-                        slots[slot] = Some(st);
-                        {
-                            let s = slots[slot].as_mut().unwrap();
-                            let ud = uring_session::pack_ud(
-                                uring_session::KIND_SPEND_PAGE_WRITE,
-                                epoch,
-                                slot as u32,
-                            );
-                            // SAFETY: `s.buf` lives until this page-write wave drains.
-                            unsafe { session.push_pwrite(body_fd, groups[gi].off, &s.buf, ud) }?;
-                        }
-                        in_flight += 1;
-                    }
-                    Phase::Writing => {
-                        let want = st.buf.len();
-                        if let Err(e) = uring_session::require_full_cqe(res, want, &body_path) {
-                            free_slots.push(slot);
-                            return Err(e);
-                        }
-                        free_slots.push(slot);
-                    }
-                }
-            }
-            arm(
-                &mut session,
-                &mut free_slots,
-                &mut slots,
-                &mut pending,
-                &groups,
-                &mut in_flight,
-                body_fd,
-            )?;
-            session.sync_submission();
-            let _ = session.submit();
-        }
-
-        while let Some(gi) = pending.pop_front() {
-            cold_group_edges(&mut cold_local, &groups[gi].writes);
-        }
-        Ok(cold_local)
-    });
-    match run {
-        Ok(Ok(c)) => Ok(c),
-        Ok(Err(e)) => {
-            rbitcoin_log::debug!(
-                "store: spend annotate pure-write uring error ({e}); pwrite fallback"
-            );
-            put_spend_batch_pure_write_pwrite(txs, writes, cold)
-        }
-        Err(e) => {
-            rbitcoin_log::debug!(
-                "store: spend annotate pure-write uring unavailable ({e}); pwrite fallback"
-            );
-            put_spend_batch_pure_write_pwrite(txs, writes, cold)
-        }
-    }
 }

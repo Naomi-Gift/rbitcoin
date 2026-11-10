@@ -737,7 +737,42 @@ fn historical_page_stays_unwritten_until_spend_checkpoint() {
     );
     assert_eq!(read_slot(&store, abs1), before1);
     assert!(q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap());
+    let mut header = [0u8; 16];
+    {
+        use std::io::Read;
+        let mut f = std::fs::File::open(store.join("spent.body")).unwrap();
+        f.read_exact(&mut header).unwrap();
+    }
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(store.join("spent.body"))
+            .unwrap();
+        for abs in [abs0, abs1] {
+            f.seek(SeekFrom::Start(abs)).unwrap();
+            f.write_all(&[0u8; 8]).unwrap();
+        }
+    }
+    drop(q);
+    let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
+    q.set_spend_index(true);
+    assert!(
+        q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap(),
+        "a zeroed body slot stays spent after reopen while the page log exists"
+    );
+    assert!(q.is_outpoint_spent(created_id.as_byte_array(), 1).unwrap());
+    assert!(!q.is_outpoint_spent(created_id.as_byte_array(), 2).unwrap());
     q.store().checkpoint_observed_spend().unwrap();
+    {
+        use std::io::Read;
+        let mut f = std::fs::File::open(store.join("spent.body")).unwrap();
+        let mut after = [0u8; 16];
+        f.read_exact(&mut after).unwrap();
+        assert_eq!(
+            after, header,
+            "folding page 0 must not rewrite the spent.body file header"
+        );
+    }
     assert_ne!(
         read_slot(&store, abs0),
         before0,

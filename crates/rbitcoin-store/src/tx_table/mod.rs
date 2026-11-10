@@ -2256,13 +2256,13 @@ impl TxTable {
 
     /// Annotate spends at known absolute spender-meta offsets.
     ///
-    /// One 4 KiB page RMW per page (uring, else the same groups via `pwrite`):
-    /// read the page, decide sole / multi / promote, write the page if dirty.
-    /// `POSIX_FADV_RANDOM` covers the sweep and restores `POSIX_FADV_NORMAL`
-    /// on every exit. `spent.ovf` appends run inline on the decision.
+    /// One read of the current slot, then a page-log insert for a full
+    /// historical page. The live tail is an 8-byte slot pwrite. A slot past
+    /// the published body is cold and is not written.
+    /// Decide sole / multi / promote from that slot.
+    /// `spent.ovf` appends run inline on the decision.
     ///
-    /// Returns edges that still need a full cold path (OOB abs / deferred).
-    /// Multi-list cases are handled here when uring/`pwrite` succeed (not returned).
+    /// Returns edges past the published body. Multi-list cases are handled here.
     pub fn put_spend_batch_by_abs_meta(
         &self,
         spenders: &crate::spender_table::SpenderTable,
@@ -2310,10 +2310,10 @@ impl TxTable {
         Ok((field, flags, vin))
     }
 
-    /// Page `pwrite` RMW for [`Self::put_spend_batch_by_abs_meta`].
+    /// Page read, then 8-byte slot pwrites, for [`Self::put_spend_batch_by_abs_meta`].
     ///
-    /// Same slot bytes and cold list as the uring helper. Slots that share a
-    /// 4 KiB page are one read and one write.
+    /// Same slot bytes and cold list as the uring helper. The write does not
+    /// store the rest of the page.
     #[doc(hidden)]
     pub fn put_spend_batch_by_abs_meta_pwrite(
         &self,
@@ -2557,11 +2557,15 @@ impl TxTable {
         self.spend_pages.hold_fold_above(tip)
     }
 
-    pub(crate) fn fold_committed_spend_pages(&self) -> Result<(), StoreError> {
-        self.spend_pages.fold_into(
+    pub(crate) fn copy_cooled_spend_pages(&self) -> Result<(), StoreError> {
+        self.spend_pages.copy_cooled(
             |off, image| self.spent.write_body_abs(off, image),
             || self.spent.sync_data_only(),
         )
+    }
+
+    pub(crate) fn finish_cooled_spend_pages(&self) -> Result<(), StoreError> {
+        self.spend_pages.finish_cooled()
     }
 
     /// Patch multi + spender_field on create tx output (packed Class A body).
@@ -2599,7 +2603,7 @@ impl TxTable {
         };
         let slot_vin = if multi { 0 } else { vin };
         let slot = encode_spent_slot(flags, field, slot_vin)?;
-        self.spent.write_body_abs(abs, &slot)?;
+        self.spent.write_body_pwrite(abs, &slot)?;
         Ok(())
     }
 

@@ -117,7 +117,7 @@ fn fold_skips_a_page_dirtied_while_an_earlier_page_is_copied() {
     log.fold_into(
         |off, image| {
             wrote.push(off);
-            if off == 0 {
+            if off == 16 {
                 log.note_slots(&[(4096 + 8, later)])?;
             }
             let _ = image;
@@ -126,7 +126,7 @@ fn fold_skips_a_page_dirtied_while_an_earlier_page_is_copied() {
         || Ok(()),
     )
     .unwrap();
-    assert_eq!(wrote, vec![0]);
+    assert_eq!(wrote, vec![16]);
     assert_eq!(log.slot(4096 + 8), Some(later));
     assert_eq!(log.slot(4096), Some(slot));
     let _ = std::fs::remove_dir_all(&d);
@@ -447,6 +447,187 @@ fn compose_rejects_the_live_tail_and_a_keep_error() {
 }
 
 #[test]
+fn fold_does_not_write_the_spent_file_header() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [7u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot), (4096, slot)]).unwrap();
+    log.commit_open(2, 8192, zeros, |_| Ok(true)).unwrap();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    let mut offs = Vec::new();
+    log.fold_into(
+        |off, image| {
+            offs.push((off, image.len()));
+            if off == 16 {
+                assert_eq!(&image[..8], &slot);
+            }
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(offs, vec![(16, 4096 - 16), (4096, 4096)]);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn hold_after_publish_before_install_is_not_folded() {
+    let d = dir();
+    let slot = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.prepare_commit(9, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(1).unwrap();
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    loaded.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+    let mut writes = 0u32;
+    loaded
+        .fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        writes, 0,
+        "a crash before install must not fold that generation"
+    );
+    assert_eq!(loaded.slot(16), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.prepare_commit(9, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(1).unwrap();
+    log.install_commit().unwrap();
+    log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, _image| {
+            writes += 1;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        writes, 0,
+        "a hold before install must survive the directory swap"
+    );
+    assert_eq!(log.slot(16), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn fold_keeps_the_log_while_a_dirtied_page_is_still_open() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let a = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let b = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    let extra = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, a)]).unwrap();
+    log.commit_open(2, 8192, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(4096, b)]).unwrap();
+    log.commit_open(
+        3,
+        8192,
+        |off, len| {
+            log.note_slots(&[(4096 + 8, extra)])?;
+            zeros(off, len)
+        },
+        |_| Ok(true),
+    )
+    .unwrap();
+    let mut wrote = Vec::new();
+    log.fold_into(
+        |off, _image| {
+            wrote.push(off);
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(wrote, vec![16]);
+    assert!(
+        d.join(SPEND_PAGES_COMMIT_NAME).exists(),
+        "fold must not delete the log while a published page is still open"
+    );
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(4096), Some(b));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn explode_keep_error_keeps_the_image() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    let other = [8u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(1).unwrap();
+    let err = log
+        .commit_open(1, 8192, zeros, |_| Err(StoreError::Corrupt("keep")))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt("keep")));
+    assert_eq!(log.slot(16), Some(slot));
+    log.note_slots(&[(4096, other)]).unwrap();
+    log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+    assert_eq!(log.slot(16), Some(slot));
+    assert_eq!(log.slot(4096), Some(other));
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(slot));
+    assert_eq!(loaded.slot(4096), Some(other));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn pages_shorter_than_the_commit_are_corrupt() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+    let pages = d.join(SPEND_PAGES_NAME);
+    let bytes = std::fs::read(&pages).unwrap();
+    assert!(bytes.len() > 8);
+    std::fs::write(&pages, &bytes[..8]).unwrap();
+    assert!(matches!(
+        SpendPageLog::load(&d),
+        Err(StoreError::Corrupt("spend.pages short"))
+    ));
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+    std::fs::remove_file(d.join(SPEND_PAGES_NAME)).unwrap();
+    assert!(matches!(SpendPageLog::load(&d), Err(StoreError::Io { .. })));
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+    let commit = d.join(SPEND_PAGES_COMMIT_NAME);
+    let mut buf = std::fs::read(&commit).unwrap();
+    buf[16..24].copy_from_slice(&0u64.to_le_bytes());
+    buf[24..28].copy_from_slice(&0u32.to_le_bytes());
+    buf.truncate(28);
+    std::fs::write(&commit, &buf).unwrap();
+    std::fs::remove_file(d.join(SPEND_PAGES_NAME)).unwrap();
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), None);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn rejected_open_page_is_not_published() {
     let d = dir();
     let log = SpendPageLog::create(&d);
@@ -455,6 +636,233 @@ fn rejected_open_page_is_not_published() {
     log.commit_open(4, 8192, zeros, |_| Ok(false)).unwrap();
     assert_eq!(log.slot(16), None);
     assert!(!d.join(SPEND_PAGES_COMMIT_NAME).exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn fold_of_page_zero_skips_the_file_header() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(2, 8192, |_off, len| Ok(vec![0xABu8; len]), |_| Ok(true))
+        .unwrap();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    let mut wrote = Vec::new();
+    log.fold_into(
+        |off, image| {
+            wrote.push((off, image.to_vec()));
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(wrote.len(), 1);
+    assert_eq!(
+        wrote[0].0, 16,
+        "page 0 fold must not pwrite the file header"
+    );
+    assert_eq!(wrote[0].1.len(), 4096 - 16);
+    assert_eq!(&wrote[0].1[..8], &slot);
+    assert_ne!(wrote[0].1[0], 0xAB);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn hold_between_prepare_and_install_is_not_folded() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [6u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.prepare_commit(9, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(1).unwrap();
+    log.install_commit().unwrap();
+    let buf = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    assert_eq!(u16::from_le_bytes(buf[6..8].try_into().unwrap()), 1);
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, _image| {
+            writes += 1;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        writes, 0,
+        "a hold after publish and before install is not folded"
+    );
+    assert_eq!(log.slot(16), Some(slot));
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(slot));
+    writes = 0;
+    loaded
+        .fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(writes, 0, "reopen keeps the hold");
+    log.commit_open(1, 8192, zeros, |_| Ok(false)).unwrap();
+    writes = 0;
+    log.fold_into(
+        |_off, _image| {
+            writes += 1;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        writes, 0,
+        "the next checkpoint does not copy the abandoned spend"
+    );
+    assert_eq!(log.slot(16), None);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn redirtied_page_stays_in_the_commit_when_an_older_page_folds() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    let later = [5u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(4096, slot)]).unwrap();
+    log.commit_open(2, 8192, zeros, |_| Ok(true)).unwrap();
+    log.commit_open(2, 8192, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(
+        3,
+        8192,
+        |off, len| {
+            log.note_slots(&[(24, later)])?;
+            zeros(off, len)
+        },
+        |_| Ok(true),
+    )
+    .unwrap();
+    let mut wrote = Vec::new();
+    log.fold_into(
+        |off, _image| {
+            wrote.push(off);
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(wrote, vec![4096]);
+    assert!(
+        d.join(SPEND_PAGES_COMMIT_NAME).exists(),
+        "fold must not delete a commit that still names an unfolded page"
+    );
+    assert_eq!(log.slot(16), Some(slot));
+    assert_eq!(log.slot(24), Some(later));
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn missing_or_short_pages_file_refuses_open() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+    let pages = d.join(SPEND_PAGES_NAME);
+    let mut bytes = std::fs::read(&pages).unwrap();
+    bytes.pop();
+    std::fs::write(&pages, &bytes).unwrap();
+    assert!(matches!(
+        SpendPageLog::load(&d),
+        Err(StoreError::Corrupt("spend.pages short"))
+    ));
+    std::fs::remove_file(&pages).unwrap();
+    assert!(matches!(SpendPageLog::load(&d), Err(StoreError::Io { .. })));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn explode_keeps_the_commit_when_keep_fails() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(1).unwrap();
+    let err = log
+        .commit_open(1, 8192, zeros, |_| Err(StoreError::Corrupt("keep")))
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt("keep")));
+    assert_eq!(log.slot(16), Some(slot));
+    assert!(d.join(SPEND_PAGES_COMMIT_NAME).exists());
+    log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+    assert_eq!(log.slot(16), Some(slot));
+    assert!(d.join(SPEND_PAGES_COMMIT_NAME).exists());
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn hold_during_fold_leaves_the_commit() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [7u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot), (4096, slot)]).unwrap();
+    log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+    log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+    let mut wrote = Vec::new();
+    log.fold_into(
+        |off, _image| {
+            wrote.push(off);
+            log.hold_fold_above(1)?;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(wrote, vec![16]);
+    assert!(d.join(SPEND_PAGES_COMMIT_NAME).exists());
+    assert_eq!(log.slot(16), Some(slot));
+    assert_eq!(log.slot(4096), Some(slot));
+    let mut later = 0u32;
+    log.fold_into(
+        |_off, _image| {
+            later += 1;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(later, 0);
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(16, slot), (4096, slot)]).unwrap();
+    log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+    log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+    let mut wrote = Vec::new();
+    log.fold_into(
+        |off, _image| {
+            wrote.push(off);
+            Ok(())
+        },
+        || {
+            log.hold_fold_above(1)?;
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(wrote, vec![16, 4096]);
+    assert!(
+        d.join(SPEND_PAGES_COMMIT_NAME).exists(),
+        "a hold during the body sync must not delete the log"
+    );
+    assert_eq!(log.slot(16), Some(slot));
+    assert_eq!(log.slot(4096), Some(slot));
     let _ = std::fs::remove_dir_all(&d);
 }
 

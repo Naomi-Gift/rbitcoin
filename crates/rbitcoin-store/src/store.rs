@@ -1979,9 +1979,14 @@ impl Store {
     }
 
     fn fold_sealed_spend_pages(&self) -> Result<(), StoreError> {
+        // The body copy can take the spindle for a full page. Readers still
+        // see the committed image, so they do not need the utxo view here.
         self.spindle_wait();
+        self.txs.copy_cooled_spend_pages()?;
+        // Disconnect holds this view and then sets the fold hold. Take it only
+        // to drop directory entries after the copy is durable.
         let _g = hold_view(&self.utxo_publish, &self.utxo_view);
-        self.txs.fold_committed_spend_pages()
+        self.txs.finish_cooled_spend_pages()
     }
 
     /// `Some` even generation, or `None` while [`Self::hold_utxo_view`] is held.

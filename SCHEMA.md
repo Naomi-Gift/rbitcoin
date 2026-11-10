@@ -132,7 +132,7 @@ catalogs, or 16-layout Class A with creates is **refused**.
 |--------|--------|
 | Loc | One loc pair per create; `seqsigwit` is the fat stem (cold) and does not force `txout` splits. `tx.head` rolls at OA 80% slots only. |
 | `strong_tx` | Always L2. **`confirmed`** and **`header_txs_*`** stay in RAM up to 256 MiB, then fd. |
-| `RWF_DONTCACHE` | **Not used.** The live tail page and the cooled fold still write `spent.body`. A full historical page is a directory insert, not a pwrite. Evicting spent pages does not protect `txout`, and the next block wants the same spent pages. |
+| `RWF_DONTCACHE` | **Not used.** The live tail page is eight-byte slot writes. The cooled fold still writes `spent.body`. A full historical page is a directory insert, not a pwrite. Evicting spent pages does not protect `txout`, and the next block wants the same spent pages. |
 
 ### New script kinds without a wipe
 
@@ -610,7 +610,7 @@ the new `meta` or an unknown kind). See [Schema 17 freeze](#schema-17-freeze).
 Best-chain spentness also requires `is_confirmed_strong(spender)` (annotations may outlive reorgs).
 A Class A append fills the slot for a spend in the same write. When the write holds more than one spender of a vout (a double spend that write rejects), it names the first in chain order, the lowest fk. A rejected write keeps that append for the retry.
 
-`spend.pages` and `spend.pages.commit` are derived, same durability class as the marker, and are not a `SCHEMA_VERSION` bump. Absent means no unsealed historical page. `spend.pages` holds 4 KiB-aligned images. `spend.pages.commit` names the snapshot height, generation, committed byte length, and the page list. A short generation, or a record past that length, is not served. The checkpoint appends one image per dirty full page and syncs the commit before `spend_durable` advances. Fold copies a generation onto `spent.body` only after a later checkpoint left it quiet, then deletes both files once nothing committed remains. The live tail page is not in this log.
+`spend.pages` and `spend.pages.commit` are derived, same durability class as the marker, and are not a `SCHEMA_VERSION` bump. A missing commit means no unsealed historical page. A commit that names bytes whose `spend.pages` file is missing or shorter than the committed length refuses open. An empty claim with no pages file opens. `spend.pages` holds the page images. `spend.pages.commit` names the snapshot height, generation, committed byte length, and the page list. A record past that length is not served. The checkpoint appends one image per dirty full page and syncs the commit before `spend_durable` advances. Fold copies a quiet generation onto `spent.body` after a later checkpoint, starting at byte 16 on the first page so the file header stays put, and skips a page confirm has re-dirtied. It deletes both files only once nothing committed, open, frozen, or pending remains. The body copy does not hold the utxo view. The live tail page is not in this log: those slots are 8-byte pwrites on `spent.body`. An older binary does not read this log. An unfolded generation can look unspent to it. Opening with this binary is the supported path.
 
 ### Multi-spender overflow (`spent.ovf`)
 

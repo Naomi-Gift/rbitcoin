@@ -303,8 +303,54 @@ fn pure_write_two_vouts_same_page_preserves_neighbor() {
             .unwrap();
         assert_eq!(
             hdr_before, hdr_after,
-            "page 0 RMW must not rewrite file header"
+            "a tail slot write must not rewrite the file header"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+/// A long body pwrite is armed to fail. The tail slot must still land, and the
+/// neighbor on that page must stay put. A page rewrite is longer than 8 bytes,
+/// so this fails closed on that path.
+#[test]
+fn tail_slot_write_survives_a_short_page_pwrite() {
+    for backend in [
+        rbitcoin_store::io_backend::WriteIoBackend::Uring,
+        rbitcoin_store::io_backend::WriteIoBackend::Pwrite,
+    ] {
+        let (dir, t, spenders) = temp_table();
+        let (cfk, off, _len) = put_n_outs(&t, 3, 0x22);
+        let abs0 = rbitcoin_store::tx_table::spent_abs(off, 0);
+        let abs1 = rbitcoin_store::tx_table::spent_abs(off, 1);
+        let sentinel = Fk(0x61);
+        let known1 = t.get_spender_meta_at_abs_batch(&[abs1]).unwrap()[0].unwrap();
+        assert!(put_spend_batch_by_abs_meta_known(
+            &t,
+            &spenders,
+            &[(abs1, cfk, 1, sentinel, 0)],
+            &[known1],
+            backend,
+        )
+        .unwrap()
+        .is_empty());
+        let known0 = t.get_spender_meta_at_abs_batch(&[abs0]).unwrap()[0].unwrap();
+        rbitcoin_store::io_handle::arm_short_pwrite(t.spent.body_write_fd());
+        let cold = put_spend_batch_by_abs_meta_known(
+            &t,
+            &spenders,
+            &[(abs0, cfk, 0, Fk(10), 0)],
+            &[known0],
+            backend,
+        )
+        .unwrap();
+        rbitcoin_store::io_handle::disarm_short_pwrite();
+        assert!(
+            cold.is_empty(),
+            "an 8-byte tail slot must not take the long page-write path"
+        );
+        let bulk = t.get_spender_meta_at_abs_batch(&[abs0, abs1]).unwrap();
+        assert_eq!(bulk[0].unwrap().0, Fk(10));
+        assert_eq!(bulk[1].unwrap().0, sentinel);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -344,7 +390,8 @@ fn pure_write_two_pages_both_land() {
     }
 }
 
-/// Same-page pair is one page-window write, not two 9 B pwrites.
+/// Same-page pair lands as slot writes. A pwrite longer than 8 bytes is armed
+/// to fail, so a page image cannot be what stored these slots.
 #[test]
 fn pure_write_same_page_is_one_page_write() {
     if !rbitcoin_store::bulk_io::io_uring_enabled() {
@@ -390,10 +437,8 @@ fn unknown_meta_annotate_is_one_rmw_per_page() {
         .put_spend_batch_by_abs_meta(&spenders, &edges)
         .unwrap()
         .is_empty());
-    // Page 0 is a full historical page: both slots stay in the directory and
-    // the body bytes stay zero. The last slot is the live tail, so its body
-    // bytes move now. The page-RMW counters stay quiet because neither write
-    // is the old unknown-meta sweep.
+    // Full-page slots stay in the directory, so those body bytes stay zero.
+    // The short tail is an 8-byte slot write. The page-RMW counters stay quiet.
     assert_eq!(
         rbitcoin_store::spend_annotate_uring::spend_annotate_counts(),
         (0, 0)
@@ -424,8 +469,8 @@ fn unknown_meta_annotate_is_one_rmw_per_page() {
 
 /// A second spend of a historical slot promotes through the directory.
 ///
-/// The body page stays zero. Zeroing that slot on disk still returns the
-/// multi head, and a tail-page slot in the same peek still comes from the body.
+/// The historical body page stays zero. Zeroing a logged slot on disk still
+/// returns the multi head. A tail-page slot in the same peek comes from the body.
 #[test]
 fn historical_second_spend_keeps_both_edges() {
     let (dir, t, spenders) = temp_table();
@@ -452,6 +497,10 @@ fn historical_second_spend_keeps_both_edges() {
         .read_prefix_at_published(published, a0, 8, &mut body)
         .unwrap();
     assert_eq!(body, [0u8; 8]);
+    t.spent
+        .read_prefix_at_published(published, a_tail, 8, &mut body)
+        .unwrap();
+    assert_ne!(body, [0u8; 8]);
     t.spent.write_body_abs(a0, &[0u8; 8]).unwrap();
     let (multi, field, vin) = t.get_output_spender_meta_at(off, len, 0).unwrap();
     assert!(multi && vin == 0);
