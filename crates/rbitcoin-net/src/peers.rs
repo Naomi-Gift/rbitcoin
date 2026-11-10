@@ -437,7 +437,7 @@ pub struct LivePeer {
     pub sent: Mutex<HashMap<String, u64>>,
     pub last_block: AtomicU64,
     pub last_transaction: AtomicU64,
-    /// Unix seconds when this peer first announced an unknown block.
+    /// Unix seconds when this peer last first announced a block unknown to us.
     pub last_block_announcement: AtomicU64,
     pub minfeefilter_sat_kvb: AtomicU64,
     /// Last BIP133 feefilter we sent (`-1` = none yet).
@@ -1767,7 +1767,7 @@ pub struct PeerInfo {
     pub last_block: u64,
     /// Unix seconds of last accepted tx from this peer (`0` = never).
     pub last_transaction: u64,
-    /// Unix seconds of the last first announcement of an unknown block (`0` = never).
+    /// Unix seconds when this peer last first announced a block unknown to us (`0` = never).
     pub last_block_announcement: u64,
     /// Fee filter they sent us, sat/kvB (`0` = none).
     pub minfeefilter_sat_kvb: u64,

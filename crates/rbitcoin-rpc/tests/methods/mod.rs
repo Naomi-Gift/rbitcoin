@@ -5862,6 +5862,99 @@ fn getpeerinfo_lists_registered_session() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[tokio::test]
+async fn getpeerinfo_last_block_announcement_tracks_new_heavier_headers() {
+    use bitcoin::block::{Header, Version};
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    use rbitcoin_net::{PeerConnType, PeerHub};
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    let (mut ctx, dir, hub) = ctx_regtest_hub();
+    let peers = PeerHub::new();
+    ctx.peers = Some(peers.clone());
+    dispatch(&ctx, "setmocktime", vec![json!(1_700_000_000)]).unwrap();
+    dispatch(&ctx, "generate", vec![json!(1)]).unwrap();
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18445);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&bind, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 1,
+        relay: true,
+    };
+    let peer = peers.register(addr, bind, &ver, true, PeerConnType::Inbound);
+    let (out_tx, _out_rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut follow = rbitcoin_net::peer::PeerFollowState::new();
+    let genesis = hub
+        .query
+        .wire_header_at_height(Height::GENESIS)
+        .unwrap()
+        .block_hash();
+    let tip = hub.tip_header().unwrap();
+
+    let mut heavier = Header {
+        version: Version::TWO,
+        prev_blockhash: tip.block_hash(),
+        merkle_root: bitcoin::TxMerkleNode::all_zeros(),
+        time: tip.time.saturating_add(1),
+        bits: tip.bits,
+        nonce: 0,
+    };
+    let target = bitcoin::Target::from_compact(heavier.bits);
+    while heavier.validate_pow(target).is_err() {
+        heavier.nonce = heavier.nonce.wrapping_add(1);
+    }
+
+    assert_eq!(
+        dispatch(&ctx, "getpeerinfo", vec![]).unwrap()[0]["last_block_announcement"],
+        0
+    );
+    rbitcoin_net::peer::on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[heavier])
+        .await
+        .unwrap();
+    let stamped = dispatch(&ctx, "getpeerinfo", vec![]).unwrap()[0]["last_block_announcement"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(stamped, 1_700_000_000);
+
+    dispatch(&ctx, "setmocktime", vec![json!(1_700_000_100)]).unwrap();
+    rbitcoin_net::peer::on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[heavier])
+        .await
+        .unwrap();
+    assert_eq!(
+        dispatch(&ctx, "getpeerinfo", vec![]).unwrap()[0]["last_block_announcement"],
+        stamped,
+        "re-announcing an indexed header does not stamp"
+    );
+
+    let mut sibling = Header {
+        prev_blockhash: genesis,
+        time: tip.time.saturating_add(2),
+        nonce: 0,
+        ..heavier
+    };
+    while sibling.validate_pow(target).is_err() {
+        sibling.nonce = sibling.nonce.wrapping_add(1);
+    }
+    rbitcoin_net::peer::on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[sibling])
+        .await
+        .unwrap();
+    assert_eq!(
+        dispatch(&ctx, "getpeerinfo", vec![]).unwrap()[0]["last_block_announcement"],
+        stamped,
+        "equal-work sibling of the active tip does not stamp"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn getpeerinfo_reports_each_peer_transport() {
     use rbitcoin_net::{PeerConnType, PeerHub};

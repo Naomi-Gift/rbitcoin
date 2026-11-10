@@ -5504,9 +5504,12 @@ pub async fn on_headers(
 ) -> Result<(), NetError> {
     let _ = session.is_some_and(|s| s.take_awaiting_headers());
     let noban = session.is_some_and(|s| s.session_noban());
-    let announced_unknown = headers
-        .iter()
-        .any(|hdr| !hub.already_have(hdr.block_hash()));
+    // Core updates this field for the last header in the batch, and only if
+    // it is new to the block index. `already_have` only checks for bodies.
+    let announcement = headers
+        .last()
+        .copied()
+        .and_then(|header| (!header_is_stored(hub, &header.block_hash())).then_some(header));
     let pending = follow.pending_headers.clone();
     let requested = follow.requested_blocks.clone();
     let have_bodies: HashSet<BlockHash> = follow.pending_blocks.keys().copied().collect();
@@ -5517,9 +5520,16 @@ pub async fn on_headers(
     .await?;
     let accepted = !apply.misbehave;
     apply_headers(apply, hub, out_tx, follow, session)?;
-    if accepted && announced_unknown {
-        if let Some(s) = session {
-            s.note_last_block_announcement();
+    if accepted {
+        if let (Some(s), Some(header)) = (session, announcement) {
+            let hash = header.block_hash();
+            if header_is_stored(hub, &hash)
+                && header_announcement_connects(hub, &follow.pending_headers, header.prev_blockhash)
+                && announced_work_cmp(hub, &follow.pending_headers, hash)
+                    == Some(std::cmp::Ordering::Greater)
+            {
+                s.note_last_block_announcement();
+            }
         }
     }
     Ok(())
@@ -5737,11 +5747,7 @@ pub async fn on_cmpctblock(
     if on_cmpctblock_reject_early(hub, follow, session, &hsi, hash)? {
         return Ok(());
     }
-    if !hub.already_have(hash) {
-        if let Some(s) = session {
-            s.note_last_block_announcement();
-        }
-    }
+    let announcement_unknown = !header_is_stored(hub, &hash);
     if hsi.header.prev_blockhash.to_byte_array() != [0u8; 32]
         && !hub.knows_header(&hsi.header.prev_blockhash)
     {
@@ -5763,6 +5769,16 @@ pub async fn on_cmpctblock(
         rbitcoin_log::info!("p2p: ignore low-work compact block from peer {id}");
         take_requested_block(hub, &mut follow.requested_blocks, &hash);
         return Ok(());
+    }
+    if announcement_unknown
+        && header_announcement_connects(hub, &follow.pending_headers, hsi.header.prev_blockhash)
+        && work_of_header_path(hub, &follow.pending_headers, hash)
+            .zip(hub.chain_work().ok())
+            .is_some_and(|(announced, tip)| announced > tip)
+    {
+        if let Some(s) = session {
+            s.note_last_block_announcement();
+        }
     }
     if hub.has_block(&hash) {
         take_requested_block(hub, &mut follow.requested_blocks, &hash);
