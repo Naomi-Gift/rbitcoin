@@ -131,6 +131,7 @@ pub fn usage() -> String {
            --stdin                read extra args from stdin, one per line until EOF\n\
            --rpcwait              retries the connection until the node is up, in a bounded loop\n\
            --named                pass named (name=value) parameters instead of positional\n\
+           --getinfo              print a Core-style chain/network summary\n\
          \n\
          Local: --datadir talks to {{datadir}}/rpc.sock (no token). TCP uses Bearer\n\
          from {{datadir}}/rpc.token. Plain HTTP, same as the node.",
@@ -150,6 +151,7 @@ pub struct CliConfig {
     pub stdin: bool,
     pub rpcwait: bool,
     pub named: bool,
+    pub getinfo: bool,
 }
 
 impl Default for CliConfig {
@@ -165,6 +167,7 @@ impl Default for CliConfig {
             stdin: false,
             rpcwait: false,
             named: false,
+            getinfo: false,
         }
     }
 }
@@ -237,6 +240,11 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
             }
             if a == "--named" {
                 cfg.named = true;
+                i += 1;
+                continue;
+            }
+            if a == "--getinfo" {
+                cfg.getinfo = true;
                 i += 1;
                 continue;
             }
@@ -588,6 +596,9 @@ fn rpc_call(
 
 #[doc(hidden)]
 pub fn dispatch_call(cfg: &CliConfig) -> Result<String, String> {
+    if cfg.getinfo {
+        return getinfo(cfg);
+    }
     let cmd = cfg.command.as_deref().ok_or_else(usage)?;
     if cmd == "help" {
         return Ok(usage());
@@ -603,11 +614,7 @@ pub fn dispatch_call(cfg: &CliConfig) -> Result<String, String> {
             .collect::<Result<_, _>>()?;
         Value::Array(positional)
     };
-    let stream = if cfg.rpcwait {
-        retry_connect(|| connect_stream(cfg), RPCWAIT_ATTEMPTS, RPCWAIT_DELAY)?
-    } else {
-        connect_stream(cfg)?
-    };
+    let stream = connect(cfg)?;
     Ok(format_result(&rpc_call(stream, cfg, cmd, &params)?))
 }
 
@@ -622,6 +629,68 @@ fn print_stdout(text: &str) -> ExitCode {
             ExitCode::from(1)
         }
     }
+}
+
+fn connect(cfg: &CliConfig) -> Result<RpcStream, String> {
+    if cfg.rpcwait {
+        retry_connect(|| connect_stream(cfg), RPCWAIT_ATTEMPTS, RPCWAIT_DELAY)
+    } else {
+        connect_stream(cfg)
+    }
+}
+
+fn getinfo(cfg: &CliConfig) -> Result<String, String> {
+    let chain = rpc_call(
+        connect(cfg)?,
+        cfg,
+        "getblockchaininfo",
+        &Value::Array(Vec::new()),
+    )?;
+    let network = rpc_call(
+        connect(cfg)?,
+        cfg,
+        "getnetworkinfo",
+        &Value::Array(Vec::new()),
+    )?;
+    format_getinfo(&chain, &network)
+}
+
+fn format_getinfo(chain: &Value, network: &Value) -> Result<String, String> {
+    let chain_name = getinfo_field(chain, "chain")?
+        .as_str()
+        .ok_or_else(|| "getinfo: chain not a string".to_string())?;
+    let blocks = getinfo_field(chain, "blocks")?.to_string();
+    let headers = getinfo_field(chain, "headers")?.to_string();
+    let progress = getinfo_field(chain, "verificationprogress")?
+        .as_f64()
+        .ok_or_else(|| "getinfo: verificationprogress not a number".to_string())?
+        * 100.0;
+    let difficulty = getinfo_field(chain, "difficulty")?.to_string();
+    let connections_in = getinfo_field(network, "connections_in")?.to_string();
+    let connections_out = getinfo_field(network, "connections_out")?.to_string();
+    let connections = getinfo_field(network, "connections")?.to_string();
+    let version = getinfo_field(network, "version")?.to_string();
+    let timeoffset = getinfo_field(network, "timeoffset")?.to_string();
+    let relayfee = getinfo_field(network, "relayfee")?
+        .as_f64()
+        .ok_or_else(|| "getinfo: relayfee not a number".to_string())?;
+    Ok(format!(
+        "Chain: {chain_name}\n\
+         Blocks: {blocks}\n\
+         Headers: {headers}\n\
+         Verification progress: {progress:.2}%\n\
+         Difficulty: {difficulty}\n\
+         \n\
+         Network: in {connections_in}, out {connections_out}, total {connections}\n\
+         Version: {version}\n\
+         Time offset (s): {timeoffset}\n\
+         Proxies: n/a\n\
+         Min tx relay fee rate (BTC/kvB): {relayfee:.8}"
+    ))
+}
+
+fn getinfo_field<'a>(v: &'a Value, key: &str) -> Result<&'a Value, String> {
+    v.get(key).ok_or_else(|| format!("getinfo: missing {key}"))
 }
 
 /// Process entry used by `main` and high-level scenarios.

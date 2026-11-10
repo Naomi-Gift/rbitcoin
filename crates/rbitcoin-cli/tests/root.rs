@@ -179,6 +179,7 @@ fn usage_describes_every_option() {
         "--stdin",
         "--rpcwait",
         "--named",
+        "--getinfo",
     ] {
         assert!(u.contains(needle), "usage must list {needle}");
     }
@@ -730,6 +731,121 @@ fn named_string_and_bool_params_keep_their_types() {
     assert_eq!(
         params,
         serde_json::json!({"txid": "deadbeef", "verbose": true})
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = h.join();
+}
+
+/// Serve two JSON-RPC requests, replying per-method, and record the methods.
+#[cfg(unix)]
+fn serve_getinfo_mock(
+    listener: std::os::unix::net::UnixListener,
+) -> (Arc<Mutex<Vec<String>>>, thread::JoinHandle<()>) {
+    let methods = Arc::new(Mutex::new(Vec::new()));
+    let seen = methods.clone();
+    let h = thread::spawn(move || {
+        for _ in 0..2 {
+            let (mut s, _) = listener.accept().unwrap();
+            let mut raw = Vec::new();
+            let mut tmp = [0u8; 1024];
+            while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = s.read(&mut tmp).unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&tmp[..n]);
+            }
+            let header_end = raw
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|p| p + 4)
+                .unwrap_or(raw.len());
+            let content_length = String::from_utf8_lossy(&raw[..header_end])
+                .lines()
+                .find_map(|l| l.strip_prefix("Content-Length:"))
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            while raw.len() < header_end + content_length {
+                let n = s.read(&mut tmp).unwrap();
+                if n == 0 {
+                    break;
+                }
+                raw.extend_from_slice(&tmp[..n]);
+            }
+            let body = &raw[header_end..header_end + content_length];
+            let method = serde_json::from_slice::<serde_json::Value>(body)
+                .ok()
+                .and_then(|v| {
+                    v.get("method")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|s| s.to_string())
+                })
+                .unwrap_or_default();
+            seen.lock().unwrap().push(method.clone());
+            let result = match method.as_str() {
+                "getblockchaininfo" => {
+                    r#"{"chain":"regtest","blocks":100,"headers":100,"verificationprogress":0.5,"difficulty":1}"#
+                }
+                "getnetworkinfo" => {
+                    r#"{"version":259900,"timeoffset":0,"connections":2,"connections_in":1,"connections_out":1,"relayfee":0.00001}"#
+                }
+                _ => "null",
+            };
+            let resp_body = format!(
+                "{{\"jsonrpc\":\"1.0\",\"id\":\"1\",\"result\":{result},\"error\":null}}\n"
+            );
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{resp_body}",
+                resp_body.len()
+            );
+            s.write_all(resp.as_bytes()).unwrap();
+        }
+    });
+    (methods, h)
+}
+
+#[test]
+fn parse_args_getinfo_is_a_flag() {
+    match parse_args(&os_args(&["rbitcoin-cli", "--getinfo"])) {
+        Ok(Action::Call(cfg)) => {
+            assert!(cfg.getinfo, "--getinfo must set the getinfo flag");
+            assert!(cfg.command.is_none(), "--getinfo takes no command");
+        }
+        Err(e) => panic!("--getinfo must parse, got: {e}"),
+        Ok(_) => panic!("expected Action::Call"),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn getinfo_prints_a_core_style_summary() {
+    use std::os::unix::net::UnixListener;
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let cfg = match parse_args(&os_args(&[
+        "rbitcoin-cli",
+        "--getinfo",
+        "--datadir",
+        dir.to_str().unwrap(),
+    ])) {
+        Ok(Action::Call(cfg)) => cfg,
+        Ok(_) => panic!("expected Action::Call"),
+        Err(e) => panic!("--getinfo must parse, got: {e}"),
+    };
+    let (methods, h) = serve_getinfo_mock(UnixListener::bind(&sock).unwrap());
+    let out = dispatch_call(&cfg).unwrap();
+    assert_eq!(
+        out,
+        "Chain: regtest\nBlocks: 100\nHeaders: 100\nVerification progress: 50.00%\nDifficulty: 1\n\nNetwork: in 1, out 1, total 2\nVersion: 259900\nTime offset (s): 0\nProxies: n/a\nMin tx relay fee rate (BTC/kvB): 0.00001000"
+    );
+    let mut got = methods.lock().unwrap().clone();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            "getblockchaininfo".to_string(),
+            "getnetworkinfo".to_string()
+        ]
     );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
