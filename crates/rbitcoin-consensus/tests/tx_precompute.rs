@@ -332,15 +332,15 @@ fn sighash_midstates_come_from_wire_spans() {
     let tx = two_input_witness();
     let raw = serialize(&tx);
     let spans = witness_wire(&tx, &raw).expect("spans");
-    let (txid, mids) = hash_wire_sighash(&tx, &spans).expect("span sighash");
+    let (txid, [prev, seq, outs]) = hash_wire_sighash(&tx, &spans).expect("span sighash");
     assert_eq!(txid, tx.compute_txid().to_byte_array());
-    assert_eq!(mids[0], Some(oracle_sha_prevouts(&tx)));
-    assert_eq!(mids[1], Some(oracle_sha_sequences(&tx)));
-    assert_eq!(mids[2], Some(oracle_sha_outputs(&tx)));
+    assert_eq!(prev, oracle_sha_prevouts(&tx));
+    assert_eq!(seq, oracle_sha_sequences(&tx));
+    assert_eq!(outs, oracle_sha_outputs(&tx));
     let w = TxPrecompute::from_tx_wire(&tx, &raw, true).expect("wire");
-    assert_eq!(w.sha_prevouts(), mids[0]);
-    assert_eq!(w.sha_sequences(), mids[1]);
-    assert_eq!(w.sha_outputs(), mids[2]);
+    assert_eq!(w.sha_prevouts(), Some(prev));
+    assert_eq!(w.sha_sequences(), Some(seq));
+    assert_eq!(w.sha_outputs(), Some(outs));
     let mut prevouts = Vec::new();
     let mut sequences = Vec::new();
     for input in &tx.input {
