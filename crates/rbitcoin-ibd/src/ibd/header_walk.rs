@@ -4285,7 +4285,6 @@ pub fn note_header_witness(
     let Some(mine) = peer_net(st, peer) else {
         return;
     };
-    // No other address has a checkpoint, so this batch cannot be a match.
     if !st
         .header_walk
         .checkpoints

@@ -180,13 +180,6 @@ impl LoadAheadState {
     }
 }
 
-/// Shared feed of tip-extension **readiness** for the dedicated confirm engine.
-///
-/// **Sole intake:** peer/rehydrate enqueues wire into the **body queue**, then
-/// notes height/hash here. Lookup/load reload wire from the body queue — the feed
-/// stores hashes only. Class A alone is never enough (no hash-only
-/// confirm). Tip-follow reorgs use peer wire via `ChainHub::accept_block`.
-///
 /// Height cap, match, and byte allowance last written into the feed.
 struct InstalledLead {
     height_limit: Option<u32>,
@@ -194,6 +187,13 @@ struct InstalledLead {
     bytes_left: Option<u64>,
 }
 
+/// Shared feed of tip-extension **readiness** for the dedicated confirm engine.
+///
+/// **Sole intake:** peer/rehydrate enqueues wire into the **body queue**, then
+/// notes height/hash here. Lookup/load reload wire from the body queue — the feed
+/// stores hashes only. Class A alone is never enough (no hash-only
+/// confirm). Tip-follow reorgs use peer wire via `ChainHub::accept_block`.
+///
 /// **In-flight tracking:** once lookup claims a contiguous run, those heights sit
 /// in `inflight` until write finishes (or re-queue). `note` will not re-insert
 /// them — otherwise offer re-notes tip+1 every main-loop tick and lookup
