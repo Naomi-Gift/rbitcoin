@@ -324,8 +324,8 @@ async fn hostile_peer_session() {
     assert_eq!(follow.pending_headers.len(), rbitcoin_net::peer::MAX_PENDING_HEADERS);
     assert!(!follow.pending_headers.contains_key(&extra_hash));
 
-    // A useful continuation from the stored tip must reclaim the unrelated
-    // pending branches and fit under the same per-peer cap.
+    // One continuation needs one slot. The other orphans stay, so a later
+    // parent can still join them.
     let mut continuation = hub
         .query
         .wire_header_at_height(rbitcoin_primitives::Height(200))
@@ -345,7 +345,10 @@ async fn hostile_peer_session() {
     )
     .await
     .unwrap();
-    assert_eq!(follow.pending_headers.len(), 1);
+    assert_eq!(
+        follow.pending_headers.len(),
+        rbitcoin_net::peer::MAX_PENDING_HEADERS
+    );
     assert!(follow.pending_headers.contains_key(&continuation_hash));
 
     while out_rx.try_recv().is_ok() {}
@@ -741,14 +744,40 @@ fn addrv2_flood_is_rate_limited_before_addrman() {
 }
 
 fn regtest_child(parent: &bitcoin::block::Header, tag: u8) -> bitcoin::block::Header {
+    pow_child(parent, u32::from(tag))
+}
+
+fn pow_child(parent: &bitcoin::block::Header, n: u32) -> bitcoin::block::Header {
     let mut header = *parent;
     header.prev_blockhash = parent.block_hash();
-    header.merkle_root = bitcoin::TxMerkleNode::from_byte_array([tag; 32]);
+    let mut merkle = [0u8; 32];
+    merkle[..4].copy_from_slice(&n.to_le_bytes());
+    header.merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle);
     header.time = parent.time.saturating_add(600);
     header.bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
     header.nonce = 0;
     rbitcoin_consensus::grind_regtest_pow(&mut header);
     header
+}
+
+/// Same shape as [`pow_child`], but the hash misses `bits`. No grind.
+fn child_missing_target(parent: &bitcoin::block::Header, n: u32) -> bitcoin::block::Header {
+    let mut header = *parent;
+    header.prev_blockhash = parent.block_hash();
+    let mut merkle = [0u8; 32];
+    merkle[..4].copy_from_slice(&n.to_le_bytes());
+    header.merkle_root = bitcoin::TxMerkleNode::from_byte_array(merkle);
+    header.time = parent.time.saturating_add(600);
+    header.bits = bitcoin::CompactTarget::from_consensus(0x207f_ffff);
+    header.nonce = n;
+    let start = header.nonce;
+    loop {
+        if header.validate_pow(header.target()).is_err() {
+            return header;
+        }
+        header.nonce = header.nonce.wrapping_add(1);
+        assert_ne!(header.nonce, start, "regtest target rejected no nonce");
+    }
 }
 
 fn pending_keys(follow: &PeerFollowState) -> HashSet<BlockHash> {
@@ -940,6 +969,197 @@ async fn cap_evicts_only_after_the_store_accepts() {
     assert!(hub
         .query
         .get_header_by_hash(&accepted_hash.to_byte_array())
+        .unwrap()
+        .is_some());
+}
+
+/// Children of the tip have more work than the tip, so a full map of them
+/// must still take one more. A longer fork than that child stays.
+#[tokio::test]
+async fn cap_accepts_the_next_header_when_equal_work_fills_the_map() {
+    use std::cmp::Ordering;
+
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-equal");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(200, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let tip = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(200))
+        .unwrap();
+    let parent = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(199))
+        .unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = hostile_ver(bind);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let peer = peers.register(
+        bind,
+        bind,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let heavy_a = regtest_child(&parent, 0xc1);
+    let heavy_b = regtest_child(&heavy_a, 0xc2);
+    let heavy_c = regtest_child(&heavy_b, 0xc3);
+    let heavy = heavy_c.block_hash();
+    let mut follow = PeerFollowState::new();
+    on_headers(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+        &[heavy_a, heavy_b, heavy_c],
+    )
+    .await
+    .unwrap();
+    let siblings: Vec<_> = (0..MAX_PENDING_HEADERS as u32 - 3)
+        .map(|n| pow_child(&tip, n))
+        .collect();
+    let sibling_hashes: HashSet<BlockHash> =
+        siblings.iter().map(|header| header.block_hash()).collect();
+    for chunk in siblings.chunks(2_000) {
+        on_headers(&hub, &out_tx, &mut follow, Some(&peer), chunk)
+            .await
+            .unwrap();
+    }
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    let sibling_hash = siblings[0].block_hash();
+    assert_eq!(
+        announced_work_cmp(&hub, &follow.pending_headers, sibling_hash),
+        Some(Ordering::Greater),
+        "a child of the tip has more work than the tip"
+    );
+    assert_eq!(
+        announced_work_cmp(&hub, &follow.pending_headers, heavy),
+        Some(Ordering::Greater)
+    );
+
+    let next = pow_child(&tip, 9_000_000);
+    let next_hash = next.block_hash();
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[next])
+        .await
+        .unwrap();
+    assert!(
+        follow.pending_headers.contains_key(&next_hash),
+        "a full map of tip children still accepts the next header"
+    );
+    assert!(follow.pending_headers.contains_key(&heavy));
+    let dropped = sibling_hashes
+        .iter()
+        .filter(|hash| !follow.pending_headers.contains_key(*hash))
+        .count();
+    assert_eq!(dropped, 1, "one equal-work sibling makes the slot");
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+
+    let grand = pow_child(&next, 9_000_001);
+    let grand_hash = grand.block_hash();
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[grand])
+        .await
+        .unwrap();
+    assert!(follow.pending_headers.contains_key(&grand_hash));
+    assert!(
+        follow.pending_headers.contains_key(&next_hash),
+        "the parent of the new header stays"
+    );
+    assert!(follow.pending_headers.contains_key(&heavy));
+    let dropped = sibling_hashes
+        .iter()
+        .filter(|hash| !follow.pending_headers.contains_key(*hash))
+        .count();
+    assert_eq!(
+        dropped, 2,
+        "the grandchild drops one more sibling and leaves the longer fork"
+    );
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    assert_eq!(
+        work_of_header_path(&hub, &follow.pending_headers, grand_hash),
+        work_of_header_path(&hub, &follow.pending_headers, heavy),
+        "the three-header fork matches the grandchild"
+    );
+}
+
+/// Headers that name the tip and miss their target fill the map without a
+/// grind. One of them makes room for a header that meets the target.
+#[tokio::test]
+async fn cap_accepts_the_next_header_when_failed_pow_fills_the_map() {
+    let (_dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cap-evict-pow");
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(200, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let tip = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(200))
+        .unwrap();
+    let parent = hub
+        .query
+        .wire_header_at_height(rbitcoin_primitives::Height(199))
+        .unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let bind = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18444);
+    let ver = hostile_ver(bind);
+    let (out_tx, _out_rx) = mpsc::unbounded_channel();
+    let peer = peers.register(
+        bind,
+        bind,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let heavy_a = regtest_child(&parent, 0xd1);
+    let heavy_b = regtest_child(&heavy_a, 0xd2);
+    let heavy_c = regtest_child(&heavy_b, 0xd3);
+    let heavy = heavy_c.block_hash();
+    let mut follow = PeerFollowState::new();
+    on_headers(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(&peer),
+        &[heavy_a, heavy_b, heavy_c],
+    )
+    .await
+    .unwrap();
+    let sample = child_missing_target(&tip, 0);
+    assert!(
+        !hub.header_claimed_pow_ok(&sample),
+        "the filler misses its target"
+    );
+    let fillers: Vec<_> = (0..MAX_PENDING_HEADERS as u32 - 3)
+        .map(|n| child_missing_target(&tip, n))
+        .collect();
+    let filler_hashes: HashSet<BlockHash> =
+        fillers.iter().map(|header| header.block_hash()).collect();
+    for chunk in fillers.chunks(2_000) {
+        on_headers(&hub, &out_tx, &mut follow, Some(&peer), chunk)
+            .await
+            .unwrap();
+    }
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    assert!(follow.pending_headers.contains_key(&heavy));
+
+    let next = pow_child(&tip, 9_000_000);
+    let next_hash = next.block_hash();
+    on_headers(&hub, &out_tx, &mut follow, Some(&peer), &[next])
+        .await
+        .unwrap();
+    assert!(
+        follow.pending_headers.contains_key(&next_hash),
+        "a valid successor was refused"
+    );
+    assert!(follow.pending_headers.contains_key(&heavy));
+    let dropped = filler_hashes
+        .iter()
+        .filter(|hash| !follow.pending_headers.contains_key(*hash))
+        .count();
+    assert_eq!(dropped, 1, "one header that misses its target makes the slot");
+    assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    assert!(hub
+        .query
+        .get_header_by_hash(&next_hash.to_byte_array())
         .unwrap()
         .is_some());
 }

@@ -5150,29 +5150,149 @@ struct HeadersApply {
     /// The last header was new, accepted, connected, and beats our tip work.
     stamp_block_announcement: bool,
 }
-/// Evict from `pending` until `incoming` new headers fit under
-/// `MAX_PENDING_HEADERS`, or until nothing safe is left to evict.
+/// Drop pending headers until `headers` fit under [`MAX_PENDING_HEADERS`].
 ///
-/// Order: (1) headers whose pending path does not reach a stored header,
-/// (2) connected forks whose tip loses on chain work to our active tip.
-/// Never evicted: the ancestors of `prev` (the new batch's path) and any
-/// connected fork whose tip does not lose on work.
+/// A header that fails claimed proof of work goes first, then one whose path
+/// does not reach a stored header, then a connected fork with less work than
+/// `headers`, then one with the same work. Stop once `headers` fit. Ancestors
+/// of `prev` stay. A fork with more work stays. A fork whose work cannot be
+/// scored stays, and so does every connected fork when `headers` cannot.
 fn evict_pending_for_room(
     hub: &ChainHub,
     pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
     prev: BlockHash,
-    incoming: usize,
+    headers: &[bitcoin::block::Header],
 ) {
-    let over = |p: &HashMap<BlockHash, bitcoin::block::Header>| {
-        p.len().saturating_add(incoming) > MAX_PENDING_HEADERS
+    let incoming = headers
+        .iter()
+        .filter(|hdr| !pending.contains_key(&hdr.block_hash()))
+        .count();
+    if !pending_over_cap(pending, incoming) {
+        return;
+    }
+    let protected = pending_ancestors(pending, prev);
+    let failed_pow: Vec<BlockHash> = pending
+        .iter()
+        .filter(|(hash, hdr)| !protected.contains(*hash) && !hub.header_claimed_pow_ok(hdr))
+        .map(|(hash, _)| *hash)
+        .collect();
+    drop_hashes_until_fit(pending, incoming, failed_pow);
+    if !pending_over_cap(pending, incoming) {
+        return;
+    }
+    let failed_forks: Vec<BlockHash> = pending_tips(pending)
+        .into_iter()
+        .filter(|tip| pending_path_fails_claimed_pow(hub, pending, *tip))
+        .collect();
+    drop_tips_until_fit(pending, &protected, incoming, &failed_forks);
+    if !pending_over_cap(pending, incoming) {
+        return;
+    }
+    drop_hashes_until_fit(
+        pending,
+        incoming,
+        disconnected_pending(hub, pending, &protected),
+    );
+    let Some(incoming_work) = incoming_header_work(hub, pending, headers) else {
+        return;
     };
+    evict_forks_with_work(
+        hub,
+        pending,
+        &protected,
+        incoming,
+        incoming_work,
+        std::cmp::Ordering::Less,
+    );
+    evict_forks_with_work(
+        hub,
+        pending,
+        &protected,
+        incoming,
+        incoming_work,
+        std::cmp::Ordering::Equal,
+    );
+}
 
-    // The new batch's own pending ancestors stay, whatever happens below.
-    let mut protected = pending_ancestors(pending, prev);
+fn pending_over_cap(pending: &HashMap<BlockHash, bitcoin::block::Header>, incoming: usize) -> bool {
+    pending.len().saturating_add(incoming) > MAX_PENDING_HEADERS
+}
 
-    // (1) Non-connecting headers. A root is a pending header whose parent is
-    // not pending; its whole subtree connects iff that parent is stored (and
-    // is not the all-zero hash). One store lookup per root.
+fn drop_hashes_until_fit(
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    incoming: usize,
+    hashes: impl IntoIterator<Item = BlockHash>,
+) {
+    for hash in hashes {
+        if !pending_over_cap(pending, incoming) {
+            return;
+        }
+        pending.remove(&hash);
+    }
+}
+
+fn drop_tips_until_fit(
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    protected: &HashSet<BlockHash>,
+    incoming: usize,
+    tips: &[BlockHash],
+) {
+    for &tip in tips {
+        let mut hash = tip;
+        loop {
+            if !pending_over_cap(pending, incoming) {
+                return;
+            }
+            if protected.contains(&hash) {
+                break;
+            }
+            let Some(parent) = pending.get(&hash).map(|hdr| hdr.prev_blockhash) else {
+                break;
+            };
+            pending.remove(&hash);
+            hash = parent;
+        }
+    }
+}
+
+fn pending_tips(pending: &HashMap<BlockHash, bitcoin::block::Header>) -> Vec<BlockHash> {
+    let has_child: HashSet<BlockHash> = pending.values().map(|hdr| hdr.prev_blockhash).collect();
+    pending
+        .keys()
+        .copied()
+        .filter(|hash| !has_child.contains(hash))
+        .collect()
+}
+
+fn pending_path_fails_claimed_pow(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    tip: BlockHash,
+) -> bool {
+    let mut hash = tip;
+    for _ in 0..PENDING_WALK_LIMIT {
+        if hub.is_connected(&hash) {
+            return false;
+        }
+        let Some(hdr) = pending.get(&hash).copied().or_else(|| hub.header_of(&hash)) else {
+            return false;
+        };
+        if !hub.header_claimed_pow_ok(&hdr) {
+            return true;
+        }
+        hash = hdr.prev_blockhash;
+        if hash.to_byte_array() == [0u8; 32] {
+            return false;
+        }
+    }
+    false
+}
+
+fn disconnected_pending(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    protected: &HashSet<BlockHash>,
+) -> Vec<BlockHash> {
     let no_pending = HashMap::new();
     let mut root_of: HashMap<BlockHash, BlockHash> = HashMap::new();
     let mut root_connects: HashMap<BlockHash, bool> = HashMap::new();
@@ -5185,46 +5305,48 @@ fn evict_pending_for_room(
                 && header_announcement_connects(hub, &no_pending, parent)
         });
     }
-    let disconnected: Vec<BlockHash> = hashes
-        .iter()
-        .copied()
-        .filter(|h| !protected.contains(h) && !root_connects[&root_of[h]])
-        .collect();
-    for hash in disconnected {
-        pending.remove(&hash);
+    hashes
+        .into_iter()
+        .filter(|hash| !protected.contains(hash) && !root_connects[&root_of[hash]])
+        .collect()
+}
+
+fn incoming_header_work(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    headers: &[bitcoin::block::Header],
+) -> Option<bitcoin::Work> {
+    let last = headers.last()?;
+    let mut with_batch = pending.clone();
+    for hdr in headers {
+        with_batch.insert(hdr.block_hash(), *hdr);
     }
-    if !over(pending) {
+    work_of_header_path(hub, &with_batch, last.block_hash())
+}
+
+fn evict_forks_with_work(
+    hub: &ChainHub,
+    pending: &mut HashMap<BlockHash, bitcoin::block::Header>,
+    protected: &HashSet<BlockHash>,
+    incoming: usize,
+    incoming_work: bitcoin::Work,
+    want: std::cmp::Ordering,
+) {
+    if !pending_over_cap(pending, incoming) {
         return;
     }
-
-    // (2) Connected forks that lose on chain work to our active tip. A tip is
-    // a pending header with no pending child. Headers shared with any tip
-    // that does not lose are protected.
-    let has_child: HashSet<BlockHash> = pending.values().map(|h| h.prev_blockhash).collect();
-    let tips: Vec<BlockHash> = pending
-        .keys()
-        .copied()
-        .filter(|h| !has_child.contains(h))
-        .collect();
-    let mut losing = Vec::new();
-    for tip in tips {
-        // `None` means the work could not be compared: keep that fork.
-        if announced_work_cmp(hub, pending, tip) == Some(std::cmp::Ordering::Less) {
-            losing.push(tip);
-        } else {
-            protected.extend(pending_ancestors(pending, tip));
+    let mut keep = protected.clone();
+    let mut victims = Vec::new();
+    for tip in pending_tips(pending) {
+        if pending_path_fails_claimed_pow(hub, pending, tip) {
+            continue;
+        }
+        match work_of_header_path(hub, pending, tip) {
+            Some(work) if work.cmp(&incoming_work) == want => victims.push(tip),
+            _ => keep.extend(pending_ancestors(pending, tip)),
         }
     }
-    for tip in losing {
-        for hash in pending_ancestors(pending, tip) {
-            if !protected.contains(&hash) {
-                pending.remove(&hash);
-            }
-        }
-        if !over(pending) {
-            return;
-        }
-    }
+    drop_tips_until_fit(pending, &keep, incoming, &victims);
 }
 
 /// `start` and its ancestors that are in `pending`, walking at most
@@ -5345,7 +5467,7 @@ fn classify_headers(
             {
                 return apply;
             }
-            evict_pending_for_room(hub, &mut pending, prev, incoming);
+            evict_pending_for_room(hub, &mut pending, prev, headers);
             if pending.len().saturating_add(incoming) > MAX_PENDING_HEADERS {
                 return apply;
             }
