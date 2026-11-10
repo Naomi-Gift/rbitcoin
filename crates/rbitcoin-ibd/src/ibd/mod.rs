@@ -524,7 +524,7 @@ pub fn publish_status_snap(st: &IbdWorkState, hub: &ChainHub, board: &StatusBoar
 }
 
 /// Live outbound full-relay slots. A `--connect` slot is manual.
-fn full_outbound_slots(slots: &[PeerSlot]) -> usize {
+fn full_outbound_slots(slots: &[peer_io::PeerSlot]) -> usize {
     slots
         .iter()
         .filter(|s| s.alive && s.conn_type == rbitcoin_net::peers::PeerConnType::OutboundFullRelay)
