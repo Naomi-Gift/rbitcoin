@@ -660,7 +660,7 @@ async fn listener_cap_silent_inbound_releases_the_slot() {
         ChainParams::regtest(),
         Milestone::NONE,
         "/rbitcoin:0.1.0(deadline)/".into(),
-        8,
+        rbitcoin_net::DEFAULT_MAX_INBOUND,
         rbitcoin_net::REDIAL_INTERVAL_TEST,
     )
     .await
@@ -705,30 +705,16 @@ async fn listener_cap_silent_inbound_releases_the_slot() {
                 .unwrap(),
         );
     }
-    let mut rows = 0usize;
-    let mut stable = 0u32;
+    let cap = rbitcoin_net::peers::MAX_INCOMPLETE_INBOUND_PER_ADDR;
     let wait = std::time::Instant::now();
-    while wait.elapsed() < Duration::from_secs(3) {
+    let mut saw = 0usize;
+    while wait.elapsed() < Duration::from_secs(2) {
         let n = node.peers.snapshot().len();
-        if n >= 24 {
-            rows = n;
-            break;
-        }
-        if n == rows && n > 0 {
-            stable += 1;
-            if stable >= 5 {
-                break;
-            }
-        } else {
-            stable = 0;
-            rows = n;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(n <= cap, "one address held {n} unfinished handshakes");
+        saw = saw.max(n);
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    assert!(
-        rows > 0 && rows < 24,
-        "one address held {rows} unfinished handshakes"
-    );
+    assert!(saw > 0, "no unfinished handshake took a slot");
     drop(parked);
     node.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);

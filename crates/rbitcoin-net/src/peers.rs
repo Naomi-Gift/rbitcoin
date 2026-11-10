@@ -2188,7 +2188,7 @@ pub fn ip_is_advertisable(ip: &IpAddr, cjdns_reachable: bool) -> bool {
 
 /// Unfinished inbound handshakes one address may hold. Localhost and NAT
 /// share an address, so this is not 1.
-pub(crate) const MAX_INCOMPLETE_INBOUND_PER_ADDR: usize = 8;
+pub const MAX_INCOMPLETE_INBOUND_PER_ADDR: usize = 8;
 
 pub(crate) struct IncompleteInbound {
     ip: IpAddr,

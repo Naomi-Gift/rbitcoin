@@ -1042,7 +1042,15 @@ fn spawn_capped<L: CappedAccept>(
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         let sem = Arc::new(Semaphore::new(max_conn.max(1)));
-        let mut conns: Vec<JoinHandle<()>> = Vec::new();
+        struct StopConns(Vec<JoinHandle<()>>);
+        impl Drop for StopConns {
+            fn drop(&mut self) {
+                for task in self.0.drain(..) {
+                    task.abort();
+                }
+            }
+        }
+        let mut conns = StopConns(Vec::new());
         loop {
             let wake = shutdown.notified();
             if shutdown.load() {
@@ -1054,7 +1062,7 @@ fn spawn_capped<L: CappedAccept>(
                 accepted = CappedAccept::accept_one(&mut listener) => {
                     match accepted {
                         Ok((io, peer)) => {
-                            conns.retain(|t| !t.is_finished());
+                            conns.0.retain(|t| !t.is_finished());
                             if !rbitcoin_net::listen::listener_fd_room() {
                                 rbitcoin_log::warn!(
                                     "esplora: reject {peer:?} (descriptor reserve)"
@@ -1070,7 +1078,7 @@ fn spawn_capped<L: CappedAccept>(
                                 continue;
                             };
                             let service = TowerToHyperService::new(app.clone());
-                            conns.push(tokio::spawn(async move {
+                            conns.0.push(tokio::spawn(async move {
                                 let _permit = permit;
                                 let mut http = http1::Builder::new();
                                 http.timer(TokioTimer::new())
@@ -1089,9 +1097,6 @@ fn spawn_capped<L: CappedAccept>(
                     }
                 }
             }
-        }
-        for task in conns {
-            task.abort();
         }
     })
 }

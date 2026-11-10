@@ -90,6 +90,66 @@ async fn listener_cap_esplora_idle_tcp_is_closed() {
     handle.shutdown().await;
 }
 
+/// Shutdown closes an accepted idle socket. The header timer is not what
+/// closes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_cap_esplora_shutdown_closes_idle_tcp() {
+    let (_dir, q) = temp_query("esplora-shutdown-idle");
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.limits.max_connections = 1;
+    cfg.limits.idle_timeout = Duration::from_secs(30);
+    let cap = rbitcoin_esplora::server::esplora_accept_cap(1);
+    let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
+    let addr = handle.local_addr;
+
+    let mut opened = Vec::new();
+    for _ in 0..(cap + 16) {
+        opened.push(TcpStream::connect(addr).await.expect("connect"));
+    }
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let mut probes = tokio::task::JoinSet::new();
+    for mut sock in opened {
+        probes.spawn(async move {
+            let mut buf = [0u8; 1];
+            let open =
+                match tokio::time::timeout(Duration::from_millis(20), sock.read(&mut buf)).await {
+                    Err(_) => true,
+                    Ok(Ok(0)) | Ok(Err(_)) => false,
+                    Ok(Ok(_)) => true,
+                };
+            (sock, open)
+        });
+    }
+    let mut still = Vec::new();
+    while let Some(joined) = probes.join_next().await {
+        let (sock, open) = joined.expect("probe");
+        if open {
+            still.push(sock);
+        }
+    }
+    assert!(
+        !still.is_empty() && still.len() <= cap,
+        "esplora held {} idle TCP connections before shutdown; cap is {cap}",
+        still.len()
+    );
+    let mut idle = still.pop().expect("accepted idle client");
+    drop(still);
+    handle.shutdown().await;
+    let closed = tokio::time::timeout(Duration::from_secs(1), async {
+        let mut buf = [0u8; 8];
+        loop {
+            match idle.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(closed.is_ok(), "shutdown left an idle esplora socket open");
+}
+
 /// `store(true)` ends the serve task without waiting out the shutdown poll.
 #[tokio::test]
 async fn esplora_shutdown_wakes_without_the_fifty_ms_poll() {
