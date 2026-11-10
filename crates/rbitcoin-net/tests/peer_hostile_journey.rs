@@ -441,11 +441,12 @@ async fn hostile_peer_session() {
     }]);
     assert_eq!(rbitcoin_net::peers::outbound_msg_bytes(&v2), 61);
     let hsi = HeaderAndShortIds::from_block(&block, 1, 1, &[0]).unwrap();
+    let compact_n = bitcoin::consensus::encode::serialize(&hsi).len();
     assert_eq!(
         rbitcoin_net::peers::outbound_msg_bytes(&NetworkMessage::CmpctBlock(CmpctBlock {
             compact_block: hsi
         })),
-        1024
+        compact_n
     );
     let txns = bitcoin::bip152::BlockTransactions {
         block_hash: block.block_hash(),

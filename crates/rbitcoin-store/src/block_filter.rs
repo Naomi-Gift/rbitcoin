@@ -309,6 +309,33 @@ impl BlockFilterTable {
         Ok(Some(out))
     }
 
+    /// Filter headers at heights 1,000, 2,000, … through `stop`.
+    ///
+    /// One idx pread per checkpoint. `None` when `stop` is past the watermark.
+    pub fn checkpoint_headers(&self, stop: Height) -> Result<Option<Vec<[u8; 32]>>, StoreError> {
+        let inner = self.read();
+        if inner.locate(stop).is_none() {
+            return Ok(None);
+        }
+        if stop.0 < 1000 {
+            return Ok(Some(Vec::new()));
+        }
+        let mut out = Vec::new();
+        let mut h = 1000u32;
+        while h <= stop.0 {
+            let Some((si, local)) = inner.locate(Height(h)) else {
+                return Ok(None);
+            };
+            let rows = read_rows(&inner.segs[si], local, 1)?;
+            let Some(row) = rows.first() else {
+                return Err(StoreError::Corrupt("blockfilter checkpoint slot missing"));
+            };
+            out.push(row.slot.filter_header);
+            h = h.saturating_add(1000);
+        }
+        Ok(Some(out))
+    }
+
     /// Idx facts for `start..=end`. `None` when `end` is past the watermark.
     pub fn slots(
         &self,

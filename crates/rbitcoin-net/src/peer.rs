@@ -1720,6 +1720,50 @@ pub fn take_outbound_write_batch(
     batch
 }
 
+struct SessionPongEmit<'a> {
+    writer: &'a mut PeerWriter,
+}
+
+impl PongEmit for SessionPongEmit<'_> {
+    #[allow(clippy::manual_async_fn)]
+    fn emit(&mut self, msg: NetworkMessage) -> impl Future<Output = Result<(), ()>> + Send + '_ {
+        async { self.writer.write_msg_offload(msg).await.map_err(|_| ()) }
+    }
+}
+
+/// Writes one pong. The future may borrow `self` until it is awaited.
+#[doc(hidden)]
+pub trait PongEmit {
+    /// `Send` so the spawned writer task can await the write.
+    #[allow(clippy::manual_async_fn)]
+    fn emit(&mut self, msg: NetworkMessage) -> impl Future<Output = Result<(), ()>> + Send + '_;
+}
+
+/// Write pongs that arrived while `written` was on the wire.
+///
+/// Each extra nonce is charged on its own. A ping during an extra write is
+/// emitted next. The pending slot is clear when this returns `Ok`.
+#[doc(hidden)]
+pub async fn write_extra_pongs<E: PongEmit>(
+    session: &crate::peers::LivePeer,
+    written: u64,
+    emit: &mut E,
+) -> Result<(), ()> {
+    let mut next = session.finish_pong_write(written);
+    while let Some(extra) = next {
+        let msg = NetworkMessage::Pong(extra);
+        let extra_n = crate::peers::outbound_msg_bytes(&msg);
+        session.note_send_queued(extra_n);
+        let failed = emit.emit(msg).await.is_err();
+        session.note_out_written(false, extra_n);
+        if failed {
+            return Err(());
+        }
+        next = session.finish_pong_write(extra);
+    }
+    Ok(())
+}
+
 pub async fn run_writer_task(
     mut writer: PeerWriter,
     mut out_rx: mpsc::UnboundedReceiver<PeerOut>,
@@ -1729,6 +1773,13 @@ pub async fn run_writer_task(
         for out in take_outbound_write_batch(first, &mut out_rx) {
             let n = crate::peers::outbound_queued_bytes(&out);
             let serve_slot = out.holds_serve_slot();
+            let (out, pong_written) = match out {
+                PeerOut::Msg(NetworkMessage::Pong(queued)) => {
+                    let nonce = pong_nonce_for_write(writer_session.as_deref(), queued);
+                    (PeerOut::Msg(NetworkMessage::Pong(nonce)), Some(nonce))
+                }
+                other => (other, None),
+            };
             let err = match out {
                 PeerOut::Msg(msg) | PeerOut::Served(msg) => {
                     writer.write_msg_offload(msg).await.is_err()
@@ -1740,6 +1791,14 @@ pub async fn run_writer_task(
             }
             if err {
                 return;
+            }
+            if let (Some(s), Some(written)) = (&writer_session, pong_written) {
+                let mut emit = SessionPongEmit {
+                    writer: &mut writer,
+                };
+                if write_extra_pongs(s, written, &mut emit).await.is_err() {
+                    return;
+                }
             }
         }
     }
@@ -2401,7 +2460,7 @@ pub async fn peer_session_with(
                 }
                 // Inbound before local tip announce so GetData during a
                 // generate burst is not queued behind hundreds of cmpctblocks.
-                frame = reader.read_frame_with_progress(magic, |_| {}, |n| {
+                frame = reader.read_frame_with_progress(magic, |_, _| {}, |n| {
                     let mut score = decoy_score.load(Ordering::Relaxed);
                     let keep = crate::peer_dos::decoy_stays(
                         &mut rate,
@@ -2579,7 +2638,7 @@ pub async fn peer_session_with(
                     }
                     if frame.is_ping() {
                         if let Some(n) = frame.ping_nonce() {
-                            queue_out(&out_tx, NetworkMessage::Pong(n))?;
+                            queue_pong(session.as_deref(), &out_tx, n)?;
                         }
                         continue;
                     }
@@ -4003,6 +4062,9 @@ pub fn on_getcfilters(
         return Ok(());
     };
     for (h, body) in (m.start_height..).zip(filters) {
+        if session.is_some_and(|s| s.send_over_budget()) {
+            return Ok(());
+        }
         let Some((_, rec)) = filter_q(hub.query.header_at_height(rbitcoin_primitives::Height(h)))?
         else {
             return Ok(());
@@ -4074,13 +4136,11 @@ pub fn on_getcfcheckpt(
         return Ok(());
     }
     let mut filter_headers = Vec::new();
-    let mut h = 1000u32;
-    while h <= stop {
-        let Some(row) = filter_q(hub.query.basic_filter_hashes_and_headers(h, h))? else {
+    if stop >= 1000 {
+        let Some(headers) = filter_q(hub.query.basic_filter_checkpoint_headers(stop))? else {
             return Ok(());
         };
-        filter_headers.push(row[0].1);
-        h = h.saturating_add(1000);
+        filter_headers = headers;
     }
     queue_accounted(
         session,
@@ -4174,7 +4234,7 @@ pub fn on_ping(
         // sees it before sync_with_ping returns.
         let _ = maybe_queue_initial_getheaders(out_tx, hub, s);
     }
-    queue_out(out_tx, NetworkMessage::Pong(n))?;
+    queue_pong(session, out_tx, n)?;
     Ok(())
 }
 
@@ -7798,6 +7858,31 @@ pub fn queue_out(
     msg: NetworkMessage,
 ) -> Result<(), NetError> {
     queue_accounted(None, out, msg)
+}
+
+/// One charged pong per session. A later ping replaces the nonce and does
+/// not queue another message. No session still queues every pong.
+#[doc(hidden)]
+pub fn queue_pong(
+    session: Option<&crate::peers::LivePeer>,
+    out: &mpsc::UnboundedSender<PeerOut>,
+    nonce: u64,
+) -> Result<(), NetError> {
+    let Some(session) = session else {
+        return queue_out(out, NetworkMessage::Pong(nonce));
+    };
+    session.store_pong_nonce(nonce);
+    if !session.claim_pong_send() {
+        return Ok(());
+    }
+    queue_accounted(Some(session), out, NetworkMessage::Pong(nonce))
+}
+
+/// Nonce the writer puts on a queued pong. The queued value is only used
+/// when no session is tracking a later ping.
+#[doc(hidden)]
+pub fn pong_nonce_for_write(session: Option<&crate::peers::LivePeer>, queued: u64) -> u64 {
+    session.map(|s| s.pong_nonce()).unwrap_or(queued)
 }
 
 /// Send filtered tx announcements in [`TX_INV_BATCH`] chunks.

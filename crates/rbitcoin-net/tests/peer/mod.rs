@@ -8234,6 +8234,276 @@ fn compact_filter_ranges_past_core_limits_disconnect() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn outbound_peer() -> Arc<rbitcoin_net::peers::LivePeer> {
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18444));
+    let ver = VersionMessage {
+        version: bitcoin::p2p::PROTOCOL_VERSION,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    peers.register(
+        addr,
+        addr,
+        &ver,
+        false,
+        rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
+    )
+}
+
+/// One `getcfilters` queues the filter that crosses the 4 MiB budget and
+/// none after it. The peer starts on the cap, so the first filter is the
+/// one that crosses.
+#[test]
+fn getcfilters_stops_after_the_filter_that_crosses_the_send_budget() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cf-budget");
+    hub.query.set_block_filter_index(true).unwrap();
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(2, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let tip_h = hub.tip_height().unwrap();
+    assert_eq!(
+        hub.query.basic_filter_hwm().unwrap(),
+        Some(tip_h),
+        "generate seals a basic filter through the tip"
+    );
+    let peer = outbound_peer();
+    peer.note_send_queued(rbitcoin_net::peers::PEER_SEND_BUDGET);
+    assert!(
+        !peer.send_over_budget(),
+        "the cap itself is still inside the budget"
+    );
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let req = bitcoin::p2p::message_filter::GetCFilters {
+        filter_type: 0,
+        start_height: 0,
+        stop_hash: hub.tip_hash().unwrap(),
+    };
+    on_getcfilters(&hub, &tx, Some(peer.as_ref()), &req).unwrap();
+    let mut n = 0usize;
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            PeerOut::Msg(NetworkMessage::CFilter(_)) => n += 1,
+            other => panic!("expected cfilter, got {other:?}"),
+        }
+    }
+    assert_eq!(n, 1, "only the filter that crosses the budget is queued");
+    assert!(peer.send_over_budget());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Heights 1000, 2000, and 3000 come back as the three checkpoint headers.
+#[test]
+fn getcfcheckpt_returns_a_header_every_thousand_heights() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cf-checkpt");
+    hub.query.set_block_filter_index(true).unwrap();
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(3_000, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    assert_eq!(hub.tip_height().unwrap(), 3_000);
+    assert_eq!(hub.query.basic_filter_hwm().unwrap(), Some(3_000));
+    let rows = hub
+        .query
+        .basic_filter_hashes_and_headers(1_000, 3_000)
+        .unwrap()
+        .expect("sealed range");
+    let expect: Vec<_> = [1_000u32, 2_000, 3_000]
+        .into_iter()
+        .map(|height| rows[(height - 1_000) as usize].1)
+        .collect();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let req = bitcoin::p2p::message_filter::GetCFCheckpt {
+        filter_type: 0,
+        stop_hash: hub.tip_hash().unwrap(),
+    };
+    on_getcfcheckpt(&hub, &tx, None, &req).unwrap();
+    match rx.try_recv().expect("cfcheckpt") {
+        PeerOut::Msg(NetworkMessage::CFCheckpt(m)) => {
+            assert_eq!(m.filter_headers, expect);
+        }
+        other => panic!("expected cfcheckpt, got {other:?}"),
+    }
+    assert!(rx.try_recv().is_err(), "one checkpoint message");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn addrfetch_peer() -> Arc<rbitcoin_net::peers::LivePeer> {
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18445));
+    let ver = VersionMessage {
+        version: bitcoin::p2p::PROTOCOL_VERSION,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: false,
+    };
+    peers.register(
+        addr,
+        addr,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::AddrFetch,
+    )
+}
+
+/// Tip-follow keeps one charged pong. Nonce 0 is a real nonce. Draining
+/// that one charge returns the send budget to its previous value.
+#[test]
+fn one_charged_pong_carries_the_latest_nonce() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-one");
+    hub.ensure_genesis().unwrap();
+    let peer = addrfetch_peer();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let before = peer.send_queued();
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 1).unwrap();
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 0).unwrap();
+    for n in 2..100_000u64 {
+        on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), n).unwrap();
+    }
+    let mut pongs = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            PeerOut::Msg(NetworkMessage::Pong(n)) => pongs.push(n),
+            other => panic!("a ping queues only a pong, got {other:?}"),
+        }
+    }
+    assert_eq!(pongs.len(), 1, "pings coalesce to one pong");
+    let charge = rbitcoin_net::peers::outbound_msg_bytes(&NetworkMessage::Pong(0));
+    assert_eq!(peer.send_queued().saturating_sub(before), charge);
+    assert_eq!(
+        pong_nonce_for_write(Some(peer.as_ref()), pongs[0]),
+        99_999,
+        "the writer sends the latest nonce"
+    );
+    peer.note_out_written(false, charge);
+    assert_eq!(
+        peer.send_queued(),
+        before,
+        "the write subtracts that one charge"
+    );
+    assert_eq!(peer.finish_pong_write(99_999), None);
+
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 7).unwrap();
+    peer.store_pong_nonce(8);
+    assert_eq!(
+        peer.finish_pong_write(7),
+        Some(8),
+        "a ping during the write is claimed for the writer"
+    );
+    assert!(
+        rx.try_recv().is_ok(),
+        "the ping that opened the slot queued one pong"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the nonce stored during the write does not queue another pong"
+    );
+
+    let fast = addrfetch_peer();
+    let fast_before = fast.send_queued();
+    queue_pong(Some(fast.as_ref()), &tx, 4).unwrap();
+    queue_pong(Some(fast.as_ref()), &tx, 0).unwrap();
+    assert_eq!(pong_nonce_for_write(Some(fast.as_ref()), 4), 0);
+    assert_eq!(
+        fast.send_queued().saturating_sub(fast_before),
+        charge,
+        "the fast path charges one pong"
+    );
+
+    let (bare_tx, mut bare_rx) = mpsc::unbounded_channel();
+    on_ping(&hub, &bare_tx, &mut follow, None, 1).unwrap();
+    on_ping(&hub, &bare_tx, &mut follow, None, 2).unwrap();
+    assert!(matches!(
+        bare_rx.try_recv(),
+        Ok(PeerOut::Msg(NetworkMessage::Pong(1)))
+    ));
+    assert!(matches!(
+        bare_rx.try_recv(),
+        Ok(PeerOut::Msg(NetworkMessage::Pong(2)))
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A ping that lands while the extra pong is being written is sent, and the
+/// slot is free for the ping after that.
+#[tokio::test]
+async fn an_extra_pong_still_answers_the_next_ping() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-extra");
+    hub.ensure_genesis().unwrap();
+    let peer = addrfetch_peer();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let before = peer.send_queued();
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 7).unwrap();
+    let charge = rbitcoin_net::peers::outbound_msg_bytes(&NetworkMessage::Pong(0));
+    assert_eq!(peer.send_queued().saturating_sub(before), charge);
+    // The nonce changed while the queued pong was on the wire.
+    peer.store_pong_nonce(8);
+    let queued = match rx.try_recv() {
+        Ok(PeerOut::Msg(NetworkMessage::Pong(n))) => n,
+        other => panic!("the opening ping queues one pong, got {other:?}"),
+    };
+    assert!(rx.try_recv().is_err());
+    peer.note_out_written(false, charge);
+    let mut sent = Vec::new();
+    struct ExtraEmit<'a> {
+        sent: &'a mut Vec<u64>,
+        peer: &'a rbitcoin_net::peers::LivePeer,
+    }
+    impl PongEmit for ExtraEmit<'_> {
+        fn emit(
+            &mut self,
+            msg: NetworkMessage,
+        ) -> impl std::future::Future<Output = Result<(), ()>> + Send {
+            if let NetworkMessage::Pong(n) = msg {
+                self.sent.push(n);
+                if n == 8 {
+                    self.peer.store_pong_nonce(9);
+                }
+            }
+            std::future::ready(Ok(()))
+        }
+    }
+    write_extra_pongs(
+        peer.as_ref(),
+        queued,
+        &mut ExtraEmit {
+            sent: &mut sent,
+            peer: peer.as_ref(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sent,
+        vec![8, 9],
+        "both nonces that arrived during a write go out"
+    );
+    assert_eq!(
+        peer.send_queued(),
+        before,
+        "each extra pong is charged and released"
+    );
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 10).unwrap();
+    assert!(
+        matches!(rx.try_recv(), Ok(PeerOut::Msg(NetworkMessage::Pong(_)))),
+        "the next ping queues one pong"
+    );
+    assert_eq!(peer.send_queued().saturating_sub(before), charge);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 mod log_text_tests;
 
 /// Core `ProcessMessage` ADDR/ADDRV2: the `getaddr` an addr-fetch session

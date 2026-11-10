@@ -153,6 +153,7 @@ fn slot(id: usize) -> (PeerSlot, mpsc::UnboundedReceiver<PeerCmd>) {
             requested: solicit_track().0,
             solicited_bytes: solicit_track().1,
             solicited_ms: solicit_track().2,
+            open_block_bytes: Arc::new(AtomicU64::new(0)),
             any_rx_ms: Arc::new(AtomicU64::new(0)),
             getdata_wire: rbitcoin_ibd::ibd::peer_io::GetdataWire::new(),
             peer_height: 50_000,
@@ -2090,7 +2091,7 @@ fn a_failure_below_the_saved_base_keeps_the_resume() {
     let q3 = mine(b2.block_hash(), 65);
     let q4 = mine(q3.block_hash(), 66);
     apply(&mut st, &hub, 2, vec![q3, q4]);
-    save_adopt(&st, &hub);
+    save_adopt(&mut st, &hub);
     st.header_walk = HeaderWalk::default();
     assert!(
         restore_adopt(&mut st, &hub),
@@ -2987,7 +2988,7 @@ fn a_retire_whose_failure_is_not_written_leaves_no_resume_point() {
         !hub.note_failed_connect(p1.block_hash()),
         "a mark whose write failed is still not on disk"
     );
-    save_adopt(&st, &hub);
+    save_adopt(&mut st, &hub);
     assert!(
         !store.join("header.adopt").exists(),
         "no walk is saved while a failure is not on disk"
@@ -3001,7 +3002,7 @@ fn a_retire_whose_failure_is_not_written_leaves_no_resume_point() {
         .unwrap()
         .windows(32)
         .any(|w| w == p1.block_hash().as_byte_array()));
-    save_adopt(&st, &hub);
+    save_adopt(&mut st, &hub);
     assert!(store.join("header.adopt").exists());
 }
 
@@ -4190,6 +4191,9 @@ fn a_restored_checkpoint_header_adopts_a_heavier_fork() {
     assert!(send_getheaders(&mut st, &hub).unwrap());
     apply(&mut st, &hub, 0, vec![tip]);
     assert_eq!(st.header_walk.checkpoints().len(), 2);
+    // The second header is a short proved batch, so the file still ends at
+    // the first. This restore is about a file that holds both checkpoints.
+    save_adopt(&mut st, &hub);
     st.header_walk = HeaderWalk::default();
     assert!(restore_adopt(&mut st, &hub));
     let mut prev = fork.block_hash();
@@ -6529,6 +6533,112 @@ fn a_short_batch_that_reaches_the_floor_is_kept() {
     assert!(!st.header_walk.proven);
 }
 
+/// After the walk has proved the floor, two short batches move the in-memory
+/// tip and leave `header.adopt` byte-for-byte. The file is rewritten when
+/// the tip is 2,000 headers past the last checkpoint.
+#[test]
+fn proved_short_batches_do_not_rewrite_header_adopt() {
+    let (dir, hub, mut st, gen) = opened("adopt-gap", false);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let first = headers_after(gen, 1, 1);
+    apply(&mut st, &hub, 0, first.clone());
+    assert!(st.header_walk.proven);
+    assert_eq!(st.header_walk.tip_height(), 1);
+    assert_eq!(st.header_walk.checkpoints.len(), 1);
+    let path = adopt_path(&hub);
+    assert!(
+        path.exists(),
+        "the batch that first proves the floor persists header.adopt"
+    );
+    let saved = std::fs::read(&path).expect("proved adopt file");
+
+    let mut parent = first[0];
+    for salt in [2u32, 3] {
+        assert!(send_getheaders(&mut st, &hub).unwrap());
+        let batch = headers_after(parent, 1, salt);
+        let tip = batch[0].block_hash();
+        apply(&mut st, &hub, 0, batch.clone());
+        assert_eq!(st.header_walk.tip_hash(), Some(tip));
+        parent = batch[0];
+    }
+    assert_eq!(st.header_walk.tip_height(), 3);
+    assert_eq!(
+        st.header_walk.checkpoints.len(),
+        3,
+        "short proved batches still checkpoint in memory so a fork can be seen"
+    );
+    assert_eq!(
+        std::fs::read(&path).expect("adopt file after short batches"),
+        saved,
+        "two short proved batches do not rewrite header.adopt"
+    );
+
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let rest = headers_after(parent, 1_998, 4);
+    let end = rest.last().unwrap().block_hash();
+    apply(&mut st, &hub, 0, rest);
+    assert_eq!(st.header_walk.tip_height(), 2_001);
+    assert_eq!(st.header_walk.tip_hash(), Some(end));
+    assert!(
+        st.header_walk.checkpoints.len() > 1,
+        "a tip 2,000 headers past the last checkpoint is recorded"
+    );
+    assert_ne!(std::fs::read(&path).expect("rewritten adopt file"), saved);
+    let mut restarted = IbdWorkState::new(Vec::new(), hub.tip_hash(), Some(0));
+    assert!(restore_adopt(&mut restarted, &hub));
+    assert_eq!(restarted.header_walk.tip_hash(), Some(end));
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// A rewind whose `header.adopt` save does not stick is written by the next
+/// short proved batch. A saved height above the tip is due on its own.
+#[test]
+fn a_missed_adopt_save_is_retried_by_the_next_short_batch() {
+    use std::sync::atomic::Ordering;
+
+    assert!(
+        adopt_checkpoint_due(true, true, Some(50), 10, 1),
+        "a saved height above the tip is due"
+    );
+    assert!(
+        !adopt_checkpoint_due(true, true, Some(10), 10, 1),
+        "a short batch on the saved height is not due"
+    );
+
+    let (dir, hub, mut st, gen) = opened("adopt-retry", false);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let first = headers_after(gen, 1, 1);
+    let saved_tip = first[0];
+    apply(&mut st, &hub, 0, first);
+    assert!(st.header_walk.proven);
+    assert_eq!(st.header_walk.tip_height(), 1);
+    let path = adopt_path(&hub);
+    assert!(path.exists());
+    hub.invalidated.pending.store(true, Ordering::Release);
+    rewind_to(&mut st, &hub, 1, None);
+    assert_eq!(st.header_walk.tip_height(), 1);
+    assert!(st.header_walk.proven);
+    assert!(
+        !path.exists(),
+        "a save that cannot stick removes the stale file"
+    );
+    assert_eq!(
+        st.header_walk.last_adopt_height, None,
+        "the missed save does not keep the old height"
+    );
+    hub.invalidated.pending.store(false, Ordering::Release);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let next = headers_after(saved_tip, 1, 2);
+    let tip = next[0].block_hash();
+    apply(&mut st, &hub, 0, next);
+    assert_eq!(st.header_walk.tip_hash(), Some(tip));
+    assert!(path.exists(), "the next short proved batch writes the file");
+    let mut restarted = IbdWorkState::new(Vec::new(), hub.tip_hash(), Some(0));
+    assert!(restore_adopt(&mut restarted, &hub));
+    assert_eq!(restarted.header_walk.tip_hash(), Some(tip));
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
 /// Below the floor a one-header reply adds no checkpoint and drops the
 /// reservation. A full window that passes context extends, including a
 /// lighter challenger. Above the floor a short reply that does not extend
@@ -7455,11 +7565,81 @@ fn header_adopt_is_rewritten_only_after_the_walk_is_proved() {
     assert!(!st.header_walk.proven);
     assert!(!adopt_path(&hub).exists());
     st.header_walk.proven = true;
-    save_adopt(&st, &hub);
+    save_adopt(&mut st, &hub);
     assert!(adopt_path(&hub).exists());
     let mut restarted = IbdWorkState::new(Vec::new(), hub.tip_hash(), Some(0));
     assert!(restore_adopt(&mut restarted, &hub));
     assert_eq!(restarted.header_walk.checkpoints.len(), 1);
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// A competing chain checkpoints on the same 2,000-header gap. Promoting it
+/// writes a file whose tip is that chain.
+#[test]
+fn promoting_a_challenger_persists_that_chains_tip() {
+    let (dir, hub, mut st, gen) = opened("adopt-promote", false);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let main = headers_after(gen, 3, 11);
+    let main_tip = main.last().unwrap().block_hash();
+    apply(&mut st, &hub, 0, main);
+    assert!(st.header_walk.proven);
+    assert_eq!(st.header_walk.tip_hash(), Some(main_tip));
+    assert_eq!(st.header_walk.checkpoints.len(), 1);
+    let path = adopt_path(&hub);
+    let saved = std::fs::read(&path).expect("candidate adopt file");
+
+    let side = headers_after(gen, 2, 50);
+    let side_tip = side.last().unwrap().block_hash();
+    apply(&mut st, &hub, 0, side);
+    assert_eq!(
+        st.header_walk
+            .challenger
+            .as_ref()
+            .and_then(|ch| ch.tip.hash),
+        Some(side_tip)
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), saved);
+
+    let tied = headers_after(
+        st.header_walk
+            .challenger
+            .as_ref()
+            .unwrap()
+            .tip
+            .header
+            .unwrap(),
+        1,
+        51,
+    );
+    apply(&mut st, &hub, 0, tied);
+    assert_eq!(st.header_walk.tip_hash(), Some(main_tip));
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        saved,
+        "a challenger that has not won does not rewrite header.adopt"
+    );
+
+    let parent = st
+        .header_walk
+        .challenger
+        .as_ref()
+        .unwrap()
+        .tip
+        .header
+        .unwrap();
+    let winning = headers_after(parent, 1, 52);
+    let fork_tip = winning[0].block_hash();
+    apply(&mut st, &hub, 0, winning);
+    assert_eq!(st.header_walk.tip_hash(), Some(fork_tip));
+    assert!(st.header_walk.challenger.is_none());
+    assert_ne!(std::fs::read(&path).unwrap(), saved);
+    let mut restarted = IbdWorkState::new(Vec::new(), hub.tip_hash(), Some(0));
+    assert!(restore_adopt(&mut restarted, &hub));
+    assert_eq!(
+        restarted.header_walk.tip_hash(),
+        Some(fork_tip),
+        "the persisted tip is the promoted chain"
+    );
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
@@ -7483,7 +7663,7 @@ fn an_old_unproved_adopt_measures_the_lead_from_the_confirmed_tip() {
         supplied_by: None,
     });
     st.header_walk.proven = true;
-    save_adopt(&st, &hub);
+    save_adopt(&mut st, &hub);
     let mut restarted = IbdWorkState::new(Vec::new(), hub.tip_hash(), Some(0));
     assert!(restore_adopt(&mut restarted, &hub));
     assert_eq!(restarted.header_walk.base_height, 0);
@@ -7521,7 +7701,7 @@ fn an_old_unproved_adopt_below_the_confirmed_tip_measures_from_that_tip() {
         supplied_by: None,
     });
     st.header_walk.proven = true;
-    save_adopt(&st, &hub);
+    save_adopt(&mut st, &hub);
     let mut restarted = IbdWorkState::new(Vec::new(), hub.tip_hash(), Some(confirmed));
     assert!(restore_adopt(&mut restarted, &hub));
     assert_eq!(restarted.header_walk.base_height, confirmed);
@@ -7558,7 +7738,7 @@ fn an_old_adopt_at_or_behind_the_confirmed_tip_is_not_installed() {
         supplied_by: None,
     });
     st.header_walk.proven = true;
-    save_adopt(&st, &hub);
+    save_adopt(&mut st, &hub);
     let mut restarted = IbdWorkState::new(Vec::new(), hub.tip_hash(), Some(confirmed));
     assert!(
         !restore_adopt(&mut restarted, &hub),
@@ -7594,7 +7774,7 @@ fn an_old_adopt_behind_the_store_does_not_leave_an_unproved_stall() {
         supplied_by: None,
     });
     st.header_walk.proven = true;
-    save_adopt(&st, &hub);
+    save_adopt(&mut st, &hub);
     let (s0, rx0) = slot(0);
     std::mem::forget(rx0);
     let mut restarted = IbdWorkState::new(vec![s0], hub.tip_hash(), Some(0));

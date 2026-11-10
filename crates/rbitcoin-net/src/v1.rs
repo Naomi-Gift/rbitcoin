@@ -274,7 +274,7 @@ impl PeerReader {
         on_decoy: D,
     ) -> Result<FramedMessage, NetError>
     where
-        F: FnMut(usize),
+        F: FnMut(usize, usize),
         D: FnMut(usize) -> Result<(), NetError>,
     {
         match self {
@@ -338,7 +338,7 @@ impl FrameRead for PeerReader {
         &mut self,
         magic: Magic,
     ) -> impl Future<Output = Result<FramedMessage, NetError>> + Send {
-        self.read_frame_with_progress(magic, |_| {}, |_| Ok(()))
+        self.read_frame_with_progress(magic, |_, _| {}, |_| Ok(()))
     }
 }
 
