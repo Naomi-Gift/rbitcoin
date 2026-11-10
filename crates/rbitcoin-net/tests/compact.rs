@@ -26,6 +26,18 @@ fn must_partial<T: Borrow<Transaction>>(
     }
 }
 
+fn partial_with(slots: Vec<Option<Transaction>>, missing: Vec<u64>) -> CmpctPartial {
+    let txids = slots
+        .iter()
+        .map(|slot| slot.as_ref().map(|tx| tx.compute_txid().to_byte_array()))
+        .collect();
+    CmpctPartial {
+        slots,
+        txids,
+        missing,
+    }
+}
+
 fn dummy_header() -> Header {
     Header {
         version: Version::from_consensus(4),
@@ -370,45 +382,38 @@ fn apply_rejects_oob_filled_slot_duplicate_and_leftover_hole() {
         block_hash: block.block_hash(),
         transactions: vec![b1.clone()],
     };
-    let oob = CmpctPartial {
-        slots: vec![Some(coinbase()), None, None],
-        missing: vec![9],
-    };
+    let oob = partial_with(vec![Some(coinbase()), None, None], vec![9]);
     assert!(apply_block_transactions(&hsi, &oob, &txn1)
         .unwrap_err()
         .is_empty());
-    let already = CmpctPartial {
-        slots: vec![Some(coinbase()), Some(b1.clone()), None],
-        missing: vec![1],
-    };
+    let already = partial_with(vec![Some(coinbase()), Some(b1.clone()), None], vec![1]);
     assert!(apply_block_transactions(&hsi, &already, &txn1)
         .unwrap_err()
         .is_empty());
-    let dup = CmpctPartial {
-        slots: vec![Some(coinbase()), Some(b1.clone()), None],
-        missing: vec![2],
-    };
+    let dup = partial_with(vec![Some(coinbase()), Some(b1.clone()), None], vec![2]);
     assert_eq!(
         apply_block_transactions(&hsi, &dup, &txn1).unwrap_err(),
         vec![2]
     );
-    let hole = CmpctPartial {
-        slots: vec![Some(coinbase()), None, None],
-        missing: vec![1],
-    };
+    let hole = partial_with(vec![Some(coinbase()), None, None], vec![1]);
     assert_eq!(
         apply_block_transactions(&hsi, &hole, &txn1).unwrap_err(),
         vec![1]
     );
-    let empty_slots = CmpctPartial {
-        slots: vec![],
-        missing: vec![],
-    };
+    let empty_slots = partial_with(vec![], vec![]);
     let empty_txn = BlockTransactions {
         block_hash: block.block_hash(),
         transactions: vec![],
     };
     assert!(apply_block_transactions(&hsi, &empty_slots, &empty_txn)
+        .unwrap_err()
+        .is_empty());
+    let mismatch = CmpctPartial {
+        slots: vec![Some(coinbase()), None],
+        txids: vec![],
+        missing: vec![1],
+    };
+    assert!(apply_block_transactions(&hsi, &mismatch, &txn1)
         .unwrap_err()
         .is_empty());
 }
@@ -457,10 +462,7 @@ fn empty_compact_and_ambiguous_shortid() {
         reconstruct(&hsi, &HashMap::<ShortId, Vec<&Transaction>>::new()),
         Reconstruct::Fail
     ));
-    let empty_partial = CmpctPartial {
-        slots: Vec::new(),
-        missing: Vec::new(),
-    };
+    let empty_partial = partial_with(Vec::new(), Vec::new());
     assert!(apply_block_transactions(
         &hsi,
         &empty_partial,

@@ -125,9 +125,12 @@ pub fn prefilled_absolute_indexes(hsi: &HeaderAndShortIds) -> Vec<(usize, &Trans
 /// Matched mempool / extra / orphan bodies are owned here. Apply overlays
 /// the peer response onto those holes and must not re-walk a live short-id
 /// map (a later `try_read` miss or eviction would drop first-pass hits).
+/// `txids[i]` is the digest already hashed for a filled `slots[i]`, or
+/// `None` on a hole. It is the same length as `slots`.
 #[derive(Clone, Debug)]
 pub struct CmpctPartial {
     pub slots: Vec<Option<Transaction>>,
+    pub txids: Vec<Option<[u8; 32]>>,
     pub missing: Vec<u64>,
 }
 
@@ -212,7 +215,11 @@ pub fn reconstruct<T: Borrow<Transaction>>(
     }
 
     if !missing.is_empty() {
-        return Reconstruct::Partial(CmpctPartial { slots, missing });
+        return Reconstruct::Partial(CmpctPartial {
+            slots,
+            txids: txid_at,
+            missing,
+        });
     }
 
     let mut txdata = Vec::with_capacity(total);
@@ -257,32 +264,49 @@ pub fn apply_block_transactions(
     if partial.slots.is_empty() {
         return Err(Vec::new());
     }
+    if partial.txids.len() != partial.slots.len() {
+        return Err(Vec::new());
+    }
 
     let mut slots = partial.slots.clone();
-    let mut placed: std::collections::HashSet<bitcoin::Txid> = slots
-        .iter()
-        .flatten()
-        .map(Transaction::compute_txid)
-        .collect();
+    let mut leaves = partial.txids.clone();
+    let mut placed = HashSet::new();
+    for (slot, leaf) in slots.iter().zip(leaves.iter()) {
+        match (slot.is_some(), leaf) {
+            (true, Some(id)) => {
+                if !placed.insert(bitcoin::Txid::from_byte_array(*id)) {
+                    return Err(partial.missing.clone());
+                }
+            }
+            (false, None) => {}
+            _ => return Err(Vec::new()),
+        }
+    }
     for (i, abs) in partial.missing.iter().enumerate() {
         let abs = *abs as usize;
         if abs >= slots.len() || slots[abs].is_some() {
             return Err(Vec::new());
         }
         let tx = &txn.transactions[i];
-        if !placed.insert(tx.compute_txid()) {
+        let txid = tx.compute_txid();
+        if !placed.insert(txid) {
             return Err(partial.missing.clone());
         }
+        leaves[abs] = Some(txid.to_byte_array());
         slots[abs] = Some(tx.clone());
     }
     let mut txdata = Vec::with_capacity(slots.len());
-    for slot in slots {
-        let Some(tx) = slot else {
-            return Err(partial.missing.clone());
-        };
-        txdata.push(tx);
+    let mut ids = Vec::with_capacity(leaves.len());
+    for (slot, leaf) in slots.into_iter().zip(leaves) {
+        match (slot, leaf) {
+            (Some(tx), Some(id)) => {
+                txdata.push(tx);
+                ids.push(id);
+            }
+            _ => return Err(partial.missing.clone()),
+        }
     }
-    finish_reconstructed(hsi.header, txdata)
+    finish_with_txids(hsi.header, txdata, &ids)
 }
 
 /// Header merkle root and the CVE-2012-2459 mutation bit from one txid list.
