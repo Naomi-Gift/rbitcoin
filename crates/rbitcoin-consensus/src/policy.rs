@@ -50,8 +50,6 @@ impl PolicyResult {
 /// become a tiny vsize. That range takes `u64::MAX / 4`, the same result
 /// as `saturating_add(3) / 4`.
 pub fn vbytes_ceil(weight: u64) -> u64 {
-    // `to_vbytes_ceil` adds 4 before dividing. `u64::MAX - 3` is the first
-    // weight that overflows that add. `u64::MAX - 4` rounds to the same vsize.
     if weight >= u64::MAX - 3 {
         return u64::MAX / 4;
     }

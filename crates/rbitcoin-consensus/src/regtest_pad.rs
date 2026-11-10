@@ -68,8 +68,6 @@ pub fn regtest_mine_fits_one_nonce_span(bits: CompactTarget) -> bool {
     let got_mant = u64::from(got & (sign - 1));
     let limit_exp = limit >> 24;
     let got_exp = got >> 24;
-    // A higher compact exponent is an easier target. Zero got mantissa makes
-    // the ratio's right side zero, so the comparison below already refuses it.
     let Some(delta) = limit_exp.checked_sub(got_exp) else {
         return true;
     };
