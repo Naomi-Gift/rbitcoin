@@ -89,6 +89,9 @@ struct Inner {
     cool_through: u32,
     /// Snapshot height named by the on-disk commit, when one is loaded.
     commit_height: Option<u32>,
+    /// Snapshot height of the compose in `prepare_commit`. Cleared when that
+    /// call returns. A disconnect can see it before the commit is installed.
+    compose_height: Option<u32>,
     /// Commit height was above the tip. Fold must not copy that image.
     fold_held: bool,
     open_edges: u64,
@@ -170,6 +173,7 @@ impl SpendPageLog {
                 generation: 0,
                 cool_through: 0,
                 commit_height: None,
+                compose_height: None,
                 fold_held: false,
                 open_edges: 0,
                 log_bytes: 0,
@@ -290,17 +294,23 @@ impl SpendPageLog {
         Ok(())
     }
 
-    /// The commit names a height above `tip`. Keep serving it, and do not fold.
+    /// An installed commit, or a compose still in flight, names a height above
+    /// `tip`. Keep serving those slots, and do not fold them. An in-flight
+    /// compose does not invent a commit height: the publish that is already
+    /// running records the hold.
     pub fn hold_fold_above(&self, tip: u32) -> Result<(), StoreError> {
         let path = self.dir.join(SPEND_PAGES_COMMIT_NAME);
-        let should = {
+        let (installed_above, composing_above) = {
             let g = self.lock();
-            g.commit_height.is_some_and(|h| h > tip)
+            (
+                g.commit_height.is_some_and(|h| h > tip),
+                g.compose_height.is_some_and(|h| h > tip),
+            )
         };
-        if !should {
+        if !installed_above && !composing_above {
             return Ok(());
         }
-        if path.exists() {
+        if installed_above && path.exists() {
             let mut buf = std::fs::read(&path).map_err(|e| StoreError::io(&path, e))?;
             if buf.len() >= COMMIT_HEAD {
                 buf[6..8].copy_from_slice(&1u16.to_le_bytes());
@@ -311,6 +321,9 @@ impl SpendPageLog {
         let mut g = self.lock();
         if g.commit_height.is_some_and(|h| h > tip) {
             g.commit_height = Some(tip);
+            g.fold_held = true;
+        }
+        if g.compose_height.is_some_and(|h| h > tip) {
             g.fold_held = true;
         }
         Ok(())
@@ -355,6 +368,14 @@ impl SpendPageLog {
         F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
         K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
     {
+        if self.lock().pending.is_some() {
+            return Ok(());
+        }
+        {
+            let mut g = self.lock();
+            g.compose_height = Some(height);
+        }
+        let _clear_compose = ClearCompose(self);
         self.explode_held(&mut keep)?;
         let (snapshot, carried) = {
             let mut g = self.lock();
@@ -826,6 +847,15 @@ impl SpendPageLog {
     }
 }
 
+/// Clears `compose_height` on every `prepare_commit` return, including errors.
+struct ClearCompose<'a>(&'a SpendPageLog);
+
+impl Drop for ClearCompose<'_> {
+    fn drop(&mut self) {
+        self.0.lock().compose_height = None;
+    }
+}
+
 fn page_hit(page: Option<&OpenPage>, rel: u16) -> Option<[u8; SLOT]> {
     let page = page?;
     if let Some((_, meta)) = page.slots.iter().find(|(r, _)| *r == rel) {
@@ -1182,6 +1212,47 @@ mod tests {
             "insert at the open-edge cap must wait for a checkpoint, waited {waited:?}"
         );
         assert_eq!(log.slot(n * 8), Some(slot));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn disconnect_during_first_compose_is_not_folded() {
+        let d = dir();
+        let log = SpendPageLog::create(&d);
+        let slot = [9u8, 1, 2, 3, 4, 5, 6, 7];
+        log.note_slots(&[(16, slot)]).unwrap();
+        log.commit_open(
+            9,
+            8192,
+            |off, len| {
+                log.hold_fold_above(1)?;
+                zeros(off, len)
+            },
+            |_| Ok(true),
+        )
+        .unwrap();
+        let mut writes = 0u32;
+        log.fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(writes, 0, "a hold during the first compose is not folded");
+        log.commit_open(1, 8192, zeros, |_| Ok(false)).unwrap();
+        writes = 0;
+        log.fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(writes, 0, "the abandoned spend is not copied later");
+        assert_eq!(log.slot(16), None);
         let _ = std::fs::remove_dir_all(&d);
     }
 }
