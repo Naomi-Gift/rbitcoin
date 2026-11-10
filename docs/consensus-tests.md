@@ -80,9 +80,9 @@ The BLVM / Orange Paper register (163 ids) is a separate crosswalk:
 not own these S/H/C rows.
 
 Hornet’s published rule table is a gap checklist against this matrix, not a
-second spec. The ID map, and where `spec.h` @ `151462fa` differs from
-spec.html, is [`peer-clients.md`](./peer-clients.md) § Hornet block-validation
-rules.
+second spec. The ID map is [`peer-clients.md`](./peer-clients.md) § Hornet
+block-validation rules. The page and `spec.h` match at `0e3b0a1b` (35 rules,
+S02 and S03 separate). GitHub `main` `151462fa` still folds S02 into S03.
 Selector: `./scripts/test-hornet-rules.sh` (runs `structure_rule_tests`,
 header version/time, `finality_tests`, `sigop_cost_tests`,
 `consensus_rules`).
