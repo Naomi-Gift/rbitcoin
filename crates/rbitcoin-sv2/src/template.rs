@@ -323,8 +323,7 @@ impl TemplateFlight {
             }
             Ok(built)
         });
-        task.await
-            .map_err(|_| io::Error::other("sv2 template flight dropped"))?
+        task.await.map_err(io::Error::other)?
     }
 }
 

@@ -238,6 +238,20 @@ impl ElectrumHandle {
     }
 }
 
+/// Log the end of one connection. A client causes any socket error by closing
+/// or resetting, so those log at DEBUG. A task this side spawned that panicked
+/// or was cancelled logs at WARN.
+#[doc(hidden)]
+pub fn log_disconnect(peer: SocketAddr, how: &std::io::Result<()>) {
+    match how {
+        Ok(()) => rbitcoin_log::debug!("electrum: disconnect {peer}"),
+        Err(e) if rbitcoin_net::is_join_error(e) => {
+            rbitcoin_log::warn!("electrum: disconnect {peer} (dispatch join: {e})")
+        }
+        Err(e) => rbitcoin_log::debug!("electrum: disconnect {peer} ({e})"),
+    }
+}
+
 /// Tip notification for header subscriptions.
 #[derive(Clone, Debug)]
 pub struct TipNotify {
@@ -297,7 +311,7 @@ pub async fn run_electrum(
                         drop(stream);
                         continue;
                     };
-                    rbitcoin_log::info!("electrum: connect {peer}");
+                    rbitcoin_log::debug!("electrum: connect {peer}");
                     // Replies, batch slots included, are small writes the
                     // client waits on whole; Nagle would hold them for an ACK.
                     if let Err(e) = stream.set_nodelay(true) {
@@ -312,12 +326,7 @@ pub async fn run_electrum(
                     let h = tokio::spawn(async move {
                         let _connection_slot = permit;
                         let how = handle_client(stream, peer, q, cfg, p, tip_rx, mp, stop).await;
-                        match how {
-                            Ok(()) => rbitcoin_log::info!("electrum: disconnect {peer}"),
-                            Err(e) => {
-                                rbitcoin_log::info!("electrum: disconnect {peer} ({e})")
-                            }
-                        }
+                        log_disconnect(peer, &how);
                     });
                     let mut g = clients_c.lock().unwrap_or_else(|e| e.into_inner());
                     g.retain(|t| !t.is_finished());
@@ -1003,7 +1012,7 @@ async fn land<W: AsyncWrite + Unpin>(
     out: &mut BatchOut<'_, W>,
     flight: InFlight,
 ) -> Result<(), std::io::Error> {
-    let (result, work, stamped, ran) = flight.task.await.map_err(dispatch_join_error)?;
+    let (result, work, stamped, ran) = flight.task.await.map_err(std::io::Error::other)?;
     if work.sh_join.is_some() {
         conn.sh_join = work.sh_join;
     }
@@ -1035,10 +1044,6 @@ impl Took {
             Took::Ran(d) => *d,
         }
     }
-}
-
-fn dispatch_join_error(e: tokio::task::JoinError) -> std::io::Error {
-    std::io::Error::other(format!("electrum dispatch join: {e}"))
 }
 
 /// Store reads that also change connection state. They stay serial in a
@@ -1195,7 +1200,7 @@ async fn answer_one(
     };
     let (result, work, stamped, _ran) = spawn_dispatch(ctx, work, &asked)
         .await
-        .map_err(dispatch_join_error)?;
+        .map_err(std::io::Error::other)?;
     *conn = work;
     Ok(finish_reply(
         ctx,
