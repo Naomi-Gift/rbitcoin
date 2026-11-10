@@ -370,7 +370,10 @@ impl SpendPageLog {
     /// after that failure stay in `open` and do not replace it.
     ///
     /// A second generation appends. It does not replace bytes an older commit
-    /// still names.
+    /// still names. A page that confirm has since put in `open` still counts:
+    /// the old image is named, and the newer slots wait. A hold clears that
+    /// image after copying its live slots into `open`, so those pages are
+    /// composed with the leftover snapshot.
     #[doc(hidden)]
     pub fn prepare_commit<F, K>(
         &self,
@@ -391,7 +394,7 @@ impl SpendPageLog {
             g.compose_height = Some(height);
         }
         let _clear_compose = ClearCompose(self);
-        self.explode_held(&mut keep)?;
+        let restored = self.explode_held(&mut keep)?;
         let (snapshot, carried, froze) = {
             let mut g = self.lock();
             let reuse = !g.frozen.is_empty();
@@ -409,7 +412,7 @@ impl SpendPageLog {
                 g.frozen = std::mem::take(&mut g.open);
                 g.open_edges = 0;
             }
-            let snapshot: Vec<(u64, OpenPage)> = g
+            let mut snapshot: Vec<(u64, OpenPage)> = g
                 .frozen
                 .iter()
                 .map(|(off, page)| {
@@ -422,10 +425,33 @@ impl SpendPageLog {
                     )
                 })
                 .collect();
+            // The hold already cleared `committed`. Compose the pages it put
+            // back into `open`, or the replacement commit drops them. A page
+            // the failed compose already froze is in the snapshot above.
+            // A note that was never committed is not in `restored`.
+            if reuse {
+                for off in &restored {
+                    if g.frozen.contains_key(off) {
+                        continue;
+                    }
+                    let Some(page) = g.open.get(off) else {
+                        continue;
+                    };
+                    snapshot.push((
+                        *off,
+                        OpenPage {
+                            slots: page.slots.clone(),
+                            base: page.base.clone(),
+                        },
+                    ));
+                }
+            }
+            // Still name a committed page whose newer slots sit in `open`.
+            // The old image is enough. Those slots wait for the next generation.
             let carried: Vec<(u64, CommittedPage)> = g
                 .committed
                 .iter()
-                .filter(|(off, _)| !g.frozen.contains_key(*off) && !g.open.contains_key(*off))
+                .filter(|(off, _)| !g.frozen.contains_key(*off))
                 .map(|(off, page)| {
                     (
                         *off,
@@ -622,15 +648,16 @@ impl SpendPageLog {
     /// A disconnect left this commit above the tip. Do not copy it onto the body.
     ///
     /// `keep` runs before any directory change. A `keep` error leaves the
-    /// commit file and the committed images where they were.
-    fn explode_held<K>(&self, keep: &mut K) -> Result<(), StoreError>
+    /// commit file and the committed images where they were. The returned
+    /// offsets are the pages whose live slots were put back into `open`.
+    fn explode_held<K>(&self, keep: &mut K) -> Result<Vec<u64>, StoreError>
     where
         K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
     {
         let held: Vec<(u64, Arc<[u8]>)> = {
             let g = self.lock();
             if !g.fold_held {
-                return Ok(());
+                return Ok(Vec::new());
             }
             g.committed
                 .iter()
@@ -657,12 +684,14 @@ impl SpendPageLog {
         }
         let mut g = self.lock();
         if !g.fold_held {
-            return Ok(());
+            return Ok(Vec::new());
         }
         g.committed.clear();
         g.fold_held = false;
         g.commit_height = None;
+        let mut offs = Vec::with_capacity(restored.len());
         for (page_off, slots) in restored {
+            offs.push(page_off);
             if let Some(page) = g.open.get_mut(&page_off) {
                 let mut added = 0u64;
                 for (rel, meta) in slots {
@@ -683,7 +712,7 @@ impl SpendPageLog {
         if empty {
             self.delete_generation_files();
         }
-        Ok(())
+        Ok(offs)
     }
 
     fn drop_frozen_pages(&self, pages: &[u64]) {

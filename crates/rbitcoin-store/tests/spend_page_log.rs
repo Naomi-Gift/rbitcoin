@@ -345,6 +345,64 @@ fn failed_compose_retries_the_frozen_page() {
 }
 
 #[test]
+fn retry_keeps_a_committed_page_that_confirm_reopened() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let sealed = [5u8, 1, 2, 3, 4, 5, 6, 7];
+    let newer = [6u8, 1, 2, 3, 4, 5, 6, 7];
+    let other = [7u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, sealed)]).unwrap();
+    log.commit_open(4, 16384, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(4096, other)]).unwrap();
+    log.commit_open(
+        5,
+        16384,
+        |_off, _len| Err(StoreError::Corrupt("boom")),
+        |_| Ok(true),
+    )
+    .unwrap_err();
+    log.note_slots(&[(24, newer)]).unwrap();
+    log.commit_open(5, 16384, zeros, |_| Ok(true)).unwrap();
+    assert_eq!(log.slot(16), Some(sealed));
+    assert_eq!(log.slot(24), Some(newer));
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(sealed));
+    assert_eq!(loaded.slot(4096), Some(other));
+    assert_eq!(loaded.slot(24), Some([0u8; 8]));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn retry_after_hold_keeps_the_exploded_page() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let sealed = [5u8, 1, 2, 3, 4, 5, 6, 7];
+    let fresh = [6u8, 1, 2, 3, 4, 5, 6, 7];
+    let waiting = [7u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, sealed)]).unwrap();
+    log.commit_open(9, 16384, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(4096, fresh)]).unwrap();
+    log.commit_open(
+        9,
+        16384,
+        |_off, _len| Err(StoreError::Corrupt("boom")),
+        |_| Ok(true),
+    )
+    .unwrap_err();
+    log.note_slots(&[(8192, waiting)]).unwrap();
+    log.hold_fold_above(1).unwrap();
+    log.commit_open(4, 16384, zeros, |_| Ok(true)).unwrap();
+    assert_eq!(log.slot(8192), Some(waiting));
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(sealed));
+    assert_eq!(loaded.slot(4096), Some(fresh));
+    assert_eq!(loaded.slot(8192), None);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn explode_keeps_a_strong_slot_and_a_newer_open_note() {
     let d = dir();
     let log = SpendPageLog::create(&d);

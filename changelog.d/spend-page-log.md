@@ -6,7 +6,9 @@ Fixed
   read the log refuses the datadir. The spend checkpoint appends the page image
   before it advances
   the marker, and the next checkpoint folds a generation the previous one left
-  quiet. Folding the first page does not rewrite the file header, and it does
+  quiet. A retry of a failed compose still names a page the previous commit
+  sealed, including when confirm has noted a newer slot on it or a disconnect
+  moved that page back into the open directory. Folding the first page does not rewrite the file header, and it does
   not publish a shorter `spent.body` end while confirm is still appending. The
   body copy does not hold the utxo view. A missing or short `spend.pages` file beside a
   commit that names bytes refuses to open. The next confirm insert waits at
