@@ -176,8 +176,8 @@ fn usage_describes_every_option() {
         "--rpc-token-file PATH",
         "-h, --help",
         "-V, --version",
-        "-stdin",
-        "-rpcwait",
+        "--stdin",
+        "--rpcwait",
         "--named",
     ] {
         assert!(u.contains(needle), "usage must list {needle}");
@@ -457,12 +457,12 @@ fn help_and_version_to_a_closed_stdout_exit_zero() {
 
 #[test]
 fn parse_args_stdin_is_a_flag() {
-    match parse_args(&os_args(&["rbitcoin-cli", "-stdin", "getblockcount"])) {
+    match parse_args(&os_args(&["rbitcoin-cli", "--stdin", "getblockcount"])) {
         Ok(Action::Call(cfg)) => {
             assert_eq!(cfg.command.as_deref(), Some("getblockcount"));
-            assert!(cfg.stdin, "-stdin must set the stdin flag");
+            assert!(cfg.stdin, "--stdin must set the stdin flag");
         }
-        Err(e) => panic!("-stdin must parse, got: {e}"),
+        Err(e) => panic!("--stdin must parse, got: {e}"),
         Ok(_) => panic!("expected Action::Call"),
     }
 }
@@ -495,7 +495,7 @@ fn stdin_flag_appends_args_from_stdin() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rbitcoin-cli"))
         .arg("--rpc-socket")
         .arg(&sock)
-        .arg("-stdin")
+        .arg("--stdin")
         .arg("getblock")
         .arg("123456789")
         .stdin(Stdio::piped())
@@ -508,22 +508,13 @@ fn stdin_flag_appends_args_from_stdin() {
     let status = child.wait().unwrap();
     assert!(
         status.success(),
-        "rbitcoin-cli -stdin must exit 0, got {status:?}"
+        "rbitcoin-cli --stdin must exit 0, got {status:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
 
     let params = captured.lock().unwrap().take().unwrap();
     assert_eq!(params, serde_json::json!(["123456789", 2]));
-}
-
-#[test]
-fn parse_args_double_dash_stdin_is_rejected() {
-    let err = match parse_args(&os_args(&["rbitcoin-cli", "--stdin", "getblockcount"])) {
-        Ok(_) => panic!("--stdin should have been rejected"),
-        Err(e) => e,
-    };
-    assert!(err.contains("unknown argument"), "--stdin -> {err}");
 }
 
 #[test]
@@ -562,12 +553,12 @@ fn retry_connect_gives_up_after_attempts() {
 
 #[test]
 fn parse_args_rpcwait_is_a_flag() {
-    match parse_args(&os_args(&["rbitcoin-cli", "-rpcwait", "getblockcount"])) {
+    match parse_args(&os_args(&["rbitcoin-cli", "--rpcwait", "getblockcount"])) {
         Ok(Action::Call(cfg)) => {
             assert_eq!(cfg.command.as_deref(), Some("getblockcount"));
-            assert!(cfg.rpcwait, "-rpcwait must set the rpcwait flag");
+            assert!(cfg.rpcwait, "--rpcwait must set the rpcwait flag");
         }
-        Err(e) => panic!("-rpcwait must parse, got: {e}"),
+        Err(e) => panic!("--rpcwait must parse, got: {e}"),
         Ok(_) => panic!("expected Action::Call"),
     }
 }
@@ -605,7 +596,7 @@ fn rpcwait_does_not_repeat_the_call() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_rbitcoin-cli"))
         .arg("--rpc-socket")
         .arg(&sock)
-        .arg("-rpcwait")
+        .arg("--rpcwait")
         .arg("getblockcount")
         .spawn()
         .unwrap();
@@ -629,7 +620,7 @@ fn rpcwait_does_not_repeat_the_call() {
 
     assert!(
         exited,
-        "-rpcwait must return the RPC error, not retry the call"
+        "--rpcwait must return the RPC error, not retry the call"
     );
     assert!(!status.success(), "the RPC error must exit non-zero");
     assert_eq!(

@@ -128,8 +128,8 @@ pub fn usage() -> String {
            --rpc-token-file PATH  Bearer token (default PATH/rpc.token from --datadir)\n\
            -h, --help             this message\n\
            -V, --version          print version\n\
-           -stdin                 read extra args from stdin, one per line until EOF\n\
-           -rpcwait               retries the connection until the node is up, in a bounded loop\n\
+           --stdin                read extra args from stdin, one per line until EOF\n\
+           --rpcwait              retries the connection until the node is up, in a bounded loop\n\
            --named                pass named (name=value) parameters instead of positional\n\
          \n\
          Local: --datadir talks to {{datadir}}/rpc.sock (no token). TCP uses Bearer\n\
@@ -225,12 +225,12 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
                 i += 1;
                 continue;
             }
-            if a == "-stdin" {
+            if a == "--stdin" {
                 cfg.stdin = true;
                 i += 1;
                 continue;
             }
-            if a == "-rpcwait" {
+            if a == "--rpcwait" {
                 cfg.rpcwait = true;
                 i += 1;
                 continue;
