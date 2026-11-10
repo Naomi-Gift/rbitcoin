@@ -112,6 +112,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [106](./106-historical-bitrot.md) | medium | Historical body bit-rot is an accepted reindex | accepted | none |
 | [107](./107-torn-spend-page.md) | medium | A torn spend page below the durable marker stays | accepted | none |
 | [108](./108-bobberb-store-index.md) | — | Bobberb store-integrity index | accepted | — |
+| [109](./109-filter-send-budget.md) | medium | Filter replies and compact blocks under-counted the send budget | fixed | `filter_and_compact_block_replies_charge_their_consensus_payload` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline
 `8f3990f`). Report-local 001–010 are **renumbered** here. Identity/BIP30

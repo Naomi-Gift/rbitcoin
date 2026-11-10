@@ -2002,3 +2002,86 @@ fn proxied_trust_peer_hostname_is_the_trusted_session() {
     );
     assert!(!hub.session_is_trusted_peer(&stranger));
 }
+
+/// Filter replies and a served compact block take their consensus payload
+/// on the send budget. A 2,000-hash `cfheaders` is far past the 64-byte
+/// fallback, and a prefilled transaction past 1 KiB is not the compact-block stub.
+#[test]
+fn filter_and_compact_block_replies_charge_their_consensus_payload() {
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::bip158::{FilterHash, FilterHeader};
+    use bitcoin::consensus::encode::serialize;
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+    use bitcoin::p2p::message_filter::{CFCheckpt, CFHeaders, CFilter};
+
+    let zero = [0u8; 32];
+    let block_hash = BlockHash::from_byte_array(zero);
+    let cfilter = CFilter {
+        filter_type: 0,
+        block_hash,
+        filter: vec![0x11; 200],
+    };
+    let cfilter_n = serialize(&cfilter).len();
+    assert!(cfilter_n > 64, "a filter body is not the fallback size");
+    assert_eq!(
+        outbound_msg_bytes(&NetworkMessage::CFilter(cfilter)),
+        cfilter_n
+    );
+
+    let cfheaders = CFHeaders {
+        filter_type: 0,
+        stop_hash: block_hash,
+        previous_filter_header: FilterHeader::from_byte_array(zero),
+        filter_hashes: vec![FilterHash::from_byte_array(zero); 2_000],
+    };
+    let cfheaders_n = serialize(&cfheaders).len();
+    assert!(
+        cfheaders_n >= 64_000,
+        "two thousand filter hashes are not the fallback size"
+    );
+    assert_eq!(
+        outbound_msg_bytes(&NetworkMessage::CFHeaders(cfheaders)),
+        cfheaders_n
+    );
+
+    let checkpoints = 3;
+    let cfcheckpt = CFCheckpt {
+        filter_type: 0,
+        stop_hash: block_hash,
+        filter_headers: vec![FilterHeader::from_byte_array(zero); checkpoints],
+    };
+    let cfcheckpt_n = serialize(&cfcheckpt).len();
+    assert!(cfcheckpt_n >= 32 * checkpoints);
+    assert_eq!(
+        outbound_msg_bytes(&NetworkMessage::CFCheckpt(cfcheckpt)),
+        cfcheckpt_n
+    );
+
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let fat = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::ONE,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![],
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::ZERO,
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x6a; 1_500]),
+        }],
+    };
+    let block = bitcoin::Block {
+        header: genesis.header,
+        txdata: vec![fat],
+    };
+    let hsi = HeaderAndShortIds::from_block(&block, 1, 1, &[0]).expect("prefilled coinbase");
+    let compact_n = serialize(&hsi).len();
+    assert!(
+        compact_n > 1_024,
+        "a prefilled fat transaction is not the compact-block stub"
+    );
+    let served = NetworkMessage::CmpctBlock(CmpctBlock { compact_block: hsi });
+    assert_eq!(outbound_msg_bytes(&served), compact_n);
+    assert_eq!(
+        outbound_queued_bytes(&PeerOut::Served(served)),
+        compact_n,
+        "a served compact block uses the same payload charge"
+    );
+}

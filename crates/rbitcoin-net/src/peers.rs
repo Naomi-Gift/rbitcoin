@@ -26,7 +26,8 @@ pub const PEER_SEND_BUDGET: usize = 4 * 1024 * 1024;
 pub const HEADERS_RESPONSE_TIME_SECS: u64 = 120;
 
 /// Queued-byte estimate. Headers are 81 wire bytes, inv-like rows are 36,
-/// legacy addr rows are 30. Encoded block bodies use their buffer length.
+/// legacy addr rows are 30. Filter replies, compact blocks, and encoded
+/// block bodies use their consensus payload length.
 pub fn outbound_msg_bytes(msg: &NetworkMessage) -> usize {
     match msg {
         NetworkMessage::Headers(h) => h.len().saturating_mul(81),
@@ -43,7 +44,12 @@ pub fn outbound_msg_bytes(msg: &NetworkMessage) -> usize {
         }
         NetworkMessage::Addr(a) => a.len().saturating_mul(30),
         NetworkMessage::AddrV2(a) => a.len().saturating_mul(61),
-        NetworkMessage::CmpctBlock(_) => 1024,
+        NetworkMessage::CFilter(m) => bitcoin::consensus::encode::serialize(m).len(),
+        NetworkMessage::CFHeaders(m) => bitcoin::consensus::encode::serialize(m).len(),
+        NetworkMessage::CFCheckpt(m) => bitcoin::consensus::encode::serialize(m).len(),
+        NetworkMessage::CmpctBlock(m) => {
+            bitcoin::consensus::encode::serialize(&m.compact_block).len()
+        }
         _ => 64,
     }
 }
