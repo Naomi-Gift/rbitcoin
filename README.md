@@ -5,7 +5,7 @@
 Bitcoin **full node** in Rust aimed at **production server-side** use: multi-peer
 IBD, tip follow, block/tx relay (tip mode), optional **Core-class JSON-RPC**, and
 in-process **Electrum + optional Esplora REST** (scripthash index via
-`--sh-index`, default off; **0.8** Core+electrs drop-in:
+`--sh-index`, default off; Core+electrs drop-in:
 [`COMPAT.md`](./COMPAT.md)) — built
 around a **relational archive (Class A/B/C)** and a **pure-Rust
 consensus/script** path.

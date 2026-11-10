@@ -76,7 +76,7 @@ changes is [When a script is red](./docs/core-functional.md#when-a-script-is-red
 
 | Area | This node | Bitcoin Core |
 |------|-----------|--------------|
-| Chainstore | Relational **map-free** archive (fd tables; see [`docs/io-modality.md`](./docs/io-modality.md)) | blocks/undo + LevelDB chainstate |
+| Chainstore | Relational archive (fd tables; [`docs/io-modality.md`](./docs/io-modality.md)) | blocks/undo + LevelDB chainstate |
 | Historical blocks | Reconstruct from archive; tip via body queue + peer wire | `blocks/` blk*.dat |
 | Transport | **BIP324 v2**; v1 only on a `--net-permission-bind v1@` listener for a local wallet indexer (own port, loopback or private address) | v1 + v2 |
 | Mempool structure | Cluster graph + chunks. Each cluster is linearized by ancestor-set feerate, then Core's `PostLinearize`, then chunked with Core's rule (a chunk absorbs the one before it only at a strictly higher feerate, so equal feerates stay separate chunks). No spanning-forest search: a cluster whose best chunk is a union of overlapping ancestor sets can get a lower chunk feerate than Core, so `fees.chunk` / `chunkweight`, `getmempoolcluster`, `getmempoolfeeratediagram`, template order and eviction rank can differ for it. On random clusters of up to 16 transactions under 1% of transactions got a different chunk feerate than the optimal diagram | Cluster mempool: spanning-forest linearization (SFL) under a cost budget, optimal with minimal chunks when the budget allows |

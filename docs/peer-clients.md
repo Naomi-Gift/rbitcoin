@@ -30,12 +30,15 @@ Sources at write time:
 
 | | **rbitcoin** | **Hornet** | **satd** |
 |--|--|--|--|
-| Thesis | Relational **archive** (no UTXO), pure-Rust scripts, in-process Electrum/Esplora, map-free Linux IO | **Spec-first** C++ consensus + custom UTXO LSM; IBD as a demo of the spec | **Core drop-in** (UTXO + `blocks/` + `bitcoin.conf`) with extra APIs in one process |
+| Thesis | Relational **archive** (no UTXO), pure-Rust scripts, in-process Electrum/Esplora | **Spec-first** C++ consensus + custom UTXO LSM; IBD as a demo of the spec | **Core drop-in** (UTXO + `blocks/` + `bitcoin.conf`) with extra APIs in one process |
 | Consensus | Independent Rust; Core JSON corpora + [`consensus-tests.md`](./consensus-tests.md); **no** `libbitcoinconsensus` | Named declarative rules in `spec.h` (published [spec.html](https://hornetnode.org/spec.html), 35 rules, S02 and S03 separate); isolated from storage | Rust engine **plus** C++ `libbitcoinconsensus` shadow |
 | Store | Class A/B/C tables, spent annotations ([`SCHEMA.md`](../SCHEMA.md)) | Age-stratified UTXO LSM, `ChainTree` + sidecars | RocksDB coins + Core-shaped flat files |
 | IBD | Multi-peer, lookup→load→scripts→write ([`concurrency.md`](./concurrency.md)); default mainnet milestone anchored at block 966143 | Single-peer concurrent UTXO pipeline; claims ~15 min assumevalid on 32 cores | “Swarm” parallel download + speculative verify |
-| Wallet APIs | Native Electrum + Esplora; SH optional and can **lag** tip ([`COMPAT.md`](../COMPAT.md)) | None yet | Native Electrum + Esplora + BIP 157; indexes **atomic** with `connect_block` |
-| Maturity | Experimental 0.x; Core functional `run` set is **Q-41** | Spec + IBD node; mempool/multi-peer still future | Operator-facing 0.3–0.4, Docker signet demo |
+| Wallet APIs | Native Electrum + Esplora. SH is optional and can lag the tip. BIP158 basic filters while `--block-filter-index` is on. `--prune-seqsigwit` is a witness window, not Core `-prune` ([`COMPAT.md`](../COMPAT.md)) | None yet | Native Electrum + Esplora + BIP 157; indexes **atomic** with `connect_block` |
+| Maturity | In-tree 0.9.99 toward 0.10. Published release 0.9.0. Format unstable until 1.0. Core functional `run` set is still **Q-41** | Spec + IBD node; mempool/multi-peer still future | Operator-facing 0.3–0.4, Docker signet demo |
+
+The Hornet and satd columns are the 2026-09-04 snapshot, except the Hornet
+spec pin above. The rbitcoin column matches this tree.
 
 Hornet IBD numbers are a UTXO + assumevalid + fat-core story. They are not a
 template for our write/pin/`tx.head` path ([`ibd-memory.md`](./ibd-memory.md)).
@@ -172,7 +175,7 @@ than a TUI.
 | **Explicit reorg log** (`reorg.log` + `getreorghistory`) | Tip-follow already disconnects hopeless forks ([`ibd-memory.md`](./ibd-memory.md)); a durable ring is cheap evidence. | Webhooks / MCP / TUI are satd product, not ours. |
 | **SIGHUP for hot mempool/relay knobs** | Useful once we have more policy flags. | We already log to stdout; do not cargo-cult Core `debug.log` reopen. satd’s split (`SIGHUP` config, `SIGUSR1` TLS) is the right shape **if** we add native TLS. |
 | **Config: unknown keys fatal, unsupported-but-recognized warned** | Honest operator surface. We already lean this way. | Full Core `bitcoin.conf` drop-in is a satd goal, not ours. |
-| **BIP 157/158** | [`COMPAT.md`](../COMPAT.md) slots 22–27 are explicit “not product.” Neutrino wallets are a later wallet-backend ask. | Do not start it until Electrum/Esplora claimed surface is boring. |
+| **BIP 157/158** | Basic filters are served while `--block-filter-index` is on. [`COMPAT.md`](../COMPAT.md) slots 22–27 are that surface. Neutrino still cannot connect: it does not speak BIP324 ([`lightning.md`](./lightning.md)). | Do not add a v1 listener so Neutrino can attach. |
 
 ### From Hornet (clarity), not the UTXO engine
 
@@ -197,9 +200,10 @@ peer**. Copying that would mean reintroducing a coins view.
   Making SH wait on Class A would regress tip-accept.
 - **Hornet UTXO LSM / speculative out-of-order apply.** Conflicts with
   “Class A never leads tip.”
-- **satd MCP, TUI, policy DSL, prune, AssumeUTXO, ZMQ.** Non-goals or later
-  ([`quality.md`](./quality.md) Won't fix / [`COMPAT.md`](../COMPAT.md)
-  deferred). AssumeUTXO is meaningless without a UTXO set.
+- **satd MCP, TUI, policy DSL, Core `-prune`, AssumeUTXO, ZMQ.** Non-goals
+  or later ([`quality.md`](./quality.md) Won't fix / [`COMPAT.md`](../COMPAT.md)).
+  `--prune-seqsigwit` drops witness bytes outside a 288-block window.
+  `txout` stays. AssumeUTXO is meaningless without a UTXO set.
 - **Hornet DSL as a second spec book.** [`consensus-tests.md`](./consensus-tests.md)
   is the owner.
 

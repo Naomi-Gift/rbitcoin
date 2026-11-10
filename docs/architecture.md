@@ -43,20 +43,21 @@ reintroduce plan-time “archive lead” heuristics (e.g. body
 body pages stay tip-hot. **No** ContigPark / archive-job fallback
 for unknown-height bodies (mark missing → re-getdata).
 
-- **Storage center** is a **transaction-relational archive** on **map-free
-  tables** (pread/pwrite + fallocate; no process `mmap` of Class A/B/C
-  `TableFile`s), not a UTXO set + LevelDB chainstate. Sealed `.fuse8`
-  sidecars are a **read-only mmap** exception. Packed MPHF `g` stays FdOnly.
+- **Storage center** is a **transaction-relational archive**, not a UTXO
+  set plus LevelDB chainstate. Class A bodies are pread/pwrite. `tx.head`
+  slot lookup is a read-only map of that file. Sealed `.fuse8` sidecars
+  are the other read-only map. Packed MPHF `g` stays FdOnly.
   IO modality: [`io-modality.md`](./io-modality.md).
 - **Consensus scripts** are verified in **pure Rust** (secp256k1 only as the
   crypto primitive via the rust-bitcoin stack — **no** `libbitcoinconsensus`
   dual-eval).
 - **Electrum** is **native** to the store (optional **scripthash** tables via
   `--sh-index`, default off), not a second process re-indexing blk files.
-  Tip-follow does **not** wait on SH materialize; Electrum/Esplora do.
-  SH tip materialize is unsorted per-shard files then unique-sort; cold megakey pages
-  stream into 4 KiB delta pages (schema 17).
-  **0.8:** Esplora covers mempool/electrs `/internal/*` bulk HTTP so this
+  Tip-follow does **not** wait on SH materialize; Electrum and Esplora do.
+  SH tip materialize is unsorted per-shard files, then a unique sort.
+  Cold megakey pages stream into 4 KiB delta pages
+  ([`SCHEMA.md`](../SCHEMA.md)).
+  Esplora covers the mempool/electrs `/internal/*` bulk HTTP, so this
   binary can replace electrs behind mempool.space `/api/`
   ([`COMPAT.md`](../COMPAT.md)).
 - **JSON-RPC** (optional) is a Core-class **subset** over archive + mempool —
@@ -70,15 +71,15 @@ for unknown-height bodies (mark missing → re-getdata).
 
 | Concern | rbitcoin | Bitcoin Core (typical) |
 |---------|----------|------------------------|
-| Primary store | **Map-free** Class A/B/C tables (fd pread/pwrite + heads; page cache L0) | `blocks/blk*.dat` + `undo` + LevelDB `chainstate` (UTXO) |
-| Historical block serve | **Reconstruct** from `txout`+`seqsigwit`; tip uses body queue + peer wire | Serve raw blk files / undo |
+| Primary store | Class A/B/C tables. Bodies are pread/pwrite. `tx.head` lookup maps its slot file read-only. Page cache is the hot tier | `blocks/blk*.dat` + `undo` + LevelDB `chainstate` (UTXO) |
+| Historical block serve | **Reconstruct** from `txout` plus `seqsigwit`. `--prune-seqsigwit` keeps witness bytes only for the last 288 blocks ([`COMPAT.md`](../COMPAT.md)). Tip serve uses the body queue and peer wire | Serve raw blk files / undo |
 | Spentness | Annotations on create outputs (+ rare multi-list); no mutable UTXO set as truth | Coins view / UTXO mutations |
 | Concurrency during IBD | Fixed **roles** (one Class A appender, separate confirm pipeline); HWM publish order — **no map epochs** | More global chainstate coupling |
 | Transport | **BIP324 v2**; v1 only on a `--net-permission-bind v1@` listener for a local wallet indexer (own port, loopback or private address) | v1 + v2 |
 | Script verification | Pure Rust in-tree (`rbitcoin-consensus::script`) | libbitcoinconsensus / script interpreter in C++ |
-| Electrum | In-process index on confirm | External (Fulcrum, ElectrumX, …) |
-| IBD vs “current” | Dedicated densify loop exits when the **connected work path** has no remainder and is at (or one chatter block from) advertised peer height; then disconnect and `enter_tip_mode`. A restart whose confirmed tip is above genesis, already meets minimum chain work and `--max-tip-age` (default 24h), and whose header store has no heavier chain at any fork depth, enters tip follow without that loop. Peer-advertised height is not an input to the skip. After the switch, **relay-inhibited** is `--min-chain-work` + `--max-tip-age`. RPC `initialblockdownload` is the Core alias for that latch (not “still densifying”). | Same header/block pipeline throughout. `IsInitialBlockDownload` latches false on min chain work + tip timestamp recency (`nMaxTipAge`). btcd/libbitcoin also latch on tip time, not empty getdata. |
-| Product scope | Full node + Electrum/Esplora; **0.8** Core+electrs drop-in ([`COMPAT.md`](../COMPAT.md)); **no** wallet/GUI/prune | Full Core product surface |
+| Electrum | In-process and optional (`--sh-index`, default off). It can lag the tip | External (Fulcrum, ElectrumX, …) |
+| IBD vs “current” | Dedicated densify loop exits when the **connected work path** has no remainder and is at (or one chatter block from) the max peer height, or when a proved header walk has no connected peer that can extend it. Then `enter_tip_mode`. A restart whose confirmed tip is above genesis, already meets minimum chain work and `--max-tip-age` (default 24h), and whose header store has no heavier chain at any fork depth, enters tip follow without that loop. Peer-advertised height is not an input to that skip. After the switch, **relay-inhibited** is `--min-chain-work` + `--max-tip-age`. RPC `initialblockdownload` is the Core alias for that latch (not “still densifying”). The owner sentence is [`concurrency.md`](./concurrency.md). | Same header/block pipeline throughout. `IsInitialBlockDownload` latches false on min chain work + tip timestamp recency (`nMaxTipAge`). btcd and libbitcoin also latch on tip time, not an empty getdata set. |
+| Product scope | Full node plus Electrum and Esplora ([`COMPAT.md`](../COMPAT.md)). `--prune-seqsigwit` drops witness bytes outside a 288-block window. It is not Core `-prune`. No wallet and no GUI | Full Core product surface |
 
 Product / wire intentional differences: [`COMPAT.md`](../COMPAT.md).
 
@@ -87,7 +88,7 @@ Product / wire intentional differences: [`COMPAT.md`](../COMPAT.md).
 | Concern | rbitcoin | Typical external indexer |
 |---------|----------|--------------------------|
 | Data source | Same process as the validating node; Class A is authoritative | Reads Core RPC or blk files after the fact |
-| SH index | Written on confirm (runs in Direct IBD → bulk at tip) | Separate DB built by scanning history |
+| SH index | Optional (`--sh-index`, default off). Direct IBD seals it at tip entry. Tip-follow does not wait, so the index can lag. Electrum and Esplora read the durable index plus a RAM head | Separate DB built by scanning history |
 | Unconfirmed | Mempool attached in-process | Depends on Core mempool RPC |
 | Consensus | This binary validates blocks/scripts | Trusts the node it indexes |
 

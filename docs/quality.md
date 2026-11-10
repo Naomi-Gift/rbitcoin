@@ -94,7 +94,7 @@ Do not “improve” these away. Design owners are linked; this is the
 checklist.
 
 - **Thesis:** relational archive, pure-Rust scripts, in-process
-  Electrum/Esplora, Linux map-free IO + optional io_uring, reproducible
+  Electrum/Esplora, optional io_uring, reproducible
   musl. Not a Core clone. [`architecture.md`](./architecture.md).
 - **No silent consensus/store fallback.** Missing promised fact →
   `StoreError::Corrupt("invariant: …")`. Confirm dual-path kill. TxApply →
