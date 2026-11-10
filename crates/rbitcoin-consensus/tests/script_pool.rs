@@ -746,24 +746,36 @@ fn second_stage_keeps_the_first_publisher_wake() {
         wait_until("second stage did not register", || {
             b_flag_for_a.load(Ordering::Acquire)
         });
+        let take_wake = || {
+            phase_a.store(0, Ordering::Release);
+            STAGE_PARKED.store(false, Ordering::Release);
+            wakes_a.fetch_add(1, Ordering::Release);
+            note_script_progress();
+        };
         for _ in 0..2 {
             let deadline = Instant::now() + Duration::from_secs(2);
             loop {
-                // Drop a stale unpark permit so the next park waits for this round.
-                thread::park_timeout(Duration::ZERO);
-                phase_a.store(1, Ordering::Release);
+                // phase 2 is this round's unpark. Storing 1 over it, or
+                // park_timeout(0), drops a wake the driver does not repeat.
+                if phase_a.load(Ordering::Acquire) == 2 {
+                    take_wake();
+                    break;
+                }
+                let raced = phase_a
+                    .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err();
+                if raced && phase_a.load(Ordering::Acquire) == 2 {
+                    continue;
+                }
                 STAGE_PARKED.store(true, Ordering::Release);
                 note_script_progress();
+                if phase_a.load(Ordering::Acquire) == 2 {
+                    continue;
+                }
                 let left = deadline.saturating_duration_since(Instant::now());
                 assert!(!left.is_zero(), "script stage was not woken");
                 thread::park_timeout(left);
                 STAGE_PARKED.store(false, Ordering::Release);
-                if phase_a.load(Ordering::Acquire) == 2 {
-                    phase_a.store(0, Ordering::Release);
-                    wakes_a.fetch_add(1, Ordering::Release);
-                    note_script_progress();
-                    break;
-                }
             }
         }
     });

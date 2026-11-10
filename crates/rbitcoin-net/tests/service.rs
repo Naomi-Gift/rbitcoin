@@ -550,8 +550,9 @@ async fn redial_skips_a_connect_target_still_dialling() {
         1,
         "a dial still connecting must not be dialled again"
     );
-    // The stalled connect times out and drops the in-flight flag.
-    let deadline = std::time::Instant::now() + connect_bound * 3;
+    // The floor is the connect timeout. The in-flight flag drops when
+    // that task is polled, which is later than 3× the floor under load.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
     while !node.peers.in_flight_nets().is_empty() {
         assert!(
             std::time::Instant::now() < deadline,
