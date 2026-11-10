@@ -339,8 +339,13 @@ fn failed_compose_retries_the_frozen_page() {
     assert_eq!(log.slot(16), Some(first));
     assert_eq!(log.slot(4096), Some(second));
     let file = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
-    assert_eq!(file.len(), 4096);
+    assert_eq!(file.len(), 8192);
     assert_eq!(&file[16..24], &first);
+    assert_eq!(&file[4096..4104], &second);
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(first));
+    assert_eq!(loaded.slot(4096), Some(second));
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -369,7 +374,7 @@ fn retry_keeps_a_committed_page_that_confirm_reopened() {
     let loaded = SpendPageLog::load(&d).unwrap();
     assert_eq!(loaded.slot(16), Some(sealed));
     assert_eq!(loaded.slot(4096), Some(other));
-    assert_eq!(loaded.slot(24), Some([0u8; 8]));
+    assert_eq!(loaded.slot(24), Some(newer));
     let _ = std::fs::remove_dir_all(&d);
 }
 
@@ -398,7 +403,67 @@ fn retry_after_hold_keeps_the_exploded_page() {
     let loaded = SpendPageLog::load(&d).unwrap();
     assert_eq!(loaded.slot(16), Some(sealed));
     assert_eq!(loaded.slot(4096), Some(fresh));
-    assert_eq!(loaded.slot(8192), None);
+    assert_eq!(loaded.slot(8192), Some(waiting));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn retry_merges_a_later_note_on_the_frozen_page() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let sealed = [5u8, 1, 2, 3, 4, 5, 6, 7];
+    let frozen_slot = [6u8, 1, 2, 3, 4, 5, 6, 7];
+    let replaced = [8u8, 1, 2, 3, 4, 5, 6, 7];
+    let added = [7u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, sealed)]).unwrap();
+    log.commit_open(4, 16384, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(24, frozen_slot), (4096, frozen_slot)])
+        .unwrap();
+    log.commit_open(
+        5,
+        16384,
+        |_off, _len| Err(StoreError::Corrupt("boom")),
+        |_| Ok(true),
+    )
+    .unwrap_err();
+    log.note_slots(&[(24, replaced), (32, added)]).unwrap();
+    log.commit_open(5, 16384, zeros, |_| Ok(true)).unwrap();
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(sealed));
+    assert_eq!(loaded.slot(24), Some(replaced));
+    assert_eq!(loaded.slot(32), Some(added));
+    assert_eq!(loaded.slot(4096), Some(frozen_slot));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn retry_after_hold_omits_a_rejected_image_slot() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let keep_slot = [5u8, 1, 2, 3, 4, 5, 6, 7];
+    let drop_slot = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    let noted = [6u8, 1, 2, 3, 4, 5, 6, 7];
+    let fresh = [7u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, keep_slot), (24, drop_slot)]).unwrap();
+    log.commit_open(9, 16384, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(32, noted), (4096, fresh)]).unwrap();
+    log.commit_open(
+        9,
+        16384,
+        |_off, _len| Err(StoreError::Corrupt("boom")),
+        |_| Ok(true),
+    )
+    .unwrap_err();
+    log.hold_fold_above(1).unwrap();
+    log.commit_open(4, 16384, zeros, |slot| Ok(slot[0] != 4))
+        .unwrap();
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(keep_slot));
+    assert_eq!(loaded.slot(24), Some([0u8; 8]));
+    assert_eq!(loaded.slot(32), Some(noted));
+    assert_eq!(loaded.slot(4096), Some(fresh));
     let _ = std::fs::remove_dir_all(&d);
 }
 

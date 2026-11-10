@@ -71,12 +71,21 @@ struct CommittedPage {
     generation: u32,
 }
 
+type SnapshotPages = Vec<(u64, OpenPage)>;
+type PageImages = Vec<(u64, Arc<[u8]>)>;
+
 struct PendingInstall {
     generation: u32,
     height: u32,
     pages: Vec<(u64, Arc<[u8]>, u64)>,
     rejected: Vec<u64>,
     kept: Vec<KeptPage>,
+}
+
+struct CommitSnapshot {
+    pages: Vec<(u64, OpenPage)>,
+    carried: Vec<(u64, CommittedPage)>,
+    froze: bool,
 }
 
 struct Inner {
@@ -366,14 +375,14 @@ impl SpendPageLog {
     /// no base image. `keep` drops a slot that is no longer best-chain so a
     /// later fold does not write it. An empty open set leaves an existing
     /// commit in place, unless a held snapshot has to be filtered first.
-    /// A frozen snapshot left by a failed compose is retried. Notes taken
-    /// after that failure stay in `open` and do not replace it.
+    ///
+    /// A frozen snapshot left by a failed compose is retried together with
+    /// every note sitting in `open`. A page in both directories merges slots,
+    /// and the later note wins on the same slot. Notes that arrive after this
+    /// snapshot is copied stay in `open` for the next generation.
     ///
     /// A second generation appends. It does not replace bytes an older commit
-    /// still names. A page that confirm has since put in `open` still counts:
-    /// the old image is named, and the newer slots wait. A hold clears that
-    /// image after copying its live slots into `open`, so those pages are
-    /// composed with the leftover snapshot.
+    /// still names, unless this generation recomposes that page.
     #[doc(hidden)]
     pub fn prepare_commit<F, K>(
         &self,
@@ -394,185 +403,21 @@ impl SpendPageLog {
             g.compose_height = Some(height);
         }
         let _clear_compose = ClearCompose(self);
-        let restored = self.explode_held(&mut keep)?;
-        let (snapshot, carried, froze) = {
-            let mut g = self.lock();
-            let reuse = !g.frozen.is_empty();
-            if !reuse && g.open.is_empty() {
-                if !g.fold_held {
-                    g.cool_through = g.generation;
-                }
-                return Ok(());
-            }
-            // Freeze is a swap, not a clone of the live map. Confirm notes the
-            // next generation into `open` while this snapshot is composed.
-            // A leftover frozen map is that snapshot: do not drop it for a
-            // newer open set, and do not zero the edges those notes added.
-            if !reuse {
-                g.frozen = std::mem::take(&mut g.open);
-                g.open_edges = 0;
-            }
-            let mut snapshot: Vec<(u64, OpenPage)> = g
-                .frozen
-                .iter()
-                .map(|(off, page)| {
-                    (
-                        *off,
-                        OpenPage {
-                            slots: page.slots.clone(),
-                            base: page.base.clone(),
-                        },
-                    )
-                })
-                .collect();
-            // The hold already cleared `committed`. Compose the pages it put
-            // back into `open`, or the replacement commit drops them. A page
-            // the failed compose already froze is in the snapshot above.
-            // A note that was never committed is not in `restored`.
-            if reuse {
-                for off in &restored {
-                    if g.frozen.contains_key(off) {
-                        continue;
-                    }
-                    let Some(page) = g.open.get(off) else {
-                        continue;
-                    };
-                    snapshot.push((
-                        *off,
-                        OpenPage {
-                            slots: page.slots.clone(),
-                            base: page.base.clone(),
-                        },
-                    ));
-                }
-            }
-            // Still name a committed page whose newer slots sit in `open`.
-            // The old image is enough. Those slots wait for the next generation.
-            let carried: Vec<(u64, CommittedPage)> = g
-                .committed
-                .iter()
-                .filter(|(off, _)| !g.frozen.contains_key(*off))
-                .map(|(off, page)| {
-                    (
-                        *off,
-                        CommittedPage {
-                            image: Arc::clone(&page.image),
-                            log_off: page.log_off,
-                            generation: page.generation,
-                        },
-                    )
-                })
-                .collect();
-            (snapshot, carried, !reuse)
+        self.explode_held(&mut keep)?;
+        let Some(snap) = self.snapshot_commit() else {
+            return Ok(());
         };
-        if froze {
+        if snap.froze {
             self.pace.notify_room();
         }
-        let mut kept: Vec<(u64, OpenPage)> = Vec::new();
-        let mut rejected: Vec<u64> = Vec::new();
-        for (page_off, mut page) in snapshot {
-            let mut slots = Vec::new();
-            for slot in page.slots.drain(..) {
-                if keep(&slot.1)? {
-                    slots.push(slot);
-                }
-            }
-            page.slots = slots;
-            if page.slots.is_empty() {
-                rejected.push(page_off);
-            } else {
-                kept.push((page_off, page));
-            }
-        }
+        let (kept, rejected) = filter_kept_pages(&mut keep, snap.pages)?;
         if kept.is_empty() {
             self.drop_frozen_pages(&rejected);
             return Ok(());
         }
-        let mut pages: Vec<(u64, Arc<[u8]>)> = Vec::with_capacity(kept.len());
-        for (page_off, page) in &kept {
-            if *page_off >= published {
-                return Err(StoreError::Corrupt(
-                    "spend page log composed past the published body",
-                ));
-            }
-            let len = BODY_PAGE_SIZE.min(published - page_off) as usize;
-            let mut buf = if let Some(base) = &page.base {
-                base[..len.min(base.len())].to_vec()
-            } else {
-                read_page(*page_off, len)?
-            };
-            if buf.len() < len {
-                buf.resize(len, 0);
-            }
-            buf.truncate(len);
-            for &(rel, meta) in &page.slots {
-                let i = rel as usize * SLOT;
-                if i + SLOT > buf.len() {
-                    return Err(StoreError::Corrupt("spend page slot past published"));
-                }
-                buf[i..i + SLOT].copy_from_slice(&meta);
-            }
-            pages.push((*page_off, Arc::from(buf.into_boxed_slice())));
-        }
-        pages.sort_by_key(|(off, _)| *off);
-
-        // Slots noted during compose are not in the image. Drop ones `keep`
-        // rejects before the directory swap, so a disconnected spend does not
-        // become the committed image.
-        {
-            let mut g = self.lock();
-            let offs: Vec<u64> = g.open.keys().copied().collect();
-            for off in offs {
-                let mut dropped = 0u64;
-                let remove = {
-                    let Some(page) = g.open.get_mut(&off) else {
-                        continue;
-                    };
-                    let mut live = Vec::new();
-                    for slot in page.slots.drain(..) {
-                        if keep(&slot.1)? {
-                            live.push(slot);
-                        } else {
-                            dropped = dropped.saturating_add(1);
-                        }
-                    }
-                    page.slots = live;
-                    page.slots.is_empty() && page.base.is_none()
-                };
-                g.open_edges = g.open_edges.saturating_sub(dropped);
-                if remove {
-                    g.open.remove(&off);
-                }
-            }
-        }
-
-        let (generation, recs) = self.publish_generation(height, &pages, &carried)?;
-        let kept_slots: Vec<KeptPage> = kept
-            .iter()
-            .map(|(off, page)| (*off, page.slots.clone()))
-            .collect();
-        let pending_pages: Vec<(u64, Arc<[u8]>, u64)> = pages
-            .into_iter()
-            .map(|(page_off, image)| {
-                let log_off = recs
-                    .iter()
-                    .find(|(off, _, _)| *off == page_off)
-                    .map(|(_, log_off, _)| *log_off)
-                    .unwrap_or(0);
-                (page_off, image, log_off)
-            })
-            .collect();
-        {
-            let mut g = self.lock();
-            g.pending = Some(PendingInstall {
-                generation,
-                height,
-                pages: pending_pages,
-                rejected,
-                kept: kept_slots,
-            });
-        }
-        Ok(())
+        let pages = compose_kept_pages(&mut read_page, published, &kept)?;
+        self.scrub_open_notes(&mut keep)?;
+        self.store_pending(height, pages, rejected, kept, &snap.carried)
     }
 
     /// Publish the composed generation into the directory.
@@ -648,16 +493,16 @@ impl SpendPageLog {
     /// A disconnect left this commit above the tip. Do not copy it onto the body.
     ///
     /// `keep` runs before any directory change. A `keep` error leaves the
-    /// commit file and the committed images where they were. The returned
-    /// offsets are the pages whose live slots were put back into `open`.
-    fn explode_held<K>(&self, keep: &mut K) -> Result<Vec<u64>, StoreError>
+    /// commit file and the committed images where they were. Live slots are
+    /// put back into `open` for the next compose.
+    fn explode_held<K>(&self, keep: &mut K) -> Result<(), StoreError>
     where
         K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
     {
         let held: Vec<(u64, Arc<[u8]>)> = {
             let g = self.lock();
             if !g.fold_held {
-                return Ok(Vec::new());
+                return Ok(());
             }
             g.committed
                 .iter()
@@ -684,14 +529,12 @@ impl SpendPageLog {
         }
         let mut g = self.lock();
         if !g.fold_held {
-            return Ok(Vec::new());
+            return Ok(());
         }
         g.committed.clear();
         g.fold_held = false;
         g.commit_height = None;
-        let mut offs = Vec::with_capacity(restored.len());
         for (page_off, slots) in restored {
-            offs.push(page_off);
             if let Some(page) = g.open.get_mut(&page_off) {
                 let mut added = 0u64;
                 for (rel, meta) in slots {
@@ -712,7 +555,116 @@ impl SpendPageLog {
         if empty {
             self.delete_generation_files();
         }
-        Ok(offs)
+        Ok(())
+    }
+
+    /// Freeze a new open set, or reuse the snapshot a failed compose left.
+    ///
+    /// The freeze is a swap. Confirm notes the next generation into `open`
+    /// while this one is composed. A leftover frozen map stays put, and the
+    /// edges those later notes added stay counted.
+    fn snapshot_commit(&self) -> Option<CommitSnapshot> {
+        let mut g = self.lock();
+        let reuse = !g.frozen.is_empty();
+        if !reuse && g.open.is_empty() {
+            if !g.fold_held {
+                g.cool_through = g.generation;
+            }
+            return None;
+        }
+        if !reuse {
+            g.frozen = std::mem::take(&mut g.open);
+            g.open_edges = 0;
+        }
+        let mut pages: SnapshotPages = g
+            .frozen
+            .iter()
+            .map(|(off, page)| {
+                (
+                    *off,
+                    OpenPage {
+                        slots: page.slots.clone(),
+                        base: page.base.clone(),
+                    },
+                )
+            })
+            .collect();
+        fold_open_into_snapshot(&mut pages, &g.open, &g.committed);
+        let carried = carried_pages(&g.committed, &pages);
+        Some(CommitSnapshot {
+            pages,
+            carried,
+            froze: !reuse,
+        })
+    }
+
+    fn scrub_open_notes<K>(&self, keep: &mut K) -> Result<(), StoreError>
+    where
+        K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
+    {
+        // Slots noted during compose are not in the image. Drop ones `keep`
+        // rejects before the directory swap, so a disconnected spend does not
+        // become the committed image.
+        let mut g = self.lock();
+        let offs: Vec<u64> = g.open.keys().copied().collect();
+        for off in offs {
+            let mut dropped = 0u64;
+            let remove = {
+                let Some(page) = g.open.get_mut(&off) else {
+                    continue;
+                };
+                let mut live = Vec::new();
+                for slot in page.slots.drain(..) {
+                    if keep(&slot.1)? {
+                        live.push(slot);
+                    } else {
+                        dropped = dropped.saturating_add(1);
+                    }
+                }
+                page.slots = live;
+                page.slots.is_empty() && page.base.is_none()
+            };
+            g.open_edges = g.open_edges.saturating_sub(dropped);
+            if remove {
+                g.open.remove(&off);
+            }
+        }
+        Ok(())
+    }
+
+    fn store_pending(
+        &self,
+        height: u32,
+        pages: PageImages,
+        rejected: Vec<u64>,
+        kept: SnapshotPages,
+        carried: &[(u64, CommittedPage)],
+    ) -> Result<(), StoreError> {
+        let (generation, recs) = self.publish_generation(height, &pages, carried)?;
+        let kept_slots: Vec<KeptPage> = kept
+            .iter()
+            .map(|(off, page)| (*off, page.slots.clone()))
+            .collect();
+        let pending_pages: Vec<(u64, Arc<[u8]>, u64)> = pages
+            .into_iter()
+            .map(|(page_off, image)| {
+                let log_off = recs
+                    .iter()
+                    .find(|(off, _, _)| *off == page_off)
+                    .map(|(_, log_off, _)| *log_off)
+                    .unwrap_or(0);
+                (page_off, image, log_off)
+            })
+            .collect();
+        let mut g = self.lock();
+        g.pending = Some(PendingInstall {
+            generation,
+            height,
+            pages: pending_pages,
+            rejected,
+            kept: kept_slots,
+        });
+        Ok(())
     }
 
     fn drop_frozen_pages(&self, pages: &[u64]) {
@@ -973,6 +925,132 @@ impl Drop for ClearCompose<'_> {
     fn drop(&mut self) {
         self.0.lock().compose_height = None;
     }
+}
+
+/// Pull notes taken after a freeze into the snapshot compose will publish.
+///
+/// A page still in `committed` keeps its base. That image holds slots this
+/// note did not repeat. Explode clears `committed` after copying live slots
+/// into `open`, and the old base still contains slots `keep` rejected, so
+/// those pages are composed from the slot lists and `read_page`.
+fn fold_open_into_snapshot(
+    pages: &mut SnapshotPages,
+    open: &HashMap<u64, OpenPage>,
+    committed: &HashMap<u64, CommittedPage>,
+) {
+    for (off, open_page) in open {
+        if let Some((_, page)) = pages.iter_mut().find(|(got, _)| got == off) {
+            overlay_slots(&mut page.slots, &open_page.slots);
+        } else {
+            pages.push((
+                *off,
+                OpenPage {
+                    slots: open_page.slots.clone(),
+                    base: open_page.base.clone(),
+                },
+            ));
+        }
+    }
+    for (off, page) in pages.iter_mut() {
+        if !committed.contains_key(off) {
+            page.base = None;
+        }
+    }
+}
+
+fn overlay_slots(dst: &mut PageSlots, src: &[(u16, [u8; SLOT])]) {
+    for (rel, meta) in src {
+        if let Some(slot) = dst.iter_mut().find(|(got, _)| got == rel) {
+            slot.1 = *meta;
+        } else {
+            dst.push((*rel, *meta));
+        }
+    }
+}
+
+fn carried_pages(
+    committed: &HashMap<u64, CommittedPage>,
+    pages: &[(u64, OpenPage)],
+) -> Vec<(u64, CommittedPage)> {
+    let mut out = Vec::new();
+    for (off, page) in committed {
+        if pages.iter().any(|(got, _)| got == off) {
+            continue;
+        }
+        out.push((
+            *off,
+            CommittedPage {
+                image: Arc::clone(&page.image),
+                log_off: page.log_off,
+                generation: page.generation,
+            },
+        ));
+    }
+    out
+}
+
+fn filter_kept_pages<K>(
+    keep: &mut K,
+    snapshot: SnapshotPages,
+) -> Result<(SnapshotPages, Vec<u64>), StoreError>
+where
+    K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
+{
+    let mut kept = Vec::new();
+    let mut rejected = Vec::new();
+    for (page_off, mut page) in snapshot {
+        let mut slots = Vec::new();
+        for slot in page.slots.drain(..) {
+            if keep(&slot.1)? {
+                slots.push(slot);
+            }
+        }
+        page.slots = slots;
+        if page.slots.is_empty() {
+            rejected.push(page_off);
+        } else {
+            kept.push((page_off, page));
+        }
+    }
+    Ok((kept, rejected))
+}
+
+fn compose_kept_pages<F>(
+    read_page: &mut F,
+    published: u64,
+    kept: &[(u64, OpenPage)],
+) -> Result<PageImages, StoreError>
+where
+    F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
+{
+    let mut pages = Vec::with_capacity(kept.len());
+    for (page_off, page) in kept {
+        if *page_off >= published {
+            return Err(StoreError::Corrupt(
+                "spend page log composed past the published body",
+            ));
+        }
+        let len = BODY_PAGE_SIZE.min(published - page_off) as usize;
+        let mut buf = if let Some(base) = &page.base {
+            base[..len.min(base.len())].to_vec()
+        } else {
+            read_page(*page_off, len)?
+        };
+        if buf.len() < len {
+            buf.resize(len, 0);
+        }
+        buf.truncate(len);
+        for &(rel, meta) in &page.slots {
+            let i = rel as usize * SLOT;
+            if i + SLOT > buf.len() {
+                return Err(StoreError::Corrupt("spend page slot past published"));
+            }
+            buf[i..i + SLOT].copy_from_slice(&meta);
+        }
+        pages.push((*page_off, Arc::from(buf.into_boxed_slice())));
+    }
+    pages.sort_by_key(|(off, _)| *off);
+    Ok(pages)
 }
 
 fn page_hit(page: Option<&OpenPage>, rel: u16) -> Option<[u8; SLOT]> {
