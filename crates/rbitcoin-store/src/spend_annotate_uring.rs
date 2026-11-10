@@ -267,7 +267,10 @@ pub fn annotate_unknown_pages_uring(
                 let Some(gi) = pending.pop_front() else {
                     break;
                 };
-                let slot = free_slots.pop().unwrap();
+                let Some(slot) = free_slots.pop() else {
+                    pending.push_front(gi);
+                    break;
+                };
                 slots[slot] = Some(PageSlot {
                     group_i: gi,
                     phase: Phase::Reading,
@@ -694,7 +697,10 @@ pub fn put_spend_batch_pure_write_uring(
                 let Some(gi) = pending.pop_front() else {
                     break;
                 };
-                let slot = free_slots.pop().unwrap();
+                let Some(slot) = free_slots.pop() else {
+                    pending.push_front(gi);
+                    break;
+                };
                 slots[slot] = Some(PageSlot {
                     group_i: gi,
                     phase: Phase::Reading,
