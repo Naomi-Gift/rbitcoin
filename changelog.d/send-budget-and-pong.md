@@ -23,4 +23,8 @@ Fixed
   checkpoint so a lighter fork can be seen. The file is written when the
   walk first proves the floor and when the tip is 2,000 headers past the
   last saved checkpoint. Promoting a competing chain writes that chain's
-  tip. An unproved walk still does not rewrite the file.
+  tip. An unproved walk still does not rewrite the file. A save that does
+  not stick is written again on the next proved batch.
+- **A pong that arrives while a pong is being written is still answered.**
+  Tip-follow and IBD each emit that nonce and clear the pending slot, so
+  the next ping queues one new pong.

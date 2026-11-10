@@ -442,6 +442,58 @@ fn ibd_pings_coalesce_and_overflow_the_message_window() {
     );
 }
 
+/// A ping during the extra pong is written, and a later ping still queues.
+#[tokio::test]
+async fn an_extra_ibd_pong_still_answers_the_next_ping() {
+    let pong = IbdPong::new();
+    assert!(pong.note(7));
+    let mut sent = Vec::new();
+    struct Emit<'a> {
+        sent: &'a mut Vec<u64>,
+        pong: &'a IbdPong,
+    }
+    impl IbdPongEmit for Emit<'_> {
+        fn emit(
+            &mut self,
+            nonce: u64,
+        ) -> impl std::future::Future<Output = Result<(), NetError>> + Send {
+            self.sent.push(nonce);
+            if nonce == 7 {
+                assert!(
+                    !self.pong.note(8),
+                    "the slot stays held during the first write"
+                );
+            }
+            if nonce == 8 {
+                assert!(
+                    !self.pong.note(9),
+                    "a ping during the extra write is stored"
+                );
+            }
+            std::future::ready(Ok(()))
+        }
+    }
+    write_ibd_pong(
+        &pong,
+        1,
+        &mut Emit {
+            sent: &mut sent,
+            pong: &pong,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sent,
+        vec![7, 8, 9],
+        "the writer emits every nonce that arrived during a write"
+    );
+    assert!(
+        pong.note(10),
+        "the slot is free after the latest nonce is written"
+    );
+}
+
 #[test]
 fn ping_and_solicited_block_stay_on_their_channels() {
     let (mut ctx, mut out_rx, mut body_rx, mut ctrl_rx) = test_ctx(1);

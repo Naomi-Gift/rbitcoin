@@ -8435,6 +8435,75 @@ fn one_charged_pong_carries_the_latest_nonce() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A ping that lands while the extra pong is being written is sent, and the
+/// slot is free for the ping after that.
+#[tokio::test]
+async fn an_extra_pong_still_answers_the_next_ping() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-extra");
+    hub.ensure_genesis().unwrap();
+    let peer = addrfetch_peer();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let before = peer.send_queued();
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 7).unwrap();
+    let charge = rbitcoin_net::peers::outbound_msg_bytes(&NetworkMessage::Pong(0));
+    assert_eq!(peer.send_queued().saturating_sub(before), charge);
+    // The nonce changed while the queued pong was on the wire.
+    peer.store_pong_nonce(8);
+    let queued = match rx.try_recv() {
+        Ok(PeerOut::Msg(NetworkMessage::Pong(n))) => n,
+        other => panic!("the opening ping queues one pong, got {other:?}"),
+    };
+    assert!(rx.try_recv().is_err());
+    peer.note_out_written(false, charge);
+    let mut sent = Vec::new();
+    struct ExtraEmit<'a> {
+        sent: &'a mut Vec<u64>,
+        peer: &'a rbitcoin_net::peers::LivePeer,
+    }
+    impl PongEmit for ExtraEmit<'_> {
+        fn emit(
+            &mut self,
+            msg: NetworkMessage,
+        ) -> impl std::future::Future<Output = Result<(), ()>> + Send {
+            if let NetworkMessage::Pong(n) = msg {
+                self.sent.push(n);
+                if n == 8 {
+                    self.peer.store_pong_nonce(9);
+                }
+            }
+            std::future::ready(Ok(()))
+        }
+    }
+    write_extra_pongs(
+        peer.as_ref(),
+        queued,
+        &mut ExtraEmit {
+            sent: &mut sent,
+            peer: peer.as_ref(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sent,
+        vec![8, 9],
+        "both nonces that arrived during a write go out"
+    );
+    assert_eq!(
+        peer.send_queued(),
+        before,
+        "each extra pong is charged and released"
+    );
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 10).unwrap();
+    assert!(
+        matches!(rx.try_recv(), Ok(PeerOut::Msg(NetworkMessage::Pong(_)))),
+        "the next ping queues one pong"
+    );
+    assert_eq!(peer.send_queued().saturating_sub(before), charge);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 mod log_text_tests;
 
 /// Core `ProcessMessage` ADDR/ADDRV2: the `getaddr` an addr-fetch session

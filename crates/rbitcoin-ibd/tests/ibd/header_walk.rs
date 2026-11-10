@@ -6589,6 +6589,55 @@ fn proved_short_batches_do_not_rewrite_header_adopt() {
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
+/// A rewind whose `header.adopt` save does not stick is written by the next
+/// short proved batch. A saved height above the tip is due on its own.
+#[test]
+fn a_missed_adopt_save_is_retried_by_the_next_short_batch() {
+    use std::sync::atomic::Ordering;
+
+    assert!(
+        adopt_checkpoint_due(true, true, Some(50), 10, 1),
+        "a saved height above the tip is due"
+    );
+    assert!(
+        !adopt_checkpoint_due(true, true, Some(10), 10, 1),
+        "a short batch on the saved height is not due"
+    );
+
+    let (dir, hub, mut st, gen) = opened("adopt-retry", false);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let first = headers_after(gen, 1, 1);
+    let saved_tip = first[0];
+    apply(&mut st, &hub, 0, first);
+    assert!(st.header_walk.proven);
+    assert_eq!(st.header_walk.tip_height(), 1);
+    let path = adopt_path(&hub);
+    assert!(path.exists());
+    hub.invalidated.pending.store(true, Ordering::Release);
+    rewind_to(&mut st, &hub, 1, None);
+    assert_eq!(st.header_walk.tip_height(), 1);
+    assert!(st.header_walk.proven);
+    assert!(
+        !path.exists(),
+        "a save that cannot stick removes the stale file"
+    );
+    assert_eq!(
+        st.header_walk.last_adopt_height, None,
+        "the missed save does not keep the old height"
+    );
+    hub.invalidated.pending.store(false, Ordering::Release);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    let next = headers_after(saved_tip, 1, 2);
+    let tip = next[0].block_hash();
+    apply(&mut st, &hub, 0, next);
+    assert_eq!(st.header_walk.tip_hash(), Some(tip));
+    assert!(path.exists(), "the next short proved batch writes the file");
+    let mut restarted = IbdWorkState::new(Vec::new(), hub.tip_hash(), Some(0));
+    assert!(restore_adopt(&mut restarted, &hub));
+    assert_eq!(restarted.header_walk.tip_hash(), Some(tip));
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
 /// Below the floor a one-header reply adds no checkpoint and drops the
 /// reservation. A full window that passes context extends, including a
 /// lighter challenger. Above the floor a short reply that does not extend

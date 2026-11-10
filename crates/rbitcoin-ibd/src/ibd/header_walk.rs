@@ -2707,7 +2707,8 @@ fn extend_connected(
 /// An unproved walk returns true and [`save_adopt`] writes nothing. The
 /// batch that first proves the floor writes. A later proved batch writes
 /// when the tip is a full headers window past the last saved checkpoint, or
-/// this batch is itself a full window. In-memory checkpoints stay per reply.
+/// this batch is itself a full window. A saved height above the tip writes.
+/// In-memory checkpoints stay per reply.
 #[doc(hidden)]
 pub fn adopt_checkpoint_due(
     proven: bool,
@@ -2719,11 +2720,16 @@ pub fn adopt_checkpoint_due(
     if !proven || !was_proven {
         return true;
     }
-    let window = rbitcoin_net::codec::MAX_HEADERS_RESULTS;
-    let gap = match last_height {
-        Some(h) => tip_height.saturating_sub(h),
-        None => u32::MAX,
+    let Some(saved) = last_height else {
+        return true;
     };
+    // A rewind or a failed save can leave the stamp above the tip. That
+    // file is not the walk we have now, so the next batch rewrites it.
+    if saved > tip_height {
+        return true;
+    }
+    let window = rbitcoin_net::codec::MAX_HEADERS_RESULTS;
+    let gap = tip_height - saved;
     gap >= window as u32 || batch_len >= window
 }
 
@@ -3863,6 +3869,7 @@ pub fn save_adopt(st: &mut IbdWorkState, hub: &ChainHub) {
     // invalid chain. No walk is the resume point until the mark is.
     if !hub.invalid_marks_on_disk() {
         forget_adopt(hub);
+        st.header_walk.last_adopt_height = None;
         return;
     }
     let mut buf = Vec::new();
@@ -3909,6 +3916,9 @@ pub fn save_adopt(st: &mut IbdWorkState, hub: &ChainHub) {
     let tmp = path.with_extension("tmp");
     if std::fs::write(&tmp, &buf).is_ok() && std::fs::rename(&tmp, &path).is_ok() {
         st.header_walk.last_adopt_height = Some(st.header_walk.tip_height());
+    } else {
+        // The bytes on disk are not this tip. The next proved batch retries.
+        st.header_walk.last_adopt_height = None;
     }
 }
 

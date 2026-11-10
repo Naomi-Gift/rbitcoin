@@ -1032,6 +1032,50 @@ pub async fn read_ibd_peer(
     }
 }
 
+/// Writes one IBD pong nonce. The future may borrow `self` until it is awaited.
+#[doc(hidden)]
+pub trait IbdPongEmit {
+    /// `Send` so the spawned IBD writer can await the write.
+    #[allow(clippy::manual_async_fn)]
+    fn emit(
+        &mut self,
+        nonce: u64,
+    ) -> impl std::future::Future<Output = Result<(), NetError>> + Send + '_;
+}
+
+/// Write the queued pong and every nonce that arrives during a write.
+///
+/// The pending slot is clear when this returns `Ok`.
+#[doc(hidden)]
+pub async fn write_ibd_pong<E: IbdPongEmit>(
+    pong: &IbdPong,
+    queued: u64,
+    emit: &mut E,
+) -> Result<(), NetError> {
+    let mut nonce = pong.wire_nonce(queued);
+    loop {
+        emit.emit(nonce).await?;
+        match pong.finish(nonce) {
+            Some(extra) => nonce = extra,
+            None => return Ok(()),
+        }
+    }
+}
+
+struct IbdPongWriter<'a> {
+    writer: &'a mut V2Writer,
+}
+
+impl IbdPongEmit for IbdPongWriter<'_> {
+    #[allow(clippy::manual_async_fn)]
+    fn emit(
+        &mut self,
+        nonce: u64,
+    ) -> impl std::future::Future<Output = Result<(), NetError>> + Send + '_ {
+        async move { write_v2_msg_offload(self.writer, NetworkMessage::Pong(nonce)).await }
+    }
+}
+
 pub async fn write_ibd_peer(
     id: usize,
     mut cmd_rx: mpsc::UnboundedReceiver<PeerCmd>,
@@ -1101,36 +1145,21 @@ pub async fn write_ibd_peer(
             msg = out_rx.recv() => {
                 match msg {
                     Some(payload) => {
-                        let payload = match payload {
+                        let failed = match payload {
                             NetworkMessage::Pong(queued) => {
-                                NetworkMessage::Pong(pong.wire_nonce(queued))
+                                let mut emit = IbdPongWriter {
+                                    writer: &mut writer,
+                                };
+                                write_ibd_pong(&pong, queued, &mut emit).await.is_err()
                             }
-                            other => other,
+                            other => write_v2_msg_offload(&mut writer, other).await.is_err(),
                         };
-                        let follow = match &payload {
-                            NetworkMessage::Pong(n) => Some(*n),
-                            _ => None,
-                        };
-                        if write_v2_msg_offload(&mut writer, payload).await.is_err() {
+                        if failed {
                             sinks_w.send_body(PeerEvent::Dead {
                                 peer: id,
                                 reason: "write outbound failed".into(),
                             });
                             break;
-                        }
-                        if let Some(written) = follow {
-                            if let Some(extra) = pong.finish(written) {
-                                if write_v2_msg_offload(&mut writer, NetworkMessage::Pong(extra))
-                                    .await
-                                    .is_err()
-                                {
-                                    sinks_w.send_body(PeerEvent::Dead {
-                                        peer: id,
-                                        reason: "write outbound failed".into(),
-                                    });
-                                    break;
-                                }
-                            }
                         }
                     }
                     None => break,

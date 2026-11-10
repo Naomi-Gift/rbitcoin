@@ -1720,6 +1720,50 @@ pub fn take_outbound_write_batch(
     batch
 }
 
+struct SessionPongEmit<'a> {
+    writer: &'a mut PeerWriter,
+}
+
+impl PongEmit for SessionPongEmit<'_> {
+    #[allow(clippy::manual_async_fn)]
+    fn emit(&mut self, msg: NetworkMessage) -> impl Future<Output = Result<(), ()>> + Send + '_ {
+        async { self.writer.write_msg_offload(msg).await.map_err(|_| ()) }
+    }
+}
+
+/// Writes one pong. The future may borrow `self` until it is awaited.
+#[doc(hidden)]
+pub trait PongEmit {
+    /// `Send` so the spawned writer task can await the write.
+    #[allow(clippy::manual_async_fn)]
+    fn emit(&mut self, msg: NetworkMessage) -> impl Future<Output = Result<(), ()>> + Send + '_;
+}
+
+/// Write pongs that arrived while `written` was on the wire.
+///
+/// Each extra nonce is charged on its own. A ping during an extra write is
+/// emitted next. The pending slot is clear when this returns `Ok`.
+#[doc(hidden)]
+pub async fn write_extra_pongs<E: PongEmit>(
+    session: &crate::peers::LivePeer,
+    written: u64,
+    emit: &mut E,
+) -> Result<(), ()> {
+    let mut next = session.finish_pong_write(written);
+    while let Some(extra) = next {
+        let msg = NetworkMessage::Pong(extra);
+        let extra_n = crate::peers::outbound_msg_bytes(&msg);
+        session.note_send_queued(extra_n);
+        let failed = emit.emit(msg).await.is_err();
+        session.note_out_written(false, extra_n);
+        if failed {
+            return Err(());
+        }
+        next = session.finish_pong_write(extra);
+    }
+    Ok(())
+}
+
 pub async fn run_writer_task(
     mut writer: PeerWriter,
     mut out_rx: mpsc::UnboundedReceiver<PeerOut>,
@@ -1749,15 +1793,11 @@ pub async fn run_writer_task(
                 return;
             }
             if let (Some(s), Some(written)) = (&writer_session, pong_written) {
-                if let Some(extra) = s.finish_pong_write(written) {
-                    let msg = NetworkMessage::Pong(extra);
-                    let extra_n = crate::peers::outbound_msg_bytes(&msg);
-                    s.note_send_queued(extra_n);
-                    let extra_err = writer.write_msg_offload(msg).await.is_err();
-                    s.note_out_written(false, extra_n);
-                    if extra_err {
-                        return;
-                    }
+                let mut emit = SessionPongEmit {
+                    writer: &mut writer,
+                };
+                if write_extra_pongs(s, written, &mut emit).await.is_err() {
+                    return;
                 }
             }
         }
