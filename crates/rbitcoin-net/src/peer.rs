@@ -4919,8 +4919,8 @@ pub fn on_inv(
             Inventory::Block(h) | Inventory::WitnessBlock(h) => {
                 if let Some(s) = session {
                     s.note_block_from_peer(*h);
-                    s.note_best_known(*h);
                 }
+                note_advanced_best_known(hub, &follow.pending_headers, session, *h);
                 if on_inv_block_needs_headers(hub, follow, session, h) {
                     need_headers = true;
                 }
@@ -5347,6 +5347,20 @@ fn best_known_moves_forward(
     }
 }
 
+fn note_advanced_best_known(
+    hub: &ChainHub,
+    pending: &HashMap<BlockHash, bitcoin::block::Header>,
+    session: Option<&crate::peers::LivePeer>,
+    hash: BlockHash,
+) {
+    let Some(s) = session else {
+        return;
+    };
+    if best_known_moves_forward(hub, pending, s.best_known(), hash) {
+        s.note_best_known(hash);
+    }
+}
+
 fn apply_headers(
     apply: HeadersApply,
     hub: &ChainHub,
@@ -5369,11 +5383,7 @@ fn apply_headers(
         admit_pending_header(&mut follow.pending_headers, hash, hdr);
     }
     for hash in apply.best_known {
-        if let Some(s) = session {
-            if best_known_moves_forward(hub, &follow.pending_headers, s.best_known(), hash) {
-                s.note_best_known(hash);
-            }
-        }
+        note_advanced_best_known(hub, &follow.pending_headers, session, hash);
     }
     if let Some((announced_h, our_tip)) = apply.disconnect {
         rbitcoin_log::info!("p2p: disconnect stale fork tip announced={announced_h} our={our_tip}");
@@ -5523,8 +5533,8 @@ pub async fn on_block(
     }
     if let Some(s) = session {
         s.note_block_from_peer(hash);
-        s.note_best_known(hash);
     }
+    note_advanced_best_known(hub, &follow.pending_headers, session, hash);
     // One frame at a time: the ping behind this body is not read until we
     // return. A duplicate must not take the process-wide tip-accept lane.
     if hub.already_have(hash) {
@@ -5825,8 +5835,8 @@ pub fn on_cmpctblock_reject_early(
     }
     if let Some(s) = session {
         s.note_block_from_peer(hash);
-        s.note_best_known(hash);
     }
+    note_advanced_best_known(hub, &follow.pending_headers, session, hash);
     Ok(false)
 }
 

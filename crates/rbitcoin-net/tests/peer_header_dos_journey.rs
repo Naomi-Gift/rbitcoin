@@ -2131,6 +2131,129 @@ async fn known_good_chain_survives_a_later_low_work_fork() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Inv, block, and compact must not replace a best-known header that has
+/// more work. A later short fork then still keeps the outbound peer.
+#[tokio::test]
+async fn earlier_block_does_not_replace_best_known() {
+    use bitcoin::bip152::HeaderAndShortIds;
+    use bitcoin::p2p::message_blockdata::Inventory;
+    use rbitcoin_net::peers::PeerConnType;
+    use std::sync::atomic::Ordering;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("ibd-best-known-inv");
+    let mut floor = [0u8; 32];
+    floor[30] = 0x10;
+    hub.set_minimum_chain_work(Some(floor));
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(4, op_true(), vec![]).unwrap();
+    let met = hub.chain_work().unwrap().to_be_bytes();
+    hub.set_minimum_chain_work(Some(met));
+    let tip_time = u64::from(hub.tip_header().unwrap().time);
+    hub.clock
+        .set_mock(i64::try_from(tip_time + hub.max_tip_age_secs() + 1).unwrap());
+    assert!(hub.in_ibd(), "a stale tip stays in initial block download");
+    let tip = hub.tip_hash().unwrap();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let peer = live_peer_as(&peers, 18512, 92, PeerConnType::OutboundFullRelay);
+    peer.note_best_known(tip);
+    let (out_tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let unknown = BlockHash::from_byte_array([0xab; 32]);
+    on_inv(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &[Inventory::Block(unknown)],
+    )
+    .unwrap();
+    assert_eq!(
+        peer.best_known(),
+        Some(tip),
+        "an unknown inv does not replace a best known header"
+    );
+    let early = hub
+        .query
+        .reconstruct_block_at_height(Height(1))
+        .unwrap();
+    on_inv(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &[Inventory::WitnessBlock(early.block_hash())],
+    )
+    .unwrap();
+    assert_eq!(
+        peer.best_known(),
+        Some(tip),
+        "an earlier block inv does not replace a best known header"
+    );
+    on_block(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &early,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        peer.best_known(),
+        Some(tip),
+        "an earlier block does not replace a best known header"
+    );
+    follow.cmpct_version = 2;
+    let hsi = HeaderAndShortIds::from_block(&early, 1, 2, &[0]).unwrap();
+    on_cmpctblock_reject_early(
+        &hub,
+        &mut follow,
+        Some(peer.as_ref()),
+        &hsi,
+        early.block_hash(),
+    )
+    .unwrap();
+    assert_eq!(
+        peer.best_known(),
+        Some(tip),
+        "an earlier compact block does not replace a best known header"
+    );
+    peer.note_best_known(early.block_hash());
+    let tip_block = hub.query.reconstruct_block_at_height(Height(4)).unwrap();
+    on_block(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &tip_block,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        peer.best_known(),
+        Some(tip),
+        "a higher-work block still becomes best known"
+    );
+    let fork = regtest_header_chain(header_at(&hub, 0).block_hash(), 1);
+    rbitcoin_log::capture_logs(true);
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(fork),
+    )
+    .await;
+    assert!(
+        !peer.stop.load(Ordering::SeqCst),
+        "a short low-work fork keeps the peer after an earlier block"
+    );
+    assert!(!logs_have(
+        "outbound peer headers chain has insufficient work"
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn full_headers_page_is_not_an_insufficient_work_disconnect() {
     use rbitcoin_net::codec::MAX_HEADERS_RESULTS;

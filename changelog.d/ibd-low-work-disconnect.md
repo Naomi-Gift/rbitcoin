@@ -4,6 +4,8 @@ Fixed
   message that ends the peer's chain and sits under `-minimumchainwork`
   disconnects outbound full-relay and block-relay peers. A later short
   fork does not drop a peer whose best-known header already meets the
-  floor. Inbound and manual peers stay. `feature_minchainwork.py` is run
+  floor. An inv, block, or compact block does not replace that header
+  with less or unknown work. Inbound and manual peers stay.
+  `feature_minchainwork.py` is run
   again. Port of
   bitcoin/bitcoin#36426 (#1484).
