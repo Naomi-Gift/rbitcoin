@@ -437,6 +437,8 @@ pub struct LivePeer {
     pub sent: Mutex<HashMap<String, u64>>,
     pub last_block: AtomicU64,
     pub last_transaction: AtomicU64,
+    /// Unix seconds when this peer last first announced a block unknown to us.
+    pub last_block_announcement: AtomicU64,
     pub minfeefilter_sat_kvb: AtomicU64,
     /// Last BIP133 feefilter we sent (`-1` = none yet).
     pub sent_feefilter_sat_kvb: AtomicI64,
@@ -1294,6 +1296,11 @@ impl LivePeer {
         self.last_block.store(now, Ordering::Relaxed);
     }
 
+    pub fn note_last_block_announcement(&self) {
+        self.last_block_announcement
+            .store(self.clock_now(), Ordering::Relaxed);
+    }
+
     pub fn note_last_transaction(&self) {
         self.last_transaction
             .store(self.clock_now(), Ordering::Relaxed);
@@ -1639,6 +1646,7 @@ impl LivePeer {
             pingwait,
             last_block: self.last_block.load(Ordering::Relaxed),
             last_transaction: self.last_transaction.load(Ordering::Relaxed),
+            last_block_announcement: self.last_block_announcement.load(Ordering::Relaxed),
             minfeefilter_sat_kvb: self.minfeefilter_sat_kvb.load(Ordering::Relaxed),
             last_inv_sequence: self.last_inv_sequence(),
             inv_to_send: self.inv_to_send(),
@@ -1759,6 +1767,8 @@ pub struct PeerInfo {
     pub last_block: u64,
     /// Unix seconds of last accepted tx from this peer (`0` = never).
     pub last_transaction: u64,
+    /// Unix seconds when this peer last first announced a block unknown to us (`0` = never).
+    pub last_block_announcement: u64,
     /// Fee filter they sent us, sat/kvB (`0` = none).
     pub minfeefilter_sat_kvb: u64,
     /// `getpeerinfo.last_inv_sequence`.
@@ -3244,6 +3254,7 @@ impl PeerHub {
             sent: Mutex::new(HashMap::new()),
             last_block: AtomicU64::new(0),
             last_transaction: AtomicU64::new(0),
+            last_block_announcement: AtomicU64::new(0),
             minfeefilter_sat_kvb: AtomicU64::new(0),
             sent_feefilter_sat_kvb: AtomicI64::new(-1),
             wire: Mutex::new(None),
