@@ -8298,25 +8298,41 @@ fn getcfilters_stops_after_the_filter_that_crosses_the_send_budget() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
-/// Heights 1000, 2000, and 3000 come back as the three checkpoint headers.
+/// A stop under height 1,000 queues an empty checkpoint message. Height
+/// 1,000 queues that one filter header. The stride past the first
+/// checkpoint stays in the store table test
+/// `checkpoint_headers_are_every_thousandth_slot`.
 #[test]
 fn getcfcheckpt_returns_a_header_every_thousand_heights() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cf-checkpt");
     hub.query.set_block_filter_index(true).unwrap();
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(3_000, ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .unwrap();
-    assert_eq!(hub.tip_height().unwrap(), 3_000);
-    assert_eq!(hub.query.basic_filter_hwm().unwrap(), Some(3_000));
+    let script = ScriptBuf::from_bytes(vec![0x51]);
+    hub.generate_to_script(999, script.clone(), vec![]).unwrap();
+    assert_eq!(hub.tip_height().unwrap(), 999);
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let below = bitcoin::p2p::message_filter::GetCFCheckpt {
+        filter_type: 0,
+        stop_hash: hub.tip_hash().unwrap(),
+    };
+    on_getcfcheckpt(&hub, &tx, None, &below).unwrap();
+    match rx.try_recv().expect("cfcheckpt below 1000") {
+        PeerOut::Msg(NetworkMessage::CFCheckpt(m)) => {
+            assert!(
+                m.filter_headers.is_empty(),
+                "a stop under 1000 has no checkpoint"
+            );
+        }
+        other => panic!("expected cfcheckpt, got {other:?}"),
+    }
+    hub.generate_to_script(1, script, vec![]).unwrap();
+    assert_eq!(hub.tip_height().unwrap(), 1_000);
+    assert_eq!(hub.query.basic_filter_hwm().unwrap(), Some(1_000));
     let rows = hub
         .query
-        .basic_filter_hashes_and_headers(1_000, 3_000)
+        .basic_filter_hashes_and_headers(1_000, 1_000)
         .unwrap()
         .expect("sealed range");
-    let expect: Vec<_> = [1_000u32, 2_000, 3_000]
-        .into_iter()
-        .map(|height| rows[(height - 1_000) as usize].1)
-        .collect();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let req = bitcoin::p2p::message_filter::GetCFCheckpt {
         filter_type: 0,
@@ -8325,7 +8341,7 @@ fn getcfcheckpt_returns_a_header_every_thousand_heights() {
     on_getcfcheckpt(&hub, &tx, None, &req).unwrap();
     match rx.try_recv().expect("cfcheckpt") {
         PeerOut::Msg(NetworkMessage::CFCheckpt(m)) => {
-            assert_eq!(m.filter_headers, expect);
+            assert_eq!(m.filter_headers, vec![rows[0].1]);
         }
         other => panic!("expected cfcheckpt, got {other:?}"),
     }
