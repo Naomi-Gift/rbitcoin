@@ -719,6 +719,85 @@ fn named_keeps_a_value_containing_eq_positional() {
 
 #[cfg(unix)]
 #[test]
+fn named_keeps_an_explicit_args_over_the_positional_list() {
+    use std::os::unix::net::UnixListener;
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let (captured, h) = serve_one_rpc(UnixListener::bind(&sock).unwrap());
+    let code = cli_main([
+        "rbitcoin-cli",
+        "--named",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "echojson",
+        "args=[1,2]",
+        r#"["a=b"]"#,
+    ]);
+    assert!(exit_ok(code), "--named echojson must succeed, got {code:?}");
+    let params = captured.lock().unwrap().take().unwrap();
+    assert_eq!(params, serde_json::json!({"args": [1, 2]}));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = h.join();
+}
+
+#[cfg(unix)]
+#[test]
+fn importmempool_positional_past_options_stays_a_string() {
+    use std::os::unix::net::UnixListener;
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let (captured, h) = serve_one_rpc(UnixListener::bind(&sock).unwrap());
+    let code = cli_main([
+        "rbitcoin-cli",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "importmempool",
+        "file.dat",
+        "{}",
+        "leftover",
+    ]);
+    assert!(exit_ok(code), "importmempool must succeed, got {code:?}");
+    let params = captured.lock().unwrap().take().unwrap();
+    assert_eq!(
+        params,
+        serde_json::json!(["file.dat", {}, "leftover"]),
+        "a positional past `options` must ship as a string, not be JSON-parsed"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = h.join();
+}
+
+#[cfg(unix)]
+#[test]
+fn importmempool_named_bools_convert() {
+    use std::os::unix::net::UnixListener;
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let (captured, h) = serve_one_rpc(UnixListener::bind(&sock).unwrap());
+    let code = cli_main([
+        "rbitcoin-cli",
+        "--named",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "importmempool",
+        "filepath=file.dat",
+        "use_current_time=true",
+    ]);
+    assert!(
+        exit_ok(code),
+        "--named importmempool must succeed, got {code:?}"
+    );
+    let params = captured.lock().unwrap().take().unwrap();
+    assert_eq!(
+        params,
+        serde_json::json!({"filepath": "file.dat", "use_current_time": true})
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = h.join();
+}
+
+#[cfg(unix)]
+#[test]
 fn named_duplicate_name_last_wins() {
     use std::os::unix::net::UnixListener;
     let dir = tmp_datadir();

@@ -23,6 +23,7 @@ const CONVERT_PARAMS: &[(&str, usize, &str, ParamFormat)] = &[
     ("decoderawtransaction", 1, "iswitness", ParamFormat::Json),
     ("disconnectnode", 1, "nodeid", ParamFormat::Json),
     ("echojson", 0, "arg0", ParamFormat::Json),
+    ("echojson", 0, "args", ParamFormat::Json),
     ("echojson", 1, "arg1", ParamFormat::Json),
     ("echojson", 2, "arg2", ParamFormat::Json),
     ("echojson", 3, "arg3", ParamFormat::Json),
@@ -70,16 +71,18 @@ const CONVERT_PARAMS: &[(&str, usize, &str, ParamFormat)] = &[
     ("gettxout", 2, "include_mempool", ParamFormat::Json),
     ("gettxspendingprevout", 0, "outputs", ParamFormat::Json),
     ("importmempool", 1, "options", ParamFormat::Json),
-    ("importmempool", 2, "use_current_time", ParamFormat::Json),
+    // The three bools share positional slot 1 with `options` in the handler, so
+    // they are named-only: a later positional is not theirs and stays a string.
+    ("importmempool", 1, "use_current_time", ParamFormat::Json),
     (
         "importmempool",
-        3,
+        1,
         "apply_fee_delta_priority",
         ParamFormat::Json,
     ),
     (
         "importmempool",
-        4,
+        1,
         "apply_unbroadcast_set",
         ParamFormat::Json,
     ),
@@ -529,7 +532,9 @@ fn named_params(method: &str, params: &[String]) -> Result<Value, String> {
             _ => positional.push(param_value(method, positional.len(), raw)?),
         }
     }
-    if !positional.is_empty() {
+    // Core's RPCConvertNamedValues pushKVEnd's the positional list, so an
+    // explicit `args=` keeps its place and is the one the server reads.
+    if !positional.is_empty() && !map.contains_key("args") {
         map.insert("args".to_string(), Value::Array(positional));
     }
     Ok(Value::Object(map))
