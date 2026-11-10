@@ -85,6 +85,7 @@ fn dummy_slot(id: usize, a: SocketAddr, alive: bool) -> PeerSlot {
         requested: solicit_track().0,
         solicited_bytes: solicit_track().1,
         solicited_ms: solicit_track().2,
+        open_block_bytes: Arc::new(AtomicU64::new(0)),
         any_rx_ms: Arc::new(AtomicU64::new(0)),
         getdata_wire: rbitcoin_ibd::ibd::peer_io::GetdataWire::new(),
         peer_height: 0,
@@ -1434,6 +1435,36 @@ fn disconnect_stalled_keeps_a_peer_still_sending_a_block() {
         !withholding_blocks(&slot, 60_000, 30_000),
         "a solicited body of one progress step is still arriving"
     );
+    slot.solicited_bytes.store(0, Ordering::Relaxed);
+    slot.open_block_bytes
+        .store(rbitcoin_ibd::ibd::rate::PROGRESS_STEP, Ordering::Relaxed);
+    assert!(
+        !withholding_blocks(&slot, 60_000, 30_000),
+        "an unfinished block frame of one progress step is still arriving"
+    );
+    disconnect_stalled_block_peers_at(
+        std::slice::from_mut(&mut slot),
+        &mut inflight,
+        &mut rbitcoin_ibd::ibd::body::BodyPresence::new(),
+        &mut cooldown,
+        &mut strikes,
+        Instant::now(),
+        Duration::from_secs(30),
+        60_000,
+        0,
+    );
+    assert!(
+        cooldown.is_empty(),
+        "an unfinished block frame is not a stall disconnect"
+    );
+    assert!(inflight.contains_key(&h));
+    slot.open_block_bytes.store(0, Ordering::Relaxed);
+    assert!(
+        withholding_blocks(&slot, 60_000, 30_000),
+        "clearing the open frame with no finished block is withholding"
+    );
+    slot.solicited_bytes
+        .store(rbitcoin_ibd::ibd::rate::PROGRESS_STEP, Ordering::Relaxed);
     disconnect_stalled_block_peers_at(
         std::slice::from_mut(&mut slot),
         &mut inflight,
@@ -1845,6 +1876,21 @@ fn relative_slow_zero_throughput_uses_solicited_bytes() {
     assert!(
         sending_samples.iter().all(|s| s.peer_id != 74),
         "solicited bytes of one progress step are not zero throughput, got {sending_samples:?}"
+    );
+
+    let mut open = dummy_slot(75, addr(75), true);
+    open.in_flight.insert(h);
+    open.rate.sample(0, 0, true);
+    open.rate.sample(RELSLOW_ACTIVE_MS, 0, true);
+    open.rate.note_bytes_at_progress(0);
+    open.solicited_bytes.store(0, Ordering::Relaxed);
+    open.bytes_rx_total
+        .store(step.saturating_mul(4), Ordering::Relaxed);
+    open.open_block_bytes.store(step, Ordering::Relaxed);
+    let open_samples = mature_relative_slow_samples(std::slice::from_ref(&open), RELSLOW_ACTIVE_MS);
+    assert!(
+        open_samples.iter().all(|s| s.peer_id != 75),
+        "an unfinished block frame is not zero throughput, got {open_samples:?}"
     );
 }
 

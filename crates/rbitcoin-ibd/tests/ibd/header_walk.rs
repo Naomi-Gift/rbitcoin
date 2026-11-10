@@ -153,6 +153,7 @@ fn slot(id: usize) -> (PeerSlot, mpsc::UnboundedReceiver<PeerCmd>) {
             requested: solicit_track().0,
             solicited_bytes: solicit_track().1,
             solicited_ms: solicit_track().2,
+            open_block_bytes: Arc::new(AtomicU64::new(0)),
             any_rx_ms: Arc::new(AtomicU64::new(0)),
             getdata_wire: rbitcoin_ibd::ibd::peer_io::GetdataWire::new(),
             peer_height: 50_000,

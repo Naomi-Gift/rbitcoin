@@ -30,6 +30,13 @@ pub const TX_INV_BATCH: usize = 1_000;
 /// Bitcoin Core `MAX_HEADERS_RESULTS` — max headers in a `headers` message.
 pub const MAX_HEADERS_RESULTS: usize = 2_000;
 
+/// One `headers` entry: 80-byte header plus the transaction-count byte.
+pub const HEADER_WIRE_BYTES: usize = 81;
+
+/// Largest BIP324 contents of a `headers` message, long command form.
+/// A block frame longer than this is not that message.
+pub const MAX_HEADERS_CONTENTS: usize = 1 + 12 + 3 + MAX_HEADERS_RESULTS * HEADER_WIRE_BYTES;
+
 /// Bitcoin Core `MAX_LOCATOR_SZ` — max block locator hashes.
 pub const MAX_LOCATOR_SZ: usize = 101;
 

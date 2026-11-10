@@ -35,6 +35,7 @@ fn dummy_slot(id: usize) -> PeerSlot {
         requested: Arc::new(Mutex::new(HashSet::new())),
         solicited_bytes: Arc::new(AtomicU64::new(0)),
         solicited_ms: Arc::new(AtomicU64::new(0)),
+        open_block_bytes: Arc::new(AtomicU64::new(0)),
         any_rx_ms: Arc::new(AtomicU64::new(0)),
         getdata_wire: GetdataWire::new(),
         peer_height: 100,
@@ -209,6 +210,30 @@ fn block_progress_stamp_records_solicited_bytes() {
         .store(step.saturating_mul(3), Ordering::Relaxed);
     note_block_rx(std::slice::from_mut(&mut slot), 8, 1_000);
     assert_eq!(slot.rate.bytes_at_progress, step.saturating_mul(3));
+}
+
+#[test]
+fn open_block_bytes_count_a_frame_past_a_headers_message() {
+    let hash = BlockHash::from_byte_array([9u8; 32]);
+    let requested = Mutex::new(HashSet::from([hash]));
+    let open = AtomicU64::new(0);
+    let step = rbitcoin_ibd::ibd::rate::PROGRESS_STEP as usize;
+    let headers = rbitcoin_net::codec::MAX_HEADERS_CONTENTS;
+    note_open_block(&open, &requested, headers, step);
+    assert_eq!(open.load(Ordering::Relaxed), 0, "a headers message is chat");
+    note_open_block(&open, &requested, headers + 1, step);
+    assert_eq!(
+        open.load(Ordering::Relaxed),
+        step as u64,
+        "a longer frame while a block is owed is that frame"
+    );
+    requested.lock().unwrap().clear();
+    note_open_block(&open, &requested, headers + 1, step);
+    assert_eq!(
+        open.load(Ordering::Relaxed),
+        0,
+        "a long frame with nothing owed is not a block"
+    );
 }
 
 #[test]

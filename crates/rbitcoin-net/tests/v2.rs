@@ -554,7 +554,7 @@ async fn decoy_packet_is_handed_to_the_rate_hook() {
         let frame = read_v2_frame_with_progress(
             &mut reader,
             magic,
-            |n| last_progress = n,
+            |n, _| last_progress = n,
             |n| {
                 seen.push(n);
                 Ok(())
@@ -626,7 +626,7 @@ async fn decoy_over_the_window_scores_like_other_frames() {
         let frame = read_v2_frame_with_progress(
             &mut reader,
             magic,
-            |_| {},
+            |_, _| {},
             |n| {
                 if decoy_stays(&mut rate, &mut score, n, BAN_SCORE_THRESHOLD) {
                     Ok(())

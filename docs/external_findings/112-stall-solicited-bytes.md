@@ -11,7 +11,9 @@ the quiet case, but chat looked like a body still arriving. Relative-slow
 zero-throughput sampling used the same socket total.
 
 Withholding and that zero-throughput sample now use solicited block bytes
-since the stamp. A ping-only peer is withholding. Solicited bytes of one
-64 KiB step keep the peer. Quiet detection is unchanged.
+since the stamp, plus the block frame still on the socket when that frame
+is longer than a headers message. A ping-only peer is withholding.
+Finished or in-flight block bytes of one 64 KiB step keep the peer. Quiet
+detection is unchanged.
 
 **Regression:** `rbitcoin-ibd` `ibd::dial::disconnect_stalled_drops_a_peer_sending_only_unsolicited_bytes`, `ibd::dial::disconnect_stalled_keeps_a_peer_still_sending_a_block`, `ibd::dial::relative_slow_zero_throughput_uses_solicited_bytes`, `ibd::peer_io::block_progress_stamp_records_solicited_bytes`.

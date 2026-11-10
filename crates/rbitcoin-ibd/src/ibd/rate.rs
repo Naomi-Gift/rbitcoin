@@ -18,9 +18,9 @@ pub const PROGRESS_STEP: u64 = 64 * 1024;
 /// solicited block progress. `any_rx_ms` is the last socket byte of any kind.
 /// Quiet disconnect uses `any_rx_ms`. Block clocks (`progress_ms`, eviction,
 /// recent-rx) ignore pings, addr, and headers.
-/// `bytes_at_progress` is the solicited-block total when block progress last
-/// moved, so a body still arriving is not scored as chat. Socket bytes that
-/// are not a requested block do not move it.
+/// `bytes_at_progress` is the completed solicited total when block progress
+/// last moved. A block frame still on the socket is `open_block_bytes` when
+/// that frame is longer than a headers message. Pings and headers stay off both.
 /// `work_started_ms` records the last getdata write and is not a stall input.
 /// A quiet in-flight gap does not rewrite the EWMA. Ranking, densify caps,
 /// and AddrMan FAST/SLOW read [`Self::bps`].

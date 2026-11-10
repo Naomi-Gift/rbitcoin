@@ -145,6 +145,8 @@ pub struct PeerSlot {
     pub requested: Arc<Mutex<HashSet<BlockHash>>>,
     /// Bytes of blocks this peer was asked for. Stall-clock input.
     pub solicited_bytes: Arc<AtomicU64>,
+    /// Bytes of the block frame still on the socket. Zero for pings and headers.
+    pub open_block_bytes: Arc<AtomicU64>,
     /// Mono ms of the last solicited block the reader accepted.
     pub solicited_ms: Arc<AtomicU64>,
     /// Mono ms of the last socket read, including pings. Quiet stall only.
@@ -366,11 +368,12 @@ impl PeerSlot {
         self.takes_block_requests() && !self.chain.lacks(hash, now_ms)
     }
 
-    /// Solicited block bytes since the last progress stamp. Pings, headers,
-    /// and other socket bytes stay on `bytes_rx_total`.
+    /// Finished solicited bytes plus the open block frame, since the stamp.
+    /// Pings, headers, and other socket bytes stay on `bytes_rx_total`.
     pub fn solicited_since_progress(&self) -> u64 {
         self.solicited_bytes
             .load(Ordering::Relaxed)
+            .saturating_add(self.open_block_bytes.load(Ordering::Relaxed))
             .saturating_sub(self.rate.bytes_at_progress)
     }
 
@@ -675,6 +678,30 @@ impl LightDecodes {
         self.tasks.retain(|t| !t.is_finished());
         self.tasks.push(task);
     }
+}
+
+/// Count `buffered` toward the open block when this frame cannot be a
+/// `headers` message and this peer still owes a block. Otherwise clear it.
+#[doc(hidden)]
+pub fn note_open_block(
+    open: &AtomicU64,
+    requested: &Mutex<HashSet<BlockHash>>,
+    contents_len: usize,
+    buffered: usize,
+) {
+    if contents_len <= rbitcoin_net::codec::MAX_HEADERS_CONTENTS {
+        open.store(0, Ordering::Relaxed);
+        return;
+    }
+    let owed = !requested
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .is_empty();
+    if !owed {
+        open.store(0, Ordering::Relaxed);
+        return;
+    }
+    open.store(buffered as u64, Ordering::Relaxed);
 }
 
 #[doc(hidden)]
@@ -995,12 +1022,14 @@ pub async fn read_ibd_peer(
     bytes_io: Arc<AtomicU64>,
     requested: Arc<Mutex<HashSet<BlockHash>>>,
     solicited_bytes: Arc<AtomicU64>,
+    open_block_bytes: Arc<AtomicU64>,
     any_rx_ms: Arc<AtomicU64>,
     solicited_ms: Arc<AtomicU64>,
     light_decode: Arc<Semaphore>,
     pong: Arc<IbdPong>,
 ) {
     let mut prog_mark = 0usize;
+    let requested_progress = Arc::clone(&requested);
     let mut ctx = IbdReadCtx {
         id,
         out_tx,
@@ -1020,13 +1049,26 @@ pub async fn read_ibd_peer(
         let frame = read_v2_frame_with_progress(
             &mut reader,
             magic,
-            |buffered| note_read_progress(&bytes_io, &any_rx_ms, &mut prog_mark, buffered),
-            |n| decoy_hook(&mut ctx.rate, &mut ctx.ban_score, n),
+            |buffered, contents_len| {
+                note_read_progress(&bytes_io, &any_rx_ms, &mut prog_mark, buffered);
+                note_open_block(
+                    &open_block_bytes,
+                    &requested_progress,
+                    contents_len,
+                    buffered,
+                );
+            },
+            |n| {
+                open_block_bytes.store(0, Ordering::Relaxed);
+                decoy_hook(&mut ctx.rate, &mut ctx.ban_score, n)
+            },
         )
         .await;
         // The progress mark is per read. The next frame starts at zero.
         prog_mark = 0;
-        if ctx.handle(frame) {
+        let stop = ctx.handle(frame);
+        open_block_bytes.store(0, Ordering::Relaxed);
+        if stop {
             break;
         }
     }
@@ -1219,11 +1261,13 @@ pub async fn spawn_peer(
     let bytes_rx_total = Arc::new(AtomicU64::new(0));
     let bytes_io = Arc::clone(&bytes_rx_total);
     let (requested, solicited_bytes, solicited_ms) = solicit_track();
+    let open_block_bytes = Arc::new(AtomicU64::new(0));
     let any_rx_ms = Arc::new(AtomicU64::new(0));
     let getdata_wire = GetdataWire::new();
     let wire_w = Arc::clone(&getdata_wire);
     let req_r = Arc::clone(&requested);
     let sol_bytes_r = Arc::clone(&solicited_bytes);
+    let open_block_r = Arc::clone(&open_block_bytes);
     let any_rx_r = Arc::clone(&any_rx_ms);
     let sol_ms_r = Arc::clone(&solicited_ms);
     let light_decode = Arc::new(Semaphore::new(LIGHT_DECODE_PERMITS));
@@ -1258,6 +1302,7 @@ pub async fn spawn_peer(
             bytes_io,
             req_r,
             sol_bytes_r,
+            open_block_r,
             any_rx_r,
             sol_ms_r,
             light_decode,
@@ -1290,6 +1335,7 @@ pub async fn spawn_peer(
         in_flight: HashSet::new(),
         requested,
         solicited_bytes,
+        open_block_bytes,
         solicited_ms,
         any_rx_ms,
         getdata_wire,

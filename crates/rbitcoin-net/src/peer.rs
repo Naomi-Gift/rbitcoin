@@ -2460,7 +2460,7 @@ pub async fn peer_session_with(
                 }
                 // Inbound before local tip announce so GetData during a
                 // generate burst is not queued behind hundreds of cmpctblocks.
-                frame = reader.read_frame_with_progress(magic, |_| {}, |n| {
+                frame = reader.read_frame_with_progress(magic, |_, _| {}, |n| {
                     let mut score = decoy_score.load(Ordering::Relaxed);
                     let keep = crate::peer_dos::decoy_stays(
                         &mut rate,
@@ -4137,17 +4137,10 @@ pub fn on_getcfcheckpt(
     }
     let mut filter_headers = Vec::new();
     if stop >= 1000 {
-        let Some(rows) = filter_q(hub.query.basic_filter_hashes_and_headers(1000, stop))? else {
+        let Some(headers) = filter_q(hub.query.basic_filter_checkpoint_headers(stop))? else {
             return Ok(());
         };
-        let mut h = 1000u32;
-        while h <= stop {
-            let Some(row) = rows.get((h - 1000) as usize) else {
-                return Ok(());
-            };
-            filter_headers.push(row.1);
-            h = h.saturating_add(1000);
-        }
+        filter_headers = headers;
     }
     queue_accounted(
         session,

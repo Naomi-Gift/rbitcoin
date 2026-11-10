@@ -26,8 +26,8 @@ pub const PEER_SEND_BUDGET: usize = 4 * 1024 * 1024;
 pub const HEADERS_RESPONSE_TIME_SECS: u64 = 120;
 
 /// Queued-byte estimate. Headers are 81 wire bytes, inv-like rows are 36,
-/// legacy addr rows are 30. Filter replies, compact blocks, and encoded
-/// block bodies use their consensus payload length.
+/// legacy addr rows are 30. Filter replies and compact blocks are counted
+/// from the fields they already hold. Encoded block bodies use their buffer.
 pub fn outbound_msg_bytes(msg: &NetworkMessage) -> usize {
     match msg {
         NetworkMessage::Headers(h) => h.len().saturating_mul(81),
@@ -39,19 +39,37 @@ pub fn outbound_msg_bytes(msg: &NetworkMessage) -> usize {
         NetworkMessage::BlockTxn(bt) => {
             // BlockTransactions: hash, compact count, then each transaction.
             let txs = &bt.transactions.transactions;
-            32 + bitcoin::consensus::encode::VarInt(txs.len() as u64).size()
-                + txs.iter().map(|tx| tx.total_size()).sum::<usize>()
+            32 + varint_len(txs.len()) + txs.iter().map(|tx| tx.total_size()).sum::<usize>()
         }
         NetworkMessage::Addr(a) => a.len().saturating_mul(30),
         NetworkMessage::AddrV2(a) => a.len().saturating_mul(61),
-        NetworkMessage::CFilter(m) => bitcoin::consensus::encode::serialize(m).len(),
-        NetworkMessage::CFHeaders(m) => bitcoin::consensus::encode::serialize(m).len(),
-        NetworkMessage::CFCheckpt(m) => bitcoin::consensus::encode::serialize(m).len(),
-        NetworkMessage::CmpctBlock(m) => {
-            bitcoin::consensus::encode::serialize(&m.compact_block).len()
-        }
+        NetworkMessage::CFilter(m) => 1 + 32 + varint_len(m.filter.len()) + m.filter.len(),
+        NetworkMessage::CFHeaders(m) => 1 + 32 + 32 + hash_vec_len(m.filter_hashes.len()),
+        NetworkMessage::CFCheckpt(m) => 1 + 32 + hash_vec_len(m.filter_headers.len()),
+        NetworkMessage::CmpctBlock(m) => compact_block_len(&m.compact_block),
         _ => 64,
     }
+}
+
+fn varint_len(n: usize) -> usize {
+    bitcoin::consensus::encode::VarInt(n as u64).size()
+}
+
+fn hash_vec_len(n: usize) -> usize {
+    varint_len(n) + n.saturating_mul(32)
+}
+
+fn compact_block_len(block: &bitcoin::bip152::HeaderAndShortIds) -> usize {
+    // Header, nonce, short ids (6 bytes), then each prefilled index and tx.
+    80 + 8
+        + varint_len(block.short_ids.len())
+        + block.short_ids.len().saturating_mul(6)
+        + varint_len(block.prefilled_txs.len())
+        + block
+            .prefilled_txs
+            .iter()
+            .map(|pre| varint_len(usize::from(pre.idx)) + pre.tx.total_size())
+            .sum::<usize>()
 }
 
 pub fn outbound_queued_bytes(out: &PeerOut) -> usize {

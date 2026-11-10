@@ -163,7 +163,7 @@ pub fn mature_relative_slow_samples(slots: &[PeerSlot], now_ms: u64) -> Vec<Rela
             continue;
         };
         if bps == 0 {
-            // Chat with getdata outstanding is a real zero. A solicited body
+            // Chat with getdata outstanding is a real zero. A block frame
             // still arriving, or a peer with nothing assigned, is not.
             if s.in_flight.is_empty() || s.solicited_since_progress() >= PROGRESS_STEP {
                 continue;
@@ -813,8 +813,8 @@ pub fn disconnect_stalled_block_peers_at(
     freed
 }
 
-/// Getdata is on the wire, block progress is stale, and solicited block
-/// bytes have not moved a body-sized chunk since that progress.
+/// Getdata is on the wire, block progress is stale, and neither a finished
+/// block nor the open block frame has moved a body-sized chunk.
 #[doc(hidden)]
 pub fn withholding_blocks(slot: &PeerSlot, now_ms: u64, stall_ms: u64) -> bool {
     if !super::peer_io::getdata_on_wire_stalled(slot, now_ms, stall_ms) {

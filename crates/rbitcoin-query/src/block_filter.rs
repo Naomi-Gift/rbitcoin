@@ -473,6 +473,22 @@ impl Query {
             .map(|v| v.into_iter().map(|(body, _)| body).collect()))
     }
 
+    /// Filter headers at heights 1,000, 2,000, … through `stop`.
+    /// `None` when the index is off or `stop` is past the watermark.
+    pub fn basic_filter_checkpoint_headers(
+        &self,
+        stop: u32,
+    ) -> Result<Option<Vec<FilterHeader>>, QueryError> {
+        let Some(table) = self.block_filter_table() else {
+            return Ok(None);
+        };
+        Ok(table.checkpoint_headers(Height(stop))?.map(|rows| {
+            rows.into_iter()
+                .map(FilterHeader::from_byte_array)
+                .collect()
+        }))
+    }
+
     /// Filter hash and header for `start..=end` without filter bytes.
     /// `None` when the index is off or `end` is past the watermark.
     pub fn basic_filter_hashes_and_headers(
