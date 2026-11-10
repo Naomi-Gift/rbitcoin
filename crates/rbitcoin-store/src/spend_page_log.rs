@@ -466,9 +466,6 @@ impl SpendPageLog {
             buf.truncate(len);
             for &(rel, meta) in &page.slots {
                 let i = rel as usize * SLOT;
-                if i + SLOT > buf.len() {
-                    return Err(StoreError::Corrupt("spend page poke past image"));
-                }
                 buf[i..i + SLOT].copy_from_slice(&meta);
             }
             pages.push((*page_off, Arc::from(buf.into_boxed_slice())));
@@ -922,6 +919,8 @@ fn encode_commit(
     buf
 }
 
+// llvm-cov drops the counters when this parser is inlined into `reload`.
+#[inline(never)]
 fn parse_commit(buf: &[u8]) -> Result<ParsedCommit, StoreError> {
     if buf.len() < COMMIT_HEAD {
         return Err(StoreError::Corrupt("spend.pages.commit short"));
@@ -1305,6 +1304,152 @@ mod tests {
         let file = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
         assert_eq!(file.len(), 4096);
         assert_eq!(&file[16..24], &first);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn explode_keeps_a_strong_slot_and_a_newer_open_note() {
+        let d = dir();
+        let log = SpendPageLog::create(&d);
+        let slot = [9u8, 1, 2, 3, 4, 5, 6, 7];
+        let newer = [8u8, 1, 2, 3, 4, 5, 6, 7];
+        log.note_slots(&[(16, slot), (24, slot)]).unwrap();
+        log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+        log.hold_fold_above(1).unwrap();
+        log.note_slots(&[(16, newer)]).unwrap();
+        log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+        // The open note at rel 2 wins. The image slot at rel 3 is still strong.
+        assert_eq!(log.slot(16), Some(newer));
+        assert_eq!(log.slot(24), Some(slot));
+        assert_eq!(log.slot(0), Some([0u8; 8]));
+        let _ = std::fs::remove_dir_all(&d);
+
+        let d = dir();
+        let log = SpendPageLog::create(&d);
+        log.note_slots(&[(16, slot)]).unwrap();
+        log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+        log.hold_fold_above(1).unwrap();
+        log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+        assert_eq!(log.slot(16), Some(slot));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn hold_ignores_a_commit_at_or_below_the_tip() {
+        let d = dir();
+        let log = SpendPageLog::create(&d);
+        let slot = [2u8, 1, 2, 3, 4, 5, 6, 7];
+        log.note_slots(&[(16, slot)]).unwrap();
+        log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+        log.hold_fold_above(9).unwrap();
+        log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+        let mut writes = 0u32;
+        log.fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(writes, 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn short_commit_file_is_not_rewritten_by_the_hold() {
+        let d = dir();
+        let log = SpendPageLog::create(&d);
+        let slot = [2u8, 1, 2, 3, 4, 5, 6, 7];
+        log.note_slots(&[(16, slot)]).unwrap();
+        log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+        let path = d.join(SPEND_PAGES_COMMIT_NAME);
+        std::fs::write(&path, [0u8; 4]).unwrap();
+        log.hold_fold_above(1).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap().len(), 4);
+        let mut writes = 0u32;
+        log.fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(writes, 0);
+        assert_eq!(log.slot(16), Some(slot));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn compose_rejects_the_live_tail_and_a_keep_error() {
+        let d = dir();
+        let log = SpendPageLog::create(&d);
+        let slot = [2u8, 1, 2, 3, 4, 5, 6, 7];
+        log.note_slots(&[(16, slot)]).unwrap();
+        let err = log.commit_open(4, 100, zeros, |_| Ok(true)).unwrap_err();
+        assert!(matches!(
+            err,
+            StoreError::Corrupt("spend page log composed the live tail")
+        ));
+        assert_eq!(log.slot(16), Some(slot));
+        let err = log
+            .commit_open(4, 8192, zeros, |_| Err(StoreError::Corrupt("keep")))
+            .unwrap_err();
+        assert!(matches!(err, StoreError::Corrupt("keep")));
+        assert_eq!(log.slot(16), Some(slot));
+        assert!(!d.join(SPEND_PAGES_COMMIT_NAME).exists());
+        log.commit_open(4, 8192, |_off, _len| Ok(vec![7u8; 8]), |_| Ok(true))
+            .unwrap();
+        let file = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
+        assert_eq!(file.len(), 4096);
+        assert_eq!(file[0], 7);
+        assert_eq!(file[8], 0);
+        assert_eq!(&file[16..24], &slot);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn rejected_open_page_is_not_published() {
+        let d = dir();
+        let log = SpendPageLog::create(&d);
+        let slot = [2u8, 1, 2, 3, 4, 5, 6, 7];
+        log.note_slots(&[(16, slot)]).unwrap();
+        log.commit_open(4, 8192, zeros, |_| Ok(false)).unwrap();
+        assert_eq!(log.slot(16), None);
+        assert!(!d.join(SPEND_PAGES_COMMIT_NAME).exists());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_second_prepare_does_not_append_another_image() {
+        let d = dir();
+        let log = SpendPageLog::create(&d);
+        let slot = [2u8, 1, 2, 3, 4, 5, 6, 7];
+        log.note_slots(&[(16, slot)]).unwrap();
+        log.prepare_commit(4, 8192, zeros, |_| Ok(true)).unwrap();
+        log.prepare_commit(4, 8192, zeros, |_| Ok(true)).unwrap();
+        log.install_commit().unwrap();
+        let file = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
+        assert_eq!(file.len(), 4096);
+        assert_eq!(log.slot(16), Some(slot));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn reload_drops_pages_without_a_commit_and_serves_a_bad_magic() {
+        let d = dir();
+        std::fs::write(d.join(SPEND_PAGES_NAME), [1u8; 8]).unwrap();
+        let log = SpendPageLog::load(&d).unwrap();
+        assert!(!d.join(SPEND_PAGES_NAME).exists());
+        assert_eq!(log.slot(16), None);
+        std::fs::write(d.join(SPEND_PAGES_COMMIT_NAME), [0u8; 28]).unwrap();
+        assert!(matches!(SpendPageLog::load(&d), Err(StoreError::BadMagic)));
+        std::fs::write(d.join(SPEND_PAGES_COMMIT_NAME), [0u8; 4]).unwrap();
+        assert!(matches!(
+            SpendPageLog::load(&d),
+            Err(StoreError::Corrupt("spend.pages.commit short"))
+        ));
         let _ = std::fs::remove_dir_all(&d);
     }
 }
