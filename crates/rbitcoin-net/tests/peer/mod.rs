@@ -19,7 +19,7 @@ use rbitcoin_net::peers::{CappedSet, PeerOut};
 use rbitcoin_net::seeds::AddrMan;
 use rbitcoin_primitives::Height;
 use rbitcoin_query::Query;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -39,6 +39,20 @@ fn served_block(p: PeerOut) -> bitcoin::Block {
         other => panic!("expected served block, got {other:?}"),
     }
 }
+
+fn frame_for(msg: NetworkMessage) -> FramedMessage {
+    let magic = Magic::from(Network::Regtest);
+    let raw = RawNetworkMessage::new(magic, msg);
+    let full = serialize(&raw);
+    let command: [u8; 12] = full[4..16].try_into().unwrap();
+    let payload = full[24..].to_vec();
+    FramedMessage {
+        magic,
+        command,
+        payload,
+    }
+}
+
 #[test]
 fn p2p_serve_line_names_tx_bytes_wall() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("serve-line");
@@ -2012,7 +2026,6 @@ fn same_peer_pending_cmpct_does_not_getblocktxn_again() {
     use bitcoin::absolute::LockTime;
     use bitcoin::bip152::HeaderAndShortIds;
     use bitcoin::block::{Header, Version};
-    use bitcoin::consensus::encode::serialize;
     use bitcoin::p2p::address::Address;
     use bitcoin::p2p::message_compact_blocks::CmpctBlock;
     use bitcoin::p2p::message_network::VersionMessage;
@@ -2020,26 +2033,11 @@ fn same_peer_pending_cmpct_does_not_getblocktxn_again() {
     use bitcoin::script::ScriptBuf;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{
-        Amount, CompactTarget, Network, OutPoint, Sequence, Transaction, TxIn, TxMerkleNode, TxOut,
-        Witness,
+        Amount, CompactTarget, OutPoint, Sequence, Transaction, TxIn, TxMerkleNode, TxOut, Witness,
     };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::sync::Arc;
     use tokio::runtime::Builder;
-
-    fn frame_for(msg: NetworkMessage) -> FramedMessage {
-        use bitcoin::p2p::message::RawNetworkMessage;
-        let magic = Magic::from(Network::Regtest);
-        let raw = RawNetworkMessage::new(magic, msg);
-        let full = serialize(&raw);
-        let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let payload = full[24..].to_vec();
-        FramedMessage {
-            magic,
-            command,
-            payload,
-        }
-    }
 
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
@@ -2150,45 +2148,16 @@ fn same_peer_pending_cmpct_does_not_getblocktxn_again() {
 
 #[test]
 fn handle_peer_frame_control_and_inv_paths() {
-    use bitcoin::consensus::encode::serialize;
     use bitcoin::hashes::Hash as _;
-    use bitcoin::Network;
     use tokio::runtime::Builder;
-
-    fn frame_for(msg: NetworkMessage) -> FramedMessage {
-        use bitcoin::p2p::message::RawNetworkMessage;
-        let magic = Magic::from(Network::Regtest);
-        let raw = RawNetworkMessage::new(magic, msg);
-        let full = serialize(&raw);
-        // 4 magic + 12 command + 4 len + 4 checksum + payload
-        let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let payload = full[24..].to_vec();
-        FramedMessage {
-            magic,
-            command,
-            payload,
-        }
-    }
 
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
         let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("handle-frame");
         hub.ensure_genesis().unwrap();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let mut follow = PeerFollowState {
-            wants_headers: false,
-            wtxid_relay: false,
-            send_cmpct: false,
-            cmpct_version: 2u32,
-            pending_headers: HashMap::new(),
-            pending_blocks: PendingBlocks::new(),
-            pending_cmpct: HashMap::new(),
-            from_this_peer: CappedSet::new(),
-            requested_blocks: HashSet::new(),
-            ban_score: 0u32,
-            getdata_tail: VecDeque::new(),
-            getblocktxn_tail: VecDeque::new(),
-        };
+        let mut follow = PeerFollowState::new();
+        follow.cmpct_version = 2;
 
         // SendHeaders / SendCmpct / WtxidRelay / Pong / GetAddr / Ping
         // (MemPool disconnects — covered by bloom_disabled_messages_request_disconnect.)
@@ -2656,26 +2625,11 @@ fn handle_peer_frame_control_and_inv_paths() {
 #[test]
 fn handle_peer_frame_mempool_tx_and_inv_paths() {
     use bitcoin::absolute::LockTime;
-    use bitcoin::consensus::encode::serialize;
     use bitcoin::hashes::Hash as _;
     use bitcoin::script::ScriptBuf;
     use bitcoin::transaction::Version as TxVersion;
     use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     use tokio::runtime::Builder;
-
-    fn frame_for(msg: NetworkMessage) -> FramedMessage {
-        use bitcoin::p2p::message::RawNetworkMessage;
-        let magic = Magic::from(Network::Regtest);
-        let raw = RawNetworkMessage::new(magic, msg);
-        let full = serialize(&raw);
-        let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let payload = full[24..].to_vec();
-        FramedMessage {
-            magic,
-            command,
-            payload,
-        }
-    }
 
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
@@ -2691,20 +2645,8 @@ fn handle_peer_frame_mempool_tx_and_inv_paths() {
         assert!(hub.attach_mempool(mp).is_ok());
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let mut follow = PeerFollowState {
-            wants_headers: false,
-            wtxid_relay: false,
-            send_cmpct: false,
-            cmpct_version: 2u32,
-            pending_headers: HashMap::new(),
-            pending_blocks: PendingBlocks::new(),
-            pending_cmpct: HashMap::new(),
-            from_this_peer: CappedSet::new(),
-            requested_blocks: HashSet::new(),
-            ban_score: 0u32,
-            getdata_tail: VecDeque::new(),
-            getblocktxn_tail: VecDeque::new(),
-        };
+        let mut follow = PeerFollowState::new();
+        follow.cmpct_version = 2;
 
         let unknown_txid = bitcoin::Txid::from_byte_array([0x42; 32]);
         handle_peer_frame(
@@ -2893,26 +2835,11 @@ fn tx_accept_log_parks_orphans_silences_duplicates() {
 /// logs `Not relaying non-mempool` instead of ATMP again (`p2p_permissions`).
 fn recent_reject_skips_atmp_on_second_send(via_cidr: bool) {
     use bitcoin::absolute::LockTime;
-    use bitcoin::consensus::encode::serialize;
     use bitcoin::script::ScriptBuf;
     use bitcoin::transaction::Version as TxVersion;
-    use bitcoin::{Amount, Network, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use tokio::runtime::Builder;
-
-    fn frame_for(msg: NetworkMessage) -> FramedMessage {
-        use bitcoin::p2p::message::RawNetworkMessage;
-        let magic = Magic::from(Network::Regtest);
-        let raw = RawNetworkMessage::new(magic, msg);
-        let full = serialize(&raw);
-        let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let payload = full[24..].to_vec();
-        FramedMessage {
-            magic,
-            command,
-            payload,
-        }
-    }
 
     let coinbase = Transaction {
         version: TxVersion::ONE,
@@ -2984,20 +2911,8 @@ fn recent_reject_skips_atmp_on_second_send(via_cidr: bool) {
         }
 
         let (out_tx, _out_rx) = mpsc::unbounded_channel();
-        let mut follow = PeerFollowState {
-            wants_headers: false,
-            wtxid_relay: false,
-            send_cmpct: false,
-            cmpct_version: 2u32,
-            pending_headers: HashMap::new(),
-            pending_blocks: PendingBlocks::new(),
-            pending_cmpct: HashMap::new(),
-            from_this_peer: CappedSet::new(),
-            requested_blocks: HashSet::new(),
-            ban_score: 0u32,
-            getdata_tail: VecDeque::new(),
-            getblocktxn_tail: VecDeque::new(),
-        };
+        let mut follow = PeerFollowState::new();
+        follow.cmpct_version = 2;
 
         rbitcoin_log::capture_logs(true);
         handle_peer_frame(
@@ -3145,23 +3060,8 @@ fn cmpct_helpers_with_mempool_skip_list_live() {
     );
 
     use bitcoin::bip152::BlockTransactions;
-    use bitcoin::consensus::encode::serialize;
     use bitcoin::p2p::message_compact_blocks::{BlockTxn, CmpctBlock};
-    use bitcoin::Network;
     use tokio::runtime::Builder;
-    fn frame_for(msg: NetworkMessage) -> FramedMessage {
-        use bitcoin::p2p::message::RawNetworkMessage;
-        let magic = Magic::from(Network::Regtest);
-        let raw = RawNetworkMessage::new(magic, msg);
-        let full = serialize(&raw);
-        let command: [u8; 12] = full[4..16].try_into().unwrap();
-        let payload = full[24..].to_vec();
-        FramedMessage {
-            magic,
-            command,
-            payload,
-        }
-    }
     let hsi_ok = hsi.clone();
     let hsi_fail = hsi.clone();
     let spend_ok = spend.clone();
@@ -3367,24 +3267,9 @@ fn p2p_side_chain_reorgs_via_held_bodies() {
 fn inv_of_already_asked_block_does_not_getdata() {
     // p2p_sendheaders Part 2: test_node announces headers (we getdata),
     // then inv_node re-invs the same hashes. One getdata in flight globally.
-    use bitcoin::consensus::encode::serialize;
     use bitcoin::script::ScriptBuf;
-    use bitcoin::Network;
     use rbitcoin_primitives::Height;
     use tokio::runtime::Builder;
-
-    fn frame_for(msg: NetworkMessage) -> FramedMessage {
-        use bitcoin::p2p::message::RawNetworkMessage;
-        let magic = Magic::from(Network::Regtest);
-        let raw = RawNetworkMessage::new(magic, msg);
-        let full = serialize(&raw);
-        let command: [u8; 12] = full[4..16].try_into().unwrap();
-        FramedMessage {
-            magic,
-            command,
-            payload: full[24..].to_vec(),
-        }
-    }
 
     fn drain_block_getdata(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<BlockHash> {
         let mut hashes = Vec::new();
@@ -3416,20 +3301,8 @@ fn inv_of_already_asked_block_does_not_getdata() {
         hub.ensure_genesis().unwrap();
 
         let (out_tx, mut out_rx) = mpsc::unbounded_channel();
-        let mut follow = PeerFollowState {
-            wants_headers: false,
-            wtxid_relay: false,
-            send_cmpct: false,
-            cmpct_version: 2u32,
-            pending_headers: HashMap::new(),
-            pending_blocks: PendingBlocks::new(),
-            pending_cmpct: HashMap::new(),
-            from_this_peer: CappedSet::new(),
-            requested_blocks: HashSet::new(),
-            ban_score: 0u32,
-            getdata_tail: VecDeque::new(),
-            getblocktxn_tail: VecDeque::new(),
-        };
+        let mut follow = PeerFollowState::new();
+        follow.cmpct_version = 2;
 
         handle_peer_frame(
             frame_for(NetworkMessage::Headers(vec![hdr])),
@@ -3470,40 +3343,13 @@ fn inv_of_already_asked_block_does_not_getdata() {
 /// `p2p_nobloomfilter_messages.py`: mempool/filter* disconnect when bloom off.
 #[test]
 fn bloom_disabled_messages_request_disconnect() {
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::p2p::message::RawNetworkMessage;
     use bitcoin::p2p::message_bloom::FilterAdd;
-    use bitcoin::Network;
-
-    fn frame_for(msg: NetworkMessage) -> FramedMessage {
-        let magic = Magic::from(Network::Regtest);
-        let raw = RawNetworkMessage::new(magic, msg);
-        let full = serialize(&raw);
-        let command: [u8; 12] = full[4..16].try_into().unwrap();
-        FramedMessage {
-            magic,
-            command,
-            payload: full[24..].to_vec(),
-        }
-    }
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("bloom-off");
     hub.ensure_genesis().unwrap();
     let (out_tx, _out_rx) = mpsc::unbounded_channel();
-    let mut follow = PeerFollowState {
-        wants_headers: false,
-        wtxid_relay: false,
-        send_cmpct: false,
-        cmpct_version: 2u32,
-        pending_headers: HashMap::new(),
-        pending_blocks: PendingBlocks::new(),
-        pending_cmpct: HashMap::new(),
-        from_this_peer: CappedSet::new(),
-        requested_blocks: HashSet::new(),
-        ban_score: 0,
-        getdata_tail: VecDeque::new(),
-        getblocktxn_tail: VecDeque::new(),
-    };
+    let mut follow = PeerFollowState::new();
+    follow.cmpct_version = 2;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -3532,40 +3378,13 @@ fn bloom_disabled_messages_request_disconnect() {
 /// `p2p_invalid_locator.py`: getheaders/getblocks with locator > MAX_LOCATOR_SZ disconnect.
 #[test]
 fn oversize_locator_request_disconnect() {
-    use bitcoin::consensus::encode::serialize;
-    use bitcoin::p2p::message::RawNetworkMessage;
     use bitcoin::p2p::message_blockdata::{GetBlocksMessage, GetHeadersMessage};
-    use bitcoin::Network;
-
-    fn frame_for(msg: NetworkMessage) -> FramedMessage {
-        let magic = Magic::from(Network::Regtest);
-        let raw = RawNetworkMessage::new(magic, msg);
-        let full = serialize(&raw);
-        let command: [u8; 12] = full[4..16].try_into().unwrap();
-        FramedMessage {
-            magic,
-            command,
-            payload: full[24..].to_vec(),
-        }
-    }
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("locator-oversize");
     hub.ensure_genesis().unwrap();
     let (out_tx, _out_rx) = mpsc::unbounded_channel();
-    let mut follow = PeerFollowState {
-        wants_headers: false,
-        wtxid_relay: false,
-        send_cmpct: false,
-        cmpct_version: 2u32,
-        pending_headers: HashMap::new(),
-        pending_blocks: PendingBlocks::new(),
-        pending_cmpct: HashMap::new(),
-        from_this_peer: CappedSet::new(),
-        requested_blocks: HashSet::new(),
-        ban_score: 0,
-        getdata_tail: VecDeque::new(),
-        getblocktxn_tail: VecDeque::new(),
-    };
+    let mut follow = PeerFollowState::new();
+    follow.cmpct_version = 2;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

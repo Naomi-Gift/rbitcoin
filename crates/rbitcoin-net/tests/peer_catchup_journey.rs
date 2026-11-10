@@ -1,15 +1,3 @@
-fn frame_for(msg: NetworkMessage) -> FramedMessage {
-    let magic = Magic::from(Network::Regtest);
-    let raw = RawNetworkMessage::new(magic, msg);
-    let full = serialize(&raw);
-    let command: [u8; 12] = full[4..16].try_into().unwrap();
-    FramedMessage {
-        magic,
-        command,
-        payload: full[24..].to_vec(),
-    }
-}
-
 fn take_msgs(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<NetworkMessage> {
     let mut out = Vec::new();
     while let Ok(item) = rx.try_recv() {
