@@ -5149,6 +5149,9 @@ struct HeadersApply {
     peer_below_floor: bool,
     /// The last header was new, accepted, connected, and beats our tip work.
     stamp_block_announcement: bool,
+    /// Empty or connecting: a reply to our getheaders. Core never counts an
+    /// unconnecting message, so its rate limit holds.
+    answers_getheaders: bool,
 }
 /// Drop pending headers until `slots` new headers fit under [`MAX_PENDING_HEADERS`].
 ///
@@ -5514,6 +5517,7 @@ fn classify_headers(
         headers_len: n,
         peer_below_floor: false,
         stamp_block_announcement: false,
+        answers_getheaders: n == 0,
     };
     let mut ignored_below_floor = false;
     if n == 0 {
@@ -5531,6 +5535,10 @@ fn classify_headers(
         let last = headers[n - 1].block_hash();
         apply.ignore_height = Some(pending_announced_height(&pending, last));
         ignored_below_floor = true;
+        // No header reads: the batch answers our getheaders when its pending
+        // path joins a best-chain block (Core: parent in the block index).
+        let (join, _) = pending_walk(pending_before, headers[0].prev_blockhash);
+        apply.answers_getheaders = is_genesis_hash(&join) || hub.is_connected(&join);
     } else if let Some(first) = headers.first() {
         let prev = first.prev_blockhash;
         if hub.is_block_invalid(&prev)
@@ -5548,6 +5556,7 @@ fn classify_headers(
         // not a continuation of any chain we hold.
         let connecting = prev != BlockHash::all_zeros()
             && header_announcement_connects(hub, pending_before, prev);
+        apply.answers_getheaders = connecting;
         let slots = newly_stored_slot_count(hub, &pending, headers);
         let mut staged_evicts = Vec::new();
         if connecting && pending.len().saturating_add(slots) > MAX_PENDING_HEADERS {
@@ -5764,6 +5773,9 @@ fn apply_headers(
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
 ) -> Result<(), NetError> {
+    if apply.answers_getheaders {
+        let _ = session.is_some_and(|s| s.take_awaiting_headers());
+    }
     if apply.misbehave {
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
@@ -5894,7 +5906,6 @@ pub async fn on_headers(
     session: Option<&crate::peers::LivePeer>,
     headers: &[bitcoin::block::Header],
 ) -> Result<(), NetError> {
-    let _ = session.is_some_and(|s| s.take_awaiting_headers());
     let noban = session.is_some_and(|s| s.session_noban());
     let pending = follow.pending_headers.clone();
     let requested = follow.requested_blocks.clone();

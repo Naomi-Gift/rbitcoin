@@ -320,7 +320,16 @@ async fn unknown_parent_bodies(
     assert!(follow.pending_headers.contains_key(&child.block_hash()));
 }
 
-/// An unconnecting header still asks for headers. A full batch continues from
+fn getheaders_count(rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> usize {
+    take_msgs(rx)
+        .iter()
+        .filter(|m| matches!(m, NetworkMessage::GetHeaders(_)))
+        .count()
+}
+
+/// Core `p2p_sendheaders` parts 5b and 5c. An unconnecting header is not a
+/// reply to our getheaders: it asks again only once an empty headers message
+/// answered, or `HEADERS_RESPONSE_TIME` passed. A full batch continues from
 /// its last hash. A long pending chain is walked from RAM back to genesis.
 async fn header_flood_and_pending_walk(
     hub: &rbitcoin_net::chain::ChainHub,
@@ -329,6 +338,8 @@ async fn header_flood_and_pending_walk(
     use bitcoin::block::{Header, Version};
     use bitcoin::{CompactTarget, TxMerkleNode};
 
+    let start = 1_700_000_000u64;
+    peers.set_mock_now(start);
     let peer = live_peer(peers, 18453, 5, false);
     peer.note_awaiting_headers();
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
@@ -341,19 +352,34 @@ async fn header_flood_and_pending_walk(
         bits: CompactTarget::from_consensus(0x207f_ffff),
         nonce: 0,
     };
-    push(
-        hub,
-        &out_tx,
-        &mut follow,
-        Some(peer.as_ref()),
-        NetworkMessage::Headers(vec![unknown]),
-    )
-    .await;
-    let msg = out_rx.try_recv().expect("getheaders").expect_msg();
-    assert!(
-        matches!(msg, NetworkMessage::GetHeaders(_)),
-        "unconnecting header must getheaders despite awaiting, got {msg:?}"
-    );
+    for (step, empty_first, now, want) in [
+        ("unconnecting header while a getheaders is out", false, start, 0),
+        ("empty headers answer, then unconnecting", true, start, 1),
+        ("unconnecting again before the response time", false, start, 0),
+        ("unconnecting after HEADERS_RESPONSE_TIME", false, start + 121, 1),
+    ] {
+        peers.set_mock_now(now);
+        if empty_first {
+            push(
+                hub,
+                &out_tx,
+                &mut follow,
+                Some(peer.as_ref()),
+                NetworkMessage::Headers(vec![]),
+            )
+            .await;
+        }
+        push(
+            hub,
+            &out_tx,
+            &mut follow,
+            Some(peer.as_ref()),
+            NetworkMessage::Headers(vec![unknown]),
+        )
+        .await;
+        assert_eq!(getheaders_count(&mut out_rx), want, "{step}");
+    }
+    peers.set_mock_now(0);
 
     let mut headers = Vec::with_capacity(MAX_HEADERS_RESULTS);
     let mut prev = BlockHash::from_byte_array([0x11; 32]);
@@ -2713,12 +2739,15 @@ async fn connected_check_does_not_catch_up_the_height_index() {
 
 /// A header that does not connect through pending headers is still ignored
 /// while our chain is under the floor. Summing that path used to give up
-/// and read parent headers.
+/// and read parent headers. A header on an earlier best-chain block answers
+/// our getheaders, and the height index tells us so without a header read.
 #[tokio::test]
 async fn below_floor_disconnected_header_does_not_walk_parents() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("below-floor-disc");
     let hub = ChainHub::new(q, ChainParams::regtest(), Milestone::NONE);
     hub.ensure_genesis().unwrap();
+    hub.generate_to_script(2, op_true(), vec![]).unwrap();
+    let tip_parent = hub.tip_header().unwrap().prev_blockhash;
     hub.set_minimum_chain_work(Some(work_floor(0xff)));
     assert!(!hub.meets_minimum_chain_work());
     let peers = rbitcoin_net::peers::PeerHub::new();
@@ -2726,6 +2755,7 @@ async fn below_floor_disconnected_header_does_not_walk_parents() {
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
     let mut follow = PeerFollowState::new();
     let orphan = regtest_header_chain(BlockHash::from_byte_array([0x11; 32]), 1);
+    peer.note_awaiting_headers();
     let before = rbitcoin_query::header_lookup_count();
     push(
         &hub,
@@ -2742,6 +2772,29 @@ async fn below_floor_disconnected_header_does_not_walk_parents() {
     );
     assert_eq!(side_tips(&hub), 0);
     assert!(asked_blocks(&mut out_rx).is_empty());
+    assert!(
+        peer.is_awaiting_headers(),
+        "an unconnecting header does not answer our getheaders"
+    );
+    let fork = regtest_header_chain(tip_parent, 1);
+    let before = rbitcoin_query::header_lookup_count();
+    push(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        NetworkMessage::Headers(fork),
+    )
+    .await;
+    let looked = rbitcoin_query::header_lookup_count().saturating_sub(before);
+    assert_eq!(
+        looked, 0,
+        "a below-floor header on the tip's parent must not read the store, looked={looked}"
+    );
+    assert!(
+        !peer.is_awaiting_headers(),
+        "a header on an earlier best-chain block answers our getheaders"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -2773,6 +2826,7 @@ async fn full_pending_below_floor_does_not_walk_parents() {
         .await;
     }
     assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    peer.note_awaiting_headers();
     let before = rbitcoin_query::header_lookup_count();
     let chain = regtest_header_chain(prev, batch);
     push(
@@ -2790,6 +2844,10 @@ async fn full_pending_below_floor_does_not_walk_parents() {
     );
     assert_eq!(side_tips(&hub), 0, "the batch stays under the floor");
     assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
+    assert!(
+        !peer.is_awaiting_headers(),
+        "a low-work batch that connects in RAM answers our getheaders"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
