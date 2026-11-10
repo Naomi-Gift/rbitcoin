@@ -143,7 +143,7 @@ pub fn finish_join<T>(joined: Result<T, tokio::task::JoinError>, cancel: &'stati
         Ok(value) => value,
         Err(err) => match err.try_into_panic() {
             Ok(payload) => std::panic::resume_unwind(payload),
-            Err(err) => Err::<T, _>(err).expect(cancel),
+            Err(err) => panic!("{cancel}: {err}"),
         },
     }
 }
