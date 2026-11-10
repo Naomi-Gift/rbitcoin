@@ -2579,3 +2579,211 @@ async fn regtest_datadir_refuses_mainnet_before_peers_and_rpc() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn tiny_signet(dir: &std::path::Path, challenge: Option<&str>) -> NodeConfig {
+    let mut cfg = NodeConfig::default()
+        .with_datadir(dir)
+        .with_network(rbitcoin_primitives::Network::Signet)
+        .with_tiny_heads();
+    cfg.signet_challenge =
+        challenge.map(|c| rbitcoin_node::config::parse_signet_challenge(c).unwrap());
+    cfg
+}
+
+fn open_and_close(cfg: NodeConfig) -> Result<(), rbitcoin_node::NodeError> {
+    run_node(cfg)?.shutdown()
+}
+
+/// Every signet shares one genesis, so only the recorded message start tells
+/// two signets' datadirs apart.
+#[test]
+fn datadir_reopens_under_the_signet_it_was_created_for() {
+    let dir = scratch_dir("net-same");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("same challenge reopens");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn datadir_refuses_a_different_signet_challenge() {
+    let dir = scratch_dir("net-other");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    let err = open_and_close(tiny_signet(&dir, Some("52"))).unwrap_err();
+    let started = rbitcoin_consensus::signet_magic(
+        rbitcoin_node::config::parse_signet_challenge("52")
+            .unwrap()
+            .as_script(),
+    );
+    let stored = rbitcoin_consensus::signet_magic(
+        rbitcoin_node::config::parse_signet_challenge("51")
+            .unwrap()
+            .as_script(),
+    );
+    let text = err.to_string();
+    assert!(text.contains("Wrong datadir for network?"), "{text}");
+    assert!(
+        text.contains(&format!(
+            "stored network signet {}",
+            bitcoin::p2p::Magic::from_bytes(stored)
+        )),
+        "{text}"
+    );
+    assert!(
+        text.contains(&format!(
+            "started network signet {}",
+            bitcoin::p2p::Magic::from_bytes(started)
+        )),
+        "{text}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn datadir_refuses_a_custom_challenge_after_the_default_signet() {
+    let dir = scratch_dir("net-default");
+    open_and_close(tiny_signet(&dir, None)).expect("default signet opens");
+    let err = open_and_close(tiny_signet(&dir, Some("51"))).unwrap_err();
+    assert!(
+        err.to_string().contains("stored network signet 0a03cf40"),
+        "{err}"
+    );
+    let err = open_and_close(tiny_signet(&dir, Some(""))).unwrap_err();
+    assert!(
+        err.to_string().contains("Wrong datadir for network?"),
+        "{err}"
+    );
+    open_and_close(tiny_signet(&dir, None)).expect("default signet reopens");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A datadir from before the marker has no record of its network. The node
+/// adopts the started one, says so, and refuses a different one afterwards.
+#[test]
+fn datadir_without_a_marker_adopts_the_started_network() {
+    let dir = scratch_dir("net-legacy");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    std::fs::remove_file(dir.join(NETWORK_MARKER)).expect("marker written on create");
+    rbitcoin_log::capture_logs(true);
+    let reopened = open_and_close(tiny_signet(&dir, Some("51")));
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    reopened.expect("legacy datadir opens");
+    assert!(
+        lines
+            .iter()
+            .any(|(_, l)| l.contains("no network marker") && l.contains("adopting signet")),
+        "no adopt line in {lines:?}"
+    );
+    assert!(open_and_close(tiny_signet(&dir, Some("52"))).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A refused start leaves no marker, so the datadir still opens on its own
+/// network.
+#[test]
+fn foreign_genesis_refusal_does_not_adopt_the_started_network() {
+    let dir = scratch_dir("net-no-adopt");
+    plant_regtest_genesis(&dir);
+    let mainnet = tiny_regtest(&dir).with_network(rbitcoin_primitives::Network::Mainnet);
+    assert!(open_and_close(mainnet).is_err());
+    assert!(!dir.join(NETWORK_MARKER).exists());
+    open_and_close(tiny_regtest(&dir)).expect("regtest datadir still opens");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every signet shares one genesis, so a datadir from before the marker
+/// takes whichever challenge its first start passes. The other one is then
+/// refused, including the challenge the datadir was really made for.
+#[test]
+fn legacy_signet_datadir_adopts_the_first_challenge_it_is_started_with() {
+    let dir = scratch_dir("net-legacy-first");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    std::fs::remove_file(dir.join(NETWORK_MARKER)).expect("marker written on create");
+    open_and_close(tiny_signet(&dir, Some("52"))).expect("legacy datadir adopts 52");
+    let err = open_and_close(tiny_signet(&dir, Some("51"))).unwrap_err();
+    assert!(
+        err.to_string().contains("Wrong datadir for network?"),
+        "{err}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A torn marker write leaves an empty file. That adopts, like a missing
+/// marker, instead of locking the datadir out on every later start.
+#[test]
+fn empty_marker_adopts_the_started_network() {
+    let dir = scratch_dir("net-empty");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    std::fs::write(dir.join(NETWORK_MARKER), "").unwrap();
+    rbitcoin_log::capture_logs(true);
+    let reopened = open_and_close(tiny_signet(&dir, Some("51")));
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    reopened.expect("empty marker adopts");
+    assert!(
+        lines.iter().any(|(_, l)| l.contains("adopting signet")),
+        "no adopt line in {lines:?}"
+    );
+    assert!(open_and_close(tiny_signet(&dir, Some("52"))).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The marker write is synced: the datadir entry for the renamed file is
+/// fsynced before the store opens for work.
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn marker_write_syncs_the_datadir() {
+    let dir = scratch_dir("net-sync");
+    rbitcoin_store::file::arm_fsync_dir_trace();
+    let opened = open_and_close(tiny_signet(&dir, Some("51")));
+    let synced = rbitcoin_store::file::take_fsynced_dirs();
+    opened.expect("first open");
+    assert!(synced.contains(&dir), "datadir not fsynced: {synced:?}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A symlinked temp file is not followed: its target keeps its bytes.
+#[cfg(unix)]
+#[test]
+fn marker_write_does_not_follow_a_temp_symlink() {
+    let dir = scratch_dir("net-tmp-link");
+    let victim = dir.join("victim");
+    std::fs::write(&victim, "keep me\n").unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::os::unix::fs::symlink(&victim, dir.join(format!("{NETWORK_MARKER}.tmp"))).unwrap();
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep me\n");
+    assert!(!std::fs::symlink_metadata(dir.join(NETWORK_MARKER))
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A huge or symlinked marker is refused without loading it into the error.
+#[cfg(unix)]
+#[test]
+fn oversized_or_symlinked_marker_refuses_with_a_short_error() {
+    let dir = scratch_dir("net-huge");
+    open_and_close(tiny_signet(&dir, Some("51"))).expect("first open");
+    let huge = "x".repeat(1 << 20);
+    std::fs::write(dir.join(NETWORK_MARKER), &huge).unwrap();
+    let err = open_and_close(tiny_signet(&dir, Some("51"))).unwrap_err();
+    assert!(
+        err.to_string().len() < 512,
+        "error carries the file: {} bytes",
+        err.to_string().len()
+    );
+
+    let target = dir.join("elsewhere");
+    std::fs::write(&target, &huge).unwrap();
+    std::fs::remove_file(dir.join(NETWORK_MARKER)).unwrap();
+    std::os::unix::fs::symlink(&target, dir.join(NETWORK_MARKER)).unwrap();
+    let err = open_and_close(tiny_signet(&dir, Some("51"))).unwrap_err();
+    assert!(
+        err.to_string().len() < 512,
+        "error carries the file: {} bytes",
+        err.to_string().len()
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

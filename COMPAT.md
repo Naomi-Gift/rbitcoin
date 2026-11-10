@@ -76,6 +76,7 @@ changes is [When a script is red](./docs/core-functional.md#when-a-script-is-red
 
 | Area | This node | Bitcoin Core |
 |------|-----------|--------------|
+| Datadir per network | One `--datadir` per network; the node never derives a subdirectory. `{datadir}/network` records the network and its message start, and a start on another network or signet challenge is refused | `-datadir` holds `testnet3/`, `testnet4/`, `signet/`, `signet_<message start>/` (custom `-signetchallenge`), `regtest/` |
 | Chainstore | Relational archive (fd tables; [`docs/io-modality.md`](./docs/io-modality.md)) | blocks/undo + LevelDB chainstate |
 | Historical blocks | Reconstruct from archive; tip via body queue + peer wire | `blocks/` blk*.dat |
 | Transport | **BIP324 v2**; v1 only on a `--net-permission-bind v1@` listener for a local wallet indexer (own port, loopback or private address) | v1 + v2 |

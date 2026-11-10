@@ -348,14 +348,27 @@ pub async fn mempool_blocking<T: Send + 'static>(
     .map_err(|e| NodeError::Config(format!("mempool task: {e}")))
 }
 
-/// Start the node: ensure datadir, exclusive-lock, open store.
+/// Datadir file that records the network the datadir was created for.
+#[doc(hidden)]
+pub const NETWORK_MARKER: &str = "network";
+
+/// Longest [`NETWORK_MARKER`] read. The line is a network name and eight hex
+/// digits; a longer file is not one this node wrote.
+const NETWORK_MARKER_MAX: u64 = 64;
+
+/// Start the node: ensure datadir, exclusive-lock, refuse another network's
+/// datadir, open store.
 pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
     config.ensure_datadir()?;
     let dir_locks = crate::lock::lock_node_dirs(&config)?;
+    let params = config.chain_params()?;
+    let marker = DatadirNetwork::check(config.datadir.path(), config.network, &params)?;
     let query = Query::open_or_create_layout_checkblocks(
         config.store_layout(),
         config.check_blocks_window(),
     )?;
+    refuse_foreign_genesis(&query, &params)?;
+    marker.record()?;
     rbitcoin_query::replay_spend_annotations(&query)
         .map_err(|e| NodeError::Init(format!("spend annotation replay: {e}")))?;
     Ok(NodeHandle {
@@ -364,6 +377,119 @@ pub fn run_node(config: NodeConfig) -> Result<NodeHandle, NodeError> {
         mempool: None,
         _dir_locks: dir_locks,
     })
+}
+
+/// The network a datadir was created for: its name and P2P message start,
+/// one line in [`NETWORK_MARKER`]. Every signet shares one genesis block, so
+/// [`refuse_foreign_genesis`] cannot tell two signets apart. The message
+/// start can.
+#[doc(hidden)]
+#[must_use = "record the marker once the store has opened"]
+pub struct DatadirNetwork {
+    datadir: PathBuf,
+    started: String,
+    missing: bool,
+}
+
+impl DatadirNetwork {
+    /// Refuse a datadir whose marker names another network. Runs before the
+    /// store opens, before any peer, and before RPC serves.
+    pub fn check(
+        datadir: &Path,
+        network: rbitcoin_primitives::Network,
+        params: &rbitcoin_consensus::ChainParams,
+    ) -> Result<Self, NodeError> {
+        let path = datadir.join(NETWORK_MARKER);
+        let started = format!(
+            "{} {}",
+            network.as_str(),
+            rbitcoin_net::service::magic_for_params(params)
+        );
+        let stored = read_network_marker(&path)?;
+        let stored = stored.trim();
+        let missing = stored.is_empty();
+        if !missing && stored != started {
+            return Err(NodeError::Init(format!(
+                "Wrong datadir for network? stored network {stored} does not match started network {started}. Use a separate --datadir for each network."
+            )));
+        }
+        Ok(Self {
+            datadir: datadir.to_path_buf(),
+            started,
+            missing,
+        })
+    }
+
+    /// Write a missing or empty marker. A datadir from before the marker
+    /// adopts the started network here, after the genesis check passed.
+    /// Every signet shares one genesis, so a legacy signet datadir adopts
+    /// whichever challenge this start passed.
+    pub fn record(self) -> Result<(), NodeError> {
+        if !self.missing {
+            return Ok(());
+        }
+        let path = self.datadir.join(NETWORK_MARKER);
+        self.write_synced(&path)
+            .map_err(|source| NodeError::Datadir {
+                path: path.clone(),
+                source,
+            })?;
+        info!(
+            "datadir: no network marker in {}; adopting {}",
+            path.display(),
+            self.started
+        );
+        Ok(())
+    }
+
+    /// Temp file, `sync_all`, rename, then sync the datadir, so a crash
+    /// leaves no marker or the whole line. A symlinked temp is unlinked, not
+    /// followed.
+    fn write_synced(&self, path: &Path) -> std::io::Result<()> {
+        let tmp = path.with_extension("tmp");
+        match std::fs::remove_file(&tmp) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        let mut file =
+            crate::lock::no_follow(std::fs::OpenOptions::new().write(true).create_new(true))
+                .open(&tmp)?;
+        std::io::Write::write_all(&mut file, format!("{}\n", self.started).as_bytes())?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        rbitcoin_store::file::fsync_parent_dir(&self.datadir)
+    }
+}
+
+/// The marker's text, empty when there is none. A symlink or a file longer
+/// than [`NETWORK_MARKER_MAX`] is refused without reading it.
+fn read_network_marker(path: &Path) -> Result<String, NodeError> {
+    let file = match crate::lock::no_follow(std::fs::OpenOptions::new().read(true)).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(String::new()),
+        Err(source) => {
+            return Err(NodeError::Datadir {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
+    };
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(
+        &mut std::io::Read::take(file, NETWORK_MARKER_MAX + 1),
+        &mut bytes,
+    )
+    .map_err(|source| NodeError::Datadir {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if bytes.len() as u64 > NETWORK_MARKER_MAX {
+        return Err(NodeError::Init(format!(
+            "Wrong datadir for network? {} is longer than {NETWORK_MARKER_MAX} bytes and is not a network marker",
+            path.display()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
 /// Height 0 is the chain this datadir already stored. No height 0 is an
@@ -441,7 +567,6 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
     let handle = run_node(config.clone())?;
     status.enter(Phase::Starting);
     let params = config.chain_params()?;
-    refuse_foreign_genesis(&handle.query, &params)?;
     let milestone = config.milestone();
     if let Some(anchor) = milestone.anchor {
         info!(
