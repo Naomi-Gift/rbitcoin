@@ -1010,6 +1010,37 @@ async fn regtest_proxy_start_does_not_wait_for_seeds() {
         .unwrap();
 }
 
+/// A P2P port another process holds is Core's bind InitError, not a log line
+/// (bitcoin/bitcoin#36305, `feature_port.py`). The primary and an extra
+/// listen fail the same way.
+#[tokio::test]
+async fn held_p2p_port_is_the_core_bind_init_error() {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let taken = held.local_addr().unwrap();
+    let want = format!(
+        "Error: Unable to bind to {taken} on this computer. rbitcoin is probably already running."
+    );
+
+    let dir = std::env::temp_dir().join(format!("rbitcoin-held-p2p-{nanos}"));
+    let cfg = tiny_regtest(&dir).with_p2p_listen(taken);
+    let err = run_p2p(cfg).await.expect_err("held port");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(err, rbitcoin_node::NodeError::Init(_)), "{err:?}");
+    assert_eq!(err.to_string(), want);
+
+    let dir = std::env::temp_dir().join(format!("rbitcoin-held-p2p-extra-{nanos}"));
+    let mut cfg = tiny_regtest(&dir).with_p2p_listen("127.0.0.1:0".parse().unwrap());
+    cfg.listen.p2p_extra.push(taken);
+    let err = run_p2p(cfg).await.expect_err("held extra port");
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(matches!(err, rbitcoin_node::NodeError::Init(_)), "{err:?}");
+    assert_eq!(err.to_string(), want);
+}
+
 /// `--proxy --only-net onion` reaches no clearnet seed, so the fixed onion
 /// seeds are the only way to a first peer. The node dials one through SOCKS.
 #[tokio::test]

@@ -166,7 +166,7 @@ impl P2PNode {
         let (stop_tx, _stop_rx) = tokio::sync::watch::channel(false);
 
         let (listener, local_addr) = if let Some(addr) = listen {
-            let listener = crate::listen::bind_tcp(addr)?;
+            let listener = bind_p2p(addr)?;
             let local_addr = listener.local_addr()?;
             (Some(listener), local_addr)
         } else {
@@ -310,7 +310,7 @@ impl P2PNode {
 
     /// Bind an additional listen socket (Core multi-`-bind`).
     pub async fn add_listen(&mut self, listen: SocketAddr) -> Result<SocketAddr, NetError> {
-        let listener = crate::listen::bind_tcp(listen)?;
+        let listener = bind_p2p(listen)?;
         let local_addr = listener.local_addr()?;
         let accept_task = spawn_inbound_accept(
             listener,
@@ -479,6 +479,10 @@ impl Drop for P2PNode {
             }
         }
     }
+}
+
+fn bind_p2p(addr: SocketAddr) -> Result<tokio::net::TcpListener, NetError> {
+    crate::listen::bind_tcp(addr).map_err(|source| NetError::Bind { addr, source })
 }
 
 #[doc(hidden)]
