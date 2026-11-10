@@ -2311,12 +2311,18 @@ pub fn features_hosts_json(config: &ElectrumConfig) -> Value {
     }
 }
 
-#[doc(hidden)]
-pub fn broadcast_raw_tx(
+fn decode_broadcast_tx(raw_hex: &str) -> Result<bitcoin::Transaction, String> {
+    let raw = decode_hex_bytes(raw_hex)?;
+    if raw.len() > 4_000_000 {
+        return Err("transaction too large".into());
+    }
+    bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string())
+}
+
+fn broadcast_tx_from_params(
     params: &Value,
     config: &ElectrumConfig,
-    mempool: Option<&MempoolHub>,
-) -> Result<Value, String> {
+) -> Result<bitcoin::Transaction, String> {
     let raw_hex = param_str(params, 0)?;
     if raw_hex.len() > config.max_broadcast_hex {
         return Err(format!(
@@ -2324,12 +2330,63 @@ pub fn broadcast_raw_tx(
             config.max_broadcast_hex
         ));
     }
-    let raw = decode_hex_bytes(raw_hex)?;
-    if raw.len() > 4_000_000 {
-        return Err("transaction too large".into());
+    decode_broadcast_tx(raw_hex)
+}
+
+/// Hex array plus the verbose flag. One size check for sync and async broadcast.
+fn decode_broadcast_package(
+    params: &Value,
+    config: &ElectrumConfig,
+) -> Result<(Vec<bitcoin::Transaction>, bool), String> {
+    let arr = params
+        .as_array()
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "broadcast_package expected array of hex txs".to_string())?;
+    let verbose = params
+        .as_array()
+        .and_then(|a| a.get(1))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let mut txs = Vec::with_capacity(arr.len());
+    let mut total_hex = 0usize;
+    for h in arr {
+        let raw_hex = h
+            .as_str()
+            .ok_or_else(|| "broadcast_package tx must be hex".to_string())?;
+        total_hex = total_hex.saturating_add(raw_hex.len());
+        if total_hex > config.max_broadcast_hex {
+            return Err("package hex too large".into());
+        }
+        txs.push(decode_broadcast_tx(raw_hex)?);
     }
-    let tx: bitcoin::Transaction =
-        bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string())?;
+    Ok((txs, verbose))
+}
+
+fn package_broadcast_value(verbose: bool, accepted: &[rbitcoin_net::AcceptResult]) -> Value {
+    if !verbose {
+        return json!("success");
+    }
+    let mut tx_results = serde_json::Map::new();
+    for r in accepted {
+        tx_results.insert(
+            r.txid.to_string(),
+            json!({"txid": r.txid.to_string(), "allowed": true}),
+        );
+    }
+    json!({
+        "package_msg": "success",
+        "tx-results": tx_results,
+    })
+}
+
+#[doc(hidden)]
+pub fn broadcast_raw_tx(
+    params: &Value,
+    config: &ElectrumConfig,
+    mempool: Option<&MempoolHub>,
+) -> Result<Value, String> {
+    let tx = broadcast_tx_from_params(params, config)?;
     let mp = mempool.ok_or_else(|| "mempool not available".to_string())?;
     let r = mp
         .accept_tx_from(&tx, rbitcoin_net::TxOrigin::Local)
@@ -2343,19 +2400,7 @@ pub async fn broadcast_raw_tx_async(
     config: &ElectrumConfig,
     mempool: Option<&Arc<MempoolHub>>,
 ) -> Result<Value, String> {
-    let raw_hex = param_str(params, 0)?;
-    if raw_hex.len() > config.max_broadcast_hex {
-        return Err(format!(
-            "transaction hex too large (max {} chars)",
-            config.max_broadcast_hex
-        ));
-    }
-    let raw = decode_hex_bytes(raw_hex)?;
-    if raw.len() > 4_000_000 {
-        return Err("transaction too large".into());
-    }
-    let tx: bitcoin::Transaction =
-        bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string())?;
+    let tx = broadcast_tx_from_params(params, config)?;
     let mp = mempool
         .ok_or_else(|| "mempool not available".to_string())?
         .clone();
@@ -2375,53 +2420,12 @@ pub fn broadcast_package(
     config: &ElectrumConfig,
     mempool: Option<&MempoolHub>,
 ) -> Result<Value, String> {
-    let arr = params
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "broadcast_package expected array of hex txs".to_string())?;
-    let verbose = params
-        .as_array()
-        .and_then(|a| a.get(1))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let mut txs = Vec::with_capacity(arr.len());
-    let mut total_hex = 0usize;
-    for h in arr {
-        let raw_hex = h
-            .as_str()
-            .ok_or_else(|| "broadcast_package tx must be hex".to_string())?;
-        total_hex = total_hex.saturating_add(raw_hex.len());
-        if total_hex > config.max_broadcast_hex {
-            return Err("package hex too large".into());
-        }
-        let raw = decode_hex_bytes(raw_hex)?;
-        if raw.len() > 4_000_000 {
-            return Err("transaction too large".into());
-        }
-        let tx: bitcoin::Transaction =
-            bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string())?;
-        txs.push(tx);
-    }
+    let (txs, verbose) = decode_broadcast_package(params, config)?;
     let mp = mempool.ok_or_else(|| "mempool not available".to_string())?;
     let accepted = mp
         .accept_package(&txs)
         .map_err(|e| format!("broadcast_package reject: {e}"))?;
-    if verbose {
-        let mut tx_results = serde_json::Map::new();
-        for r in &accepted {
-            tx_results.insert(
-                r.txid.to_string(),
-                json!({"txid": r.txid.to_string(), "allowed": true}),
-            );
-        }
-        Ok(json!({
-            "package_msg": "success",
-            "tx-results": tx_results,
-        }))
-    } else {
-        Ok(json!("success"))
-    }
+    Ok(package_broadcast_value(verbose, &accepted))
 }
 
 /// [`broadcast_package`] with each member's scripts awaited on the connection task.
@@ -2430,34 +2434,7 @@ pub async fn broadcast_package_async(
     config: &ElectrumConfig,
     mempool: Option<&Arc<MempoolHub>>,
 ) -> Result<Value, String> {
-    let arr = params
-        .as_array()
-        .and_then(|a| a.first())
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "broadcast_package expected array of hex txs".to_string())?;
-    let verbose = params
-        .as_array()
-        .and_then(|a| a.get(1))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let mut txs = Vec::with_capacity(arr.len());
-    let mut total_hex = 0usize;
-    for h in arr {
-        let raw_hex = h
-            .as_str()
-            .ok_or_else(|| "broadcast_package tx must be hex".to_string())?;
-        total_hex = total_hex.saturating_add(raw_hex.len());
-        if total_hex > config.max_broadcast_hex {
-            return Err("package hex too large".into());
-        }
-        let raw = decode_hex_bytes(raw_hex)?;
-        if raw.len() > 4_000_000 {
-            return Err("transaction too large".into());
-        }
-        let tx: bitcoin::Transaction =
-            bitcoin::consensus::deserialize(&raw).map_err(|e| e.to_string())?;
-        txs.push(tx);
-    }
+    let (txs, verbose) = decode_broadcast_package(params, config)?;
     let mp = mempool
         .ok_or_else(|| "mempool not available".to_string())?
         .clone();
@@ -2465,21 +2442,7 @@ pub async fn broadcast_package_async(
     let accepted = rbitcoin_net::with_store_budget(budget, mp.accept_package_async(txs))
         .await
         .map_err(|e| format!("broadcast_package reject: {e}"))?;
-    if verbose {
-        let mut tx_results = serde_json::Map::new();
-        for r in &accepted {
-            tx_results.insert(
-                r.txid.to_string(),
-                json!({"txid": r.txid.to_string(), "allowed": true}),
-            );
-        }
-        Ok(json!({
-            "package_msg": "success",
-            "tx-results": tx_results,
-        }))
-    } else {
-        Ok(json!("success"))
-    }
+    Ok(package_broadcast_value(verbose, &accepted))
 }
 
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled

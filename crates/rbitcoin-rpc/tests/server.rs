@@ -27,6 +27,26 @@ fn tcp_addr(handle: &RpcHandle) -> SocketAddr {
     handle.local_addr.expect("tcp listen")
 }
 
+fn regtest_rpc(dir: &std::path::Path) -> RpcConfig {
+    RpcConfig {
+        listen: Some("127.0.0.1:0".parse().unwrap()),
+        socket_path: None,
+        socket_shared: false,
+        datadir: dir.to_path_buf(),
+        network: Network::Regtest,
+        token_path: None,
+        cookie_path: None,
+        cookie_perms: RpcCookiePerms::Owner,
+        subversion: None,
+        work_queue: None,
+        rest: false,
+        alert_notify: None,
+        blocksonly: false,
+        package_dialect: false,
+        client_version: 190_000,
+    }
+}
+
 /// `run_rpc` stores the bound address before the accept task is polled.
 async fn connect_tcp(addr: SocketAddr) -> tokio::net::TcpStream {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -134,24 +154,8 @@ async fn long_socket_path_keeps_the_tcp_stop_flag() {
     let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-long-sock").expect("temp dir");
     let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
     let sock = dir.path().join(format!("{}.sock", "s".repeat(200)));
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: Some(sock),
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: false,
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let mut cfg = regtest_rpc(dir.path());
+    cfg.socket_path = Some(sock);
     let handle = run_rpc(cfg, q, None, None, None, None, None)
         .await
         .expect("tcp listener stays up when the unix path exceeds SUN_LEN");
@@ -177,25 +181,8 @@ async fn rpc_smoke_getblockcount_and_help() {
     let mp =
         MempoolHub::open_with_weight(dir.join("mempool"), Arc::clone(&q), 300_000_000).unwrap();
     mp.set_relay_enabled(true);
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: true,
-
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let mut cfg = regtest_rpc(dir.path());
+    cfg.rest = true;
     let handle = run_rpc(cfg, q, Some(mp), None, None, None, None)
         .await
         .unwrap();
@@ -280,24 +267,7 @@ async fn rpc_smoke_getblockcount_and_help() {
 async fn rest_is_404_without_the_flag() {
     let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-rest-off").expect("temp dir");
     let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: false,
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let cfg = regtest_rpc(dir.path());
     let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let mut rest = tokio::net::TcpStream::connect(tcp_addr(&handle))
@@ -392,23 +362,7 @@ fn assert_json_line(raw: &[u8], expect: &str) {
 async fn jsonrpc_http_body_matches_core_line() {
     let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-nl").expect("temp dir");
     let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: false,
-        alert_notify: None,
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let cfg = regtest_rpc(dir.path());
     let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
     let addr = tcp_addr(&handle);
     let auth = &handle.auth;
@@ -492,25 +446,7 @@ async fn jsonrpc_v2_batch_and_http_codes() {
     let mp =
         MempoolHub::open_with_weight(dir.join("mempool"), Arc::clone(&q), 300_000_000).unwrap();
     mp.set_relay_enabled(true);
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: false,
-
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let cfg = regtest_rpc(dir.path());
     let handle = run_rpc(cfg, q, Some(mp), None, None, None, None)
         .await
         .unwrap();
@@ -578,24 +514,7 @@ async fn unauthorized_large_content_length_is_401_before_body() {
     use tokio::time::{timeout, Duration};
     let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-auth-body").expect("temp dir");
     let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: false,
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let cfg = regtest_rpc(dir.path());
     let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
     let mut stream = tokio::net::TcpStream::connect(tcp_addr(&handle))
         .await
@@ -623,24 +542,7 @@ async fn oversized_bearer_body_is_413_and_small_body_still_runs() {
     use tokio::time::{timeout, Duration};
     let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-body-cap").expect("temp dir");
     let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: false,
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let cfg = regtest_rpc(dir.path());
     let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
     let (st, body) = post_raw(
         tcp_addr(&handle),
@@ -892,23 +794,9 @@ async fn large_block_submit_and_proposal_clear_http_413() {
 
     let query = Arc::clone(&hub.query);
     let socket_path = cfg!(unix).then(|| dir.join("rpc.sock"));
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: socket_path.clone(),
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: true,
-        alert_notify: None,
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let mut cfg = regtest_rpc(dir.path());
+    cfg.socket_path = socket_path.clone();
+    cfg.rest = true;
     let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
         .await
         .unwrap();
@@ -1082,24 +970,7 @@ async fn waitforblock_positional_hash_returns_current_tip() {
     hub.ensure_genesis().unwrap();
     let hub = Arc::new(hub);
     let query = Arc::clone(&hub.query);
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: false,
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let cfg = regtest_rpc(dir.path());
     let handle = run_rpc(cfg, query, None, None, None, Some(Arc::clone(&hub)), None)
         .await
         .unwrap();
@@ -1220,24 +1091,7 @@ async fn long_poll_deadline_returns_the_tip() {
     hub.ensure_genesis().unwrap();
     let hub = Arc::new(hub);
     let query = Arc::clone(&hub.query);
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: false,
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let cfg = regtest_rpc(dir.path());
     let handle = run_rpc(cfg, query, None, None, None, Some(Arc::clone(&hub)), None)
         .await
         .unwrap();
@@ -1375,24 +1229,9 @@ async fn stalled_rpc_connections_expire_and_free_capacity() {
     hub.ensure_genesis().unwrap();
     let query = Arc::clone(&hub.query);
     let socket_path = cfg!(unix).then(|| dir.join("rpc.sock"));
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: socket_path.clone(),
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: true,
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let mut cfg = regtest_rpc(dir.path());
+    cfg.socket_path = socket_path.clone();
+    cfg.rest = true;
     let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
         .await
         .unwrap();
@@ -1493,24 +1332,7 @@ fn waitfor_does_not_hold_the_blocking_pool() {
         );
         hub.ensure_genesis().unwrap();
         let query = Arc::clone(&hub.query);
-        let cfg = RpcConfig {
-            listen: Some("127.0.0.1:0".parse().unwrap()),
-            socket_path: None,
-            socket_shared: false,
-            datadir: dir.path().to_path_buf(),
-            network: Network::Regtest,
-            token_path: None,
-            cookie_path: None,
-            cookie_perms: RpcCookiePerms::Owner,
-            subversion: None,
-            work_queue: None,
-            rest: false,
-            alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-};
+        let cfg = regtest_rpc(dir.path());
         let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
             .await
             .unwrap();
@@ -1584,24 +1406,8 @@ async fn long_poll_does_not_hold_the_work_queue() {
     );
     hub.ensure_genesis().unwrap();
     let query = Arc::clone(&hub.query);
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: Some(1),
-        rest: false,
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let mut cfg = regtest_rpc(dir.path());
+    cfg.work_queue = Some(1);
     let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
         .await
         .unwrap();
@@ -1704,25 +1510,8 @@ async fn rpc_work_queue_exceeded() {
     let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
     let mp =
         MempoolHub::open_with_weight(dir.join("mempool"), Arc::clone(&q), 300_000_000).unwrap();
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: Some(1),
-        rest: false,
-
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let mut cfg = regtest_rpc(dir.path());
+    cfg.work_queue = Some(1);
     let handle = run_rpc(cfg, q, Some(mp), None, None, None, None)
         .await
         .unwrap();
@@ -2090,23 +1879,8 @@ async fn long_poll_does_not_hold_the_store_budget() {
     hub.ensure_genesis().unwrap();
     let query = Arc::clone(&hub.query);
     query.set_api_read_budget(1);
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: Some(4),
-        rest: false,
-        alert_notify: None,
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let mut cfg = regtest_rpc(dir.path());
+    cfg.work_queue = Some(4);
     let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
         .await
         .unwrap();
@@ -2151,23 +1925,8 @@ async fn batched_long_poll_does_not_hold_the_store_budget() {
     hub.ensure_genesis().unwrap();
     let query = Arc::clone(&hub.query);
     query.set_api_read_budget(1);
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: Some(4),
-        rest: false,
-        alert_notify: None,
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let mut cfg = regtest_rpc(dir.path());
+    cfg.work_queue = Some(4);
     let handle = run_rpc(cfg, query, None, None, None, Some(Arc::new(hub)), None)
         .await
         .unwrap();
@@ -2624,24 +2383,7 @@ async fn jsonrpc_envelope_junk_and_auth() {
     let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
     let mp =
         MempoolHub::open_with_weight(dir.join("mempool"), Arc::clone(&q), 300_000_000).unwrap();
-    let cfg = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: false,
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let cfg = regtest_rpc(dir.path());
     let handle = run_rpc(cfg, q, Some(mp), None, None, None, None)
         .await
         .unwrap();
@@ -2808,24 +2550,7 @@ async fn tcp_accepts_bearer_and_opted_in_core_cookie_basic() {
         .unwrap();
     }
     let query = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
-    let without_cookie = RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: false,
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let without_cookie = regtest_rpc(dir.path());
     let handle = run_rpc(
         without_cookie,
         Arc::clone(&query),
@@ -2854,23 +2579,10 @@ async fn tcp_accepts_bearer_and_opted_in_core_cookie_basic() {
     handle.shutdown().await;
 
     let cookie_path = dir.path().join(".cookie");
-    let with_cookie = || RpcConfig {
-        listen: Some("127.0.0.1:0".parse().unwrap()),
-        socket_path: None,
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: Some(cookie_path.clone()),
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: false,
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
+    let with_cookie = || {
+        let mut cfg = regtest_rpc(dir.path());
+        cfg.cookie_path = Some(cookie_path.clone());
+        cfg
     };
     // The cookie is TCP-only: a socket-only listener must not silently ignore it.
     std::fs::write(&cookie_path, "mempool:secret").unwrap();
@@ -3021,24 +2733,9 @@ async fn unix_socket_without_tcp_refuses_without_af_unix() {
     let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-sock-win").expect("temp dir");
     let sock = dir.path().join("rpc.sock");
     let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
-    let cfg = RpcConfig {
-        listen: None,
-        socket_path: Some(sock),
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: false,
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let mut cfg = regtest_rpc(dir.path());
+    cfg.listen = None;
+    cfg.socket_path = Some(sock);
     let err = run_rpc(cfg, q, None, None, None, None, None)
         .await
         .unwrap_err();
@@ -3054,24 +2751,9 @@ async fn unix_socket_needs_no_http_auth() {
     let dir = rbitcoin_store::testutil::TempDir::for_socket().expect("temp dir");
     let sock = dir.path().join("rpc.sock");
     let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
-    let cfg = RpcConfig {
-        listen: None,
-        socket_path: Some(sock.clone()),
-        socket_shared: false,
-        datadir: dir.path().to_path_buf(),
-        network: Network::Regtest,
-        token_path: None,
-        cookie_path: None,
-        cookie_perms: RpcCookiePerms::Owner,
-        subversion: None,
-        work_queue: None,
-        rest: false,
-        alert_notify: None,
-
-        blocksonly: false,
-        package_dialect: false,
-        client_version: 190_000,
-    };
+    let mut cfg = regtest_rpc(dir.path());
+    cfg.listen = None;
+    cfg.socket_path = Some(sock.clone());
     let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
     assert!(sock.exists(), "socket file");
     {
