@@ -714,7 +714,9 @@ impl LivePeer {
         }
         let hub = self.owner.upgrade()?;
         let link = self.self_announce_link(&hub);
-        let onion = hub.p2p_onion().filter(|_| link == SelfAnnounceLink::Tor);
+        let onion = hub
+            .announced_p2p_onion()
+            .filter(|_| link == SelfAnnounceLink::Tor);
         let i2p = hub.p2p_i2p().filter(|_| link == SelfAnnounceLink::I2p);
         let sock = link.local_socket(&hub, self.reported_local_ip);
         if onion.is_none() && i2p.is_none() && sock.is_none() {
@@ -1942,6 +1944,8 @@ pub struct PeerHub {
     pub external_ips: Mutex<Vec<IpAddr>>,
     pub wallet_onions: Mutex<Vec<(String, u16)>>,
     pub p2p_onion: Mutex<Option<(String, u16)>>,
+    tor_wallet_onions: Mutex<Vec<(String, u16)>>,
+    tor_onions_down: AtomicBool,
     pub p2p_i2p: Mutex<Option<crate::NetAddr>>,
     /// P2P listen port used with advertised external IPs.
     pub listen_port: AtomicU16,
@@ -2168,6 +2172,8 @@ impl PeerHub {
             external_ips: Mutex::new(Vec::new()),
             wallet_onions: Mutex::new(Vec::new()),
             p2p_onion: Mutex::new(None),
+            tor_wallet_onions: Mutex::new(Vec::new()),
+            tor_onions_down: AtomicBool::new(false),
             p2p_i2p: Mutex::new(None),
             listen_port: AtomicU16::new(0),
             discover: AtomicBool::new(true),
@@ -2246,6 +2252,27 @@ impl PeerHub {
 
     pub fn set_p2p_onion(&self, host: String, port: u16) {
         *self.p2p_onion.lock().unwrap_or_else(|e| e.into_inner()) = Some((host, port));
+    }
+
+    pub fn set_tor_wallet_onion(&self, host: String, port: u16) {
+        let mut onions = self
+            .tor_wallet_onions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        onions.retain(|(kept, _)| *kept != host);
+        onions.push((host, port));
+    }
+
+    pub fn set_tor_onions_down(&self, down: bool) {
+        self.tor_onions_down.store(down, Ordering::Relaxed);
+    }
+
+    fn tor_onions_up(&self) -> bool {
+        !self.tor_onions_down.load(Ordering::Relaxed)
+    }
+
+    pub fn announced_p2p_onion(&self) -> Option<crate::NetAddr> {
+        self.p2p_onion().filter(|_| self.tor_onions_up())
     }
 
     pub fn p2p_onion(&self) -> Option<crate::NetAddr> {
@@ -2349,13 +2376,18 @@ impl PeerHub {
             .cloned()
             .map(|(address, port)| (address, port, LOCAL_MANUAL))
             .collect();
-        if let Some((host, port)) = self
-            .p2p_onion
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-        {
-            rows.push((host, port, LOCAL_MANUAL));
+        if self.tor_onions_up() {
+            rows.extend(
+                self.tor_wallet_onions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .cloned()
+                    .map(|(address, port)| (address, port, LOCAL_MANUAL)),
+            );
+        }
+        if let Some(onion) = self.announced_p2p_onion() {
+            rows.push((onion.host_str(), onion.port(), LOCAL_MANUAL));
         }
         if let Some(addr) = self.p2p_i2p() {
             rows.push((addr.host_str(), addr.port(), LOCAL_MANUAL));
@@ -2510,11 +2542,18 @@ impl PeerHub {
     }
 
     pub(crate) fn own_addrs(&self) -> OwnAddrs {
-        let wallet = self
+        let mut wallet = self
             .wallet_onions
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        wallet.extend(
+            self.tor_wallet_onions
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .cloned(),
+        );
         let onions = wallet
             .iter()
             .filter_map(|(host, port)| format!("{host}:{port}").parse().ok())

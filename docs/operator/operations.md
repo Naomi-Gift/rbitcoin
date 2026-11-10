@@ -253,6 +253,13 @@ elsewhere, or is a unix socket, is a start error. `getnetworkinfo.localaddresses
 even with `--no-discover`. Sparrow: `tcp://<id>.onion:50001` (plain TCP; no
 in-binary TLS). JSON-RPC stays off the onion (`rpc.sock` / `--rpc-listen` only).
 Cookie path differs by distro; pass `--tor-control-cookie` rather than globbing.
+If tor restarts or closes the control connection, the node stops announcing the
+P2P onion (as Core's `RemoveLocal`) and leaves its onions out of
+`getnetworkinfo.localaddresses`, but still treats them as its own addresses. It
+reconnects after 1 s, then 1.5 times longer each try up to 600 s, logs in again
+and re-adds every onion from its key file, so the addresses do not change. An
+Electrum or Esplora onion asked for while tor is away is added on reconnect; only
+a refusal from tor (or a bad key file) is an error.
 
 `--i2p-sam [HOST:PORT]` talks to **system i2pd** SAM v3 (not SOCKS, not Arti).
 Omit ADDR for `127.0.0.1:7656`. Failed HELLO / `SESSION CREATE` is a start
