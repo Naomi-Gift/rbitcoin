@@ -113,6 +113,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [107](./107-torn-spend-page.md) | medium | A torn spend page below the durable marker stays | accepted | none |
 | [108](./108-bobberb-store-index.md) | — | Bobberb store-integrity index | accepted | — |
 | [109](./109-filter-send-budget.md) | medium | Filter replies and compact blocks under-counted the send budget | fixed | `filter_and_compact_block_replies_charge_their_consensus_payload` |
+| [110](./110-getcfilters-budget.md) | medium | `getcfilters` kept queueing after the send budget | fixed | `getcfilters_stops_after_the_filter_that_crosses_the_send_budget`, `getcfcheckpt_returns_a_header_every_thousand_heights` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline
 `8f3990f`). Report-local 001–010 are **renumbered** here. Identity/BIP30

@@ -8234,6 +8234,105 @@ fn compact_filter_ranges_past_core_limits_disconnect() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn outbound_peer() -> Arc<rbitcoin_net::peers::LivePeer> {
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18444));
+    let ver = VersionMessage {
+        version: bitcoin::p2p::PROTOCOL_VERSION,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    peers.register(
+        addr,
+        addr,
+        &ver,
+        false,
+        rbitcoin_net::peers::PeerConnType::OutboundFullRelay,
+    )
+}
+
+/// One `getcfilters` queues the filter that crosses the 4 MiB budget and
+/// none after it. The peer starts on the cap, so the first filter is the
+/// one that crosses.
+#[test]
+fn getcfilters_stops_after_the_filter_that_crosses_the_send_budget() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cf-budget");
+    hub.query.set_block_filter_index(true).unwrap();
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(2, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    let tip_h = hub.tip_height().unwrap();
+    assert_eq!(
+        hub.query.basic_filter_hwm().unwrap(),
+        Some(tip_h),
+        "generate seals a basic filter through the tip"
+    );
+    let peer = outbound_peer();
+    peer.note_send_queued(rbitcoin_net::peers::PEER_SEND_BUDGET);
+    assert!(
+        !peer.send_over_budget(),
+        "the cap itself is still inside the budget"
+    );
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let req = bitcoin::p2p::message_filter::GetCFilters {
+        filter_type: 0,
+        start_height: 0,
+        stop_hash: hub.tip_hash().unwrap(),
+    };
+    on_getcfilters(&hub, &tx, Some(peer.as_ref()), &req).unwrap();
+    let mut n = 0usize;
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            PeerOut::Msg(NetworkMessage::CFilter(_)) => n += 1,
+            other => panic!("expected cfilter, got {other:?}"),
+        }
+    }
+    assert_eq!(n, 1, "only the filter that crosses the budget is queued");
+    assert!(peer.send_over_budget());
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Heights 1000, 2000, and 3000 come back as the three checkpoint headers.
+#[test]
+fn getcfcheckpt_returns_a_header_every_thousand_heights() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cf-checkpt");
+    hub.query.set_block_filter_index(true).unwrap();
+    hub.ensure_genesis().unwrap();
+    hub.generate_to_script(3_000, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .unwrap();
+    assert_eq!(hub.tip_height().unwrap(), 3_000);
+    assert_eq!(hub.query.basic_filter_hwm().unwrap(), Some(3_000));
+    let rows = hub
+        .query
+        .basic_filter_hashes_and_headers(1_000, 3_000)
+        .unwrap()
+        .expect("sealed range");
+    let expect: Vec<_> = [1_000u32, 2_000, 3_000]
+        .into_iter()
+        .map(|height| rows[(height - 1_000) as usize].1)
+        .collect();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let req = bitcoin::p2p::message_filter::GetCFCheckpt {
+        filter_type: 0,
+        stop_hash: hub.tip_hash().unwrap(),
+    };
+    on_getcfcheckpt(&hub, &tx, None, &req).unwrap();
+    match rx.try_recv().expect("cfcheckpt") {
+        PeerOut::Msg(NetworkMessage::CFCheckpt(m)) => {
+            assert_eq!(m.filter_headers, expect);
+        }
+        other => panic!("expected cfcheckpt, got {other:?}"),
+    }
+    assert!(rx.try_recv().is_err(), "one checkpoint message");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 mod log_text_tests;
 
 /// Core `ProcessMessage` ADDR/ADDRV2: the `getaddr` an addr-fetch session

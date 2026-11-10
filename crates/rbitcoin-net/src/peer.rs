@@ -4003,6 +4003,9 @@ pub fn on_getcfilters(
         return Ok(());
     };
     for (h, body) in (m.start_height..).zip(filters) {
+        if session.is_some_and(|s| s.send_over_budget()) {
+            return Ok(());
+        }
         let Some((_, rec)) = filter_q(hub.query.header_at_height(rbitcoin_primitives::Height(h)))?
         else {
             return Ok(());
@@ -4074,13 +4077,18 @@ pub fn on_getcfcheckpt(
         return Ok(());
     }
     let mut filter_headers = Vec::new();
-    let mut h = 1000u32;
-    while h <= stop {
-        let Some(row) = filter_q(hub.query.basic_filter_hashes_and_headers(h, h))? else {
+    if stop >= 1000 {
+        let Some(rows) = filter_q(hub.query.basic_filter_hashes_and_headers(1000, stop))? else {
             return Ok(());
         };
-        filter_headers.push(row[0].1);
-        h = h.saturating_add(1000);
+        let mut h = 1000u32;
+        while h <= stop {
+            let Some(row) = rows.get((h - 1000) as usize) else {
+                return Ok(());
+            };
+            filter_headers.push(row.1);
+            h = h.saturating_add(1000);
+        }
     }
     queue_accounted(
         session,

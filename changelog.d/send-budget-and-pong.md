@@ -5,3 +5,6 @@ Fixed
   `cfcheckpt`, or `cmpctblock` is charged the consensus encoding of that
   message, not a flat 64 or 1,024 bytes. One reply may still cross the
   4 MiB cap. The next request from that peer waits until the writer drains.
+  One `getcfilters` stops after the filter that crosses the cap.
+  `getcfcheckpt` still returns a filter header every 1,000 heights, from
+  one range read.
