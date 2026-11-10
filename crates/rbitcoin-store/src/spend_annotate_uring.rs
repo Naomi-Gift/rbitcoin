@@ -1,8 +1,8 @@
 //! Spender-meta annotation for Class A.
 //!
 //! Unknown meta reads a page, decides sole / multi / promote, then pwrites
-//! each changed 8-byte slot. A full historical page is a directory insert.
-//! The live tail page is an 8-byte slot pwrite. A full page image is not
+//! each changed 8-byte slot. Confirm does not use that path. It logs every
+//! published slot, including the short tail. A full page image is not
 //! written: a torn page rewrite can zero a neighbor the spend marker already
 //! covers. Queue depth stays 128 pages.
 
@@ -542,8 +542,8 @@ pub fn group_writes_by_spent_page(writes: &[SpentAbsWrite], body_pub: u64) -> Ve
 
 /// Pure-write annotate: `known[i]` is structural `(field, flags)` for `abs_edges[i]`.
 ///
-/// A full historical page is a directory insert. The live tail is an 8-byte
-/// slot pwrite. Returns edges past the published body as cold.
+/// A published slot, including the short tail, is a directory insert.
+/// Returns edges past the published body as cold.
 pub fn put_spend_batch_by_abs_meta_known(
     txs: &TxTable,
     spenders: &SpenderTable,
@@ -591,12 +591,9 @@ pub fn put_spend_batch_by_abs_meta_known(
     Ok(cold)
 }
 
-/// A full historical page is a directory insert. The live tail is an 8-byte
-/// slot pwrite. A slot past the published body is cold.
+/// Every slot inside the published body lands in the page directory.
 ///
-/// The tail write does not rewrite the page or the file header. Replay does
-/// not cover a slot once `spend_durable` has passed it, and that slot is not
-/// in the page log.
+/// A slot past that length is cold. This path does not write `spent.body`.
 fn apply_prepared_spend_writes(
     txs: &TxTable,
     writes: &[SpentAbsWrite],
@@ -605,21 +602,13 @@ fn apply_prepared_spend_writes(
     let published = txs.spent.body_published_len();
     let mut cold = Vec::new();
     let mut hist: Vec<(u64, [u8; META_LEN])> = Vec::new();
-    let mut tail: Vec<&SpentAbsWrite> = Vec::new();
     for w in writes {
         if crate::spend_page_log::is_historical(published, w.0) {
             hist.push((w.0, w.5));
-        } else if w.0.saturating_add(META_LEN as u64) <= published {
-            tail.push(w);
         } else {
             cold.push((w.1, w.2, w.3, w.4));
         }
     }
     txs.note_historical_spend_slots(&hist)?;
-    for w in tail {
-        if txs.spent.write_body_pwrite(w.0, &w.5).is_err() {
-            cold.push((w.1, w.2, w.3, w.4));
-        }
-    }
     Ok(cold)
 }

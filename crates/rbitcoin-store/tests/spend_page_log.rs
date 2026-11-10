@@ -419,17 +419,41 @@ fn short_commit_file_is_not_rewritten_by_the_hold() {
 }
 
 #[test]
-fn compose_rejects_the_live_tail_and_a_keep_error() {
+fn short_tail_is_logged_and_a_slot_past_published_is_corrupt() {
     let d = dir();
     let log = SpendPageLog::create(&d);
     let slot = [2u8, 1, 2, 3, 4, 5, 6, 7];
     log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(4, 100, zeros, |_| Ok(true)).unwrap();
+    let file = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
+    assert_eq!(file.len(), 100);
+    assert_eq!(&file[16..24], &slot);
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(4096, slot)]).unwrap();
     let err = log.commit_open(4, 100, zeros, |_| Ok(true)).unwrap_err();
     assert!(matches!(
         err,
-        StoreError::Corrupt("spend page log composed the live tail")
+        StoreError::Corrupt("spend page log composed past the published body")
     ));
-    assert_eq!(log.slot(16), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(96, slot)]).unwrap();
+    let err = log.commit_open(4, 100, zeros, |_| Ok(true)).unwrap_err();
+    assert!(matches!(
+        err,
+        StoreError::Corrupt("spend page slot past published")
+    ));
+    assert_eq!(log.slot(96), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(16, slot)]).unwrap();
     let err = log
         .commit_open(4, 8192, zeros, |_| Err(StoreError::Corrupt("keep")))
         .unwrap_err();
@@ -608,7 +632,10 @@ fn pages_shorter_than_the_commit_are_corrupt() {
     log.note_slots(&[(16, slot)]).unwrap();
     log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
     std::fs::remove_file(d.join(SPEND_PAGES_NAME)).unwrap();
-    assert!(matches!(SpendPageLog::load(&d), Err(StoreError::Io { .. })));
+    assert!(matches!(
+        SpendPageLog::load(&d),
+        Err(StoreError::Corrupt("spend.pages short"))
+    ));
     let _ = std::fs::remove_dir_all(&d);
 
     let d = dir();
@@ -781,7 +808,10 @@ fn missing_or_short_pages_file_refuses_open() {
         Err(StoreError::Corrupt("spend.pages short"))
     ));
     std::fs::remove_file(&pages).unwrap();
-    assert!(matches!(SpendPageLog::load(&d), Err(StoreError::Io { .. })));
+    assert!(matches!(
+        SpendPageLog::load(&d),
+        Err(StoreError::Corrupt("spend.pages short"))
+    ));
     let _ = std::fs::remove_dir_all(&d);
 }
 

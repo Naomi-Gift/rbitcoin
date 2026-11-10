@@ -717,6 +717,8 @@ fn historical_page_stays_unwritten_until_spend_checkpoint() {
     let s1 = spend_vout(created_id, 1, Amount::from_sat(900));
     let b1s = mine(tip, tip_time + 600, h1, vec![s1]);
     accept_and_connect_block(&q, &params, Height(h1), &b1s, ms).unwrap();
+    tip = b1s.block_hash();
+    tip_time = b1s.header.time;
 
     assert!(q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap());
     assert!(q.is_outpoint_spent(created_id.as_byte_array(), 1).unwrap());
@@ -737,6 +739,7 @@ fn historical_page_stays_unwritten_until_spend_checkpoint() {
     );
     assert_eq!(read_slot(&store, abs1), before1);
     assert!(q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap());
+    connect_until(&q, &params, ms, &mut tip, &mut tip_time, h1 + 1);
     let mut header = [0u8; 16];
     {
         use std::io::Read;

@@ -1,8 +1,7 @@
 //! Open spend-slot directory and the sequential page log behind `spent.body`.
 //!
-//! Confirm records 8-byte slots from a full historical page here. The partial
-//! last page is the live tail: confirm pwrites those slots and does not log
-//! the page. Each dirty page is composed into `spend.pages` and named by
+//! Confirm records 8-byte slots here, including a short tail page. Each dirty
+//! page is composed into `spend.pages` and named by
 //! `spend.pages.commit` before `spend_durable` advances. Fold copies a cooled
 //! image onto `spent.body` after that marker, starting at byte 16 on page 0
 //! so the file header stays put. A commit that names bytes refuses a missing
@@ -152,11 +151,10 @@ pub struct SpendPageLog {
     pace: Arc<SpendPace>,
 }
 
-/// A page whose end is still inside the published body. The partial last page
-/// is the tail. Confirm pwrites those 8-byte slots and does not log the page.
+/// True when the 8-byte slot lies inside the published body, including the
+/// short tail page. Confirm logs that slot. A slot past `published` is cold.
 pub fn is_historical(published: u64, abs: u64) -> bool {
-    let page_off = abs & !(BODY_PAGE_SIZE - 1);
-    page_off.saturating_add(BODY_PAGE_SIZE) <= published
+    abs.saturating_add(SLOT as u64) <= published
 }
 
 impl SpendPageLog {
@@ -466,10 +464,12 @@ impl SpendPageLog {
         }
         let mut pages: Vec<(u64, Arc<[u8]>)> = Vec::with_capacity(kept.len());
         for (page_off, page) in &kept {
-            if page_off.saturating_add(BODY_PAGE_SIZE) > published {
-                return Err(StoreError::Corrupt("spend page log composed the live tail"));
+            if *page_off >= published {
+                return Err(StoreError::Corrupt(
+                    "spend page log composed past the published body",
+                ));
             }
-            let len = BODY_PAGE_SIZE as usize;
+            let len = BODY_PAGE_SIZE.min(published - page_off) as usize;
             let mut buf = if let Some(base) = &page.base {
                 base[..len.min(base.len())].to_vec()
             } else {
@@ -896,8 +896,12 @@ impl SpendPageLog {
         let pages_path = self.dir.join(SPEND_PAGES_NAME);
         let file = match std::fs::read(&pages_path) {
             Ok(file) => file,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && parsed.committed_len == 0 => {
-                Vec::new()
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if parsed.committed_len == 0 && parsed.recs.is_empty() {
+                    Vec::new()
+                } else {
+                    return Err(StoreError::Corrupt("spend.pages short"));
+                }
             }
             Err(e) => return Err(StoreError::io(&pages_path, e)),
         };

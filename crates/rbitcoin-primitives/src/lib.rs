@@ -105,10 +105,13 @@ pub const STORE_MAGIC: [u8; 4] = *b"RBT1";
 /// Current on-disk schema version. Live layout: workspace `SCHEMA.md`.
 /// Historic versions: `SCHEMA_HISTORY.md`.
 ///
-/// **27:** `meta` only. `--prune-seqsigwit` can leave `seqsigwit` at a header
-///         while creates remain. A 26 binary treats that empty locator as
-///         damage and truncates the chain. This binary rewrites `meta` to 27
-///         on open, including an unpruned datadir. A 26 binary refuses 27 `meta`.
+/// **27:** `meta` only. Historical spend slots, including the short tail
+///         page, live in `spend.pages` until fold. `--prune-seqsigwit` can
+///         leave `seqsigwit` at a header while creates remain. A 26 binary
+///         treats that empty locator as damage and truncates the chain, and
+///         it does not read the spend page log. This binary rewrites `meta`
+///         to 27 on open, including an unpruned datadir. A 26 binary refuses
+///         27 `meta`.
 /// **26:** `header.body` is 88 B again. Occupied 24/25 strips the trailing
 ///         `size:u32` + `weight:u32`. Block size and weight come from `txstat`.
 ///         A 25 binary refuses 26 `meta`.

@@ -1,7 +1,7 @@
 # On-disk schema (current)
 
 **Version:** `SCHEMA_VERSION = 27` (`rbitcoin_primitives`).  
-**Status:** 27 rewrites `meta` only. `--prune-seqsigwit` can leave `seqsigwit` at a header while creates remain. A 26 binary treats that empty locator as damage and truncates the chain, so it refuses 27 `meta`. Opening any 22–26 datadir here, pruned or not, rewrites `meta` to 27 and syncs that directory before a witness cut. A 0.9.0 binary then refuses the directory. 26 is `header.body` 88 B (consensus fields only). Occupied 24/25
+**Status:** 27 rewrites `meta` only. Historical spend slots, including the short tail page, live in `spend.pages` until fold. `--prune-seqsigwit` can leave `seqsigwit` at a header while creates remain. A 26 binary treats that empty locator as damage and truncates the chain, and it does not read the spend page log, so it refuses 27 `meta`. Opening any 22–26 datadir here, pruned or not, rewrites `meta` to 27 and syncs that directory before a witness cut. A 0.9.0 binary then refuses the directory. 26 is `header.body` 88 B (consensus fields only). Occupied 24/25
 rewrites each 96 B row down to 88 B (`header.body.grow` then rename), dropping
 the trailing `size:u32` + `weight:u32`. Block size and weight are summed from
 `txstat` for that header's create range. A 25 binary refuses 26 `meta`.
@@ -91,7 +91,7 @@ Table file headers **22–27** remain `schema_file_openable`. A 22 binary refuse
 **22→23 open:** occupied Class A rewrites `create.loc.ovf` 12 B rows (`fk:u64` + two u16) to 16 B (`fk:u64` + two u32) and `store/meta` to 23. Empty 22 rewrites `meta`. A 22 binary refuses 23 `meta`. Spent vin stays u16 (stripped input ≥ ~41 B ⇒ ≲24k vins in a 1 MB block; widening would bump the 8 B spent slot).
 **23→24 open** (schema 24/25 binaries): rewrote `header.body` 88 B rows to 96 B. This binary does not expand. An 88 B body stays 88 B and `meta` rewrites to 27.
 **24/25→26 open:** rewrite each 96 B `header.body` row to 88 B (drop trailing `size`/`weight`) via `header.body.grow` then rename; rewrite `meta` to 26. A body that is already 88 B is unchanged. A 25 binary refuses 26 `meta`. Crash with leftover `.grow` discards it and retries.
-**26→27 open:** rewrite `store/meta` to 27 and sync its directory. No table rewrite. A 26 binary refuses 27 `meta`. The sync lands before a witness stem cut, so a crash cannot leave schema 26 beside an empty witness locator.
+**26→27 open:** rewrite `store/meta` to 27 and sync its directory. No table rewrite. Historical spend slots that are not yet in `spent.body` live in `spend.pages` until fold. A 26 binary refuses 27 `meta`. The sync lands before a witness stem cut, so a crash cannot leave schema 26 beside an empty witness locator.
 **24→25 open:** rewrite `meta` to 25; create or zero-extend `txstat.body` to `create.loc` count. Do **not** rewrite `txout.body`. Unlink leftover `txfixed.body`. A 24 binary refuses 25 `meta`.
 **Endianness:** little-endian for all multi-byte integers.
 
@@ -132,7 +132,7 @@ catalogs, or 16-layout Class A with creates is **refused**.
 |--------|--------|
 | Loc | One loc pair per create; `seqsigwit` is the fat stem (cold) and does not force `txout` splits. `tx.head` rolls at OA 80% slots only. |
 | `strong_tx` | Always L2. **`confirmed`** and **`header_txs_*`** stay in RAM up to 256 MiB, then fd. |
-| `RWF_DONTCACHE` | **Not used.** The live tail page is eight-byte slot writes. The cooled fold still writes `spent.body`. A full historical page is a directory insert, not a pwrite. Evicting spent pages does not protect `txout`, and the next block wants the same spent pages. |
+| `RWF_DONTCACHE` | **Not used.** Confirm logs every published spend slot, including the short tail. The cooled fold still writes `spent.body`. Evicting spent pages does not protect `txout`, and the next block wants the same spent pages. |
 
 ### New script kinds without a wipe
 
@@ -230,7 +230,7 @@ itself changed.
     seqsigwit.window/                # prune window: one {height}.bin per kept height. The only witness payload while seqsigwit.prune exists
     seqsigwit.reloc                  # optional: append-only files live under --datadir-cold/store
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
-    spend.pages / spend.pages.commit                       # derived historical page log; not a schema bump
+    spend.pages / spend.pages.commit                       # historical spend slots until fold (schema 27)
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
     txstat.body / txstat.ovf / txstat.blk            # 8 B/create ULEB econ + per-header tails (schema 25)
@@ -610,7 +610,7 @@ the new `meta` or an unknown kind). See [Schema 17 freeze](#schema-17-freeze).
 Best-chain spentness also requires `is_confirmed_strong(spender)` (annotations may outlive reorgs).
 A Class A append fills the slot for a spend in the same write. When the write holds more than one spender of a vout (a double spend that write rejects), it names the first in chain order, the lowest fk. A rejected write keeps that append for the retry.
 
-`spend.pages` and `spend.pages.commit` are derived, same durability class as the marker, and are not a `SCHEMA_VERSION` bump. A missing commit means no unsealed historical page. A commit that names bytes whose `spend.pages` file is missing or shorter than the committed length refuses open. An empty claim with no pages file opens. `spend.pages` holds the page images. `spend.pages.commit` names the snapshot height, generation, committed byte length, and the page list. A record past that length is not served. The checkpoint appends one image per dirty full page and syncs the commit before `spend_durable` advances. Fold copies a quiet generation onto `spent.body` after a later checkpoint, starting at byte 16 on the first page so the file header stays put, and skips a page confirm has re-dirtied. It deletes both files only once nothing committed, open, frozen, or pending remains. The body copy does not hold the utxo view. The live tail page is not in this log: those slots are 8-byte pwrites on `spent.body`. An older binary does not read this log. An unfolded generation can look unspent to it. Opening with this binary is the supported path.
+`spend.pages` and `spend.pages.commit` name historical spend slots that are not yet folded onto `spent.body`, including the short tail page. This is a `SCHEMA_VERSION` bump: a binary that does not read the log refuses the datadir. A missing commit means no unsealed historical page. A commit that names bytes whose `spend.pages` file is missing or shorter than the committed length refuses open. An empty claim with no pages file opens. `spend.pages` holds the page images. `spend.pages.commit` names the snapshot height, generation, committed byte length, and the page list. A record past that length is not served. The checkpoint appends one image per dirty page and syncs the commit before `spend_durable` advances. Fold copies a quiet generation onto `spent.body` after a later checkpoint, starting at byte 16 on the first page so the file header stays put, and skips a page confirm has re-dirtied. It deletes both files only once nothing committed, open, frozen, or pending remains. The body copy does not hold the utxo view. The directory drop does.
 
 ### Multi-spender overflow (`spent.ovf`)
 

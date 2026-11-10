@@ -2256,9 +2256,8 @@ impl TxTable {
 
     /// Annotate spends at known absolute spender-meta offsets.
     ///
-    /// One read of the current slot, then a page-log insert for a full
-    /// historical page. The live tail is an 8-byte slot pwrite. A slot past
-    /// the published body is cold and is not written.
+    /// One read of the current slot, then a page-log insert. A slot past the
+    /// published body is cold and is not written.
     /// Decide sole / multi / promote from that slot.
     /// `spent.ovf` appends run inline on the decision.
     ///

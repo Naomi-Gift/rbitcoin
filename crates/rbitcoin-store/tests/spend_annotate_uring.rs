@@ -437,8 +437,8 @@ fn unknown_meta_annotate_is_one_rmw_per_page() {
         .put_spend_batch_by_abs_meta(&spenders, &edges)
         .unwrap()
         .is_empty());
-    // Full-page slots stay in the directory, so those body bytes stay zero.
-    // The short tail is an 8-byte slot write. The page-RMW counters stay quiet.
+    // Every published slot, including the short tail, stays in the directory.
+    // The body bytes stay zero. The page-RMW counters stay quiet.
     assert_eq!(
         rbitcoin_store::spend_annotate_uring::spend_annotate_counts(),
         (0, 0)
@@ -456,7 +456,7 @@ fn unknown_meta_annotate_is_one_rmw_per_page() {
     t.spent
         .read_prefix_at_published(published, a2, 8, &mut slot)
         .unwrap();
-    assert_ne!(slot, [0u8; 8]);
+    assert_eq!(slot, [0u8; 8]);
     let (off, len) = t.spent_range(fk).unwrap();
     let (m0, f0, v0) = t.get_output_spender_meta_at(off, len, 0).unwrap();
     let (m1, f1, v1) = t.get_output_spender_meta_at(off, len, 1).unwrap();
@@ -469,8 +469,8 @@ fn unknown_meta_annotate_is_one_rmw_per_page() {
 
 /// A second spend of a historical slot promotes through the directory.
 ///
-/// The historical body page stays zero. Zeroing a logged slot on disk still
-/// returns the multi head. A tail-page slot in the same peek comes from the body.
+/// The body page stays zero, including the short tail. Zeroing a logged slot
+/// on disk still returns the multi head.
 #[test]
 fn historical_second_spend_keeps_both_edges() {
     let (dir, t, spenders) = temp_table();
@@ -500,7 +500,7 @@ fn historical_second_spend_keeps_both_edges() {
     t.spent
         .read_prefix_at_published(published, a_tail, 8, &mut body)
         .unwrap();
-    assert_ne!(body, [0u8; 8]);
+    assert_eq!(body, [0u8; 8]);
     t.spent.write_body_abs(a0, &[0u8; 8]).unwrap();
     let (multi, field, vin) = t.get_output_spender_meta_at(off, len, 0).unwrap();
     assert!(multi && vin == 0);

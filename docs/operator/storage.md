@@ -82,6 +82,7 @@ names the dirs. Corrupt files are **not** repaired in-process.
 
 | Incoming `meta` | What this binary does |
 |-----------------|------------------------|
+| **27** | Open. Historical spend slots live in `spend.pages` until fold. |
 | **26** | Rewrite `meta` to 27 and sync the store directory. No table rewrite. A 0.9.0 binary then refuses the directory. |
 | **25** | If `header.body` is still 96 B, rewrite each row to 88 B (`header.body.grow`, then rename), dropping trailing size and weight. An 88 B body is left alone. Then rewrite `meta` to 27. |
 | **24** | Same header shrink as 25. Zero-extend `txstat.body` to the `create.loc` count (no `txout.body` rewrite). Unlink leftover `txfixed.body`. Rewrite `meta` to 27. |
