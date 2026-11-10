@@ -649,9 +649,10 @@ pub struct ChainHub {
     pub confirmed: Arc<RwLock<HashSet<BlockHash>>>,
     /// Serializes tip connect / reorg so multi-peer accept cannot double Class A+C.
     pub connect_lock: std::sync::Mutex<()>,
-    /// Serializes one `generate` call, every block in the loop. Async generate
-    /// holds it across `.await`. Sync generate uses `blocking_lock` only when
-    /// the thread has no runtime handle; otherwise it spins on `try_lock`.
+    /// Serializes one `generate` call, from pool selection through the last
+    /// block. Async generate holds it across `.await`. Sync generate uses
+    /// `blocking_lock` only when the thread has no runtime handle; otherwise
+    /// it spins on `try_lock`.
     pub generate_lock: tokio::sync::Mutex<()>,
     /// Tests stop one `generate` before this 0-based block index. `0` mines
     /// the whole call. Production never sets it.
@@ -798,6 +799,15 @@ pub fn remember_stored_header(
             min_diff_walk: None,
         },
     );
+}
+
+/// Transactions for the first block of one `generate` call.
+///
+/// `Pool` is resolved only while `generate_lock` is held, so the next call
+/// sees removals from the call that just confirmed.
+enum GenerateFirst {
+    Chosen(Vec<Transaction>),
+    Pool,
 }
 
 impl ChainHub {
@@ -2584,7 +2594,7 @@ impl ChainHub {
         self.generate_paying(
             nblocks,
             script_pubkey,
-            extra_txs,
+            GenerateFirst::Chosen(extra_txs),
             Self::GENERATE_MAX_BLOCKS,
             false,
             false,
@@ -2607,10 +2617,30 @@ impl ChainHub {
         self.generate_paying(
             nblocks,
             script_pubkey,
-            extra_txs,
+            GenerateFirst::Chosen(extra_txs),
             Self::GENERATE_MAX_BLOCKS,
             true,
             record_assembly,
+        )
+    }
+
+    /// RPC `generate` / `generatetoaddress` / `generatetodescriptor`.
+    ///
+    /// The pool is read after [`Self::generate_lock`] is held. A second call
+    /// waits, then selects what the first call left.
+    #[doc(hidden)]
+    pub fn generate_pool_for_rpc(
+        &self,
+        nblocks: u32,
+        script_pubkey: ScriptBuf,
+    ) -> Result<Vec<BlockHash>, NetError> {
+        self.generate_paying(
+            nblocks,
+            script_pubkey,
+            GenerateFirst::Pool,
+            Self::GENERATE_MAX_BLOCKS,
+            true,
+            true,
         )
     }
 
@@ -2626,10 +2656,28 @@ impl ChainHub {
         self.generate_paying_async(
             nblocks,
             script_pubkey,
-            extra_txs,
+            GenerateFirst::Chosen(extra_txs),
             Self::GENERATE_MAX_BLOCKS,
             true,
             record_assembly,
+        )
+        .await
+    }
+
+    /// HTTP form of [`Self::generate_pool_for_rpc`].
+    #[doc(hidden)]
+    pub async fn generate_pool_for_rpc_async(
+        self: &std::sync::Arc<Self>,
+        nblocks: u32,
+        script_pubkey: ScriptBuf,
+    ) -> Result<Vec<BlockHash>, NetError> {
+        self.generate_paying_async(
+            nblocks,
+            script_pubkey,
+            GenerateFirst::Pool,
+            Self::GENERATE_MAX_BLOCKS,
+            true,
+            true,
         )
         .await
     }
@@ -2638,7 +2686,7 @@ impl ChainHub {
         self: &std::sync::Arc<Self>,
         nblocks: u32,
         script_pubkey: ScriptBuf,
-        extra_txs: Vec<Transaction>,
+        first: GenerateFirst,
         limit: u32,
         commit_on_accept: bool,
         record_assembly: bool,
@@ -2662,7 +2710,13 @@ impl ChainHub {
             }
             let _guard = hub.generate_lock.lock().await;
             let mut hashes = Vec::with_capacity(nblocks as usize);
-            let mut extras = extra_txs;
+            let mut extras = match first {
+                GenerateFirst::Chosen(txs) => txs,
+                GenerateFirst::Pool => {
+                    let hub = std::sync::Arc::clone(&hub);
+                    crate::reactor::off_pool(move || hub.pool_txs_for_generate()).await
+                }
+            };
             for i in 0..nblocks {
                 let stop = hub.generate_fail_before.load(Ordering::Relaxed);
                 if stop > 0 && i == stop {
@@ -2754,14 +2808,38 @@ impl ChainHub {
         extra_txs: Vec<Transaction>,
         limit: u32,
     ) -> Result<Vec<BlockHash>, NetError> {
-        self.generate_paying(nblocks, script_pubkey, extra_txs, limit, false, false)
+        self.generate_paying(
+            nblocks,
+            script_pubkey,
+            GenerateFirst::Chosen(extra_txs),
+            limit,
+            false,
+            false,
+        )
+    }
+
+    /// Live pool transactions for the first block of `generate`.
+    ///
+    /// Caller holds `generate_lock`. The copy does not remove them;
+    /// `commit_generated_txids` does that after the block is accepted.
+    fn pool_txs_for_generate(&self) -> Vec<Transaction> {
+        self.mempool()
+            .map(|mp| mp.select_generate_txs(self.block_min_tx_fee_sat_kvb()))
+            .unwrap_or_default()
+    }
+
+    fn pool_or_chosen(&self, first: GenerateFirst) -> Vec<Transaction> {
+        match first {
+            GenerateFirst::Chosen(txs) => txs,
+            GenerateFirst::Pool => self.pool_txs_for_generate(),
+        }
     }
 
     fn generate_paying(
         &self,
         nblocks: u32,
         script_pubkey: ScriptBuf,
-        extra_txs: Vec<Transaction>,
+        first: GenerateFirst,
         limit: u32,
         commit_on_accept: bool,
         record_assembly: bool,
@@ -2779,7 +2857,7 @@ impl ChainHub {
         // (rpc_generate.py parallel) cannot race the same tip into AlreadyHave.
         let _guard = self.lock_generate_sync();
         let mut hashes = Vec::with_capacity(nblocks as usize);
-        let mut extras = extra_txs;
+        let mut extras = self.pool_or_chosen(first);
         for i in 0..nblocks {
             let stop = self.generate_fail_before.load(Ordering::Relaxed);
             if stop > 0 && i == stop {

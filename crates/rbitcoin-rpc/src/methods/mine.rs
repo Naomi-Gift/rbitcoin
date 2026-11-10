@@ -194,31 +194,25 @@ pub fn generate_with_mempool(
     nblocks: u32,
     script: ScriptBuf,
 ) -> Result<Value, Value> {
-    let miner = require_regtest_miner(ctx, "generate")?;
+    let _miner = require_regtest_miner(ctx, "generate")?;
     if nblocks == 0 {
         return Ok(hashes_json(&[]));
     }
-    let listing = ctx.pool_listing();
     // Catch-up leaves confirmed transactions in the pool, so mine the coinbase
     // only. Any other listing is removed when the block that contains it is
     // accepted, including while relay is off, and before a later block of this
     // call is mined. A refusal before that block leaves the pool as it was.
-    let extras = if matches!(listing, PoolListing::Downloading) {
-        Vec::new()
+    // The pool read for a maintained listing happens under `generate_lock`.
+    let chain = ctx
+        .chain
+        .as_ref()
+        .ok_or_else(|| rpc_error(ERR_MISC, "generate requires a live chain hub"))?;
+    let mined = if matches!(ctx.pool_listing(), PoolListing::Downloading) {
+        chain.generate_to_script_for_rpc(nblocks, script, Vec::new(), true)
     } else {
-        let min = ctx
-            .chain
-            .as_ref()
-            .map(|c| c.block_min_tx_fee_sat_kvb())
-            .unwrap_or(1);
-        ctx.mempool
-            .as_ref()
-            .map(|mp| mp.select_generate_txs(min))
-            .unwrap_or_default()
+        chain.generate_pool_for_rpc(nblocks, script)
     };
-    let hashes = miner
-        .generate_to_script(nblocks, script, extras, true)
-        .map_err(|e| generate_error(&e))?;
+    let hashes = mined.map_err(|e| generate_error(&submit_reject_reason(&e)))?;
     Ok(hashes_json(&hashes))
 }
 
@@ -233,24 +227,16 @@ pub async fn generate_with_mempool_async(
     if nblocks == 0 {
         return Ok(hashes_json(&[]));
     }
-    let blocksonly = ctx.blocksonly;
-    let mempool = ctx.mempool.clone();
-    let min = chain.block_min_tx_fee_sat_kvb();
-    let extras = rbitcoin_net::off_pool(move || -> Vec<Transaction> {
-        let downloading = !blocksonly && mempool.as_ref().is_some_and(|m| !m.pool_maintained());
-        if downloading {
-            return Vec::new();
-        }
-        mempool
-            .as_ref()
-            .map(|mp| mp.select_generate_txs(min))
-            .unwrap_or_default()
-    })
-    .await;
-    let hashes = chain
-        .generate_to_script_for_rpc_async(nblocks, script, extras, true)
-        .await
-        .map_err(|e| generate_error(&submit_reject_reason(&e)))?;
+    // Same catch-up rule as the sync path. Selection of a maintained pool
+    // waits on `generate_lock` so two calls cannot copy one transaction.
+    let mined = if matches!(ctx.pool_listing(), PoolListing::Downloading) {
+        chain
+            .generate_to_script_for_rpc_async(nblocks, script, Vec::new(), true)
+            .await
+    } else {
+        chain.generate_pool_for_rpc_async(nblocks, script).await
+    };
+    let hashes = mined.map_err(|e| generate_error(&submit_reject_reason(&e)))?;
     Ok(hashes_json(&hashes))
 }
 

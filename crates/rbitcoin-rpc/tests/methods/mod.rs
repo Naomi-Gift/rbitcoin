@@ -7646,6 +7646,84 @@ fn request_task_generate_is_an_active_command() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Two HTTP `generate` calls must not both copy the same pool transaction.
+/// The first parks after accept and before `commit_generated_txids`, still
+/// holding `generate_lock`. The second waits there, then mines what remains.
+#[test]
+fn overlapping_generate_mines_the_pool_tx_once() {
+    let (ctx, dir, hub) = ctx_from_mature_pad(300_000_000);
+    let (hex, spend) = mature_coinbase_spend_hex(&ctx, generated_coinbase_value(&ctx, 1) - 1_000);
+    let txid = spend.compute_txid();
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
+    hub.pause_before_generate_commit
+        .store(true, Ordering::Release);
+    let ctx = std::sync::Arc::new(ctx);
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (first, second) = rt.block_on(async {
+        let ctx_a = std::sync::Arc::clone(&ctx);
+        let first = tokio::spawn(async move {
+            rbitcoin_rpc::methods::dispatch_tip_connect(
+                &ctx_a,
+                "generate",
+                rbitcoin_rpc::methods::RpcParams::positional(vec![json!(1)]),
+            )
+            .await
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !hub.generate_commit_parked.load(Ordering::Acquire) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "first generate never parked"
+            );
+            tokio::task::yield_now().await;
+        }
+        let ctx_b = std::sync::Arc::clone(&ctx);
+        let second = tokio::spawn(async move {
+            rbitcoin_rpc::methods::dispatch_tip_connect(
+                &ctx_b,
+                "generate",
+                rbitcoin_rpc::methods::RpcParams::positional(vec![json!(1)]),
+            )
+            .await
+        });
+        // Let the second call reach the lock. A select outside the lock
+        // would copy the transaction during this wait; the parked call has
+        // not removed it yet.
+        let started = std::time::Instant::now();
+        while started.elapsed() < std::time::Duration::from_millis(200) {
+            tokio::task::yield_now().await;
+        }
+        hub.pause_before_generate_commit
+            .store(false, Ordering::Release);
+        let first = first.await.expect("join first").expect("first generate");
+        let second = second.await.expect("join second").expect("second generate");
+        (first, second)
+    });
+    let hashes = [first[0].as_str().unwrap(), second[0].as_str().unwrap()];
+    assert_ne!(hashes[0], hashes[1], "both calls returned {hashes:?}");
+    let mut with_tx = 0;
+    for hash in hashes {
+        let block = dispatch(&ctx, "getblock", vec![json!(hash), json!(1)]).unwrap();
+        let ntx = block["nTx"].as_u64().unwrap();
+        assert!(ntx == 1 || ntx == 2, "{block}");
+        if block["tx"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|id| id.as_str() == Some(txid.to_string().as_str()))
+        {
+            with_tx += 1;
+        }
+    }
+    assert_eq!(with_tx, 1, "pool tx in {with_tx} blocks");
+    assert!(!ctx.mempool.as_ref().unwrap().contains(&txid));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Aborting the request after the tx is published still records it
 /// unbroadcast. The note shares the admit task. The latch holds that task
 /// between publish and the note, so the abort is the thing under test.
