@@ -262,9 +262,19 @@ pub async fn run_health(
     let app = router(status, metrics);
     let task = tokio::spawn(async move {
         let sem = Arc::new(Semaphore::new(HEALTH_MAX_CONNECTIONS));
+        struct StopConns(Vec<JoinHandle<()>>);
+        impl Drop for StopConns {
+            fn drop(&mut self) {
+                for task in self.0.drain(..) {
+                    task.abort();
+                }
+            }
+        }
+        let mut conns = StopConns(Vec::new());
         loop {
             match listener.accept().await {
                 Ok((io, peer)) => {
+                    conns.0.retain(|t| !t.is_finished());
                     if !rbitcoin_net::listen::listener_fd_room() {
                         warn!("health: reject {peer} (descriptor reserve)");
                         drop(io);
@@ -278,13 +288,13 @@ pub async fn run_health(
                         continue;
                     };
                     let service = TowerToHyperService::new(app.clone());
-                    tokio::spawn(async move {
+                    conns.0.push(tokio::spawn(async move {
                         let _permit = permit;
                         let mut http = http1::Builder::new();
                         http.timer(TokioTimer::new())
                             .header_read_timeout(REQUEST_TIMEOUT);
                         let _ = http.serve_connection(TokioIo::new(io), service).await;
-                    });
+                    }));
                 }
                 Err(e) => {
                     if rbitcoin_net::service::accept_error_ends_listen(&e) {

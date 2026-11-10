@@ -37,33 +37,42 @@ async fn listener_cap_esplora_idle_tcp_is_closed() {
     let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
     cfg.limits.max_connections = 4;
     cfg.limits.idle_timeout = Duration::from_millis(300);
+    let cap = rbitcoin_esplora::server::esplora_accept_cap(4);
     let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
     let addr = handle.local_addr;
 
     let mut opened = Vec::new();
-    for _ in 0..12 {
+    for _ in 0..(cap + 16) {
         opened.push(TcpStream::connect(addr).await.expect("connect"));
     }
-    tokio::time::sleep(Duration::from_millis(150)).await;
-    let mut held = 0usize;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let mut probes = tokio::task::JoinSet::new();
     for mut sock in opened {
-        let mut buf = [0u8; 1];
-        let open = match tokio::time::timeout(Duration::from_millis(40), sock.read(&mut buf)).await
-        {
-            Err(_) => true,
-            Ok(Ok(0)) | Ok(Err(_)) => false,
-            Ok(Ok(_)) => true,
-        };
+        probes.spawn(async move {
+            let mut buf = [0u8; 1];
+            let open =
+                match tokio::time::timeout(Duration::from_millis(20), sock.read(&mut buf)).await {
+                    Err(_) => true,
+                    Ok(Ok(0)) | Ok(Err(_)) => false,
+                    Ok(Ok(_)) => true,
+                };
+            (sock, open)
+        });
+    }
+    let mut still = Vec::new();
+    while let Some(joined) = probes.join_next().await {
+        let (sock, open) = joined.expect("probe");
         if open {
-            held += 1;
+            still.push(sock);
         }
     }
     assert!(
-        held <= 4,
-        "esplora held {held} idle TCP connections past the cap of 4"
+        !still.is_empty() && still.len() <= cap,
+        "esplora held {} idle TCP connections; cap is {cap}",
+        still.len()
     );
-
-    let mut idle = TcpStream::connect(addr).await.expect("one idle client");
+    let mut idle = still.pop().expect("accepted idle client");
+    drop(still);
     let closed = tokio::time::timeout(Duration::from_secs(2), async {
         let mut buf = [0u8; 8];
         loop {

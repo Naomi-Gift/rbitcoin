@@ -1025,6 +1025,12 @@ impl CappedAccept for tokio::net::UnixListener {
     }
 }
 
+/// Accepted sockets include requests waiting on the in-flight gate, so this
+/// is above `--esplora-max-inflight`. A connection past it is closed.
+pub fn esplora_accept_cap(max_inflight: usize) -> usize {
+    max_inflight.max(1).saturating_mul(8)
+}
+
 /// Accept loop for TCP and unix. Caps sockets, closes one that never sends
 /// headers, and leaves the accept task as soon as `shutdown` is stored.
 fn spawn_capped<L: CappedAccept>(
@@ -1296,7 +1302,13 @@ pub async fn run_esplora(
         EsploraListen::Tcp(addr) => {
             let listener = rbitcoin_net::listen::bind_tcp(addr)?;
             let local_addr = listener.local_addr()?;
-            let task = spawn_capped(listener, app, max_conn, idle, shutdown_c);
+            let task = spawn_capped(
+                listener,
+                app,
+                esplora_accept_cap(max_conn),
+                idle,
+                shutdown_c,
+            );
             Ok(EsploraHandle {
                 local_addr,
                 socket_path: None,
@@ -1315,7 +1327,13 @@ pub async fn run_esplora(
             }
             let _ = std::fs::remove_file(&path);
             let listener = bind_unix_mode(&path, 0o660)?;
-            let task = spawn_capped(listener, app, max_conn, idle, shutdown_c);
+            let task = spawn_capped(
+                listener,
+                app,
+                esplora_accept_cap(max_conn),
+                idle,
+                shutdown_c,
+            );
             Ok(EsploraHandle {
                 local_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
                 socket_path: Some(path),
