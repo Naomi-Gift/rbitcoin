@@ -686,10 +686,14 @@ pub fn settle_walk_peer(
     if !st.header_walk.origin {
         return;
     }
-    // Below the floor a short or non-extending reply ended light. Drop it.
+    // Below the floor a short reply ended light, even when the store kept
+    // one connecting header. A full window that moved the queue stays.
     // An empty reply stays with the all-peers rewind.
     if below_floor(hub, &st.header_walk.tip_work()) {
-        if batch_len > 0 && !extended {
+        let stored_window = batch_len >= rbitcoin_net::codec::MAX_HEADERS_RESULTS
+            && st.ordered.len() > queued_before;
+        let advanced = st.header_walk.tip_hash() != tip_before || stored_window || fork_advanced;
+        if batch_len > 0 && !advanced {
             st.header_walk.walk_quiet.insert(peer);
             if st.header_walk.reserved == Some(peer) {
                 st.header_walk.reserved = None;
@@ -2549,14 +2553,15 @@ pub fn note_empty(st: &mut IbdWorkState, hub: &ChainHub, peer: usize) -> bool {
 
 /// Checkpoint at the batch end when these stored headers extend the candidate.
 ///
-/// Context was already checked by [`ChainHub::ensure_headers_batch`]. A batch
-/// the walk absorbed is written on that same path; this only records the
-/// checkpoint when the tip has not already moved.
+/// `reply_len` is the headers message, before the store drops a rejected tail.
+/// A full window follows the prefix that was kept. A shorter reply still has
+/// to clear the floor on that prefix.
 pub fn note_stored_candidate(
     st: &mut IbdWorkState,
     hub: &ChainHub,
     peer: usize,
     headers: &[Header],
+    reply_len: usize,
 ) {
     if !st.header_walk.origin || headers.is_empty() || !pow_linked(headers) {
         return;
@@ -2567,9 +2572,11 @@ pub fn note_stored_candidate(
     if headers[0].prev_blockhash != tip || st.header_walk.dead_ends.contains(&tip) {
         return;
     }
-    // The short-batch gate already ran on the reply. The store may have kept
-    // only a prefix, and that prefix is still the walk.
-    let _ = extend_connected(st, hub, headers, Some(peer));
+    if reply_len >= rbitcoin_net::codec::MAX_HEADERS_RESULTS {
+        let _ = extend_connected(st, hub, headers, Some(peer));
+    } else {
+        let _ = extend_tip(st, hub, headers, Some(peer));
+    }
 }
 
 /// A batch shorter than a full window whose work, after the batch, is still
@@ -4253,8 +4260,9 @@ pub fn note_unproven_class_a(st: &mut IbdWorkState, height: u32, wire_bytes: u64
 /// A full batch we asked for, checked against checkpoints another peer supplied.
 /// A match moves the height confirm may follow.
 ///
-/// `linked` is the caller's single [`pow_linked`] result. This does not hash
-/// the batch again. A proved walk ignores the match.
+/// `linked` is the caller's single [`pow_linked`] result. The batch is hashed
+/// only when a checkpoint was supplied by a different address. A proved walk
+/// ignores the match.
 #[doc(hidden)]
 pub fn note_header_witness(
     st: &mut IbdWorkState,
@@ -4274,14 +4282,23 @@ pub fn note_header_witness(
     {
         return;
     }
+    let Some(mine) = peer_net(st, peer) else {
+        return;
+    };
+    // No other address has a checkpoint, so this batch cannot be a match.
+    if !st
+        .header_walk
+        .checkpoints
+        .iter()
+        .any(|c| c.supplied_by.is_some_and(|supplier| supplier != mine))
+    {
+        return;
+    }
     let prev = headers[0].prev_blockhash;
     let Some(start) = height_of(st, hub, prev) else {
         return;
     };
     let PathAgree::Checkpoint(height) = path_agree(st, start, headers, true) else {
-        return;
-    };
-    let Some(mine) = peer_net(st, peer) else {
         return;
     };
     let other = st

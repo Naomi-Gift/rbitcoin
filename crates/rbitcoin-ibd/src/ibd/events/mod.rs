@@ -358,7 +358,7 @@ pub fn on_headers_batch(
         }
         stored.push(hdr);
     }
-    super::header_walk::note_stored_candidate(st, hub, peer, &stored);
+    super::header_walk::note_stored_candidate(st, hub, peer, &stored, headers.len());
     added
 }
 

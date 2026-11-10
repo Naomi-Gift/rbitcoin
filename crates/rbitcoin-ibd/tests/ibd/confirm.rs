@@ -2877,6 +2877,45 @@ fn a_lower_match_installs_the_new_byte_remainder() {
     assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(1_000));
 }
 
+/// Offer installs the same height cap, match, and byte allowance on later
+/// turns. That repeat leaves a remainder lookup already set.
+#[test]
+fn an_unchanged_lead_install_leaves_the_remainder() {
+    let feed = ConfirmFeed::new();
+    feed.install_unproven_bounds(Some(10_000), 0, Some(1_000));
+    feed.inner.lock().unwrap().lead_bytes_left = Some(1);
+    feed.install_unproven_bounds(Some(10_000), 0, Some(1_000));
+    assert_eq!(
+        feed.inner.lock().unwrap().lead_bytes_left,
+        Some(1),
+        "the same allowance does not lock and rewrite the remainder"
+    );
+    feed.inner.lock().unwrap().lead_bytes_left = Some(1);
+    feed.install_unproven_bounds(Some(10_000), 0, Some(0));
+    assert_eq!(
+        feed.inner.lock().unwrap().lead_bytes_left,
+        Some(0),
+        "a zero allowance is still a cap"
+    );
+    feed.install_unproven_bounds(Some(10_000), 4, Some(0));
+    assert_eq!(feed.inner.lock().unwrap().lead_from, 4);
+    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(0));
+}
+
+/// Releasing a height does not put the bytes back. The next install of the
+/// same allowance subtracts only what is still reserved.
+#[test]
+fn the_same_allowance_install_refreshes_after_release() {
+    use rbitcoin_ibd::ibd::confirm::take_unproven_lead;
+    let feed = ConfirmFeed::new();
+    feed.install_unproven_bounds(Some(10_000), 0, Some(1_000));
+    assert_eq!(take_unproven_lead(&feed, Some(&[40]), vec![1]), vec![1]);
+    feed.release_lead_reserve(1);
+    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(960));
+    feed.install_unproven_bounds(Some(10_000), 0, Some(1_000));
+    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(1_000));
+}
+
 /// The match did not move. A rewind dropped the spent bytes, so the walk
 /// reports a fresh allowance and confirm may use it.
 #[test]

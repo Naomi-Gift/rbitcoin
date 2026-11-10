@@ -5857,14 +5857,14 @@ fn note_stored_candidate_ignores_a_dead_end_tip() {
     st.header_walk.tip.hash = Some(gen);
     st.header_walk.tip.height = 0;
     st.header_walk.dead_ends.insert(gen);
-    note_stored_candidate(&mut st, &hub, 0, &[mine(gen, 30)]);
+    note_stored_candidate(&mut st, &hub, 0, &[mine(gen, 30)], 1);
     assert_eq!(st.header_walk.tip_hash(), Some(gen));
     assert!(st.header_walk.checkpoints.is_empty());
 
     st.header_walk.dead_ends.clear();
     let mut broken = mine(gen, 31);
     broken.bits = CompactTarget::from_consensus(0x1d00ffff);
-    note_stored_candidate(&mut st, &hub, 0, &[broken]);
+    note_stored_candidate(&mut st, &hub, 0, &[broken], 1);
     assert_eq!(st.header_walk.tip_hash(), Some(gen));
     assert!(st.header_walk.checkpoints.is_empty());
 }
@@ -6626,6 +6626,45 @@ fn a_full_reply_prefix_does_not_leave_an_unproved_stall() {
         send_getheaders(&mut st, &hub).unwrap(),
         "the next header is not already stored, so the walk can ask"
     );
+}
+
+/// One real continuation plus a header that does not link to it. The proof
+/// on each header is valid, so this is not a bad-target disconnect. The
+/// store may keep the connecting header. The walk does not follow it, and
+/// that peer does not stay reserved to drip the next header.
+#[test]
+fn an_unlinked_short_reply_below_the_floor_does_not_walk() {
+    let (_dir, hub, mut st, gen) = opened("unproven-unlinked-short", true);
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    assert_eq!(st.header_walk.reserved, Some(0));
+    let tip = st.header_walk.tip_hash();
+    let height = st.header_walk.tip_height();
+    let mut batch = headers_after(gen, 2, 40);
+    batch[1].prev_blockhash = BlockHash::from_byte_array([0x5a; 32]);
+    batch[1].nonce = 0;
+    rbitcoin_consensus::grind_regtest_pow(&mut batch[1]);
+    apply(&mut st, &hub, 0, batch);
+    assert_eq!(st.header_walk.tip_hash(), tip);
+    assert_eq!(st.header_walk.tip_height(), height);
+    assert!(st.header_walk.checkpoints.is_empty());
+    assert!(
+        st.header_walk.walk_quiet.contains(&0),
+        "a short unlinked reply does not keep the peer"
+    );
+    assert_ne!(st.header_walk.reserved, Some(0));
+
+    let stored = headers_after(gen, 1, 40).pop().unwrap();
+    let mut again = headers_after(stored, 2, 41);
+    again[1].prev_blockhash = BlockHash::from_byte_array([0x5b; 32]);
+    again[1].nonce = 0;
+    rbitcoin_consensus::grind_regtest_pow(&mut again[1]);
+    apply(&mut st, &hub, 0, again);
+    assert_eq!(
+        st.header_walk.tip_hash(),
+        tip,
+        "a second short unlinked reply does not walk one header"
+    );
+    assert_eq!(st.header_walk.tip_height(), height);
 }
 
 #[test]

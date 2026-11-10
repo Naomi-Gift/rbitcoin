@@ -187,6 +187,13 @@ impl LoadAheadState {
 /// stores hashes only. Class A alone is never enough (no hash-only
 /// confirm). Tip-follow reorgs use peer wire via `ChainHub::accept_block`.
 ///
+/// Height cap, match, and byte allowance last written into the feed.
+struct InstalledLead {
+    height_limit: Option<u32>,
+    lead_from: u32,
+    bytes_left: Option<u64>,
+}
+
 /// **In-flight tracking:** once lookup claims a contiguous run, those heights sit
 /// in `inflight` until write finishes (or re-queue). `note` will not re-insert
 /// them — otherwise offer re-notes tip+1 every main-loop tick and lookup
@@ -211,6 +218,13 @@ pub struct ConfirmFeed {
     /// `lead_bytes_left` is `Some`. Accept skips the reserve lock when this
     /// is clear. Written under `inner` before that lock is released.
     byte_capped: AtomicBool,
+    /// Last `(height_limit, lead_from, bytes_left)` passed to
+    /// [`Self::set_unproven_bounds`]. Offer compares this and skips `inner`
+    /// when the triple is unchanged and no reservation has moved.
+    lead_bounds: std::sync::Mutex<Option<InstalledLead>>,
+    /// A reservation was taken, released, or cleared since the last install.
+    /// The next identical allowance still has to recompute the remainder.
+    lead_bounds_dirty: AtomicBool,
 }
 
 pub struct ConfirmFeedInner {
@@ -261,6 +275,8 @@ impl ConfirmFeed {
             dropped_bodies: std::sync::Mutex::new(std::collections::HashSet::new()),
             height_capped: AtomicBool::new(false),
             byte_capped: AtomicBool::new(false),
+            lead_bounds: std::sync::Mutex::new(None),
+            lead_bounds_dirty: AtomicBool::new(false),
         }
     }
 
@@ -314,11 +330,18 @@ impl ConfirmFeed {
             .store(g.height_limit.is_some(), Ordering::Release);
         self.byte_capped
             .store(g.lead_bytes_left.is_some(), Ordering::Release);
+        *self.lead_bounds.lock().unwrap() = Some(InstalledLead {
+            height_limit,
+            lead_from,
+            bytes_left,
+        });
+        self.lead_bounds_dirty.store(false, Ordering::Release);
     }
 
     /// Install the next unproven lead. A repeat of the lifted lead does not
     /// lock the feed. `None` means no cap, so the skip runs only once both
-    /// caps are already clear.
+    /// caps are already clear. The same height cap, match, and allowance
+    /// also skip, until a reservation is taken, released, or cleared.
     pub fn install_unproven_bounds(
         &self,
         height_limit: Option<u32>,
@@ -331,6 +354,16 @@ impl ConfirmFeed {
             && !self.byte_capped.load(Ordering::Acquire)
         {
             return;
+        }
+        if !self.lead_bounds_dirty.load(Ordering::Acquire) {
+            let snap = self.lead_bounds.lock().unwrap();
+            if snap.as_ref().is_some_and(|saved| {
+                saved.height_limit == height_limit
+                    && saved.lead_from == lead_from
+                    && saved.bytes_left == bytes_left
+            }) {
+                return;
+            }
         }
         self.set_unproven_bounds(height_limit, lead_from, bytes_left);
     }
@@ -346,7 +379,9 @@ impl ConfirmFeed {
         if g.lead_bytes_left.is_none() {
             return;
         }
-        g.lead_reserved.remove(&height);
+        if g.lead_reserved.remove(&height).is_some() {
+            self.lead_bounds_dirty.store(true, Ordering::Release);
+        }
     }
 
     fn unproven_lead_active(&self) -> bool {
@@ -478,6 +513,9 @@ impl ConfirmFeed {
         g.lead_reserved.retain(|&h, _| h <= confirmed_tip);
         if let Some(left) = g.lead_bytes_left.as_mut() {
             *left = left.saturating_add(refund);
+        }
+        if refund > 0 {
+            self.lead_bounds_dirty.store(true, Ordering::Release);
         }
         drop(g);
         self.epoch.fetch_add(1, Ordering::AcqRel);
@@ -3479,9 +3517,13 @@ pub fn take_unproven_lead(
         out.push(ht);
     }
     if g.lead_bytes_left.is_some() {
+        let changed = g.lead_bytes_left != bytes_left || !reserved.is_empty();
         g.lead_bytes_left = bytes_left;
         for (ht, wire) in reserved {
             g.lead_reserved.insert(ht, wire);
+        }
+        if changed {
+            feed.lead_bounds_dirty.store(true, Ordering::Release);
         }
     }
     out
