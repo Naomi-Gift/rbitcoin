@@ -9292,7 +9292,11 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
     assert!(body.trim().len() > 20, "{body}");
     let tx_bin = dispatch_rest(&ctx, &format!("/rest/tx/{child_txid}.bin"), "", &[]);
     assert_eq!(tx_bin.status, axum::http::StatusCode::OK);
-    assert!(!tx_bin.body.is_empty());
+    assert_eq!(
+        tx_bin.body,
+        rbitcoin_primitives::hex_decode(body.trim()).unwrap(),
+        "REST bin bytes are the hex body"
+    );
 
     let height2 = dispatch(&ctx, "getblockhash", vec![json!(2)]).unwrap();
     let coinbase = dispatch(&ctx, "getblock", vec![height2, json!(1)]).unwrap();
