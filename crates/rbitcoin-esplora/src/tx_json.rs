@@ -180,50 +180,6 @@ fn status_for(query: &Query, tx_fk: Fk, view: Option<&ChainView>) -> Result<Valu
     }
 }
 
-/// Inputs for `tx_json_from_wire`. Prune mode has no `seqsigwit.body`.
-/// Parent edges still live in `input`, and the wire tx has the scripts.
-fn stored_inputs_for_json(
-    query: &Query,
-    tx_fk: Fk,
-    wire: &Transaction,
-) -> Result<Vec<InputRecord>, QueryError> {
-    match query.store().get_tx_full(tx_fk) {
-        Ok((_, ins, _)) => return Ok(ins),
-        Err(rbitcoin_store::StoreError::NotFound) if query.prune_seqsigwit() => {}
-        Err(e) => return Err(e),
-    }
-    let Some(edges) = query.store().input_edges(tx_fk)? else {
-        return Err(rbitcoin_store::StoreError::NotFound);
-    };
-    if edges.len() != wire.input.len() {
-        return Err(rbitcoin_store::StoreError::Corrupt(
-            "invariant: esplora pruned input count",
-        ));
-    }
-    let mut out = Vec::with_capacity(edges.len());
-    for (edge, inp) in edges.iter().zip(wire.input.iter()) {
-        if edge.parent.is_null() {
-            out.push(InputRecord::coinbase(
-                inp.sequence.to_consensus_u32(),
-                inp.script_sig.to_bytes(),
-                inp.witness.to_vec(),
-            ));
-            continue;
-        }
-        out.push(InputRecord {
-            prev_txid: inp.previous_output.txid.to_byte_array(),
-            parent: rbitcoin_store::InputParent::Prevout {
-                create_fk: edge.parent,
-                vout: edge.vout,
-            },
-            sequence: inp.sequence.to_consensus_u32(),
-            script_sig: inp.script_sig.to_bytes(),
-            witness: inp.witness.to_vec(),
-        });
-    }
-    Ok(out)
-}
-
 /// Full `GET /tx/:txid` body (Esplora API.md transaction format).
 ///
 /// `view` is the status pin. `None` uses the live tip. The wire body is the
@@ -234,15 +190,14 @@ pub fn build_tx_json(
     network: Network,
     view: Option<&ChainView>,
 ) -> Result<Value, QueryError> {
-    let wire = match query.reconstruct_tx(tx_fk) {
-        Ok(w) => w,
+    let (wire, stored_inputs) = match query.reconstruct_tx_with_inputs(tx_fk) {
+        Ok(v) => v,
         Err(rbitcoin_store::StoreError::Pruned { .. }) => {
             return build_tx_json_pruned(query, tx_fk, network, view);
         }
         Err(e) => return Err(e),
     };
     let status = status_for(query, tx_fk, view)?;
-    let stored_inputs = stored_inputs_for_json(query, tx_fk, &wire)?;
     let stored_txid = query
         .store()
         .txs
@@ -416,7 +371,9 @@ pub fn tx_json_from_wire(
         let mut spk_for_inner: Option<Vec<u8>> = None;
         if is_coinbase {
             prev_spks.push(Vec::new());
-        } else if let Some(prev) = prevout_json(query, stored_inputs, i, tin, network, mempool)? {
+        } else if let Some((prev, spk)) =
+            prevout_json(query, stored_inputs, i, tin, network, mempool)?
+        {
             if let Some(v) = prev.get("value").and_then(|x| x.as_i64()) {
                 if let Some(acc) = fee_in.as_mut() {
                     *acc = acc.saturating_add(v);
@@ -424,18 +381,6 @@ pub fn tx_json_from_wire(
             } else {
                 fee_in = None;
             }
-            let spk = prev
-                .get("scriptpubkey")
-                .and_then(|x| x.as_str())
-                .and_then(|h| {
-                    rbitcoin_primitives::hex_decode(
-                        h.strip_prefix("0x")
-                            .or_else(|| h.strip_prefix("0X"))
-                            .unwrap_or(h),
-                    )
-                    .ok()
-                })
-                .unwrap_or_default();
             spk_for_inner = Some(spk.clone());
             prev_spks.push(spk);
             vin_obj["prevout"] = prev;
@@ -504,30 +449,35 @@ pub fn prevout_json(
     tin: &bitcoin::TxIn,
     network: Network,
     mempool: Option<&MempoolHub>,
-) -> Result<Option<Value>, QueryError> {
+) -> Result<Option<(Value, Vec<u8>)>, QueryError> {
     if let Some(inp) = stored_inputs.get(idx) {
         if !inp.create_fk().is_null() {
             if let Ok(out) = query.tx_output_at_fk(inp.create_fk(), inp.prev_index()) {
-                return Ok(Some(vout_fields(&out.script, out.value, network)));
+                return Ok(Some(prevout_value(out.script, out.value, network)));
             }
         }
     }
     let prev_txid = tin.previous_output.txid.to_byte_array();
     if let Some(pfk) = query.tx_fk_by_txid(&prev_txid)? {
         if let Ok(out) = query.tx_output_at_fk(pfk, tin.previous_output.vout) {
-            return Ok(Some(vout_fields(&out.script, out.value, network)));
+            return Ok(Some(prevout_value(out.script, out.value, network)));
         }
     }
     if let Some(prev) = mempool.and_then(|m| m.get_tx(&tin.previous_output.txid)) {
         if let Some(o) = prev.output.get(tin.previous_output.vout as usize) {
-            return Ok(Some(vout_fields(
-                o.script_pubkey.as_bytes(),
+            return Ok(Some(prevout_value(
+                o.script_pubkey.as_bytes().to_vec(),
                 o.value.to_sat(),
                 network,
             )));
         }
     }
     Ok(None)
+}
+
+fn prevout_value(script: Vec<u8>, value: u64, network: Network) -> (Value, Vec<u8>) {
+    let json = vout_fields(&script, value, network);
+    (json, script)
 }
 
 #[doc(hidden)]

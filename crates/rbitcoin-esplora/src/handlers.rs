@@ -444,24 +444,22 @@ pub fn tx_merkleblock_proof_sync(st: AppState, txid_hex: String) -> Response {
     if !matches!(st.query.store().is_confirmed_strong(fk), Ok(true)) {
         return not_found();
     }
-    let proof = match st.query.merkle_proof(Height(height), &txid) {
-        Ok(p) => p,
-        Err(e) => return store_err(e),
-    };
     let ids = match st.query.block_txids(Height(height)) {
         Ok(v) => v,
         Err(e) => return store_err(e),
     };
-    let pos = proof.pos as usize;
-    if pos >= ids.len() {
-        return (StatusCode::INTERNAL_SERVER_ERROR, "merkle pos out of range").into_response();
+    if !ids.iter().any(|t| t == &txid) {
+        return not_found();
     }
-    let mut header = match st.query.wire_header_at_height(Height(height)) {
+    let header = match st.query.wire_header_at_height(Height(height)) {
         Ok(h) => h,
         Err(e) => return store_err(e),
     };
-    header.merkle_root =
-        bitcoin::TxMerkleNode::from_byte_array(rbitcoin_store::merkle_root_from_txids(&ids));
+    // The header already stores the root connect checked. A txid list that
+    // does not hash to it is a torn body, not a proof we rewrite.
+    if header.merkle_root.to_byte_array() != rbitcoin_store::merkle_root_from_txids(&ids) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "merkle root").into_response();
+    }
     let txids: Vec<bitcoin::Txid> = ids
         .iter()
         .copied()
