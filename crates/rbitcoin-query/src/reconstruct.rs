@@ -229,22 +229,43 @@ impl Query {
 
     /// Reconstruct a consensus `Transaction` from Class A rows (no stored raw).
     pub fn reconstruct_tx(&self, tx_fk: Fk) -> Result<Transaction, QueryError> {
-        Ok(self.reconstruct_tx_with_inputs(tx_fk)?.0)
+        let (rec, stored_outputs, stored_inputs) = self.filled_body(tx_fk)?;
+        Ok(Self::transaction_from_class_a(
+            rec,
+            stored_outputs,
+            stored_inputs,
+        ))
     }
 
     /// [`Self::reconstruct_tx`] plus the input rows that load already read.
     ///
     /// Callers that need both the wire tx and `InputRecord`s (Esplora vin)
-    /// must not load the body a second time.
+    /// must not load the body a second time. Those rows are cloned into the
+    /// wire transaction. [`Self::reconstruct_tx`] does not clone them.
     pub fn reconstruct_tx_with_inputs(
         &self,
         tx_fk: Fk,
     ) -> Result<(Transaction, Vec<rbitcoin_store::InputRecord>), QueryError> {
+        let (rec, stored_outputs, stored_inputs) = self.filled_body(tx_fk)?;
+        let wire = Self::transaction_from_class_a(rec, stored_outputs, stored_inputs.clone());
+        Ok((wire, stored_inputs))
+    }
+
+    fn filled_body(
+        &self,
+        tx_fk: Fk,
+    ) -> Result<
+        (
+            TxRecord,
+            Vec<OutputRecord>,
+            Vec<rbitcoin_store::InputRecord>,
+        ),
+        QueryError,
+    > {
         let (rec, stored_outputs, mut stored_inputs) = self.load_body_from_store(tx_fk)?;
         let mut cache = U64Map::default();
         self.fill_input_prev_txids_cached(&mut stored_inputs, &mut cache)?;
-        let wire = Self::transaction_from_class_a(rec, stored_outputs, stored_inputs.clone());
-        Ok((wire, stored_inputs))
+        Ok((rec, stored_outputs, stored_inputs))
     }
 
     #[doc(hidden)]
