@@ -413,8 +413,9 @@ Trust-peer: --trust-peer ADDR (conf trustpeer=) dials only that address, the sam
 Scripthash: --sh-index (default off) builds Class B for Electrum/Esplora address history.\n\
 Block filters: --block-filter-index (default off) builds BIP158 basic filters. Independent of --sh-index.\n\
   Electrum/Esplora start without it; scripthash/address methods fail closed.\n\
-  --prune-seqsigwit refuse seqsigwit reconstruct below tip-288 heights; advertise NETWORK_LIMITED.\n\
-    Kept heights are store/seqsigwit.window/{{height}}.bin plus a RAM cache. Unpruned nodes read seqsigwit.body.\n\
+  --prune-seqsigwit keep witness only for the last 288 heights, in store/seqsigwit.window/{{height}}.bin plus a RAM cache.\n\
+    seqsigwit.body stays a header. Enabling the flag on an archive copies that window out and cuts the stem. Advertise NETWORK_LIMITED.\n\
+    Unpruned nodes read seqsigwit.body. txout, input, txstat, and filters are not pruned.\n\
   --prune-seqsigwit-ram-threshold-bytes N RAM cap for that cache (default 268435456; 0 keeps nothing in RAM).\n\
   --max-sh-creates N refuses an unpaged Electrum/Esplora join with more than N creates (default 10000; 0 = unlimited). A paged history request is still served.\n\
   --heavy-sh-creates N runs unpaged Electrum/Esplora joins with more than N creates one at a time across the node (default 10000; 0 = no limit). Lighter joins stay parallel.\n\
@@ -426,7 +427,12 @@ Block filters: --block-filter-index (default off) builds BIP158 basic filters. I
   --esplora-onion (default off) ADD_ONION for --esplora-listen. Needs --tor-control and a TCP listen on 127.0.0.1 or 0.0.0.0.\n\
   --electrum-i2p / --esplora-i2p (default off) I2P destination and STREAM FORWARD for that listener. Need --i2p-sam and the same TCP listen.\n\
 Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak index.\n\
-  Not with --prune-seqsigwit (tweaks read scriptSig and witness).\n\
+  With --prune-seqsigwit, turn it on before taproot, or later once every\n\
+  height from that origin through the dropped range is sealed or still in\n\
+  the last 288 blocks. Turning prune on after the index is built is allowed\n\
+  when the index covers every height the cut will drop. Sealed rows stay served.\n\
+  Omitting --sp-tweaks while those files exist and prune is on logs how many\n\
+  blocks remain before the index cannot be enabled again.\n\
   --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
 Health: --health-listen [ADDR] serves GET /healthz, GET /readyz, and GET /progress (JSON:\n\
   the running index build, rebuild, or backfill stage, at any log level) from the first\n\
@@ -445,7 +451,7 @@ RPC: --rpc unix socket {{datadir}}/rpc.sock; --rpc-listen [ADDR] adds TCP (defau
 Cold files: --datadir-cold PATH puts append-only IBD files under PATH/store\n\
   (seqsigwit, txstat, input, and blockfilter / sp_tweaks once enabled).\n\
   Default (flag omitted): those files live under --datadir. --prune-seqsigwit\n\
-  is separate: it drops old seqsigwit and keeps a 288-height window on the hot store.\n\
+  is separate: witness lives only in the 288 hot height files, and seqsigwit.body stays a header.\n\
   --datadir-hdd says the main datadir is rotating media. The node does not probe the device. When --store-read-budget is omitted or 0, API store reads are limited to 1.\n\
   Default off keeps the SSD confirm schedule.\n\
 Conf: --conf FILE (snake_case key=value; CLI kebab overrides conf). See OPERATOR.md and docs/rpc.md.\n\
