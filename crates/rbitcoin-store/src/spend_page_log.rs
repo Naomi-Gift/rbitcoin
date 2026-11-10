@@ -11,7 +11,7 @@ use crate::error::StoreError;
 use crate::file::{write_synced_tmp_file, write_synced_tmp_rename};
 use crate::tx_table::BODY_PAGE_SIZE;
 use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -153,8 +153,9 @@ impl SpendPace {
 pub struct SpendPageLog {
     dir: PathBuf,
     inner: Mutex<Inner>,
-    /// Serializes `spend.pages.commit` renames. Hold and publish both rewrite
-    /// that file.
+    /// Serializes `spend.pages.commit` renames and the unlink of a finished
+    /// generation. Hold, publish, and delete take this lock before the
+    /// directory lock.
     commit_io: Mutex<()>,
     pace: Arc<SpendPace>,
 }
@@ -373,7 +374,9 @@ impl SpendPageLog {
     /// `read_page` supplies neighbor bytes from `spent.body` when the page has
     /// no base image. `keep` drops a slot that is no longer best-chain so a
     /// later fold does not write it. An empty open set leaves an existing
-    /// commit in place, unless a held snapshot has to be filtered first.
+    /// commit in place, unless that commit's height is above this checkpoint.
+    /// A restart can load that height with the held bit still clear. Those
+    /// slots are filtered before an empty open set marks the image cool.
     ///
     /// A frozen snapshot left by a failed compose is retried together with
     /// every note sitting in `open`. A page in both directories merges slots,
@@ -400,6 +403,9 @@ impl SpendPageLog {
         }
         {
             let mut g = self.lock();
+            if g.commit_height.is_some_and(|committed| committed > height) {
+                g.fold_held = true;
+            }
             g.compose_height = Some(height);
         }
         let _clear_compose = ClearCompose(self);
@@ -437,6 +443,11 @@ impl SpendPageLog {
         let Some(pending) = pending else {
             return Ok(());
         };
+        let kept_by_page: HashMap<u64, HashSet<OpenSlot>> = pending
+            .kept
+            .iter()
+            .map(|(off, slots)| (*off, slots.iter().copied().collect()))
+            .collect();
         {
             let mut g = self.lock();
             g.generation = pending.generation;
@@ -449,18 +460,16 @@ impl SpendPageLog {
             }
             for (page_off, image, log_off) in pending.pages {
                 g.frozen.remove(&page_off);
-                let kept = pending
-                    .kept
-                    .iter()
-                    .find(|(off, _)| *off == page_off)
-                    .map(|(_, slots)| slots.as_slice())
-                    .unwrap_or(&[]);
+                let kept = kept_by_page.get(&page_off);
                 let unchanged = match g.open.get(&page_off) {
                     None => true,
-                    Some(page) => {
-                        page.slots.len() == kept.len()
-                            && page.slots.iter().all(|slot| kept.contains(slot))
-                    }
+                    Some(page) => match kept {
+                        Some(set) => {
+                            page.slots.len() == set.len()
+                                && page.slots.iter().all(|slot| set.contains(slot))
+                        }
+                        None => page.slots.is_empty(),
+                    },
                 };
                 if unchanged {
                     if let Some(page) = g.open.remove(&page_off) {
@@ -540,9 +549,10 @@ impl SpendPageLog {
         g.commit_height = None;
         for (page_off, slots) in restored {
             if let Some(page) = g.open.get_mut(&page_off) {
+                let mut have: HashSet<u16> = page.slots.iter().map(|(rel, _)| *rel).collect();
                 let mut added = 0u64;
                 for (rel, meta) in slots {
-                    if page.slots.iter().any(|(r, _)| *r == rel) {
+                    if !have.insert(rel) {
                         continue;
                     }
                     page.slots.push((rel, meta));
@@ -647,14 +657,14 @@ impl SpendPageLog {
             .iter()
             .map(|(off, page)| (*off, page.slots.clone()))
             .collect();
+        let log_off_by_page: HashMap<u64, u64> = recs
+            .iter()
+            .map(|(off, log_off, _)| (*off, *log_off))
+            .collect();
         let pending_pages: Vec<(u64, Arc<[u8]>, u64)> = pages
             .into_iter()
             .map(|(page_off, image)| {
-                let log_off = recs
-                    .iter()
-                    .find(|(off, _, _)| *off == page_off)
-                    .map(|(_, log_off, _)| *log_off)
-                    .unwrap_or(0);
+                let log_off = log_off_by_page.get(&page_off).copied().unwrap_or(0);
                 (page_off, image, log_off)
             })
             .collect();
@@ -692,9 +702,10 @@ impl SpendPageLog {
         let pages_path = self.dir.join(SPEND_PAGES_NAME);
         let commit_path = self.dir.join(SPEND_PAGES_COMMIT_NAME);
         let mut recs: Vec<PageRec> = Vec::new();
+        let fresh: HashSet<u64> = pages.iter().map(|(off, _)| *off).collect();
         let committed_len = if commit_path.exists() {
             for (off, page) in carried {
-                if pages.iter().any(|(new_off, _)| new_off == off) {
+                if fresh.contains(off) {
                     continue;
                 }
                 recs.push((*off, page.log_off, page.image.len() as u32));
@@ -745,6 +756,10 @@ impl SpendPageLog {
     }
 
     fn delete_generation_files(&self) {
+        // A hold that already sampled a live compose will rename this commit
+        // back if it runs between the two unlinks. Keep the file names and the
+        // RAM height behind the same lock the hold uses.
+        let _io = self.commit_io.lock().unwrap_or_else(|e| e.into_inner());
         let _ = std::fs::remove_file(self.dir.join(SPEND_PAGES_COMMIT_NAME));
         let _ = std::fs::remove_file(self.dir.join(SPEND_PAGES_NAME));
         let mut g = self.lock();
@@ -940,10 +955,15 @@ fn fold_open_into_snapshot(
     open: &HashMap<u64, OpenPage>,
     committed: &HashMap<u64, CommittedPage>,
 ) {
+    let mut index: HashMap<u64, usize> = HashMap::new();
+    for (i, (off, _)) in pages.iter().enumerate() {
+        index.entry(*off).or_insert(i);
+    }
     for (off, open_page) in open {
-        if let Some((_, page)) = pages.iter_mut().find(|(got, _)| got == off) {
-            overlay_slots(&mut page.slots, &open_page.slots);
+        if let Some(&i) = index.get(off) {
+            overlay_slots(&mut pages[i].1.slots, &open_page.slots);
         } else {
+            index.insert(*off, pages.len());
             pages.push((
                 *off,
                 OpenPage {
@@ -961,10 +981,15 @@ fn fold_open_into_snapshot(
 }
 
 fn overlay_slots(dst: &mut PageSlots, src: &[(u16, [u8; SLOT])]) {
+    let mut at: HashMap<u16, usize> = HashMap::new();
+    for (i, (rel, _)) in dst.iter().enumerate() {
+        at.entry(*rel).or_insert(i);
+    }
     for (rel, meta) in src {
-        if let Some(slot) = dst.iter_mut().find(|(got, _)| got == rel) {
-            slot.1 = *meta;
+        if let Some(&i) = at.get(rel) {
+            dst[i].1 = *meta;
         } else {
+            at.insert(*rel, dst.len());
             dst.push((*rel, *meta));
         }
     }
@@ -979,9 +1004,10 @@ fn carried_pages(
     committed: &HashMap<u64, CommittedPage>,
     kept: &[(u64, OpenPage)],
 ) -> Vec<(u64, CommittedPage)> {
+    let recomposed: HashSet<u64> = kept.iter().map(|(off, _)| *off).collect();
     let mut out = Vec::new();
     for (off, page) in committed {
-        if kept.iter().any(|(got, _)| got == off) {
+        if recomposed.contains(off) {
             continue;
         }
         out.push((

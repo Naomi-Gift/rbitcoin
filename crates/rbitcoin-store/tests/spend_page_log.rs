@@ -516,6 +516,103 @@ fn explode_keeps_a_strong_slot_and_a_newer_open_note() {
 }
 
 #[test]
+fn loaded_commit_above_the_checkpoint_is_not_folded() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [5u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    drop(log);
+    let log = SpendPageLog::load(&d).unwrap();
+    log.commit_open(4, 8192, zeros, |_| Ok(false)).unwrap();
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, image| {
+            writes += 1;
+            assert!(
+                !image.windows(8).any(|w| w == slot),
+                "a not-strong slot from a higher commit must not reach the body"
+            );
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(writes, 0);
+    assert_ne!(log.slot(16), Some(slot));
+    assert!(!d.join(SPEND_PAGES_COMMIT_NAME).exists());
+    assert!(!d.join(SPEND_PAGES_NAME).exists());
+    log.hold_fold_above(0).unwrap();
+    assert!(!d.join(SPEND_PAGES_COMMIT_NAME).exists());
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_ne!(loaded.slot(16), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn loaded_commit_above_the_checkpoint_keeps_a_strong_slot() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let strong = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let stale = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, strong), (24, stale)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    drop(log);
+    let log = SpendPageLog::load(&d).unwrap();
+    log.commit_open(4, 8192, zeros, |meta| Ok(meta[0] == 1))
+        .unwrap();
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, image| {
+            writes += 1;
+            assert!(!image.windows(8).any(|w| w == stale));
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(writes, 0);
+    assert_eq!(log.slot(16), Some(strong));
+    assert_ne!(log.slot(24), Some(stale));
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(strong));
+    assert_ne!(loaded.slot(24), Some(stale));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn loaded_commit_above_the_checkpoint_does_not_carry_a_stale_page() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let stale = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    let fresh = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, stale)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    drop(log);
+    let log = SpendPageLog::load(&d).unwrap();
+    log.note_slots(&[(4096, fresh)]).unwrap();
+    log.commit_open(4, 8192, zeros, |meta| Ok(meta[0] == 4))
+        .unwrap();
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, image| {
+            writes += 1;
+            assert!(!image.windows(8).any(|w| w == stale));
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(writes, 0);
+    assert_eq!(log.slot(4096), Some(fresh));
+    assert_ne!(log.slot(16), Some(stale));
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(4096), Some(fresh));
+    assert_ne!(loaded.slot(16), Some(stale));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn hold_ignores_a_commit_at_or_below_the_tip() {
     let d = dir();
     let log = SpendPageLog::create(&d);

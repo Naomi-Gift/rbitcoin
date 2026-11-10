@@ -12,7 +12,9 @@ Fixed
   the open directory. A page whose new notes are no longer best-chain still
   names that sealed image. Folding the first page does not rewrite the file header, and it does
   not publish a shorter `spent.body` end while confirm is still appending. The
-  body copy does not hold the utxo view. A missing or short `spend.pages` file beside a
+  body copy does not hold the utxo view. A checkpoint below a loaded commit height
+  filters that image before fold, even when the held bit was never written.
+  Unlinking a finished generation takes the same lock as a fold hold. A missing or short `spend.pages` file beside a
   commit that names bytes refuses to open. The next confirm insert waits at
   2,000,000 open edges. A 1 GiB log asks for one extra checkpoint. Neither is a
   knob.
