@@ -2378,6 +2378,22 @@ fn kill_first_start_interrupted_creation_reopens_empty_chain() {
     drop(s);
     Store::open_or_create_tiny(&ingest).unwrap();
     let _ = std::fs::remove_dir_all(&ingest);
+
+    let root = tmp();
+    let hot = root.join("hot");
+    let cold = root.join("cold");
+    {
+        let s = Store::create_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)).unwrap();
+        s.flush().unwrap();
+    }
+    std::fs::remove_file(hot.join("meta")).unwrap();
+    let s = Store::open_or_create_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)).unwrap();
+    assert!(s.tip_height().is_none());
+    assert!(cold.join("seqsigwit.body").is_file());
+    drop(s);
+    let s = Store::open_or_create_layout(StoreLayout::tiny(&hot).with_cold_dir(&cold)).unwrap();
+    assert!(s.tip_height().is_none());
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

@@ -575,12 +575,12 @@ impl Store {
             if creation_has_chain(&dir) {
                 return Err(StoreError::Corrupt("store meta missing"));
             }
-            if store_dir_has_child(&dir) {
+            if incomplete_creation_files(&layout) {
                 rbitcoin_log::warn!(
                     "store: replacing incomplete first creation at {} (no meta)",
                     dir.display()
                 );
-                clear_store_children(&dir)?;
+                clear_incomplete_creation(&layout)?;
             }
             return Self::create_layout(layout);
         }
@@ -591,7 +591,7 @@ impl Store {
                     "store: replacing incomplete first creation at {} ({err})",
                     dir.display()
                 );
-                clear_store_children(&dir)?;
+                clear_incomplete_creation(&layout)?;
                 Self::create_layout(layout)
             }
             Err(err) => Err(err),
@@ -2190,6 +2190,19 @@ impl Store {
         rbitcoin_log::info!("store: shutdown flush done elapsed={:?}", t0.elapsed());
         Ok(())
     }
+}
+
+fn incomplete_creation_files(layout: &StoreLayout) -> bool {
+    store_dir_has_child(&layout.dir)
+        || (layout.is_split() && store_dir_has_child(layout.seqsigwit_dir()))
+}
+
+fn clear_incomplete_creation(layout: &StoreLayout) -> Result<(), StoreError> {
+    clear_store_children(&layout.dir)?;
+    if layout.is_split() {
+        clear_store_children(layout.seqsigwit_dir())?;
+    }
+    Ok(())
 }
 
 fn store_dir_has_child(dir: &Path) -> bool {
