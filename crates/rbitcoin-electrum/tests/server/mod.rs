@@ -3082,7 +3082,7 @@ fn mempool_verbose_tx_matches_serialized_json() {
             previous_output: bitcoin::OutPoint::null(),
             script_sig: bitcoin::ScriptBuf::from_bytes(vec![0x01, 0x02]),
             sequence: bitcoin::Sequence::MAX,
-            witness: bitcoin::Witness::new(),
+            witness: bitcoin::Witness::from_slice(&[b"abcd" as &[u8]]),
         }],
         output: vec![bitcoin::TxOut {
             value: bitcoin::Amount::from_sat(50),
@@ -3097,6 +3097,11 @@ fn mempool_verbose_tx_matches_serialized_json() {
     assert_eq!(from_tx, from_wire);
     assert_eq!(from_tx["confirmations"], 0);
     assert_eq!(from_tx["vin"][0]["sequence"], 0xffff_ffffu32);
+    assert_eq!(
+        from_tx["hash"].as_str().unwrap(),
+        hash_hex_rev(&tx.compute_wtxid().to_byte_array())
+    );
+    assert_ne!(from_tx["hash"], from_tx["txid"]);
 }
 
 mod surface_tests;

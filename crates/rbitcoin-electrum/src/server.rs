@@ -2749,16 +2749,24 @@ pub fn dispatch_pinned(
                     true
                 };
                 if confirmed_ok {
-                    let raw = query.tx_wire_bytes(fk).map_err(|e| {
+                    let map_missing = |e: StoreError| {
                         if matches!(e, StoreError::Pruned { .. }) {
                             "pruned".to_string()
                         } else {
                             e.to_string()
                         }
-                    })?;
+                    };
                     if verbose {
-                        return Ok(verbose_tx_json(query, &raw, &txid, Some(fk), chain.network));
+                        let tx = query.reconstruct_tx(fk).map_err(map_missing)?;
+                        return Ok(verbose_tx_from_tx(
+                            query,
+                            &tx,
+                            &txid,
+                            Some(fk),
+                            chain.network,
+                        ));
                     }
+                    let raw = query.tx_wire_bytes(fk).map_err(map_missing)?;
                     return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
                 }
             }
@@ -3191,8 +3199,8 @@ pub fn verbose_tx_json(
     verbose_tx_fields(query, raw, tx.as_ref(), txid, fk, network)
 }
 
-/// Mempool `transaction.get` already holds the `Transaction`. Encode the hex
-/// once. Do not parse those bytes back into the same struct.
+/// Verbose `transaction.get` from a `Transaction` the caller already holds.
+/// Encode the hex once. Do not parse those bytes back into the same struct.
 #[doc(hidden)]
 pub fn verbose_tx_from_tx(
     query: &Query,
@@ -3221,7 +3229,9 @@ fn verbose_tx_fields(
     if let Some(tx) = tx {
         obj["version"] = json!(tx.version.0);
         obj["locktime"] = json!(tx.lock_time.to_consensus_u32());
-        obj["hash"] = json!(hash_hex_rev(&tx.compute_wtxid().to_byte_array()));
+        obj["hash"] = json!(hash_hex_rev(
+            bitcoin::hashes::sha256d::Hash::hash(raw).as_byte_array(),
+        ));
         obj["vin"] = Value::Array(tx.input.iter().map(verbose_vin).collect());
         obj["vout"] = Value::Array(
             tx.output
