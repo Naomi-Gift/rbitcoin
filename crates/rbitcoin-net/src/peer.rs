@@ -1729,6 +1729,13 @@ pub async fn run_writer_task(
         for out in take_outbound_write_batch(first, &mut out_rx) {
             let n = crate::peers::outbound_queued_bytes(&out);
             let serve_slot = out.holds_serve_slot();
+            let (out, pong_written) = match out {
+                PeerOut::Msg(NetworkMessage::Pong(queued)) => {
+                    let nonce = pong_nonce_for_write(writer_session.as_deref(), queued);
+                    (PeerOut::Msg(NetworkMessage::Pong(nonce)), Some(nonce))
+                }
+                other => (other, None),
+            };
             let err = match out {
                 PeerOut::Msg(msg) | PeerOut::Served(msg) => {
                     writer.write_msg_offload(msg).await.is_err()
@@ -1740,6 +1747,18 @@ pub async fn run_writer_task(
             }
             if err {
                 return;
+            }
+            if let (Some(s), Some(written)) = (&writer_session, pong_written) {
+                if let Some(extra) = s.finish_pong_write(written) {
+                    let msg = NetworkMessage::Pong(extra);
+                    let extra_n = crate::peers::outbound_msg_bytes(&msg);
+                    s.note_send_queued(extra_n);
+                    let extra_err = writer.write_msg_offload(msg).await.is_err();
+                    s.note_out_written(false, extra_n);
+                    if extra_err {
+                        return;
+                    }
+                }
             }
         }
     }
@@ -2579,7 +2598,7 @@ pub async fn peer_session_with(
                     }
                     if frame.is_ping() {
                         if let Some(n) = frame.ping_nonce() {
-                            queue_out(&out_tx, NetworkMessage::Pong(n))?;
+                            queue_pong(session.as_deref(), &out_tx, n)?;
                         }
                         continue;
                     }
@@ -4182,7 +4201,7 @@ pub fn on_ping(
         // sees it before sync_with_ping returns.
         let _ = maybe_queue_initial_getheaders(out_tx, hub, s);
     }
-    queue_out(out_tx, NetworkMessage::Pong(n))?;
+    queue_pong(session, out_tx, n)?;
     Ok(())
 }
 
@@ -7806,6 +7825,31 @@ pub fn queue_out(
     msg: NetworkMessage,
 ) -> Result<(), NetError> {
     queue_accounted(None, out, msg)
+}
+
+/// One charged pong per session. A later ping replaces the nonce and does
+/// not queue another message. No session still queues every pong.
+#[doc(hidden)]
+pub fn queue_pong(
+    session: Option<&crate::peers::LivePeer>,
+    out: &mpsc::UnboundedSender<PeerOut>,
+    nonce: u64,
+) -> Result<(), NetError> {
+    let Some(session) = session else {
+        return queue_out(out, NetworkMessage::Pong(nonce));
+    };
+    session.store_pong_nonce(nonce);
+    if !session.claim_pong_send() {
+        return Ok(());
+    }
+    queue_accounted(Some(session), out, NetworkMessage::Pong(nonce))
+}
+
+/// Nonce the writer puts on a queued pong. The queued value is only used
+/// when no session is tracking a later ping.
+#[doc(hidden)]
+pub fn pong_nonce_for_write(session: Option<&crate::peers::LivePeer>, queued: u64) -> u64 {
+    session.map(|s| s.pong_nonce()).unwrap_or(queued)
 }
 
 /// Send filtered tx announcements in [`TX_INV_BATCH`] chunks.

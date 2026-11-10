@@ -441,6 +441,10 @@ pub struct LivePeer {
     pub ping_start_secs: AtomicU64,
     /// RPC `ping` queued a probe.
     pub ping_queued: AtomicBool,
+    /// Latest nonce to put on the pong. Zero is a real nonce.
+    pub pong_nonce: AtomicU64,
+    /// A pong is already sitting on this session's outbound queue.
+    pub pong_pending: AtomicBool,
     pub pingtime: Mutex<Option<f64>>,
     pub minping: Mutex<Option<f64>>,
     pub owner: std::sync::Weak<PeerHub>,
@@ -1156,6 +1160,34 @@ impl LivePeer {
 
     pub fn queue_ping(&self) {
         self.ping_queued.store(true, Ordering::Relaxed);
+    }
+
+    /// Remember the nonce a pong must carry. Does not queue the message.
+    pub fn store_pong_nonce(&self, n: u64) {
+        self.pong_nonce.store(n, Ordering::Release);
+    }
+
+    /// `true` when this call should queue the one pending pong.
+    pub fn claim_pong_send(&self) -> bool {
+        self.pong_pending
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn pong_nonce(&self) -> u64 {
+        self.pong_nonce.load(Ordering::Acquire)
+    }
+
+    /// Drop the pending slot after the pong is written. A ping that landed
+    /// during the write is claimed again so its nonce is not dropped.
+    pub fn finish_pong_write(&self, written: u64) -> Option<u64> {
+        self.pong_pending.store(false, Ordering::Release);
+        let now = self.pong_nonce.load(Ordering::Acquire);
+        if now != written && self.claim_pong_send() {
+            Some(now)
+        } else {
+            None
+        }
     }
 
     pub fn queue_msg(&self, msg: NetworkMessage) -> bool {
@@ -3309,6 +3341,8 @@ impl PeerHub {
             ping_nonce_sent: AtomicU64::new(0),
             ping_start_secs: AtomicU64::new(0),
             ping_queued: AtomicBool::new(false),
+            pong_nonce: AtomicU64::new(0),
+            pong_pending: AtomicBool::new(false),
             pingtime: Mutex::new(None),
             minping: Mutex::new(None),
             owner: Arc::downgrade(self),

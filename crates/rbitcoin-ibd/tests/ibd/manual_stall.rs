@@ -283,6 +283,7 @@ fn reader_of(st: &IbdWorkState, id: usize) -> (IbdReadCtx, mpsc::UnboundedReceiv
         rate: rbitcoin_net::peer_dos::PeerRateLimiter::default_limits(),
         logged_invalid_v2: false,
         ban_score: 0,
+        pong: std::sync::Arc::new(rbitcoin_ibd::ibd::peer_io::IbdPong::new()),
     };
     (ctx, body_rx)
 }

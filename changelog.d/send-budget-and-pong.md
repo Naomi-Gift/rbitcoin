@@ -8,3 +8,8 @@ Fixed
   One `getcfilters` stops after the filter that crosses the cap.
   `getcfcheckpt` still returns a filter header every 1,000 heights, from
   one range read.
+- **A peer gets one pong, and that pong counts on the send budget.**
+  Tip-follow and IBD each keep the latest ping nonce, including nonce 0,
+  on a single queued pong. Writing it subtracts that one charge. IBD pings
+  past the per-peer message window take the existing misbehavior disconnect.
+  A block this node requested still skips that window.

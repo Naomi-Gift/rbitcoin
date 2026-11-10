@@ -8333,6 +8333,108 @@ fn getcfcheckpt_returns_a_header_every_thousand_heights() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+fn addrfetch_peer() -> Arc<rbitcoin_net::peers::LivePeer> {
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, 18445));
+    let ver = VersionMessage {
+        version: bitcoin::p2p::PROTOCOL_VERSION,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: false,
+    };
+    peers.register(
+        addr,
+        addr,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::AddrFetch,
+    )
+}
+
+/// Tip-follow keeps one charged pong. Nonce 0 is a real nonce. Draining
+/// that one charge returns the send budget to its previous value.
+#[test]
+fn one_charged_pong_carries_the_latest_nonce() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-one");
+    hub.ensure_genesis().unwrap();
+    let peer = addrfetch_peer();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let before = peer.send_queued();
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 1).unwrap();
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 0).unwrap();
+    for n in 2..100_000u64 {
+        on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), n).unwrap();
+    }
+    let mut pongs = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            PeerOut::Msg(NetworkMessage::Pong(n)) => pongs.push(n),
+            other => panic!("a ping queues only a pong, got {other:?}"),
+        }
+    }
+    assert_eq!(pongs.len(), 1, "pings coalesce to one pong");
+    let charge = rbitcoin_net::peers::outbound_msg_bytes(&NetworkMessage::Pong(0));
+    assert_eq!(peer.send_queued().saturating_sub(before), charge);
+    assert_eq!(
+        pong_nonce_for_write(Some(peer.as_ref()), pongs[0]),
+        99_999,
+        "the writer sends the latest nonce"
+    );
+    peer.note_out_written(false, charge);
+    assert_eq!(
+        peer.send_queued(),
+        before,
+        "the write subtracts that one charge"
+    );
+    assert_eq!(peer.finish_pong_write(99_999), None);
+
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 7).unwrap();
+    peer.store_pong_nonce(8);
+    assert_eq!(
+        peer.finish_pong_write(7),
+        Some(8),
+        "a ping during the write is claimed for the writer"
+    );
+    assert!(
+        rx.try_recv().is_ok(),
+        "the ping that opened the slot queued one pong"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the nonce stored during the write does not queue another pong"
+    );
+
+    let fast = addrfetch_peer();
+    let fast_before = fast.send_queued();
+    queue_pong(Some(fast.as_ref()), &tx, 4).unwrap();
+    queue_pong(Some(fast.as_ref()), &tx, 0).unwrap();
+    assert_eq!(pong_nonce_for_write(Some(fast.as_ref()), 4), 0);
+    assert_eq!(
+        fast.send_queued().saturating_sub(fast_before),
+        charge,
+        "the fast path charges one pong"
+    );
+
+    let (bare_tx, mut bare_rx) = mpsc::unbounded_channel();
+    on_ping(&hub, &bare_tx, &mut follow, None, 1).unwrap();
+    on_ping(&hub, &bare_tx, &mut follow, None, 2).unwrap();
+    assert!(matches!(
+        bare_rx.try_recv(),
+        Ok(PeerOut::Msg(NetworkMessage::Pong(1)))
+    ));
+    assert!(matches!(
+        bare_rx.try_recv(),
+        Ok(PeerOut::Msg(NetworkMessage::Pong(2)))
+    ));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 mod log_text_tests;
 
 /// Core `ProcessMessage` ADDR/ADDRV2: the `getaddr` an addr-fetch session

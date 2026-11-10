@@ -284,6 +284,7 @@ fn test_ctx(
         rate: PeerRateLimiter::default_limits(),
         logged_invalid_v2: false,
         ban_score: 0,
+        pong: Arc::new(IbdPong::new()),
     };
     (ctx, out_rx, body_rx, ctrl_rx)
 }
@@ -342,6 +343,73 @@ fn second_decoy_past_the_window_is_the_threshold() {
         err,
         NetError::Protocol("peer misbehavior threshold")
     ));
+}
+
+fn ping_frame(nonce: u64) -> FramedMessage {
+    framed(*b"ping\0\0\0\0\0\0\0\0", nonce.to_le_bytes().to_vec())
+}
+
+/// Two valid pings leave one pong, and the writer emits the later nonce.
+/// Pings past the message window take the misbehavior disconnect. A block
+/// this node requested still skips that window.
+#[test]
+fn ibd_pings_coalesce_and_overflow_the_message_window() {
+    use rbitcoin_net::peer_dos::DEFAULT_MAX_MSGS_PER_SEC;
+
+    let (mut ctx, mut out_rx, _body_rx, _ctrl) = test_ctx(1);
+    assert!(!ctx.handle(Ok(ping_frame(1))));
+    assert!(!ctx.handle(Ok(ping_frame(0))));
+    assert!(matches!(out_rx.try_recv(), Ok(NetworkMessage::Pong(_))));
+    assert!(
+        out_rx.try_recv().is_err(),
+        "a second ping does not queue a second pong"
+    );
+    assert_eq!(
+        ctx.pong.wire_nonce(1),
+        0,
+        "nonce 0 is the pong the writer sends"
+    );
+    assert!(ctx.pong.finish(0).is_none());
+
+    let (mut ctx, mut out_rx, mut body_rx, _ctrl) = test_ctx(1);
+    for n in 0..DEFAULT_MAX_MSGS_PER_SEC {
+        assert!(
+            !ctx.handle(Ok(ping_frame(u64::from(n) + 1))),
+            "ping {n} fits the window"
+        );
+    }
+    let mut queued = 0usize;
+    while out_rx.try_recv().is_ok() {
+        queued += 1;
+    }
+    assert_eq!(queued, 1, "the window of pings is one pong");
+    assert!(!ctx.handle(Ok(ping_frame(9))));
+    assert_eq!(ctx.ban_score, RATE_LIMIT_BAN_SCORE);
+    assert!(body_rx.try_recv().is_err(), "the first overflow stays");
+    assert!(ctx.handle(Ok(ping_frame(10))));
+    match recv_body(&mut body_rx) {
+        PeerEvent::Dead { peer, reason } => {
+            assert_eq!(peer, 3);
+            assert_eq!(reason, "peer misbehavior threshold");
+        }
+        _ => panic!("the next ping disconnects"),
+    }
+
+    let (mut ctx, _out, mut body_rx, _ctrl) = test_ctx(1);
+    for n in 0..DEFAULT_MAX_MSGS_PER_SEC {
+        assert!(!ctx.handle(Ok(ping_frame(u64::from(n) + 1))));
+    }
+    let block = framed(*b"block\0\0\0\0\0\0\0", vec![7u8; 80]);
+    let hash = block.block_hash_from_header().expect("80-byte header");
+    ctx.requested.lock().unwrap().insert(hash);
+    assert!(
+        !ctx.handle(Ok(block)),
+        "a requested block skips the ping window"
+    );
+    assert!(
+        matches!(recv_body(&mut body_rx), PeerEvent::BlockFramed { .. }),
+        "the requested block is delivered"
+    );
 }
 
 #[test]
