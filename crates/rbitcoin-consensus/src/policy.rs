@@ -125,11 +125,13 @@ pub fn is_annex_standard(annex: &[u8]) -> bool {
 /// never an annex even if it happens to start with `0x50`.
 pub fn check_libre_annex(tx: &Transaction) -> PolicyResult {
     for inp in &tx.input {
-        let stack = inp.witness.to_vec();
-        if stack.len() < 2 {
+        // BIP341 annex is the last stack item, and only when another item
+        // sits under it. Borrow that item. A non-standard annex is the rare
+        // reject; the success path does not copy the stack.
+        if inp.witness.len() < 2 {
             continue;
         }
-        let Some(last) = stack.last() else {
+        let Some(last) = inp.witness.last() else {
             continue;
         };
         if !is_annex_standard(last) {
