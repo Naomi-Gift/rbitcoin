@@ -79,23 +79,32 @@ fn eviction_drops_the_newest_in_the_largest_netgroup() {
 
 #[test]
 fn eviction_protects_block_tx_ping_and_netgroup() {
-    // 4 block + 5 slow + 4 tx + 8 fast = 21; after protects, one slow remains.
-    let mut cands = Vec::new();
-    for i in 0..4 {
-        cands.push(cand(i, 100 + i, Some(0.05), 1000 + i, 0));
+    // 27 peers. Each protected set is newer than the two unprotected peers,
+    // or sits in a larger netgroup, so dropping any one protect evicts from
+    // that set (Core #36470). Netgroup keeps ids 0 and 1. Longest keeps
+    // ids 2..=9.
+    let mut cands = vec![cand(0, 500, Some(1.0), 0, 0)];
+    for i in 1..=8 {
+        cands.push(InboundEvictCandidate {
+            netgroup: 2,
+            ..cand(i, i, Some(1.0), 0, 0)
+        });
     }
-    for i in 4..9 {
-        cands.push(cand(i, 200 + i, Some(0.5), 0, 0));
+    cands.push(cand(9, 100, Some(1.0), 0, 0));
+    cands.push(cand(10, 101, Some(1.0), 0, 0));
+    for i in 11..=18 {
+        cands.push(cand(i, 200 + i, Some(0.01), 0, 0));
     }
-    for i in 9..13 {
-        cands.push(cand(i, 300 + i, Some(0.05), 0, 1000 + i));
+    for i in 19..=22 {
+        cands.push(cand(i, 300 + i, Some(1.0), 0, 1000 + i));
     }
-    for i in 13..21 {
-        cands.push(cand(i, 400 + i, Some(0.01), 0, 0));
+    for i in 23..=26 {
+        cands.push(cand(i, 400 + i, Some(1.0), 1000 + i, 0));
     }
-    assert!(
-        select_inbound_eviction(cands).is_none(),
-        "block, tx, ping, netgroup, and longest-connected protects cover this set"
+    assert_eq!(
+        select_inbound_eviction(cands),
+        Some(10),
+        "netgroup, block, tx, ping, and longest protects leave only id 10"
     );
 }
 
