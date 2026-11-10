@@ -931,6 +931,106 @@ fn stored_zero_survives_a_strong_slot() {
 }
 
 #[test]
+fn prior_zero_survives_a_new_reject() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let live = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let stale = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    let fresh = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, live), (24, stale), (32, fresh)])
+        .unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let first_slots = [(24, stale)];
+    let first = body_with(&first_slots);
+    log.commit_open(4, 8192, &first, |meta| Ok(meta[0] != 2))
+        .unwrap();
+    assert_eq!(log.slot(24), Some([0u8; 8]));
+    assert_eq!(log.slot(32), Some(fresh));
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, _image| {
+            writes += 1;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(writes, 0);
+    log.hold_fold_above(2).unwrap();
+    let planted = [(24, stale), (32, fresh)];
+    let read = body_with(&planted);
+    log.commit_open(2, 8192, &read, |meta| Ok(meta[0] == 1))
+        .unwrap();
+    assert_eq!(log.slot(16), Some(live));
+    assert_ne!(log.slot(32), Some(fresh));
+    assert_eq!(
+        log.slot(24),
+        Some([0u8; 8]),
+        "a stored zero must stay when another slot on the page is rejected"
+    );
+    log.commit_open(2, 8192, &read, |meta| Ok(meta[0] == 1))
+        .unwrap();
+    let mut wrote_stale = false;
+    log.fold_into(
+        |_off, image| {
+            if image.windows(8).any(|w| w == stale) {
+                wrote_stale = true;
+            }
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(
+        !wrote_stale,
+        "fold must not write the spend the stored zero already cleared"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn prior_zero_survives_a_reject_the_body_lacks() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let stale = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    let fresh = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(24, stale), (32, fresh)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let first_slots = [(24, stale)];
+    let first = body_with(&first_slots);
+    log.commit_open(4, 8192, &first, |meta| Ok(meta[0] == 4))
+        .unwrap();
+    assert_eq!(log.slot(24), Some([0u8; 8]));
+    assert_eq!(log.slot(32), Some(fresh));
+    log.hold_fold_above(2).unwrap();
+    let planted = [(24, stale)];
+    let read = body_with(&planted);
+    log.commit_open(2, 8192, &read, |_| Ok(false)).unwrap();
+    assert!(
+        d.join(SPEND_PAGES_COMMIT_NAME).exists(),
+        "a stored zero must keep the commit when the new reject is not on the body"
+    );
+    assert_eq!(log.slot(24), Some([0u8; 8]));
+    assert_ne!(log.slot(32), Some(fresh));
+    log.commit_open(2, 8192, &read, |_| Ok(false)).unwrap();
+    let mut wrote_stale = false;
+    log.fold_into(
+        |_off, image| {
+            if image.windows(8).any(|w| w == stale) {
+                wrote_stale = true;
+            }
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(!wrote_stale);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn hold_ignores_a_commit_at_or_below_the_tip() {
     let d = dir();
     let log = SpendPageLog::create(&d);

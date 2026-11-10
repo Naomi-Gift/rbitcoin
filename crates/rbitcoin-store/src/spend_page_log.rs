@@ -438,10 +438,10 @@ impl SpendPageLog {
             let g = self.lock();
             g.fold_held && !g.committed.is_empty()
         };
-        let from_body: HashSet<u64> = clears.iter().map(|clear| clear.page_off).collect();
-        let Some(snap) = self.snapshot_commit(&from_body) else {
+        let stored = self.committed_images();
+        let Some(snap) = self.snapshot_commit() else {
             self.scrub_open_notes(&mut keep)?;
-            let pages = compose_kept_pages(&mut read_page, published, &[], &clears)?;
+            let pages = compose_kept_pages(&mut read_page, published, &[], &clears, &stored)?;
             return self.settle_deferred_clear(height, pages, deferred);
         };
         if snap.froze {
@@ -449,7 +449,7 @@ impl SpendPageLog {
         }
         let (kept, rejected, more) = filter_kept_pages(&mut keep, snap.pages)?;
         clears.extend(more);
-        let pages = compose_kept_pages(&mut read_page, published, &kept, &clears)?;
+        let pages = compose_kept_pages(&mut read_page, published, &kept, &clears, &stored)?;
         if pages.is_empty() {
             self.drop_frozen_pages(&rejected);
             return Ok(());
@@ -555,6 +555,14 @@ impl SpendPageLog {
         let mut g = self.lock();
         g.committed.retain(|off, _| keep.contains(off));
         g.fold_held = false;
+    }
+
+    fn committed_images(&self) -> HashMap<u64, Arc<[u8]>> {
+        let g = self.lock();
+        g.committed
+            .iter()
+            .map(|(off, page)| (*off, Arc::clone(&page.image)))
+            .collect()
     }
 
     fn committed_zero_images(&self) -> PageImages {
@@ -722,7 +730,7 @@ impl SpendPageLog {
     /// The freeze is a swap. Confirm notes the next generation into `open`
     /// while this one is composed. A leftover frozen map stays put, and the
     /// edges those later notes added stay counted.
-    fn snapshot_commit(&self, from_body: &HashSet<u64>) -> Option<CommitSnapshot> {
+    fn snapshot_commit(&self) -> Option<CommitSnapshot> {
         let mut g = self.lock();
         g.holding_filter = false;
         let reuse = !g.frozen.is_empty();
@@ -752,7 +760,7 @@ impl SpendPageLog {
                 )
             })
             .collect();
-        fold_open_into_snapshot(&mut pages, &g.open, &g.committed, from_body);
+        fold_open_into_snapshot(&mut pages, &g.open, &g.committed);
         merge_later(&mut g, reset_edges);
         Some(CommitSnapshot {
             pages,
@@ -1120,14 +1128,14 @@ impl Drop for ReleaseLater<'_> {
 
 /// Pull notes taken after a freeze into the snapshot compose will publish.
 ///
-/// A restored page has no base, so compose reads the body. The old image
-/// stays in `committed` until the replacement rename returns. A rejected
-/// slot is zeroed only when the body still holds that meta.
+/// A restored page has no base. The stored image is still that base, including
+/// a zero fold has not written. Compose zeros a rejected slot in that image
+/// only when the body still holds it. The old image stays in `committed`
+/// until the replacement rename returns.
 fn fold_open_into_snapshot(
     pages: &mut SnapshotPages,
     open: &HashMap<u64, OpenPage>,
     committed: &HashMap<u64, CommittedPage>,
-    from_body: &HashSet<u64>,
 ) {
     let mut index: HashMap<u64, usize> = HashMap::new();
     for (i, (off, _)) in pages.iter().enumerate() {
@@ -1150,11 +1158,11 @@ fn fold_open_into_snapshot(
     for (off, page) in pages.iter_mut() {
         if !committed.contains_key(off) {
             page.base = None;
-        } else if page.base.is_none() && !from_body.contains(off) {
-            // A note taken while the filter ran has no base. The stored
-            // image, including a zero that fold has not written, is the
-            // page. A page in `from_body` still holds a rejected slot, so
-            // compose has to read the body and zero that slot.
+        } else if page.base.is_none() {
+            // A note taken while the filter ran, or a page this checkpoint
+            // is clearing, has no base. The stored image is still the page,
+            // including a zero fold has not written. Compose zeros a
+            // rejected slot in that image only when the body still holds it.
             if let Some(stored) = committed.get(off) {
                 page.base = Some(Arc::clone(&stored.image));
             }
@@ -1243,6 +1251,7 @@ fn compose_kept_pages<F>(
     published: u64,
     kept: &[(u64, OpenPage)],
     clears: &[BodyClear],
+    stored: &HashMap<u64, Arc<[u8]>>,
 ) -> Result<PageImages, StoreError>
 where
     F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
@@ -1271,6 +1280,7 @@ where
             page_off,
             kept_at.get(&page_off).copied(),
             clear_at.get(&page_off),
+            stored.get(&page_off).map(Arc::as_ref),
         )? {
             pages.push((page_off, image));
         }
@@ -1278,14 +1288,17 @@ where
     Ok(pages)
 }
 
-/// `None` when the page has no kept slot and the body does not still hold a
-/// rejected spend. A matching body slot is zeroed so the next fold clears it.
+/// `None` when the page has no kept slot, the body does not still hold a
+/// rejected spend, and the stored image is not hiding a body spend with a
+/// zero. A matching body slot is zeroed in the stored image so the next
+/// fold clears it. The body is not the base when an image is already stored.
 fn compose_one_page<F>(
     read_page: &mut F,
     published: u64,
     page_off: u64,
     kept: Option<&OpenPage>,
     clears: Option<&Vec<(u16, [u8; SLOT])>>,
+    stored: Option<&[u8]>,
 ) -> Result<Option<Arc<[u8]>>, StoreError>
 where
     F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
@@ -1296,40 +1309,68 @@ where
         ));
     }
     let len = BODY_PAGE_SIZE.min(published - page_off) as usize;
-    let base = kept.and_then(|page| page.base.as_ref());
-    let mut buf = if let Some(base) = base {
-        base[..len.min(base.len())].to_vec()
+    let image = kept.and_then(|page| page.base.as_deref()).or(stored);
+    let body = if image.is_none() || clears.is_some() {
+        Some(fit_page(read_page(page_off, len)?, len))
     } else {
-        read_page(page_off, len)?
+        None
     };
-    if buf.len() < len {
-        buf.resize(len, 0);
-    }
-    buf.truncate(len);
+    let mut buf = if let Some(image) = image {
+        fit_page(image[..len.min(image.len())].to_vec(), len)
+    } else {
+        body.clone().unwrap_or_else(|| vec![0u8; len])
+    };
     if let Some(page) = kept {
         for &(rel, meta) in &page.slots {
             write_slot(&mut buf, rel, &meta)?;
         }
     }
     let mut zeroed = false;
-    if base.is_none() {
+    if let Some(body) = body.as_deref() {
         if let Some(clears) = clears {
             for &(rel, meta) in clears {
                 if kept.is_some_and(|page| page.slots.iter().any(|(r, _)| *r == rel)) {
                     continue;
                 }
-                if slot_from_image(&buf, rel) == meta {
+                if slot_from_image(body, rel) == meta {
                     write_slot(&mut buf, rel, &[0u8; SLOT])?;
                     zeroed = true;
+                } else if image.is_some() {
+                    let on_body = slot_from_image(body, rel);
+                    write_slot(&mut buf, rel, &on_body)?;
                 }
             }
         }
     }
-    let keep_page = kept.is_some_and(|page| !page.slots.is_empty()) || zeroed;
+    let hides = match (image, body.as_deref()) {
+        (Some(image), Some(body)) => image_hides_body(page_off, image, body, len),
+        _ => false,
+    };
+    let keep_page = kept.is_some_and(|page| !page.slots.is_empty()) || zeroed || hides;
     if !keep_page {
         return Ok(None);
     }
     Ok(Some(Arc::from(buf.into_boxed_slice())))
+}
+
+fn fit_page(mut buf: Vec<u8>, len: usize) -> Vec<u8> {
+    if buf.len() < len {
+        buf.resize(len, 0);
+    }
+    buf.truncate(len);
+    buf
+}
+
+/// A zero in the stored image is hiding a spend fold has not written.
+fn image_hides_body(page_off: u64, image: &[u8], body: &[u8], len: usize) -> bool {
+    let n = len / SLOT;
+    (0..n).any(|rel| {
+        if page_off == 0 && rel < 2 {
+            return false;
+        }
+        let rel = rel as u16;
+        slot_from_image(image, rel) == [0u8; SLOT] && slot_from_image(body, rel) != [0u8; SLOT]
+    })
 }
 
 fn write_slot(buf: &mut [u8], rel: u16, meta: &[u8; SLOT]) -> Result<(), StoreError> {
