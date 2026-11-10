@@ -11,17 +11,52 @@ use crate::tx_table::BODY_PAGE_SIZE;
 use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 
 pub const SPEND_PAGES_NAME: &str = "spend.pages";
 pub const SPEND_PAGES_COMMIT_NAME: &str = "spend.pages.commit";
+
+/// Open slot deltas that make the next confirm insert wait for a checkpoint.
+pub const OPEN_EDGE_CAP: u64 = 2_000_000;
+/// On-disk `spend.pages` length that asks for a checkpoint before the ten-minute timer.
+pub const LOG_IMAGE_CAP: u64 = 1024 * 1024 * 1024;
 
 const SLOT: usize = 8;
 const COMMIT_HEAD: usize = 28;
 const COMMIT_REC: usize = 24;
 
+/// True when a spend checkpoint should run before the ten-minute timer.
+pub fn spend_checkpoint_early(open_edges: u64, image_bytes: u64) -> bool {
+    open_edges >= OPEN_EDGE_CAP || image_bytes >= LOG_IMAGE_CAP
+}
+
+/// `(request another checkpoint, follow-up already used for this oversized log)`.
+///
+/// Crossing the image cap schedules one extra checkpoint so the generation
+/// that filled the file can cool and fold. It does not spin while the file
+/// stays large. The edge cap keeps requesting until the open directory drains.
+pub fn pace_after_checkpoint(
+    open_edges: u64,
+    image_bytes: u64,
+    followup_done: bool,
+) -> (bool, bool) {
+    if open_edges >= OPEN_EDGE_CAP {
+        return (true, followup_done);
+    }
+    if image_bytes >= LOG_IMAGE_CAP && !followup_done {
+        return (true, true);
+    }
+    (false, image_bytes >= LOG_IMAGE_CAP)
+}
+
 /// `(page_off, log_off, image_len)` in one commit record.
 type PageRec = (u64, u64, u32);
+type OpenSlot = (u16, [u8; SLOT]);
+type PageSlots = Vec<OpenSlot>;
+type KeptPage = (u64, PageSlots);
+/// Condvar `rbtc-spend-sync` waits on. The flag is the thread's stop bit.
+pub type SpendSyncWake = Arc<(Mutex<bool>, Condvar)>;
 
 struct OpenPage {
     slots: Vec<(u16, [u8; SLOT])>,
@@ -31,21 +66,79 @@ struct OpenPage {
 struct CommittedPage {
     image: Arc<[u8]>,
     log_off: u64,
+    generation: u32,
+}
+
+struct PendingInstall {
+    generation: u32,
+    height: u32,
+    pages: Vec<(u64, Arc<[u8]>, u64)>,
+    rejected: Vec<u64>,
+    kept: Vec<KeptPage>,
 }
 
 struct Inner {
+    /// Slots confirm has noted since the last freeze.
     open: HashMap<u64, OpenPage>,
+    /// The generation the sync thread is composing. Readers still see it.
+    frozen: HashMap<u64, OpenPage>,
     committed: HashMap<u64, CommittedPage>,
+    pending: Option<PendingInstall>,
     generation: u32,
+    /// Fold copies a committed page only when its generation is at or below this.
+    cool_through: u32,
     /// Snapshot height named by the on-disk commit, when one is loaded.
     commit_height: Option<u32>,
     /// Commit height was above the tip. Fold must not copy that image.
     fold_held: bool,
+    open_edges: u64,
+    log_bytes: u64,
+}
+
+struct SpendPace {
+    early: AtomicBool,
+    image_followup: AtomicBool,
+    sync_wake: Mutex<Option<SpendSyncWake>>,
+    room: Condvar,
+    room_mu: Mutex<()>,
+}
+
+impl SpendPace {
+    fn new() -> Self {
+        Self {
+            early: AtomicBool::new(false),
+            image_followup: AtomicBool::new(false),
+            sync_wake: Mutex::new(None),
+            room: Condvar::new(),
+            room_mu: Mutex::new(()),
+        }
+    }
+
+    fn arm(&self) {
+        self.early.store(true, Ordering::Release);
+        let wake = self
+            .sync_wake
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(wake) = wake else {
+            return;
+        };
+        let (lock, cv) = &*wake;
+        let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+        cv.notify_one();
+    }
+
+    fn notify_room(&self) {
+        let _g = self.room_mu.lock().unwrap_or_else(|e| e.into_inner());
+        self.room.notify_all();
+    }
 }
 
 pub struct SpendPageLog {
     dir: PathBuf,
     inner: Mutex<Inner>,
+    pace: Arc<SpendPace>,
 }
 
 /// A page whose end is still inside the published body. The partial last page
@@ -71,11 +164,61 @@ impl SpendPageLog {
             dir: dir.to_path_buf(),
             inner: Mutex::new(Inner {
                 open: HashMap::new(),
+                frozen: HashMap::new(),
                 committed: HashMap::new(),
+                pending: None,
                 generation: 0,
+                cool_through: 0,
                 commit_height: None,
                 fold_held: false,
+                open_edges: 0,
+                log_bytes: 0,
             }),
+            pace: Arc::new(SpendPace::new()),
+        }
+    }
+
+    /// `rbtc-spend-sync` waits on `wake`. An edge or image cap notifies it.
+    pub(crate) fn bind_sync_wake(&self, wake: SpendSyncWake) {
+        *self
+            .pace
+            .sync_wake
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(wake);
+    }
+
+    pub(crate) fn checkpoint_early(&self) -> bool {
+        self.pace.early.load(Ordering::Acquire)
+    }
+
+    /// After a checkpoint, arm one follow-up when the log is still over the
+    /// image cap, and keep arming while the open directory is over the edge cap.
+    pub(crate) fn relax_pace(&self) {
+        let (edges, images) = {
+            let g = self.lock();
+            (g.open_edges, g.log_bytes)
+        };
+        let follow = self.pace.image_followup.load(Ordering::Acquire);
+        let (early, follow) = pace_after_checkpoint(edges, images, follow);
+        self.pace.image_followup.store(follow, Ordering::Release);
+        self.pace.early.store(early, Ordering::Release);
+        if early {
+            self.pace.arm();
+        }
+    }
+
+    /// Block while the open directory is still at the edge cap.
+    ///
+    /// The page-log lock is not held across the wait. `commit_open` notifies
+    /// once it has frozen the directory into the generation being composed.
+    pub fn wait_open_edge_room(&self) {
+        loop {
+            let room = self.pace.room_mu.lock().unwrap_or_else(|e| e.into_inner());
+            if self.lock().open_edges < OPEN_EDGE_CAP {
+                return;
+            }
+            self.pace.arm();
+            drop(self.pace.room.wait(room).unwrap_or_else(|e| e.into_inner()));
         }
     }
 
@@ -83,19 +226,17 @@ impl SpendPageLog {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Current 8-byte image for `abs`, from the open directory or a committed
-    /// page. `None` means the body still holds the slot.
+    /// Current 8-byte image for `abs`, from the open directory, the frozen
+    /// generation, or a committed page. `None` means the body still holds the slot.
     pub fn slot(&self, abs: u64) -> Option<[u8; SLOT]> {
         let page_off = abs & !(BODY_PAGE_SIZE - 1);
         let rel = ((abs - page_off) / SLOT as u64) as u16;
         let g = self.lock();
-        if let Some(page) = g.open.get(&page_off) {
-            if let Some((_, meta)) = page.slots.iter().find(|(r, _)| *r == rel) {
-                return Some(*meta);
-            }
-            if let Some(base) = &page.base {
-                return Some(slot_from_image(base, rel));
-            }
+        if let Some(meta) = page_hit(g.open.get(&page_off), rel) {
+            return Some(meta);
+        }
+        if let Some(meta) = page_hit(g.frozen.get(&page_off), rel) {
+            return Some(meta);
         }
         g.committed
             .get(&page_off)
@@ -106,31 +247,45 @@ impl SpendPageLog {
         if slots.is_empty() {
             return Ok(());
         }
-        let mut g = self.lock();
-        for &(abs, meta) in slots {
-            let page_off = abs & !(BODY_PAGE_SIZE - 1);
-            let rel = ((abs - page_off) / SLOT as u64) as u16;
-            if (rel as usize) >= (BODY_PAGE_SIZE as usize / SLOT) {
-                return Err(StoreError::Corrupt("spend page slot past page"));
+        self.wait_open_edge_room();
+        let mut added = false;
+        {
+            let mut g = self.lock();
+            for &(abs, meta) in slots {
+                let page_off = abs & !(BODY_PAGE_SIZE - 1);
+                let rel = ((abs - page_off) / SLOT as u64) as u16;
+                if (rel as usize) >= (BODY_PAGE_SIZE as usize / SLOT) {
+                    return Err(StoreError::Corrupt("spend page slot past page"));
+                }
+                if !g.open.contains_key(&page_off) {
+                    let base = if g.frozen.contains_key(&page_off) {
+                        None
+                    } else {
+                        g.committed.get(&page_off).map(|c| Arc::clone(&c.image))
+                    };
+                    g.open.insert(
+                        page_off,
+                        OpenPage {
+                            slots: Vec::new(),
+                            base,
+                        },
+                    );
+                }
+                let Some(page) = g.open.get_mut(&page_off) else {
+                    return Err(StoreError::Corrupt("spend page directory missing"));
+                };
+                if let Some(slot) = page.slots.iter_mut().find(|(r, _)| *r == rel) {
+                    slot.1 = meta;
+                } else {
+                    page.slots.push((rel, meta));
+                    g.open_edges = g.open_edges.saturating_add(1);
+                    added = true;
+                }
             }
-            if !g.open.contains_key(&page_off) {
-                let base = g.committed.get(&page_off).map(|c| Arc::clone(&c.image));
-                g.open.insert(
-                    page_off,
-                    OpenPage {
-                        slots: Vec::new(),
-                        base,
-                    },
-                );
-            }
-            let Some(page) = g.open.get_mut(&page_off) else {
-                return Err(StoreError::Corrupt("spend page directory missing"));
-            };
-            if let Some(slot) = page.slots.iter_mut().find(|(r, _)| *r == rel) {
-                slot.1 = meta;
-            } else {
-                page.slots.push((rel, meta));
-            }
+            added = added && spend_checkpoint_early(g.open_edges, g.log_bytes);
+        }
+        if added {
+            self.pace.arm();
         }
         Ok(())
     }
@@ -161,6 +316,25 @@ impl SpendPageLog {
         Ok(())
     }
 
+    /// Compose, publish, and install one generation.
+    ///
+    /// Callers that must hold the utxo view across the directory swap use
+    /// [`Self::prepare_commit`] and [`Self::install_commit`] instead.
+    pub fn commit_open<F, K>(
+        &self,
+        height: u32,
+        published: u64,
+        read_page: F,
+        keep: K,
+    ) -> Result<(), StoreError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
+        K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
+    {
+        self.prepare_commit(height, published, read_page, keep)?;
+        self.install_commit()
+    }
+
     /// Compose open pages into one generation and publish the commit record.
     ///
     /// `read_page` supplies neighbor bytes from `spent.body` when the page has
@@ -170,7 +344,7 @@ impl SpendPageLog {
     ///
     /// A second generation appends. It does not replace bytes an older commit
     /// still names.
-    pub fn commit_open<F, K>(
+    pub(crate) fn prepare_commit<F, K>(
         &self,
         height: u32,
         published: u64,
@@ -183,12 +357,19 @@ impl SpendPageLog {
     {
         self.explode_held(&mut keep)?;
         let (snapshot, carried) = {
-            let g = self.lock();
+            let mut g = self.lock();
             if g.open.is_empty() {
+                if g.frozen.is_empty() && !g.fold_held {
+                    g.cool_through = g.generation;
+                }
                 return Ok(());
             }
+            // Freeze is a swap, not a clone of the live map. Confirm notes the
+            // next generation into `open` while this snapshot is composed.
+            g.frozen = std::mem::take(&mut g.open);
+            g.open_edges = 0;
             let snapshot: Vec<(u64, OpenPage)> = g
-                .open
+                .frozen
                 .iter()
                 .map(|(off, page)| {
                     (
@@ -203,19 +384,21 @@ impl SpendPageLog {
             let carried: Vec<(u64, CommittedPage)> = g
                 .committed
                 .iter()
-                .filter(|(off, _)| !g.open.contains_key(*off))
+                .filter(|(off, _)| !g.frozen.contains_key(*off) && !g.open.contains_key(*off))
                 .map(|(off, page)| {
                     (
                         *off,
                         CommittedPage {
                             image: Arc::clone(&page.image),
                             log_off: page.log_off,
+                            generation: page.generation,
                         },
                     )
                 })
                 .collect();
             (snapshot, carried)
         };
+        self.pace.notify_room();
         let mut kept: Vec<(u64, OpenPage)> = Vec::new();
         let mut rejected: Vec<u64> = Vec::new();
         for (page_off, mut page) in snapshot {
@@ -233,7 +416,7 @@ impl SpendPageLog {
             }
         }
         if kept.is_empty() {
-            self.drop_open_pages(&rejected)?;
+            self.drop_frozen_pages(&rejected);
             return Ok(());
         }
         let mut pages: Vec<(u64, Arc<[u8]>)> = Vec::with_capacity(kept.len());
@@ -262,57 +445,142 @@ impl SpendPageLog {
         }
         pages.sort_by_key(|(off, _)| *off);
 
-        let (generation, recs) = self.publish_generation(height, &pages, &carried)?;
-        let log_off_of = |page_off: u64| -> u64 {
-            recs.iter()
-                .find(|(off, _, _)| *off == page_off)
-                .map(|(_, log_off, _)| *log_off)
-                .unwrap_or(0)
-        };
-
-        let mut g = self.lock();
-        g.generation = generation;
-        g.commit_height = Some(height);
-        g.fold_held = false;
-        for page_off in &rejected {
-            g.open.remove(page_off);
+        // Slots noted during compose are not in the image. Drop ones `keep`
+        // rejects before the directory swap, so a disconnected spend does not
+        // become the committed image.
+        {
+            let mut g = self.lock();
+            let offs: Vec<u64> = g.open.keys().copied().collect();
+            for off in offs {
+                let mut dropped = 0u64;
+                let remove = {
+                    let Some(page) = g.open.get_mut(&off) else {
+                        continue;
+                    };
+                    let mut live = Vec::new();
+                    for slot in page.slots.drain(..) {
+                        if keep(&slot.1)? {
+                            live.push(slot);
+                        } else {
+                            dropped = dropped.saturating_add(1);
+                        }
+                    }
+                    page.slots = live;
+                    page.slots.is_empty() && page.base.is_none()
+                };
+                g.open_edges = g.open_edges.saturating_sub(dropped);
+                if remove {
+                    g.open.remove(&off);
+                }
+            }
         }
-        for (page_off, image) in pages {
-            if let Some(page) = g.open.get_mut(&page_off) {
-                let mut live = Vec::with_capacity(page.slots.len());
-                for slot in page.slots.drain(..) {
-                    if keep(&slot.1)? {
-                        live.push(slot);
+
+        let (generation, recs) = self.publish_generation(height, &pages, &carried)?;
+        let kept_slots: Vec<KeptPage> = kept
+            .iter()
+            .map(|(off, page)| (*off, page.slots.clone()))
+            .collect();
+        let pending_pages: Vec<(u64, Arc<[u8]>, u64)> = pages
+            .into_iter()
+            .map(|(page_off, image)| {
+                let log_off = recs
+                    .iter()
+                    .find(|(off, _, _)| *off == page_off)
+                    .map(|(_, log_off, _)| *log_off)
+                    .unwrap_or(0);
+                (page_off, image, log_off)
+            })
+            .collect();
+        {
+            let mut g = self.lock();
+            g.pending = Some(PendingInstall {
+                generation,
+                height,
+                pages: pending_pages,
+                rejected,
+                kept: kept_slots,
+            });
+        }
+        Ok(())
+    }
+
+    /// Publish the composed generation into the directory.
+    ///
+    /// Call under `hold_utxo_view` so a reader cannot observe the swap. A hold
+    /// taken while the generation was composed stays set: this does not clear it.
+    pub(crate) fn install_commit(&self) -> Result<(), StoreError> {
+        let pending = {
+            let mut g = self.lock();
+            g.pending.take()
+        };
+        let Some(pending) = pending else {
+            return Ok(());
+        };
+        {
+            let mut g = self.lock();
+            g.generation = pending.generation;
+            if !g.fold_held {
+                g.commit_height = Some(pending.height);
+                g.cool_through = pending.generation.wrapping_sub(1);
+            }
+            for page_off in &pending.rejected {
+                g.frozen.remove(page_off);
+            }
+            for (page_off, image, log_off) in pending.pages {
+                g.frozen.remove(&page_off);
+                let kept = pending
+                    .kept
+                    .iter()
+                    .find(|(off, _)| *off == page_off)
+                    .map(|(_, slots)| slots.as_slice())
+                    .unwrap_or(&[]);
+                let unchanged = match g.open.get(&page_off) {
+                    None => true,
+                    Some(page) => {
+                        page.slots.len() == kept.len()
+                            && page.slots.iter().all(|slot| kept.contains(slot))
+                    }
+                };
+                if unchanged {
+                    if let Some(page) = g.open.remove(&page_off) {
+                        g.open_edges = g.open_edges.saturating_sub(page.slots.len() as u64);
+                    }
+                    g.committed.insert(
+                        page_off,
+                        CommittedPage {
+                            image,
+                            log_off,
+                            generation: pending.generation,
+                        },
+                    );
+                } else {
+                    let removed = {
+                        let Some(page) = g.open.get_mut(&page_off) else {
+                            continue;
+                        };
+                        let before = page.slots.len() as u64;
+                        page.slots
+                            .retain(|(rel, meta)| slot_from_image(&image, *rel) != *meta);
+                        page.base = Some(Arc::clone(&image));
+                        let left = page.slots.len() as u64;
+                        (before.saturating_sub(left), left == 0)
+                    };
+                    g.open_edges = g.open_edges.saturating_sub(removed.0);
+                    if removed.1 {
+                        g.open.remove(&page_off);
+                        g.committed.insert(
+                            page_off,
+                            CommittedPage {
+                                image,
+                                log_off,
+                                generation: pending.generation,
+                            },
+                        );
                     }
                 }
-                page.slots = live;
-            }
-            let unchanged = g.open.get(&page_off).is_some_and(|page| {
-                page.slots.len() == snapshot_slots(&kept, page_off).len()
-                    && page
-                        .slots
-                        .iter()
-                        .all(|slot| snapshot_slots(&kept, page_off).contains(slot))
-            });
-            let log_off = log_off_of(page_off);
-            if unchanged {
-                g.open.remove(&page_off);
-                g.committed
-                    .insert(page_off, CommittedPage { image, log_off });
-            } else if let Some(page) = g.open.get_mut(&page_off) {
-                page.slots
-                    .retain(|(rel, meta)| slot_from_image(&image, *rel) != *meta);
-                page.base = Some(image.clone());
-                if page.slots.is_empty() {
-                    g.open.remove(&page_off);
-                    g.committed
-                        .insert(page_off, CommittedPage { image, log_off });
-                }
-            } else {
-                g.committed
-                    .insert(page_off, CommittedPage { image, log_off });
             }
         }
+        self.pace.notify_room();
         Ok(())
     }
 
@@ -348,24 +616,45 @@ impl SpendPageLog {
             if slots.is_empty() {
                 continue;
             }
-            g.open.insert(page_off, OpenPage { slots, base: None });
+            if g.open.contains_key(&page_off) {
+                let mut added = 0u64;
+                {
+                    let page = g
+                        .open
+                        .get_mut(&page_off)
+                        .expect("spend page open after contains");
+                    for (rel, meta) in slots {
+                        if page.slots.iter().any(|(r, _)| *r == rel) {
+                            continue;
+                        }
+                        page.slots.push((rel, meta));
+                        added = added.saturating_add(1);
+                    }
+                }
+                g.open_edges = g.open_edges.saturating_add(added);
+            } else {
+                g.open_edges = g.open_edges.saturating_add(slots.len() as u64);
+                g.open.insert(page_off, OpenPage { slots, base: None });
+            }
         }
+        let empty = g.open.is_empty() && g.frozen.is_empty();
         drop(g);
-        if self.lock().open.is_empty() {
+        if empty {
             self.delete_generation_files();
         }
         Ok(())
     }
 
-    fn drop_open_pages(&self, pages: &[u64]) -> Result<(), StoreError> {
+    fn drop_frozen_pages(&self, pages: &[u64]) {
         if pages.is_empty() {
-            return Ok(());
+            return;
         }
         let mut g = self.lock();
         for off in pages {
-            g.open.remove(off);
+            g.frozen.remove(off);
         }
-        Ok(())
+        drop(g);
+        self.pace.notify_room();
     }
 
     /// Append new images when a commit already exists. A fresh file is renamed
@@ -417,11 +706,13 @@ impl SpendPageLog {
             })?;
             blob.len() as u64
         };
-        let generation = {
-            let g = self.lock();
-            g.generation.wrapping_add(1)
+        let (generation, held) = {
+            let mut g = self.lock();
+            let generation = g.generation.wrapping_add(1);
+            g.log_bytes = committed_len;
+            (generation, g.fold_held)
         };
-        let commit = encode_commit(height, generation, committed_len, &recs);
+        let commit = encode_commit(height, generation, committed_len, &recs, held);
         write_synced_tmp_rename(&commit_path, &commit)?;
         Ok((generation, recs))
     }
@@ -429,6 +720,9 @@ impl SpendPageLog {
     fn delete_generation_files(&self) {
         let _ = std::fs::remove_file(self.dir.join(SPEND_PAGES_COMMIT_NAME));
         let _ = std::fs::remove_file(self.dir.join(SPEND_PAGES_NAME));
+        let mut g = self.lock();
+        g.log_bytes = 0;
+        g.commit_height = None;
     }
 
     /// Copy committed pages that confirm has not re-dirtied onto `spent.body`.
@@ -445,10 +739,15 @@ impl SpendPageLog {
             if g.fold_held {
                 return Ok(());
             }
+            let cool_through = g.cool_through;
             let mut quiet: Vec<(u64, Arc<[u8]>)> = g
                 .committed
                 .iter()
-                .filter(|(off, _)| !g.open.contains_key(*off))
+                .filter(|(off, page)| {
+                    page.generation <= cool_through
+                        && !g.open.contains_key(*off)
+                        && !g.frozen.contains_key(*off)
+                })
                 .map(|(off, page)| (*off, Arc::clone(&page.image)))
                 .collect();
             quiet.sort_by_key(|(off, _)| *off);
@@ -461,7 +760,7 @@ impl SpendPageLog {
         for (off, image) in quiet {
             let still_quiet = {
                 let g = self.lock();
-                !g.open.contains_key(&off)
+                !g.open.contains_key(&off) && !g.frozen.contains_key(&off)
             };
             if !still_quiet {
                 continue;
@@ -501,8 +800,11 @@ impl SpendPageLog {
         let limit = parsed.committed_len.min(file.len() as u64);
         let mut g = self.lock();
         g.generation = parsed.generation;
+        g.cool_through = 0;
         g.commit_height = Some(parsed.height);
         g.fold_held = parsed.fold_held;
+        g.log_bytes = parsed.committed_len;
+        g.open_edges = 0;
         g.committed.clear();
         for rec in parsed.recs {
             let end = rec.log_off.saturating_add(u64::from(rec.image_len));
@@ -516,6 +818,7 @@ impl SpendPageLog {
                 CommittedPage {
                     image,
                     log_off: rec.log_off,
+                    generation: parsed.generation,
                 },
             );
         }
@@ -523,12 +826,12 @@ impl SpendPageLog {
     }
 }
 
-fn snapshot_slots(snapshot: &[(u64, OpenPage)], page_off: u64) -> &[(u16, [u8; SLOT])] {
-    snapshot
-        .iter()
-        .find(|(off, _)| *off == page_off)
-        .map(|(_, page)| page.slots.as_slice())
-        .unwrap_or(&[])
+fn page_hit(page: Option<&OpenPage>, rel: u16) -> Option<[u8; SLOT]> {
+    let page = page?;
+    if let Some((_, meta)) = page.slots.iter().find(|(r, _)| *r == rel) {
+        return Some(*meta);
+    }
+    page.base.as_ref().map(|base| slot_from_image(base, rel))
 }
 
 fn slot_from_image(image: &[u8], rel: u16) -> [u8; SLOT] {
@@ -559,10 +862,14 @@ fn encode_commit(
     generation: u32,
     committed_len: u64,
     recs: &[(u64, u64, u32)],
+    fold_held: bool,
 ) -> Vec<u8> {
     let mut buf = vec![0u8; COMMIT_HEAD + recs.len() * COMMIT_REC];
     buf[..4].copy_from_slice(&STORE_MAGIC);
     buf[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+    if fold_held {
+        buf[6..8].copy_from_slice(&1u16.to_le_bytes());
+    }
     buf[8..12].copy_from_slice(&height.to_le_bytes());
     buf[12..16].copy_from_slice(&generation.to_le_bytes());
     buf[16..24].copy_from_slice(&committed_len.to_le_bytes());
@@ -627,6 +934,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&p);
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn image_cap_schedules_one_followup_and_the_edge_cap_stays_due() {
+        assert!(!spend_checkpoint_early(
+            OPEN_EDGE_CAP - 1,
+            LOG_IMAGE_CAP - 1
+        ));
+        assert!(spend_checkpoint_early(OPEN_EDGE_CAP, 0));
+        assert!(spend_checkpoint_early(0, LOG_IMAGE_CAP));
+        assert_eq!(pace_after_checkpoint(0, LOG_IMAGE_CAP, false), (true, true));
+        assert_eq!(pace_after_checkpoint(0, LOG_IMAGE_CAP, true), (false, true));
+        assert_eq!(
+            pace_after_checkpoint(OPEN_EDGE_CAP, LOG_IMAGE_CAP, true),
+            (true, true)
+        );
+        assert_eq!(pace_after_checkpoint(0, 0, true), (false, false));
     }
 
     fn zeros(off: u64, len: usize) -> Result<Vec<u8>, StoreError> {
@@ -703,6 +1027,17 @@ mod tests {
         let later = [7u8, 1, 2, 3, 4, 5, 6, 7];
         log.note_slots(&[(16, slot), (4096, slot)]).unwrap();
         log.commit_open(2, 8192, zeros, |_| Ok(true)).unwrap();
+        let mut early = 0u32;
+        log.fold_into(
+            |_off, _image| {
+                early += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(early, 0, "the publishing checkpoint does not fold");
+        log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
         let mut wrote = Vec::new();
         log.fold_into(
             |off, image| {
@@ -719,6 +1054,134 @@ mod tests {
         assert_eq!(wrote, vec![0]);
         assert_eq!(log.slot(4096 + 8), Some(later));
         assert_eq!(log.slot(4096), Some(slot));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn three_batches_on_one_page_are_one_image() {
+        let d = dir();
+        let log = SpendPageLog::create(&d);
+        let a = [1u8, 1, 2, 3, 4, 5, 6, 7];
+        let b = [2u8, 1, 2, 3, 4, 5, 6, 7];
+        let c = [3u8, 1, 2, 3, 4, 5, 6, 7];
+        log.note_slots(&[(16, a)]).unwrap();
+        log.note_slots(&[(24, b)]).unwrap();
+        log.note_slots(&[(32, c)]).unwrap();
+        log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+        let file = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
+        assert_eq!(file.len(), 4096);
+        assert_eq!(&file[16..24], &a);
+        assert_eq!(&file[24..32], &b);
+        assert_eq!(&file[32..40], &c);
+        assert_eq!(file[40], 0, "an untouched neighbor stays in the image");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn note_during_compose_stays_out_of_that_image() {
+        let d = dir();
+        let log = SpendPageLog::create(&d);
+        let first = [4u8, 1, 2, 3, 4, 5, 6, 7];
+        let second = [5u8, 1, 2, 3, 4, 5, 6, 7];
+        log.note_slots(&[(16, first)]).unwrap();
+        log.commit_open(
+            4,
+            8192,
+            |off, len| {
+                log.note_slots(&[(4096, second)])?;
+                zeros(off, len)
+            },
+            |_| Ok(true),
+        )
+        .unwrap();
+        let file = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
+        assert_eq!(file.len(), 4096);
+        assert_eq!(log.slot(16), Some(first));
+        assert_eq!(log.slot(4096), Some(second));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn hold_during_compose_is_not_folded() {
+        let d = dir();
+        let log = SpendPageLog::create(&d);
+        let slot = [6u8, 1, 2, 3, 4, 5, 6, 7];
+        log.note_slots(&[(16, slot)]).unwrap();
+        log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+        log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+        log.note_slots(&[(4096, slot)]).unwrap();
+        log.commit_open(
+            9,
+            8192,
+            |off, len| {
+                log.hold_fold_above(1)?;
+                zeros(off, len)
+            },
+            |_| Ok(true),
+        )
+        .unwrap();
+        let mut writes = 0u32;
+        log.fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(
+            writes, 0,
+            "a hold taken while composing must survive publish"
+        );
+        assert_eq!(log.slot(16), Some(slot));
+        assert_eq!(log.slot(4096), Some(slot));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn open_edge_cap_blocks_the_next_insert_until_commit() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+        let d = dir();
+        let log = Arc::new(SpendPageLog::create(&d));
+        let slot = [8u8, 1, 2, 3, 4, 5, 6, 7];
+        let mut batch = Vec::with_capacity(512);
+        let mut n = 0u64;
+        while n < 2_000_000 {
+            let page = n / 512;
+            let rel = n % 512;
+            batch.push((page * 4096 + rel * 8, slot));
+            n += 1;
+            if batch.len() == 512 {
+                log.note_slots(&batch).unwrap();
+                batch.clear();
+            }
+        }
+        if !batch.is_empty() {
+            log.note_slots(&batch).unwrap();
+        }
+        let published = 3907 * 4096;
+        let log2 = Arc::clone(&log);
+        let gate = Arc::new(AtomicBool::new(false));
+        let gate2 = Arc::clone(&gate);
+        let worker = std::thread::spawn(move || {
+            while !gate2.load(Ordering::Acquire) {
+                std::thread::yield_now();
+            }
+            std::thread::sleep(Duration::from_millis(80));
+            log2.commit_open(3, published, zeros, |_| Ok(true)).unwrap();
+        });
+        gate.store(true, Ordering::Release);
+        let started = Instant::now();
+        log.note_slots(&[(n * 8, slot)]).unwrap();
+        let waited = started.elapsed();
+        worker.join().unwrap();
+        assert!(
+            waited >= Duration::from_millis(60),
+            "insert at the open-edge cap must wait for a checkpoint, waited {waited:?}"
+        );
+        assert_eq!(log.slot(n * 8), Some(slot));
         let _ = std::fs::remove_dir_all(&d);
     }
 }

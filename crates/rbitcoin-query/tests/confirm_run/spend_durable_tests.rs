@@ -660,8 +660,9 @@ fn read_slot(store: &std::path::Path, abs: u64) -> [u8; 8] {
 }
 
 /// Two later blocks spend outputs on a full historical page. Readers see both
-/// spends and the unspent neighbor before the spend checkpoint, and the page
-/// bytes on `spent.body` stay the pre-spend image until that checkpoint folds.
+/// spends and the unspent neighbor before any checkpoint, and the page bytes
+/// on `spent.body` stay the pre-spend image until the next checkpoint folds
+/// the generation the first one published.
 #[test]
 fn historical_page_stays_unwritten_until_spend_checkpoint() {
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-page-log");
@@ -729,10 +730,18 @@ fn historical_page_stays_unwritten_until_spend_checkpoint() {
     assert_eq!(read_slot(&store, abs_neighbor), before_n);
 
     q.store().checkpoint_observed_spend().unwrap();
+    assert_eq!(
+        read_slot(&store, abs0),
+        before0,
+        "the publishing checkpoint leaves the body page for the next one"
+    );
+    assert_eq!(read_slot(&store, abs1), before1);
+    assert!(q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap());
+    q.store().checkpoint_observed_spend().unwrap();
     assert_ne!(
         read_slot(&store, abs0),
         before0,
-        "the checkpoint folds the spent slot onto spent.body"
+        "the next checkpoint folds the cooled page onto spent.body"
     );
     assert_ne!(read_slot(&store, abs1), before1);
     assert_eq!(read_slot(&store, abs_neighbor), before_n);

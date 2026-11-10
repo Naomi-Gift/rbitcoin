@@ -490,6 +490,7 @@ pub fn post_commit(
 ) -> Result<u64, ConfirmError> {
     let t_spent = Instant::now();
     if query.spend_index_enabled() && !slots.abs_edges.is_empty() {
+        query.store().wait_spend_edge_room();
         let _utxo_view = query.store().hold_utxo_view();
         let backend = spend_ann_backend_next();
         let t_ann = Instant::now();

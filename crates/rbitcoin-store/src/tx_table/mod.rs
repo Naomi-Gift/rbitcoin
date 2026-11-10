@@ -2515,12 +2515,12 @@ impl TxTable {
         self.spend_pages.note_slots(slots)
     }
 
-    pub(crate) fn commit_open_spend_pages<K>(&self, height: u32, keep: K) -> Result<(), StoreError>
+    pub(crate) fn prepare_open_spend_pages<K>(&self, height: u32, keep: K) -> Result<(), StoreError>
     where
         K: FnMut(&[u8; OutputRecord::SPENT_SLOT_LEN]) -> Result<bool, StoreError>,
     {
         let published = self.spent.body_published_len();
-        self.spend_pages.commit_open(
+        self.spend_pages.prepare_commit(
             height,
             published,
             |off, len| {
@@ -2531,6 +2531,26 @@ impl TxTable {
             },
             keep,
         )
+    }
+
+    pub(crate) fn install_open_spend_pages(&self) -> Result<(), StoreError> {
+        self.spend_pages.install_commit()
+    }
+
+    pub(crate) fn bind_spend_sync_wake(&self, wake: crate::spend_page_log::SpendSyncWake) {
+        self.spend_pages.bind_sync_wake(wake);
+    }
+
+    pub(crate) fn spend_checkpoint_early(&self) -> bool {
+        self.spend_pages.checkpoint_early()
+    }
+
+    pub(crate) fn relax_spend_pace(&self) {
+        self.spend_pages.relax_pace();
+    }
+
+    pub(crate) fn wait_spend_edge_room(&self) {
+        self.spend_pages.wait_open_edge_room();
     }
 
     pub(crate) fn hold_spend_fold_above(&self, tip: u32) -> Result<(), StoreError> {

@@ -345,6 +345,8 @@ pub struct Store {
     /// Even while confirmed spentness is stable. Odd while a confirm annotate
     /// or a disconnect is publishing a change.
     pub utxo_view: crate::sync::atomic::AtomicU64,
+    /// One publisher at a time. Overlapping holds would make the stamp look even.
+    utxo_publish: std::sync::Mutex<()>,
     /// Confirm readers wait here while a `--datadir-hdd` write holds the spindle.
     /// Flag off never locks, so [`Self::spindle_wait`] returns immediately.
     pub spindle: Spindle,
@@ -387,6 +389,25 @@ impl Drop for SpindleHold<'_> {
 /// Holds [`Store::utxo_view`] odd until drop.
 pub struct UtxoViewGuard<'a> {
     pub view: &'a crate::sync::atomic::AtomicU64,
+    _exclusive: std::sync::MutexGuard<'a, ()>,
+}
+
+fn hold_view<'a>(
+    publish: &'a std::sync::Mutex<()>,
+    view: &'a crate::sync::atomic::AtomicU64,
+) -> UtxoViewGuard<'a> {
+    use crate::sync::atomic::Ordering;
+    let exclusive = publish.lock().unwrap_or_else(|e| e.into_inner());
+    let prev = view.fetch_add(1, Ordering::AcqRel);
+    debug_assert_eq!(
+        prev & 1,
+        0,
+        "utxo view guards must not overlap; the counter would look stable"
+    );
+    UtxoViewGuard {
+        view,
+        _exclusive: exclusive,
+    }
 }
 
 impl Drop for UtxoViewGuard<'_> {
@@ -478,6 +499,7 @@ impl Store {
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
             utxo_view: crate::sync::atomic::AtomicU64::new(0),
+            utxo_publish: std::sync::Mutex::new(()),
             spend_marker: std::sync::Mutex::new(()),
             spindle: Spindle::new(),
             datadir_bytes_cache: std::sync::Mutex::new(None),
@@ -545,6 +567,7 @@ impl Store {
             spend_annotate_from: std::sync::atomic::AtomicU64::new(0),
             spend_reorg_gen: std::sync::atomic::AtomicU64::new(0),
             utxo_view: crate::sync::atomic::AtomicU64::new(0),
+            utxo_publish: std::sync::Mutex::new(()),
             spend_marker: std::sync::Mutex::new(()),
             spindle: Spindle::new(),
             datadir_bytes_cache: std::sync::Mutex::new(None),
@@ -1857,13 +1880,11 @@ impl Store {
         let gen = self
             .spend_reorg_gen
             .load(std::sync::atomic::Ordering::Acquire);
-        self.txs
-            .commit_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
+        self.publish_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
         self.txs.sync_replay_data()?;
         self.spenders.sync_data_only()?;
         self.store_spend_marker(tip, tip, gen)?;
-        self.spindle_wait();
-        self.txs.fold_committed_spend_pages()?;
+        self.fold_sealed_spend_pages()?;
         Ok(t.elapsed().as_nanos() as u64)
     }
 
@@ -1923,16 +1944,44 @@ impl Store {
     /// Odd for the guard's life. Callers who sample an even stamp and read
     /// coins can trust that read only when the stamp is unchanged afterward.
     pub fn hold_utxo_view(&self) -> UtxoViewGuard<'_> {
-        use crate::sync::atomic::Ordering;
-        let prev = self.utxo_view.fetch_add(1, Ordering::AcqRel);
-        debug_assert_eq!(
-            prev & 1,
-            0,
-            "utxo view guards must not overlap; the counter would look stable"
-        );
-        UtxoViewGuard {
-            view: &self.utxo_view,
-        }
+        hold_view(&self.utxo_publish, &self.utxo_view)
+    }
+
+    /// Block a confirm insert while the open spend directory is still at the edge cap.
+    pub fn wait_spend_edge_room(&self) {
+        self.txs.wait_spend_edge_room();
+    }
+
+    pub fn bind_spend_sync_wake(&self, wake: crate::spend_page_log::SpendSyncWake) {
+        self.txs.bind_spend_sync_wake(wake);
+    }
+
+    pub fn spend_checkpoint_early(&self) -> bool {
+        self.txs.spend_checkpoint_early()
+    }
+
+    pub fn relax_spend_pace(&self) {
+        self.txs.relax_spend_pace();
+    }
+
+    fn publish_open_spend_pages(
+        &self,
+        height: u32,
+        keep: impl FnMut(&[u8; 8]) -> Result<bool, StoreError>,
+    ) -> Result<(), StoreError> {
+        self.txs.prepare_open_spend_pages(height, keep)?;
+        self.install_prepared_spend_pages()
+    }
+
+    fn install_prepared_spend_pages(&self) -> Result<(), StoreError> {
+        let _g = hold_view(&self.utxo_publish, &self.utxo_view);
+        self.txs.install_open_spend_pages()
+    }
+
+    fn fold_sealed_spend_pages(&self) -> Result<(), StoreError> {
+        self.spindle_wait();
+        let _g = hold_view(&self.utxo_publish, &self.utxo_view);
+        self.txs.fold_committed_spend_pages()
     }
 
     /// `Some` even generation, or `None` while [`Self::hold_utxo_view`] is held.
@@ -2048,6 +2097,9 @@ impl Store {
         let gen = self.spend_reorg_gen.load(Ordering::Acquire);
         after_first_read(self);
         let Some(height) = self.spend_snapshot_height() else {
+            let tip = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
+            self.publish_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
+            self.fold_sealed_spend_pages()?;
             return Ok(());
         };
         self.sync_spend_checkpoint(height, gen, during_sync)
@@ -2075,8 +2127,7 @@ impl Store {
         during_sync: impl FnOnce(&Self),
     ) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
-        self.txs
-            .commit_open_spend_pages(height, |meta| self.spend_slot_still_live(meta))?;
+        self.publish_open_spend_pages(height, |meta| self.spend_slot_still_live(meta))?;
         self.txs.sync_replay_data()?;
         self.spenders.sync_data_only()?;
         during_sync(self);
@@ -2100,8 +2151,7 @@ impl Store {
             return Ok(());
         };
         self.store_spend_marker(height, height, gen)?;
-        self.spindle_wait();
-        self.txs.fold_committed_spend_pages()
+        self.fold_sealed_spend_pages()
     }
 
     /// [`Self::checkpoint_observed_spend`] with hooks around the two reads

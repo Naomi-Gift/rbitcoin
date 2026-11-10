@@ -20,6 +20,7 @@ pub struct SpendSync {
 impl SpendSync {
     pub fn spawn(query: Arc<Query>) -> Self {
         let wake = Arc::new((Mutex::new(false), Condvar::new()));
+        query.store().bind_spend_sync_wake(Arc::clone(&wake));
         let flag = Arc::clone(&wake);
         let join = std::thread::Builder::new()
             .name("rbtc-spend-sync".into())
@@ -65,11 +66,13 @@ pub fn run(query: Arc<Query>, wake: Arc<(Mutex<bool>, Condvar)>) {
             let guard = lock.lock().unwrap();
             if *guard {
                 true
+            } else if query.store().spend_checkpoint_early() {
+                false
             } else {
                 let elapsed = since_ok.elapsed().as_millis() as u64;
                 let wait = SPEND_DURABLE_INTERVAL_MS.saturating_sub(elapsed);
                 if wait == 0 {
-                    *guard
+                    false
                 } else {
                     let (guard, _) = cv.wait_timeout(guard, Duration::from_millis(wait)).unwrap();
                     *guard
@@ -77,6 +80,10 @@ pub fn run(query: Arc<Query>, wake: Arc<(Mutex<bool>, Condvar)>) {
             }
         };
         let elapsed = since_ok.elapsed().as_millis() as u64;
+        let due = query.store().spend_checkpoint_early() || elapsed >= SPEND_DURABLE_INTERVAL_MS;
+        if !stop && !due {
+            continue;
+        }
         let published = match checkpoint(&query) {
             Ok(()) => true,
             Err(e) => {
@@ -84,6 +91,7 @@ pub fn run(query: Arc<Query>, wake: Arc<(Mutex<bool>, Condvar)>) {
                 false
             }
         };
+        query.store().relax_spend_pace();
         // A failed publish stays due. Park one interval so the retry cannot spin.
         if elapsed_after_checkpoint(elapsed, published) == 0 {
             since_ok = Instant::now();
