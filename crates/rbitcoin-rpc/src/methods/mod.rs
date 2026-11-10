@@ -8,7 +8,7 @@ use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 pub use chain::difficulty_rpc_f64;
@@ -212,29 +212,8 @@ pub fn parse_hash32_display(hex: &str) -> Result<[u8; 32], Value> {
 /// to the coins view, and its txindex skips height 0. The coin is never
 /// unspent and the tx is not an ordinary transaction.
 pub fn genesis_coinbase_txid(ctx: &RpcContext) -> [u8; 32] {
-    match ctx.network {
-        Network::Mainnet => *GENESIS_CB_MAIN.get_or_init(|| genesis_coinbase_txid_of(ctx.network)),
-        Network::Testnet => *GENESIS_CB_TEST.get_or_init(|| genesis_coinbase_txid_of(ctx.network)),
-        Network::Testnet4 => {
-            *GENESIS_CB_TEST4.get_or_init(|| genesis_coinbase_txid_of(ctx.network))
-        }
-        Network::Signet => *GENESIS_CB_SIGN.get_or_init(|| genesis_coinbase_txid_of(ctx.network)),
-        Network::Regtest => *GENESIS_CB_REG.get_or_init(|| genesis_coinbase_txid_of(ctx.network)),
-    }
+    rbitcoin_consensus::ChainParams::for_network(ctx.network).genesis_coinbase_txid
 }
-
-fn genesis_coinbase_txid_of(network: Network) -> [u8; 32] {
-    use bitcoin::hashes::Hash;
-    bitcoin::blockdata::constants::genesis_block(rpc_btc_network(network)).txdata[0]
-        .compute_txid()
-        .to_byte_array()
-}
-
-static GENESIS_CB_MAIN: OnceLock<[u8; 32]> = OnceLock::new();
-static GENESIS_CB_TEST: OnceLock<[u8; 32]> = OnceLock::new();
-static GENESIS_CB_TEST4: OnceLock<[u8; 32]> = OnceLock::new();
-static GENESIS_CB_SIGN: OnceLock<[u8; 32]> = OnceLock::new();
-static GENESIS_CB_REG: OnceLock<[u8; 32]> = OnceLock::new();
 
 mod asm;
 #[doc(hidden)]

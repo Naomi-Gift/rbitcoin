@@ -3092,9 +3092,8 @@ fn mempool_verbose_tx_matches_serialized_json() {
     let raw = bitcoin::consensus::serialize(&tx);
     let txid = tx.compute_txid().to_byte_array();
     let network = bitcoin::Network::Regtest;
-    let from_wire = verbose_tx_json(&query, &raw, &txid, None, network);
     let from_tx = verbose_tx_from_tx(&query, &tx, &txid, None, network);
-    assert_eq!(from_tx, from_wire);
+    assert_eq!(from_tx["hex"], rbitcoin_primitives::hex_encode(&raw));
     assert_eq!(from_tx["confirmations"], 0);
     assert_eq!(from_tx["vin"][0]["sequence"], 0xffff_ffffu32);
     assert_eq!(

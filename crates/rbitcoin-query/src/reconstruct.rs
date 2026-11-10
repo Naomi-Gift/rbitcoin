@@ -238,9 +238,6 @@ impl Query {
     }
 
     /// [`Self::reconstruct_tx`] plus the txid and parent edges that load already read.
-    ///
-    /// The wire transaction owns the input script and witness. Callers that
-    /// only need the parent fk and vout use the copied [`rbitcoin_store::InputParent`]s.
     pub fn reconstruct_tx_with_inputs(
         &self,
         tx_fk: Fk,

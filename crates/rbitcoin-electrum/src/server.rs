@@ -3188,19 +3188,6 @@ pub fn id_from_pos(query: &Query, params: &Value) -> Result<Value, String> {
 /// Electrs-shaped verbose `transaction.get`. `fk` Some = confirmed (header
 /// stamp); None = mempool (`confirmations: 0`, no block fields).
 #[doc(hidden)]
-pub fn verbose_tx_json(
-    query: &Query,
-    raw: &[u8],
-    txid: &[u8; 32],
-    fk: Option<Fk>,
-    network: bitcoin::Network,
-) -> Value {
-    let tx = bitcoin::consensus::deserialize::<bitcoin::Transaction>(raw).ok();
-    verbose_tx_fields(query, raw, tx.as_ref(), txid, fk, network)
-}
-
-/// Verbose `transaction.get` from a `Transaction` the caller already holds.
-#[doc(hidden)]
 pub fn verbose_tx_from_tx(
     query: &Query,
     tx: &bitcoin::Transaction,
@@ -3209,13 +3196,13 @@ pub fn verbose_tx_from_tx(
     network: bitcoin::Network,
 ) -> Value {
     let raw = bitcoin::consensus::serialize(tx);
-    verbose_tx_fields(query, &raw, Some(tx), txid, fk, network)
+    verbose_tx_fields(query, &raw, tx, txid, fk, network)
 }
 
 fn verbose_tx_fields(
     query: &Query,
     raw: &[u8],
-    tx: Option<&bitcoin::Transaction>,
+    tx: &bitcoin::Transaction,
     txid: &[u8; 32],
     fk: Option<Fk>,
     network: bitcoin::Network,
@@ -3224,22 +3211,12 @@ fn verbose_tx_fields(
         "hex": rbitcoin_primitives::hex_encode(raw),
         "txid": txid_hex(txid),
         "size": raw.len(),
+        "version": tx.version.0,
+        "locktime": tx.lock_time.to_consensus_u32(),
+        "hash": hash_hex_rev(bitcoin::hashes::sha256d::Hash::hash(raw).as_byte_array()),
+        "vin": tx.input.iter().map(verbose_vin).collect::<Vec<_>>(),
+        "vout": tx.output.iter().enumerate().map(|(n, o)| verbose_vout(n, o, network)).collect::<Vec<_>>(),
     });
-    if let Some(tx) = tx {
-        obj["version"] = json!(tx.version.0);
-        obj["locktime"] = json!(tx.lock_time.to_consensus_u32());
-        obj["hash"] = json!(hash_hex_rev(
-            bitcoin::hashes::sha256d::Hash::hash(raw).as_byte_array(),
-        ));
-        obj["vin"] = Value::Array(tx.input.iter().map(verbose_vin).collect());
-        obj["vout"] = Value::Array(
-            tx.output
-                .iter()
-                .enumerate()
-                .map(|(n, o)| verbose_vout(n, o, network))
-                .collect(),
-        );
-    }
     match fk {
         Some(fk) => {
             if let Ok(Some(h)) = query.store().tx_height_get(fk) {

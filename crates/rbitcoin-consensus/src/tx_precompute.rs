@@ -306,9 +306,6 @@ impl TxPrecompute {
     }
 
     /// Non-witness tx: stripped == wire, so one SHA256d engine (wtxid = txid).
-    ///
-    /// Common midstates are not computed here. A legacy script row fills them
-    /// with [`TxScriptPrecompute::from_connect`].
     #[doc(hidden)]
     pub fn from_tx_legacy_one_engine(tx: &Transaction) -> Self {
         let mut eng = sha256d::Hash::engine();
