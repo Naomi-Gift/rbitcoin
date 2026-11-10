@@ -23,7 +23,7 @@ admission) and optional **Esplora-compatible REST** for the same role (history,
 UTXO, broadcast, block/tx fetch by id). Optional **Core-class JSON-RPC subset**
 (see [`docs/rpc.md`](./docs/rpc.md)) — not full Core wallet / mining parity.
 **Scripthash index (`--sh-index`) defaults off**. Electrum/Esplora **start without it**; address/scripthash methods fail closed (`scripthash index disabled`). Txid/outpoint/block/broadcast/fees work. Which wallets use that surface: [`docs/wallets.md`](./docs/wallets.md). Lightning chain sources: [`docs/lightning.md`](./docs/lightning.md).
-On/off costs and start/IBD/tip behavior: [`OPERATOR.md`](./OPERATOR.md)
+On/off costs and start/IBD/tip behavior: [`docs/operator/storage.md`](./docs/operator/storage.md)
 (Scripthash index). Disable later leaves SH files on disk; follow does not
 wait on SH materialize.
 

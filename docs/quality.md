@@ -80,11 +80,11 @@ stay out.
 ### Parked (not now; promote to Open with a rank to revisit)
 
 Wallet-backing extras from the 2026-09 node survey. Not Won't-fix forever —
-just not the current product. COMPAT/OPERATOR stay the shipped contract.
+just not the current product. COMPAT and `docs/operator/` stay the shipped contract.
 
 | ID | Item | Why parked | Reopen when |
 |----|------|------------|-------------|
-| **Q-63** | Electrum TLS (50002) + Tor onion **in the binary** | Home Sparrow/phone off-LAN today uses nginx (`OPERATOR.md`). Node stays plain TCP. | Operators refuse a reverse proxy, or a first-class onion listener is the 1.0 install. |
+| **Q-63** | Electrum TLS (50002) + Tor onion **in the binary** | Home Sparrow/phone off-LAN today uses nginx ([`docs/operator/interfaces.md`](./operator/interfaces.md)). Node stays plain TCP. | Operators refuse a reverse proxy, or a first-class onion listener is the 1.0 install. |
 
 ---
 

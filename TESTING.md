@@ -141,7 +141,7 @@ Host forensics and `cargo bench` one-offs are **not** in the default compile
 graph (`scripts/check_default_targets.test.sh`). Optional **client** comparison
 is `rbitcoin-bench` (`cargo run -p rbitcoin-bench --features cli --release`);
 not a musl product bin. Suites and packed `--corpus` lists:
-[`OPERATOR.md`](./OPERATOR.md) (Client benchmark). IBD progress/rejects belong in node logs (`ibd: confirm reject`,
+[`docs/operator/interfaces.md`](./docs/operator/interfaces.md) (Client benchmark). IBD progress/rejects belong in node logs (`ibd: confirm reject`,
 `ibd: archive reject`); host A/B is musl + `ibd: perf`.
 
 ## Running tests

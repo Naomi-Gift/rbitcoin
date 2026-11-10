@@ -14,7 +14,7 @@ Occupied **0.6.x** stores refuse
 (wipe and sync again). Schema 24 and 25 open in place and rewrite to 26.
 A published 0.8 directory is already schema 26. The runbook is
 [`docs/operator/mainnet.md`](./docs/operator/mainnet.md). Day-to-day flags
-are [`OPERATOR.md`](./OPERATOR.md).
+are [`docs/operator/`](./docs/operator/).
 
 `--trust-peer` stores and serves a chain rbitcoin considers invalid. Do not
 point a wallet at that node unless you accept that peer. The fault list is
@@ -80,7 +80,7 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   [`docs/operator/interfaces.md`](docs/operator/interfaces.md). Esplora is
   opt-in (`--esplora-listen`). Internal electrs HTTP (`/internal/*`) is unix
   listen only, not the public TCP bind. Edge TLS, multi-tenant metering, and API keys
-  are still out of process (see [`OPERATOR.md`](./OPERATOR.md)).
+  are still out of process (see [`docs/operator/interfaces.md`](./docs/operator/interfaces.md)).
 - **Health listener:** `--health-listen` is opt-in, read-only, and
   unauthenticated (`/healthz`, `/readyz`, `/progress`, and `/metrics` with
   `--metrics`). It binds before the store opens. Requests carry no body and

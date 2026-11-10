@@ -84,7 +84,7 @@ every read surface. In-tree pin:
 `esplora_broadcast_visible_in_rpc_and_electrum` (Esplora `POST /tx` → RPC
 `getrawmempool` + Electrum `get_mempool` / `get_history` on one `run_p2p`
 datadir). Casa/Sparrow numbers stay host-only
-([`OPERATOR.md`](../OPERATOR.md) Client benchmark).
+([`docs/operator/interfaces.md`](./operator/interfaces.md) Client benchmark).
 
 ### 3. Hornet block-validation rules ↔ our tests
 
@@ -159,7 +159,7 @@ than a TUI.
 
 | Idea | Why it fits | Why not blindly |
 |------|-------------|-----------------|
-| **Self-authenticating BIP352 tweak rows** (block hash in the row; stream/replay without trusting the server) | We already have `--sp-tweaks` and Electrum `tweaks.subscribe` ([`OPERATOR.md`](../OPERATOR.md)). Their row shape is a better serve contract than “trust the node.” | Do not make SH/tweaks wait on Class A if that fights write-behind. |
+| **Self-authenticating BIP352 tweak rows** (block hash in the row; stream/replay without trusting the server) | We already have `--sp-tweaks` and Electrum `tweaks.subscribe` ([`docs/operator/storage.md`](./operator/storage.md)). Their row shape is a better serve contract than “trust the node.” | Do not make SH/tweaks wait on Class A if that fights write-behind. |
 | **`/healthz` + `/readyz` + Prometheus** | Operators and k8s probe these. Logs are not a probe. | Unauthenticated loopback; do not grow a second metrics dialect. `GET /progress` is not one: it is the always-on human view of the long-stage counters that `/metrics` (opt-in) also exports ([`operations.md`](./operator/operations.md#progress)). |
 | **Explicit reorg log** (`reorg.log` + `getreorghistory`) | Tip-follow already disconnects hopeless forks ([`ibd-memory.md`](./ibd-memory.md)); a durable ring is cheap evidence. | Webhooks / MCP / TUI are satd product, not ours. |
 | **SIGHUP for hot mempool/relay knobs** | Useful once we have more policy flags. | We already log to stdout; do not cargo-cult Core `debug.log` reopen. satd’s split (`SIGHUP` config, `SIGUSR1` TLS) is the right shape **if** we add native TLS. |
@@ -209,7 +209,7 @@ scheduling a slice.
 | 2 | One cross-surface scenario: Esplora `POST /tx` → Electrum history + RPC mempool (**landed**; `esplora_broadcast_visible_in_rpc_and_electrum`) | satd E2E | `rbitcoin-test` `--test suite cross_surface::` |
 | — | ~~Hornet spec.html vs consensus-tests.md gap hunt~~ **done 2026-09-04** (table in this file; pins in `structure_rule_tests` / `header.rs` / `consensus_rules`) | Hornet | this file + [`consensus-tests.md`](./consensus-tests.md) |
 | 4 | `/healthz` + `/readyz` on the node listen; Prometheus as a flag (**landed**; `--health-listen`, `--metrics`) | satd | node / [`operations.md`](./operator/operations.md#health-probes-and-metrics) |
-| 5 | BIP352 serve: hash-bind tweak batches so a client can audit the stream | satd row idea on our tweaks path | Electrum tweaks / [`OPERATOR.md`](../OPERATOR.md) |
+| 5 | BIP352 serve: hash-bind tweak batches so a client can audit the stream | satd row idea on our tweaks path | Electrum tweaks / [`docs/operator/storage.md`](./operator/storage.md) |
 
 1, 2, and 4 landed. 5 is small product. None require becoming a UTXO node or a
 Core conf clone.

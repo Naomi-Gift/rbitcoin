@@ -231,7 +231,7 @@ after connect resolves prevouts.
 (testnet3: block 5128859), Core 32.1 `defaultAssumeValid`, and skips **script/sig** checks only when that
 header path contains the anchor hash and this block is the path hash at
 its height. Chain work does not have to meet the floor first. An explicit
-`--milestone HEIGHT` is height-only. Signet’s default is full scripts. Flags and honesty: [`OPERATOR.md`](../OPERATOR.md).
+`--milestone HEIGHT` is height-only. Signet’s default is full scripts. The flag is [`docs/operator/operations.md`](./operator/operations.md). How the skip differs from Core is [`COMPAT.md`](../COMPAT.md).
 
 Test matrix for rules we own: [`docs/consensus-tests.md`](./consensus-tests.md).
 Map of every owner: [`docs/README.md`](./README.md).

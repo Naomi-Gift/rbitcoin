@@ -210,7 +210,7 @@ still wait for durable SH when shindex is on.
 ## Related
 
 - [`COMPAT.md`](../COMPAT.md) — product surface
-- [`OPERATOR.md`](../OPERATOR.md) — flags and shindex tradeoffs
+- [`docs/operator/`](./operator/) — flags. Scripthash costs are [`docs/operator/storage.md`](./operator/storage.md)
 - [`mempool-fee-estimation.md`](./mempool-fee-estimation.md) — fee product
 - [`wallets.md`](./wallets.md) — which wallets use Electrum, Esplora, or this RPC
 - [`lightning.md`](./lightning.md) — CLN, LDK, LND chain sources
