@@ -95,6 +95,13 @@ struct CommitSnapshot {
     froze: bool,
 }
 
+/// `Clear` writes the commit with the held bit off. RAM still has the old
+/// generation until that rename succeeds.
+enum PublishHold {
+    Sample,
+    Clear,
+}
+
 struct Inner {
     /// Slots confirm has noted since the last freeze.
     open: HashMap<u64, OpenPage>,
@@ -425,13 +432,16 @@ impl SpendPageLog {
         let _clear_compose = ClearCompose(self);
         let _release_later = ReleaseLater(self);
         let mut clears = self.explode_held(&mut keep)?;
+        // Every slot was rejected. The commit file is still the retry record
+        // until compose publishes a replacement or decides the body has none.
+        let deferred = {
+            let g = self.lock();
+            g.fold_held && !g.committed.is_empty()
+        };
         let Some(snap) = self.snapshot_commit() else {
             self.scrub_open_notes(&mut keep)?;
             let pages = compose_kept_pages(&mut read_page, published, &[], &clears)?;
-            if pages.is_empty() {
-                return Ok(());
-            }
-            return self.store_pending(height, pages, Vec::new(), Vec::new(), &[]);
+            return self.settle_deferred_clear(height, pages, deferred);
         };
         if snap.froze {
             self.pace.notify_room();
@@ -448,7 +458,47 @@ impl SpendPageLog {
             let g = self.lock();
             carried_pages(&g.committed, &kept)
         };
-        self.store_pending(height, pages, rejected, kept, &carried)
+        self.store_pending(height, pages, rejected, kept, &carried, PublishHold::Sample)
+    }
+
+    /// Publish a clearing image, or drop a rejected generation the body does not hold.
+    ///
+    /// The commit file stays in place until this returns. A `read_page` error
+    /// never reaches here, so a restart still loads the old image.
+    fn settle_deferred_clear(
+        &self,
+        height: u32,
+        pages: PageImages,
+        deferred: bool,
+    ) -> Result<(), StoreError> {
+        if pages.is_empty() {
+            if deferred {
+                self.drop_rejected_generation();
+            }
+            return Ok(());
+        }
+        let hold = if deferred {
+            PublishHold::Clear
+        } else {
+            PublishHold::Sample
+        };
+        self.store_pending(height, pages, Vec::new(), Vec::new(), &[], hold)?;
+        if deferred {
+            self.forget_held_directory();
+        }
+        Ok(())
+    }
+
+    fn forget_held_directory(&self) {
+        let mut g = self.lock();
+        g.committed.clear();
+        g.fold_held = false;
+        g.commit_height = None;
+    }
+
+    fn drop_rejected_generation(&self) {
+        self.forget_held_directory();
+        self.delete_generation_files();
     }
 
     /// Publish the composed generation into the directory.
@@ -528,7 +578,9 @@ impl SpendPageLog {
     ///
     /// `keep` runs before any directory change. A `keep` error leaves the
     /// commit file and the committed images where they were. Live slots are
-    /// put back into `open` for the next compose.
+    /// put back into `open` for the next compose. When every slot is rejected
+    /// and nothing else is open, the file stays until compose publishes the
+    /// replacement or finds the body does not hold those slots.
     fn explode_held<K>(&self, keep: &mut K) -> Result<Vec<BodyClear>, StoreError>
     where
         K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
@@ -574,6 +626,10 @@ impl SpendPageLog {
         if !g.fold_held {
             return Ok(Vec::new());
         }
+        // Leave this generation loaded. Compose still has to read the body.
+        if restored.is_empty() && g.open.is_empty() && g.frozen.is_empty() {
+            return Ok(cleared);
+        }
         g.committed.clear();
         g.fold_held = false;
         g.commit_height = None;
@@ -593,11 +649,6 @@ impl SpendPageLog {
                 g.open_edges = g.open_edges.saturating_add(slots.len() as u64);
                 g.open.insert(page_off, OpenPage { slots, base: None });
             }
-        }
-        let empty = g.open.is_empty() && g.frozen.is_empty();
-        drop(g);
-        if empty {
-            self.delete_generation_files();
         }
         Ok(cleared)
     }
@@ -686,8 +737,9 @@ impl SpendPageLog {
         rejected: Vec<u64>,
         kept: SnapshotPages,
         carried: &[(u64, CommittedPage)],
+        hold: PublishHold,
     ) -> Result<(), StoreError> {
-        let (generation, recs) = self.publish_generation(height, &pages, carried)?;
+        let (generation, recs) = self.publish_generation(height, &pages, carried, hold)?;
         let kept_slots: Vec<KeptPage> = kept
             .iter()
             .map(|(off, page)| (*off, page.slots.clone()))
@@ -733,6 +785,7 @@ impl SpendPageLog {
         height: u32,
         pages: &[(u64, Arc<[u8]>)],
         carried: &[(u64, CommittedPage)],
+        hold: PublishHold,
     ) -> Result<(u32, Vec<PageRec>), StoreError> {
         let pages_path = self.dir.join(SPEND_PAGES_NAME);
         let commit_path = self.dir.join(SPEND_PAGES_COMMIT_NAME);
@@ -781,7 +834,11 @@ impl SpendPageLog {
             let mut g = self.lock();
             let generation = g.generation.wrapping_add(1);
             g.log_bytes = committed_len;
-            (generation, g.fold_held)
+            let held = match hold {
+                PublishHold::Sample => g.fold_held,
+                PublishHold::Clear => false,
+            };
+            (generation, held)
         };
         let commit = encode_commit(height, generation, committed_len, &recs, held);
         write_synced_tmp_rename(&commit_path, &commit)?;

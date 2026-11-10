@@ -736,6 +736,37 @@ fn rejected_page_already_on_the_body_is_cleared() {
 }
 
 #[test]
+fn rejected_body_survives_a_failed_clear() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let stale = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, stale)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let planted = [(16, stale)];
+    let err = log
+        .commit_open(
+            4,
+            8192,
+            |_off, _len| Err(StoreError::Corrupt("body read failed")),
+            |_| Ok(false),
+        )
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt("body read failed")));
+    assert!(
+        d.join(SPEND_PAGES_COMMIT_NAME).exists(),
+        "a failed clear must leave the commit so a restart can retry"
+    );
+    assert_eq!(log.slot(16), Some(stale));
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(stale));
+    let read = body_with(&planted);
+    log.commit_open(4, 8192, &read, |_| Ok(false)).unwrap();
+    assert_ne!(log.slot(16), Some(stale));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn hold_ignores_a_commit_at_or_below_the_tip() {
     let d = dir();
     let log = SpendPageLog::create(&d);

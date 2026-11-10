@@ -18,7 +18,9 @@ Fixed
   noted while that filter walks the image stays out of the checkpoint height
   already sampled, so a later fold does not seal it at the lower tip. A
   rejected spend that `spent.body` already holds is zeroed in the next image
-  instead of being copied back. A missing or short `spend.pages` file beside a
+  instead of being copied back. The old commit stays on disk until that
+  replacement is renamed, or until the body does not hold the rejected spend.
+  A missing or short `spend.pages` file beside a
   commit that names bytes refuses to open. The next confirm insert waits at
   2,000,000 open edges. A 1 GiB log asks for one extra checkpoint. Neither is a
   knob.
