@@ -241,8 +241,6 @@ fn missing_marker_replays_a_spend_below_the_tip_window() {
 /// spend slot that names one is a store fault, not an unspent output.
 #[test]
 fn spender_below_its_create_height_is_corrupt() {
-    use std::io::Read;
-
     let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-below-create");
     let params = ChainParams::regtest();
     let ms = Milestone::NONE;
@@ -272,21 +270,23 @@ fn spender_below_its_create_height_is_corrupt() {
         let fk = q.tx_fk_by_txid(txid.as_byte_array()).unwrap().unwrap();
         spent_abs(q.store().tx_spent_range(fk).unwrap().0, 0)
     };
-    let (from, to) = (slot_abs(cbs[0]), slot_abs(later_txid));
+    let early_fk = q.tx_fk_by_txid(cbs[0].as_byte_array()).unwrap().unwrap();
+    let (multi, field, vin) = q.store().txs.get_output_spender_meta(early_fk, 0).unwrap();
+    assert!(
+        !field.is_null(),
+        "the early spend is in the page log until a checkpoint folds it"
+    );
+    let flags = if multi {
+        rbitcoin_store::output_flags::MULTI_SPENDER
+    } else {
+        0
+    };
+    let slot = rbitcoin_store::tx_table::encode_spent_slot(flags, field, vin).unwrap();
+    assert_ne!(slot, [0u8; 8]);
+    let to = slot_abs(later_txid);
+    q.store().txs.spent.write_body_pwrite(to, &slot).unwrap();
     let store = q.store().path().to_path_buf();
     drop(q);
-    {
-        let mut f = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(store.join("spent.body"))
-            .unwrap();
-        let mut slot = [0u8; 8];
-        f.seek(SeekFrom::Start(from)).unwrap();
-        f.read_exact(&mut slot).unwrap();
-        f.seek(SeekFrom::Start(to)).unwrap();
-        f.write_all(&slot).unwrap();
-    }
 
     let q = rbitcoin_query::Query::open_or_create_tiny(&store).unwrap();
     let tip_h = q.tip_height().unwrap();

@@ -912,3 +912,123 @@ fn reload_drops_pages_without_a_commit_and_serves_a_bad_magic() {
     ));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// Confirm publishes a longer `spent.body` end while fold copies cooled pages.
+/// The fold must not store the shorter length it sampled.
+#[test]
+fn fold_does_not_publish_a_shorter_body_end() {
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::io_backend::WriteIoBackend;
+    use rbitcoin_store::Store;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    const PAGE: u64 = 4096;
+    let d = dir();
+    let store = Arc::new(Store::create_tiny(&d).unwrap());
+    let nbytes = (256 * PAGE) as usize;
+    let prep = store
+        .txs
+        .spent
+        .prepare_batch_encode(1, nbytes, |_i, buf| {
+            buf.resize(buf.len() + nbytes, 0);
+        })
+        .unwrap()
+        .expect("one spent append");
+    store
+        .txs
+        .spent
+        .write_body_blob_bulk(prep.start, &prep.body_blob)
+        .unwrap();
+    store.txs.spent.finish_prepared(prep).unwrap();
+    let end = store.txs.spent.body_published_len();
+    let mut slots = Vec::new();
+    let mut abs = 16u64;
+    while abs.saturating_add(8) <= end {
+        slots.push(abs);
+        let next = (abs & !(PAGE - 1)).saturating_add(PAGE);
+        if next <= abs {
+            break;
+        }
+        abs = next;
+    }
+    assert!(
+        slots.len() >= 64,
+        "fold needs many pages, got {}",
+        slots.len()
+    );
+
+    let mut saw_shrink = false;
+    for _ in 0..4 {
+        let mut edges = Vec::with_capacity(slots.len());
+        let mut known = Vec::with_capacity(slots.len());
+        for (i, &abs) in slots.iter().enumerate() {
+            edges.push((abs, Fk(1), 0, Fk(10 + i as u64), 0));
+            known.push((Fk(1), 0u8, 0));
+        }
+        let cold = store
+            .put_spend_batch_by_abs_meta_known(&edges, &known, WriteIoBackend::Pwrite)
+            .unwrap();
+        assert!(cold.is_empty());
+        store.checkpoint_observed_spend().unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let shrunk = Arc::new(AtomicBool::new(false));
+        let base = store.txs.spent.body.logical_len();
+        let landed = Arc::new(AtomicU64::new(base));
+        let next = Arc::new(AtomicU64::new(base.saturating_add(8)));
+        let cap = base.saturating_add(32 * 1024 * 1024);
+        let racer = {
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            let shrunk = Arc::clone(&shrunk);
+            let landed = Arc::clone(&landed);
+            let next = Arc::clone(&next);
+            std::thread::spawn(move || {
+                let spent = &store.txs.spent;
+                while !stop.load(Ordering::Relaxed) {
+                    let n = next.fetch_add(8, Ordering::Relaxed);
+                    if n >= cap {
+                        if spent.body.logical_len() < cap - 8 {
+                            shrunk.store(true, Ordering::Release);
+                            break;
+                        }
+                        std::hint::spin_loop();
+                        continue;
+                    }
+                    let _ = spent.note_body_end(n, true);
+                    if spent.body.logical_len() < n {
+                        shrunk.store(true, Ordering::Release);
+                        break;
+                    }
+                    landed.fetch_max(n, Ordering::Release);
+                }
+            })
+        };
+        let started = next.load(Ordering::Relaxed);
+        while next.load(Ordering::Relaxed) == started
+            && started < cap
+            && !shrunk.load(Ordering::Relaxed)
+        {
+            std::hint::spin_loop();
+        }
+        store.checkpoint_observed_spend().unwrap();
+        stop.store(true, Ordering::Release);
+        racer.join().unwrap();
+        let end = store.txs.spent.body.logical_len();
+        let posted = landed.load(Ordering::Acquire);
+        if shrunk.load(Ordering::Acquire) || end < posted {
+            saw_shrink = true;
+            break;
+        }
+        assert!(
+            !d.join(SPEND_PAGES_COMMIT_NAME).exists(),
+            "the second checkpoint must fold the cooled pages"
+        );
+    }
+    assert!(
+        !saw_shrink,
+        "fold stored a spent.body end confirm had already grown past"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}

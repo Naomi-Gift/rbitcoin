@@ -2557,8 +2557,10 @@ impl TxTable {
     }
 
     pub(crate) fn copy_cooled_spend_pages(&self) -> Result<(), StoreError> {
+        // Grow-only. `write_body_abs` samples the length, then stores that
+        // sample. Confirm can publish a longer end in between.
         self.spend_pages.copy_cooled(
-            |off, image| self.spent.write_body_abs(off, image),
+            |off, image| self.spent.write_body_pwrite(off, image),
             || self.spent.sync_data_only(),
         )
     }

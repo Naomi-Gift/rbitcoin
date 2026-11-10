@@ -6,8 +6,9 @@ Fixed
   read the log refuses the datadir. The spend checkpoint appends the page image
   before it advances
   the marker, and the next checkpoint folds a generation the previous one left
-  quiet. Folding the first page does not rewrite the file header. The body copy
-  does not hold the utxo view. A missing or short `spend.pages` file beside a
+  quiet. Folding the first page does not rewrite the file header, and it does
+  not publish a shorter `spent.body` end while confirm is still appending. The
+  body copy does not hold the utxo view. A missing or short `spend.pages` file beside a
   commit that names bytes refuses to open. The next confirm insert waits at
   2,000,000 open edges. A 1 GiB log asks for one extra checkpoint. Neither is a
   knob.
