@@ -96,6 +96,11 @@ fn rpc_url_is_host_and_port() {
         ("fe80::1%lo".into(), 8332)
     );
     assert_eq!(
+        parse_rpc_addr("[fe80::1%a_b-c.d]:8332").unwrap(),
+        ("fe80::1%a_b-c.d".into(), 8332)
+    );
+    assert_eq!(parse_rpc_addr("0x:8332").unwrap(), ("0x".into(), 8332));
+    assert_eq!(
         parse_rpc_addr("dead.beef:8332").unwrap(),
         ("dead.beef".into(), 8332)
     );
@@ -152,6 +157,7 @@ fn param_tokens_json_or_string() {
 fn equals_form_datadir_is_accepted() {
     let dir = tmp_datadir();
     std::fs::write(dir.join("rpc.token"), "s3cret").unwrap();
+    std::fs::write(dir.join("rpc.sock"), b"").unwrap();
     let (port, h) = spawn_rpc_mock("s3cret", "0");
     let flag = format!("--datadir={}", dir.display());
     let code = cli_main([

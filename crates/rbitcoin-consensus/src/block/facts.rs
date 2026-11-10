@@ -5,7 +5,6 @@
 
 use super::{exceeds_sigops_limit, is_final_tx, sequence_locks_satisfied};
 use crate::ConsensusError;
-use bitcoin::block::Header;
 use bitcoin::Transaction;
 
 pub fn reject_non_final(
@@ -102,7 +101,7 @@ pub fn fee_with_waived_coinbase(
     if value_out > all_in {
         return Err(ConsensusError::BadTx("in < out"));
     }
-    if value_out > paid_in {
+    if value_out >= paid_in {
         return Ok(0);
     }
     paid_in
@@ -348,17 +347,6 @@ pub fn header_gap_on_chain(height: u32, tip: u32) -> Result<(), ConsensusError> 
         Ok(())
     } else {
         Err(ConsensusError::BadPrev)
-    }
-}
-
-pub fn reject_bits(
-    header: &Header,
-    expected: bitcoin::CompactTarget,
-) -> Result<(), ConsensusError> {
-    if header.bits == expected {
-        Ok(())
-    } else {
-        Err(ConsensusError::BadHeader("incorrect proof of work bits"))
     }
 }
 

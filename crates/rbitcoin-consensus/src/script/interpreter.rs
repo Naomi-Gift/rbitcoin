@@ -1011,11 +1011,10 @@ pub fn eval_script(
     Ok(true)
 }
 
-/// The type bit does not overlap the low 16, so `|` and `^` are the same mask.
-#[cfg_attr(feature = "mutants", mutants::skip)]
+/// The type bit sits above the low 16, so adding it is the CSV mask.
 #[doc(hidden)]
 pub fn csv_locktime_mask(type_bit: u32) -> u32 {
-    0x0000_ffff | type_bit
+    0x0000_ffff_u32.wrapping_add(type_bit)
 }
 
 #[doc(hidden)]

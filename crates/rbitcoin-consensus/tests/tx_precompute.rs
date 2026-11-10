@@ -268,6 +268,26 @@ fn flag_zero_wire_is_one_slice() {
     assert_eq!(w.base_size, flag.base_size());
     assert_eq!(w.total_size, raw.len());
     assert!(TxPrecompute::from_tx_wire(&p2wpkh_like(), &raw, false).is_none());
+    assert!(flag_zero_wire(&raw));
+    let mut marker = raw;
+    marker[4] = 1;
+    assert!(!flag_zero_wire(&marker));
+    let mut with_out = flag.clone();
+    with_out.output.push(TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::new(),
+    });
+    assert!(!flag_zero_tx(&with_out, &raw));
+    let mut empty_out = legacy_1in();
+    empty_out.output.clear();
+    let empty_raw = bitcoin::consensus::encode::serialize(&empty_out);
+    assert!(!flag_zero_tx(&empty_out, &empty_raw));
+    assert!(witness_wire(&empty_out, &empty_raw).is_none());
+    let legacy = legacy_1in();
+    let legacy_raw = bitcoin::consensus::encode::serialize(&legacy);
+    let spans = legacy_spans(&legacy, &legacy_raw).expect("legacy spans");
+    let (txid, _) = hash_wire_sighash(&legacy, &spans).expect("legacy sighash");
+    assert_eq!(txid, legacy.compute_txid().to_byte_array());
 }
 
 #[test]

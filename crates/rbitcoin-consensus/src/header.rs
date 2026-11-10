@@ -290,16 +290,11 @@ pub fn retarget_bits(
     } else {
         prev_bits
     };
-    // A regtest retarget target times the timespan must fit 256 bits.
-    let base = match params.regtest_retarget {
-        Some(r) if Target::from_compact(base) > r.ceiling => r.ceiling.to_compact_lossy(),
-        _ => base,
-    };
     let timespan = u64::from(prev_time.saturating_sub(first.time));
     let bits = CompactTarget::from_next_work_required(base, timespan, &params.btc);
     // Integer division rounds a tiny target to zero, which no hash meets.
     match params.regtest_retarget {
-        Some(r) if Target::from_compact(bits) < r.floor => r.floor.to_compact_lossy(),
+        Some(r) if Target::from_compact(bits) <= r.floor => r.floor.to_compact_lossy(),
         _ => bits,
     }
 }

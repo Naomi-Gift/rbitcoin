@@ -928,6 +928,9 @@ fn stack_size_limit_on_2dup() {
         rot,
         vec![num(1), num(4), num(5), num(6), num(7), num(2), num(3)]
     );
+    assert_eq!(csv_locktime_mask(1 << 22), 0x0040_ffff);
+    let tuck = eval_stack(&[0x51, 0x52, 0x7d], SigVersion::WitnessV0).expect("TUCK");
+    assert_eq!(tuck, vec![num(2), num(1), num(2)]);
     let swap4 = eval_stack(&[0x51, 0x52, 0x53, 0x54, 0x72], SigVersion::WitnessV0).expect("2SWAP");
     assert_eq!(swap4, vec![num(3), num(4), num(1), num(2)]);
     let swap5 =

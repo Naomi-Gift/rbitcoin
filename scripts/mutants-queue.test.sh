@@ -777,8 +777,8 @@ assert_ok "consensus mutants feature is the optional dep" \
   grep -q 'mutants = \["dep:mutants"\]' "$ROOT/crates/rbitcoin-consensus/Cargo.toml"
 assert_ok "query mutants feature is the optional dep" \
   grep -q 'mutants = \["dep:mutants"\]' "$ROOT/crates/rbitcoin-query/Cargo.toml"
-assert_ok "csv mask skip is behind the mutants feature" \
-  grep -q 'cfg_attr(feature = "mutants", mutants::skip)' \
+assert_ok "csv mask adds the type bit" \
+  grep -q '0x0000_ffff_u32.wrapping_add(type_bit)' \
   "$ROOT/crates/rbitcoin-consensus/src/script/interpreter.rs"
 assert_ok "parent stamp skip is behind the mutants feature" \
   grep -q 'cfg_attr(feature = "mutants", mutants::skip)' \

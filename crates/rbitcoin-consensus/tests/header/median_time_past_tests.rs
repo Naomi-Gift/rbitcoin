@@ -627,3 +627,48 @@ fn regtest_retarget_refuses_a_period_the_clamp_cannot_carry() {
         assert!((step - 4.0).abs() < 0.01, "difficulty rose {step}x");
     }
 }
+
+#[test]
+fn regtest_retarget_clamps_an_easy_base_and_a_tiny_result() {
+    let mut params = ChainParams::regtest();
+    params.apply_regtest_retarget(1, 4).unwrap();
+    let ret = params.regtest_retarget.unwrap();
+    let easy = params.pow_limit.to_compact_lossy();
+    assert!(Target::from_compact(easy) > ret.ceiling);
+    let t = 1_000_000u32;
+    let clamped = retarget_bits(
+        &params,
+        easy,
+        t + 4,
+        PeriodFirst {
+            time: t,
+            bits: easy,
+        },
+    );
+    assert!(Target::from_compact(clamped) <= ret.ceiling);
+    // Four times the target timespan is the retarget cap, so this easy base
+    // comes back as the ceiling compact.
+    let stretched = retarget_bits(
+        &params,
+        easy,
+        t + 1_000,
+        PeriodFirst {
+            time: t,
+            bits: easy,
+        },
+    );
+    assert_eq!(stretched, ret.ceiling.to_compact_lossy());
+
+    let floor_bits = ret.floor.to_compact_lossy();
+    let sunk = retarget_bits(
+        &params,
+        floor_bits,
+        t,
+        PeriodFirst {
+            time: t + 100,
+            bits: floor_bits,
+        },
+    );
+    assert!(Target::from_compact(sunk) >= ret.floor);
+    assert_ne!(sunk.to_consensus(), 0);
+}
