@@ -389,6 +389,37 @@ pub fn refuse_foreign_genesis(
     )))
 }
 
+/// A P2P bind failure is Core's `BindListenPort` InitError (`feature_port.py`).
+fn p2p_start_err(what: &str, e: rbitcoin_net::NetError) -> NodeError {
+    let rbitcoin_net::NetError::Bind { addr, source } = e else {
+        return NodeError::Config(format!("{what}: {e}"));
+    };
+    if source.kind() == std::io::ErrorKind::AddrInUse {
+        return NodeError::Init(format!(
+            "Unable to bind to {addr} on this computer. rbitcoin is probably already running."
+        ));
+    }
+    NodeError::Init(format!(
+        "Unable to bind to {addr} on this computer (bind returned error {})",
+        os_error_text(&source)
+    ))
+}
+
+/// Core's `NetworkErrorString`: `<OS text> (<code>)`, not Rust's
+/// `(os error N)`.
+fn os_error_text(e: &std::io::Error) -> String {
+    let text = e.to_string();
+    match e.raw_os_error() {
+        Some(n) => {
+            let os = text
+                .strip_suffix(&format!(" (os error {n})"))
+                .unwrap_or(&text);
+            format!("{os} ({n})")
+        }
+        None => text,
+    }
+}
+
 /// Long-running P2P (+ optional Electrum): seed resolve, catch-up, persistent follow, progress logs.
 ///
 /// Cleanly exits on **SIGTERM** / **SIGINT** (`kill <pid>` or Ctrl+C): flushes the store
@@ -476,7 +507,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             .await
         }
     }
-    .map_err(|e| NodeError::Config(format!("p2p start: {e}")))?;
+    .map_err(|e| p2p_start_err("p2p start", e))?;
     node.peers
         .set_trust_peer(config.trust_peer, config.trust_peer_host.clone());
     if config.trust_peer_set() {
@@ -494,7 +525,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         let bound = node
             .add_listen(*extra)
             .await
-            .map_err(|e| NodeError::Config(format!("p2p extra listen {extra}: {e}")))?;
+            .map_err(|e| p2p_start_err(&format!("p2p extra listen {extra}"), e))?;
         info!(
             "rbitcoin-node listening on {} ({})",
             bound,

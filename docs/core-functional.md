@@ -216,8 +216,9 @@ Shim-only scripts that used to be `run` stay skip: `feature_help.py`
 (`no-prune`), `feature_dirsymlinks.py` stays skip (`core-internal`). Dummy `blk00000.dat`
 still exists so `rpc_getblockstats.py`'s rename-file needle can run; the rest
 of that script is `submitblock` + archive `getblockstats`. `feature_port.py`
-maps `-bind`/`-port` to `--listen` on those sockets. It is skip until the
-P2P listener is exclusive (#1485).
+runs: the shim maps `-bind`/`-port` to `--listen` on those sockets, and a
+P2P port another process holds fails startup with Core's
+`Error: Unable to bind to …` InitError (#1485).
 `p2p_opportunistic_1p1c.py` is skip (`core-net-policy`): a peer's low-fee
 parent and its child are admitted together only when the child spends the
 parent's 0-value anchor (#1407). Core does this for any low-fee parent, and
