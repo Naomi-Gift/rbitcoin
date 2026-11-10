@@ -11,74 +11,99 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
-/// Mirrors the non-string parameter positions the RPC handlers read in
-/// `crates/rbitcoin-rpc/src/methods/`. A handler change that adds or moves a
-/// non-string parameter must add or update the matching row here in the same
-/// change, or a new argument ships as a string.
-const CONVERT_PARAMS: &[(&str, usize, ParamFormat)] = &[
-    ("addconnection", 2, ParamFormat::Json),
-    ("addnode", 2, ParamFormat::Json),
-    ("addpeeraddress", 1, ParamFormat::Json),
-    ("addpeeraddress", 2, ParamFormat::Json),
-    ("decoderawtransaction", 1, ParamFormat::Json),
-    ("disconnectnode", 1, ParamFormat::Json),
-    ("echojson", 0, ParamFormat::Json),
-    ("echojson", 1, ParamFormat::Json),
-    ("echojson", 2, ParamFormat::Json),
-    ("echojson", 3, ParamFormat::Json),
-    ("echojson", 4, ParamFormat::Json),
-    ("echojson", 5, ParamFormat::Json),
-    ("echojson", 6, ParamFormat::Json),
-    ("echojson", 7, ParamFormat::Json),
-    ("echojson", 8, ParamFormat::Json),
-    ("echojson", 9, ParamFormat::Json),
-    ("estimaterawfee", 0, ParamFormat::Json),
-    ("estimaterawfee", 1, ParamFormat::Json),
-    ("estimatesmartfee", 0, ParamFormat::Json),
-    ("estimatesmartfee", 2, ParamFormat::Json),
-    ("generate", 0, ParamFormat::Json),
-    ("generate", 1, ParamFormat::Json),
-    ("generateblock", 1, ParamFormat::Json),
-    ("generateblock", 2, ParamFormat::Json),
-    ("generatetoaddress", 0, ParamFormat::Json),
-    ("generatetoaddress", 2, ParamFormat::Json),
-    ("generatetodescriptor", 0, ParamFormat::Json),
-    ("generatetodescriptor", 2, ParamFormat::Json),
-    ("getblock", 1, ParamFormat::Json),
-    ("getblockhash", 0, ParamFormat::Json),
-    ("getblockheader", 1, ParamFormat::Json),
-    ("getblockstats", 0, ParamFormat::JsonOrString),
-    ("getblockstats", 1, ParamFormat::Json),
-    ("getblocktemplate", 0, ParamFormat::Json),
-    ("getmempoolancestors", 1, ParamFormat::Json),
-    ("getmempooldescendants", 1, ParamFormat::Json),
-    ("getnetworkhashps", 0, ParamFormat::Json),
-    ("getnetworkhashps", 1, ParamFormat::Json),
-    ("getnodeaddresses", 0, ParamFormat::Json),
-    ("getorphantxs", 0, ParamFormat::Json),
-    ("getrawmempool", 0, ParamFormat::Json),
-    ("getrawmempool", 1, ParamFormat::Json),
-    ("getrawtransaction", 1, ParamFormat::Json),
-    ("gettxout", 1, ParamFormat::Json),
-    ("gettxout", 2, ParamFormat::Json),
-    ("gettxspendingprevout", 0, ParamFormat::Json),
-    ("importmempool", 1, ParamFormat::Json),
-    ("mockscheduler", 0, ParamFormat::Json),
-    ("prioritisetransaction", 1, ParamFormat::Json),
-    ("prioritisetransaction", 2, ParamFormat::Json),
-    ("sendrawtransaction", 1, ParamFormat::JsonOrString),
-    ("sendrawtransaction", 2, ParamFormat::JsonOrString),
-    ("setmocktime", 0, ParamFormat::Json),
-    ("stop", 0, ParamFormat::Json),
-    ("submitpackage", 0, ParamFormat::Json),
-    ("submitpackage", 1, ParamFormat::JsonOrString),
-    ("submitpackage", 2, ParamFormat::JsonOrString),
-    ("testmempoolaccept", 0, ParamFormat::Json),
-    ("testmempoolaccept", 1, ParamFormat::JsonOrString),
-    ("waitforblock", 1, ParamFormat::Json),
-    ("waitforblockheight", 0, ParamFormat::Json),
-    ("waitforblockheight", 1, ParamFormat::Json),
-    ("waitfornewblock", 0, ParamFormat::Json),
+/// Mirrors the non-string parameter positions and names the RPC handlers read
+/// in `crates/rbitcoin-rpc/src/methods/`. A handler change that adds, moves,
+/// or renames a non-string parameter must add or update the matching row here
+/// in the same change, or a new argument ships as a string.
+const CONVERT_PARAMS: &[(&str, usize, &str, ParamFormat)] = &[
+    ("addconnection", 2, "v2transport", ParamFormat::Json),
+    ("addnode", 2, "v2transport", ParamFormat::Json),
+    ("addpeeraddress", 1, "port", ParamFormat::Json),
+    ("addpeeraddress", 2, "tried", ParamFormat::Json),
+    ("decoderawtransaction", 1, "iswitness", ParamFormat::Json),
+    ("disconnectnode", 1, "nodeid", ParamFormat::Json),
+    ("echojson", 0, "arg0", ParamFormat::Json),
+    ("echojson", 1, "arg1", ParamFormat::Json),
+    ("echojson", 2, "arg2", ParamFormat::Json),
+    ("echojson", 3, "arg3", ParamFormat::Json),
+    ("echojson", 4, "arg4", ParamFormat::Json),
+    ("echojson", 5, "arg5", ParamFormat::Json),
+    ("echojson", 6, "arg6", ParamFormat::Json),
+    ("echojson", 7, "arg7", ParamFormat::Json),
+    ("echojson", 8, "arg8", ParamFormat::Json),
+    ("echojson", 9, "arg9", ParamFormat::Json),
+    ("estimaterawfee", 0, "conf_target", ParamFormat::Json),
+    ("estimaterawfee", 1, "threshold", ParamFormat::Json),
+    ("estimatesmartfee", 0, "conf_target", ParamFormat::Json),
+    ("estimatesmartfee", 2, "options", ParamFormat::Json),
+    ("generate", 0, "nblocks", ParamFormat::Json),
+    ("generate", 1, "maxtries", ParamFormat::Json),
+    ("generateblock", 1, "transactions", ParamFormat::Json),
+    ("generateblock", 2, "submit", ParamFormat::Json),
+    ("generatetoaddress", 0, "nblocks", ParamFormat::Json),
+    ("generatetoaddress", 2, "maxtries", ParamFormat::Json),
+    ("generatetodescriptor", 0, "nblocks", ParamFormat::Json),
+    ("generatetodescriptor", 2, "maxtries", ParamFormat::Json),
+    ("getblock", 1, "verbosity", ParamFormat::Json),
+    ("getblockhash", 0, "height", ParamFormat::Json),
+    ("getblockheader", 1, "verbose", ParamFormat::Json),
+    (
+        "getblockstats",
+        0,
+        "hash_or_height",
+        ParamFormat::JsonOrString,
+    ),
+    ("getblockstats", 1, "stats", ParamFormat::Json),
+    ("getblocktemplate", 0, "template_request", ParamFormat::Json),
+    ("getmempoolancestors", 1, "verbose", ParamFormat::Json),
+    ("getmempooldescendants", 1, "verbose", ParamFormat::Json),
+    ("getnetworkhashps", 0, "nblocks", ParamFormat::Json),
+    ("getnetworkhashps", 1, "height", ParamFormat::Json),
+    ("getnodeaddresses", 0, "count", ParamFormat::Json),
+    ("getorphantxs", 0, "verbosity", ParamFormat::Json),
+    ("getrawmempool", 0, "verbose", ParamFormat::Json),
+    ("getrawmempool", 1, "mempool_sequence", ParamFormat::Json),
+    ("getrawtransaction", 1, "verbose", ParamFormat::Json),
+    ("gettxout", 1, "n", ParamFormat::Json),
+    ("gettxout", 2, "include_mempool", ParamFormat::Json),
+    ("gettxspendingprevout", 0, "outputs", ParamFormat::Json),
+    ("importmempool", 1, "options", ParamFormat::Json),
+    ("mockscheduler", 0, "delta_seconds", ParamFormat::Json),
+    ("prioritisetransaction", 1, "dummy", ParamFormat::Json),
+    ("prioritisetransaction", 2, "fee_delta", ParamFormat::Json),
+    (
+        "sendrawtransaction",
+        1,
+        "maxfeerate",
+        ParamFormat::JsonOrString,
+    ),
+    (
+        "sendrawtransaction",
+        2,
+        "maxburnamount",
+        ParamFormat::JsonOrString,
+    ),
+    ("setmocktime", 0, "timestamp", ParamFormat::Json),
+    ("stop", 0, "wait", ParamFormat::Json),
+    ("submitpackage", 0, "package", ParamFormat::Json),
+    ("submitpackage", 1, "maxfeerate", ParamFormat::JsonOrString),
+    (
+        "submitpackage",
+        2,
+        "maxburnamount",
+        ParamFormat::JsonOrString,
+    ),
+    ("testmempoolaccept", 0, "rawtxs", ParamFormat::Json),
+    (
+        "testmempoolaccept",
+        1,
+        "maxfeerate",
+        ParamFormat::JsonOrString,
+    ),
+    ("waitforblock", 1, "timeout", ParamFormat::Json),
+    ("waitforblockheight", 0, "height", ParamFormat::Json),
+    ("waitforblockheight", 1, "timeout", ParamFormat::Json),
+    ("waitfornewblock", 0, "timeout", ParamFormat::Json),
 ];
 
 const RPCWAIT_ATTEMPTS: u32 = 30;
@@ -105,6 +130,7 @@ pub fn usage() -> String {
            -V, --version          print version\n\
            -stdin                 read extra args from stdin, one per line until EOF\n\
            -rpcwait               retries the connection until the node is up, in a bounded loop\n\
+           --named                pass named (name=value) parameters instead of positional\n\
          \n\
          Local: --datadir talks to {{datadir}}/rpc.sock (no token). TCP uses Bearer\n\
          from {{datadir}}/rpc.token. Plain HTTP, same as the node.",
@@ -123,6 +149,7 @@ pub struct CliConfig {
     pub params: Vec<String>,
     pub stdin: bool,
     pub rpcwait: bool,
+    pub named: bool,
 }
 
 impl Default for CliConfig {
@@ -137,6 +164,7 @@ impl Default for CliConfig {
             params: Vec::new(),
             stdin: false,
             rpcwait: false,
+            named: false,
         }
     }
 }
@@ -204,6 +232,11 @@ pub fn parse_args(args: &[OsString]) -> Result<Action, String> {
             }
             if a == "-rpcwait" {
                 cfg.rpcwait = true;
+                i += 1;
+                continue;
+            }
+            if a == "--named" {
+                cfg.named = true;
                 i += 1;
                 continue;
             }
@@ -379,8 +412,17 @@ pub fn retry_connect<T>(
 }
 
 fn convert_format(method: &str, index: usize) -> Option<ParamFormat> {
-    for &(m, i, f) in CONVERT_PARAMS {
+    for &(m, i, _name, f) in CONVERT_PARAMS {
         if m == method && i == index {
+            return Some(f);
+        }
+    }
+    None
+}
+
+fn convert_named_format(method: &str, name: &str) -> Option<ParamFormat> {
+    for &(m, _i, n, f) in CONVERT_PARAMS {
+        if m == method && n == name {
             return Some(f);
         }
     }
@@ -389,7 +431,15 @@ fn convert_format(method: &str, index: usize) -> Option<ParamFormat> {
 
 #[doc(hidden)]
 pub fn param_value(method: &str, index: usize, raw: &str) -> Result<Value, String> {
-    match convert_format(method, index) {
+    param_convert(convert_format(method, index), raw)
+}
+
+fn named_param_value(method: &str, name: &str, raw: &str) -> Result<Value, String> {
+    param_convert(convert_named_format(method, name), raw)
+}
+
+fn param_convert(format: Option<ParamFormat>, raw: &str) -> Result<Value, String> {
+    match format {
         None => Ok(Value::String(raw.to_string())),
         Some(ParamFormat::Json) => {
             serde_json::from_str(raw).map_err(|_| format!("Error parsing JSON: {raw}"))
@@ -400,6 +450,20 @@ pub fn param_value(method: &str, index: usize, raw: &str) -> Result<Value, Strin
     }
 }
 
+fn named_params(method: &str, params: &[String]) -> Result<Value, String> {
+    let mut map = serde_json::Map::new();
+    for raw in params {
+        let (name, value) = raw
+            .split_once('=')
+            .ok_or_else(|| "non-named-argument passed to --named".to_string())?;
+        if map.contains_key(name) {
+            return Err(format!("Parameter {name} specified twice"));
+        }
+        map.insert(name.to_string(), named_param_value(method, name, value)?);
+    }
+    Ok(Value::Object(map))
+}
+
 #[doc(hidden)]
 pub fn rpc_http(
     mut stream: impl Read + Write,
@@ -407,7 +471,7 @@ pub fn rpc_http(
     port: u16,
     auth: Option<&str>,
     method: &str,
-    params: &[Value],
+    params: &Value,
 ) -> Result<Value, String> {
     let body = serde_json::json!({
         "jsonrpc": "1.0",
@@ -511,7 +575,7 @@ fn rpc_call(
     stream: RpcStream,
     cfg: &CliConfig,
     cmd: &str,
-    params: &[Value],
+    params: &Value,
 ) -> Result<Value, String> {
     match stream {
         RpcStream::Unix(s) => rpc_http(s, "localhost", 0, None, cmd, params),
@@ -528,12 +592,17 @@ pub fn dispatch_call(cfg: &CliConfig) -> Result<String, String> {
     if cmd == "help" {
         return Ok(usage());
     }
-    let params: Vec<Value> = cfg
-        .params
-        .iter()
-        .enumerate()
-        .map(|(i, p)| param_value(cmd, i, p))
-        .collect::<Result<_, _>>()?;
+    let params = if cfg.named {
+        named_params(cmd, &cfg.params)?
+    } else {
+        let positional: Vec<Value> = cfg
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| param_value(cmd, i, p))
+            .collect::<Result<_, _>>()?;
+        Value::Array(positional)
+    };
     let stream = if cfg.rpcwait {
         retry_connect(|| connect_stream(cfg), RPCWAIT_ATTEMPTS, RPCWAIT_DELAY)?
     } else {

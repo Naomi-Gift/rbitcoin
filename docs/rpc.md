@@ -122,6 +122,7 @@ comes from `{datadir}/rpc.token` or `--rpc-token-file`. Prints the JSON-RPC
 `result` (strings unquoted). `-stdin` reads extra arguments from standard input, one per line until EOF,
 appended after the command-line arguments (Core-compatible; for values that
 should not appear in the process list). `-rpcwait` retries the connection until the node is up, in a bounded loop.
+`--named` takes `name=value` arguments and sends them as a JSON object instead of a positional array.
 
 ```bash
 rbitcoin-cli --datadir datadir getblockcount

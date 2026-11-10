@@ -11,7 +11,7 @@ use std::net::TcpListener;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
-type CapturedParams = Arc<Mutex<Option<Vec<serde_json::Value>>>>;
+type CapturedParams = Arc<Mutex<Option<serde_json::Value>>>;
 
 fn exit_ok(c: ExitCode) -> bool {
     format!("{c:?}") == format!("{:?}", ExitCode::SUCCESS)
@@ -178,6 +178,7 @@ fn usage_describes_every_option() {
         "-V, --version",
         "-stdin",
         "-rpcwait",
+        "--named",
     ] {
         assert!(u.contains(needle), "usage must list {needle}");
     }
@@ -272,10 +273,7 @@ fn serve_one_rpc(
         }
         let body = &raw[header_end..header_end + content_length];
         if let Ok(v) = serde_json::from_slice::<serde_json::Value>(body) {
-            *c.lock().unwrap() = v
-                .get("params")
-                .and_then(serde_json::Value::as_array)
-                .cloned();
+            *c.lock().unwrap() = v.get("params").cloned();
         }
         let body = "{\"jsonrpc\":\"1.0\",\"id\":\"1\",\"result\":7,\"error\":null}\n".to_string();
         let resp = format!(
@@ -395,10 +393,7 @@ fn getblock_keeps_a_digit_only_hash_a_string() {
     ]);
     assert!(exit_ok(code), "getblock must succeed, got {code:?}");
     let params = captured.lock().unwrap().take().unwrap();
-    assert_eq!(
-        params,
-        vec![serde_json::json!("123456789"), serde_json::json!(2)]
-    );
+    assert_eq!(params, serde_json::json!(["123456789", 2]));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
 }
@@ -419,7 +414,7 @@ fn getnetworkhashps_negative_nblocks_is_a_number() {
     ]);
     assert!(exit_ok(code), "getnetworkhashps must succeed, got {code:?}");
     let params = captured.lock().unwrap().take().unwrap();
-    assert_eq!(params, vec![serde_json::json!(-1)]);
+    assert_eq!(params, serde_json::json!([-1]));
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
 }
@@ -519,10 +514,7 @@ fn stdin_flag_appends_args_from_stdin() {
     let _ = h.join();
 
     let params = captured.lock().unwrap().take().unwrap();
-    assert_eq!(
-        params,
-        vec![serde_json::json!("123456789"), serde_json::json!(2)]
-    );
+    assert_eq!(params, serde_json::json!(["123456789", 2]));
 }
 
 #[test]
@@ -645,4 +637,109 @@ fn rpcwait_does_not_repeat_the_call() {
         1,
         "the call must be sent exactly once"
     );
+}
+
+#[test]
+fn parse_args_named_is_a_flag() {
+    match parse_args(&os_args(&[
+        "rbitcoin-cli",
+        "--named",
+        "getblockhash",
+        "height=1",
+    ])) {
+        Ok(Action::Call(cfg)) => {
+            assert_eq!(cfg.command.as_deref(), Some("getblockhash"));
+            assert_eq!(cfg.params, vec!["height=1".to_string()]);
+            assert!(cfg.named, "--named must set the named flag");
+        }
+        Err(e) => panic!("--named must parse, got: {e}"),
+        Ok(_) => panic!("expected Action::Call"),
+    }
+}
+
+#[test]
+fn named_rejects_a_bare_positional_arg() {
+    let cfg = match parse_args(&os_args(&[
+        "rbitcoin-cli",
+        "--named",
+        "getblockhash",
+        "100",
+    ])) {
+        Ok(Action::Call(cfg)) => cfg,
+        Ok(_) => panic!("expected Action::Call"),
+        Err(e) => panic!("--named must parse, got: {e}"),
+    };
+    let err = dispatch_call(&cfg).unwrap_err();
+    assert_eq!(err, "non-named-argument passed to --named");
+}
+
+#[test]
+fn named_rejects_duplicate_keys() {
+    let cfg = match parse_args(&os_args(&[
+        "rbitcoin-cli",
+        "--named",
+        "getblockhash",
+        "height=1",
+        "height=2",
+    ])) {
+        Ok(Action::Call(cfg)) => cfg,
+        Ok(_) => panic!("expected Action::Call"),
+        Err(e) => panic!("--named must parse, got: {e}"),
+    };
+    let err = dispatch_call(&cfg).unwrap_err();
+    assert_eq!(err, "Parameter height specified twice");
+}
+
+#[cfg(unix)]
+#[test]
+fn named_params_reach_server_as_object() {
+    use std::os::unix::net::UnixListener;
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let (captured, h) = serve_one_rpc(UnixListener::bind(&sock).unwrap());
+    let code = cli_main([
+        "rbitcoin-cli",
+        "--named",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "getblockhash",
+        "height=1",
+    ]);
+    assert!(
+        exit_ok(code),
+        "--named getblockhash height=1 must succeed, got {code:?}"
+    );
+    let params = captured.lock().unwrap().take().unwrap();
+    assert_eq!(params, serde_json::json!({"height": 1}));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = h.join();
+}
+
+#[cfg(unix)]
+#[test]
+fn named_string_and_bool_params_keep_their_types() {
+    use std::os::unix::net::UnixListener;
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let (captured, h) = serve_one_rpc(UnixListener::bind(&sock).unwrap());
+    let code = cli_main([
+        "rbitcoin-cli",
+        "--named",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "getrawtransaction",
+        "txid=deadbeef",
+        "verbose=true",
+    ]);
+    assert!(
+        exit_ok(code),
+        "--named getrawtransaction must succeed, got {code:?}"
+    );
+    let params = captured.lock().unwrap().take().unwrap();
+    assert_eq!(
+        params,
+        serde_json::json!({"txid": "deadbeef", "verbose": true})
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = h.join();
 }
