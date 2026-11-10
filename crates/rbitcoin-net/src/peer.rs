@@ -5230,7 +5230,10 @@ fn classify_headers(
             }
             if !header_path_meets_minwork(hub, &pending, last) {
                 if noban {
+                    let should_stamp = work_cmp == Some(std::cmp::Ordering::Greater)
+                        && !header_is_stored(hub, &last);
                     persist_pending_header_path(hub, &pending, last);
+                    apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
                     apply.sync_height = Some(announced_h);
                 } else {
                     apply.ignore_height = Some(announced_h);

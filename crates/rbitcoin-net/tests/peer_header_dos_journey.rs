@@ -2653,6 +2653,11 @@ async fn below_floor_headers_do_not_walk_parents() {
         side_tips(&hub) > 0,
         "a noban peer still persists a below-floor chain"
     );
+    assert_eq!(
+        noban.last_block_announcement.load(Ordering::Relaxed),
+        noban.clock_now(),
+        "a noban peer stamps its accepted heavier below-floor header"
+    );
     peers.set_noban(false);
     let _ = std::fs::remove_dir_all(dir);
     let _ = std::fs::remove_dir_all(src_dir);
