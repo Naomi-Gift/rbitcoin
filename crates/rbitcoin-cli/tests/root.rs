@@ -525,7 +525,7 @@ fn retry_connect_retries_until_success() {
         || {
             calls += 1;
             if calls < 3 {
-                Err("connection refused".to_string())
+                Err(ConnectError::transient("connection refused"))
             } else {
                 Ok(42)
             }
@@ -543,13 +543,29 @@ fn retry_connect_gives_up_after_attempts() {
     let out = retry_connect(
         || {
             calls += 1;
-            Err::<i32, String>("connection refused".to_string())
+            Err::<i32, ConnectError>(ConnectError::transient("connection refused"))
         },
         2,
         std::time::Duration::ZERO,
     );
-    assert!(out.is_err());
+    assert_eq!(out, Err("connection refused".to_string()));
     assert_eq!(calls, 2);
+}
+
+/// A bad address or socket path must not be retried: one attempt, then out.
+#[test]
+fn retry_connect_does_not_retry_a_permanent_error() {
+    let mut calls = 0;
+    let out = retry_connect(
+        || {
+            calls += 1;
+            Err::<i32, ConnectError>(ConnectError::permanent("bad rpc url"))
+        },
+        30,
+        std::time::Duration::ZERO,
+    );
+    assert_eq!(out, Err("bad rpc url".to_string()));
+    assert_eq!(calls, 1, "a permanent error must not be retried");
 }
 
 #[test]
@@ -649,37 +665,82 @@ fn parse_args_named_is_a_flag() {
     }
 }
 
+#[cfg(unix)]
 #[test]
-fn named_rejects_a_bare_positional_arg() {
-    let cfg = match parse_args(&os_args(&[
+fn named_sends_positionals_in_args_array() {
+    use std::os::unix::net::UnixListener;
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let (captured, h) = serve_one_rpc(UnixListener::bind(&sock).unwrap());
+    let code = cli_main([
         "rbitcoin-cli",
         "--named",
+        "--datadir",
+        dir.to_str().unwrap(),
         "getblockhash",
         "100",
-    ])) {
-        Ok(Action::Call(cfg)) => cfg,
-        Ok(_) => panic!("expected Action::Call"),
-        Err(e) => panic!("--named must parse, got: {e}"),
-    };
-    let err = dispatch_call(&cfg).unwrap_err();
-    assert_eq!(err, "non-named-argument passed to --named");
+    ]);
+    assert!(
+        exit_ok(code),
+        "--named getblockhash 100 must succeed, got {code:?}"
+    );
+    let params = captured.lock().unwrap().take().unwrap();
+    assert_eq!(params, serde_json::json!({"args": [100]}));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = h.join();
 }
 
+/// A positional whose value contains `=` is not a named argument: a JSON array
+/// such as `["tx","a=b"]` would otherwise split at that `=` into a bogus name.
+#[cfg(unix)]
 #[test]
-fn named_rejects_duplicate_keys() {
-    let cfg = match parse_args(&os_args(&[
+fn named_keeps_a_value_containing_eq_positional() {
+    use std::os::unix::net::UnixListener;
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let (captured, h) = serve_one_rpc(UnixListener::bind(&sock).unwrap());
+    let code = cli_main([
         "rbitcoin-cli",
         "--named",
+        "--datadir",
+        dir.to_str().unwrap(),
+        "submitpackage",
+        r#"["tx","a=b"]"#,
+    ]);
+    assert!(
+        exit_ok(code),
+        "--named submitpackage with an = inside a value must succeed, got {code:?}"
+    );
+    let params = captured.lock().unwrap().take().unwrap();
+    assert_eq!(params, serde_json::json!({"args": [["tx", "a=b"]]}));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = h.join();
+}
+
+#[cfg(unix)]
+#[test]
+fn named_duplicate_name_last_wins() {
+    use std::os::unix::net::UnixListener;
+    let dir = tmp_datadir();
+    let sock = dir.join("rpc.sock");
+    let (captured, h) = serve_one_rpc(UnixListener::bind(&sock).unwrap());
+    let code = cli_main([
+        "rbitcoin-cli",
+        "--named",
+        "--datadir",
+        dir.to_str().unwrap(),
         "getblockhash",
         "height=1",
         "height=2",
-    ])) {
-        Ok(Action::Call(cfg)) => cfg,
-        Ok(_) => panic!("expected Action::Call"),
-        Err(e) => panic!("--named must parse, got: {e}"),
-    };
-    let err = dispatch_call(&cfg).unwrap_err();
-    assert_eq!(err, "Parameter height specified twice");
+    ]);
+    assert!(
+        exit_ok(code),
+        "--named getblockhash height=1 height=2 must succeed, got {code:?}"
+    );
+    let params = captured.lock().unwrap().take().unwrap();
+    assert_eq!(params, serde_json::json!({"height": 2}));
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = h.join();
 }
 
 #[cfg(unix)]
@@ -787,7 +848,7 @@ fn serve_getinfo_mock(
                     r#"{"chain":"regtest","blocks":100,"headers":100,"verificationprogress":0.5,"difficulty":1}"#
                 }
                 "getnetworkinfo" => {
-                    r#"{"version":259900,"timeoffset":0,"connections":2,"connections_in":1,"connections_out":1,"relayfee":0.00001}"#
+                    r#"{"version":259900,"timeoffset":0,"connections":2,"connections_in":1,"connections_out":1,"relayfee":0.00001,"networks":[{"name":"ipv4","proxy":"127.0.0.1:9050"},{"name":"ipv6","proxy":""},{"name":"onion","proxy":"127.0.0.1:9050"}],"warnings":["fee estimation disabled"]}"#
                 }
                 _ => "null",
             };
@@ -836,7 +897,7 @@ fn getinfo_prints_a_core_style_summary() {
     let out = dispatch_call(&cfg).unwrap();
     assert_eq!(
         out,
-        "Chain: regtest\nBlocks: 100\nHeaders: 100\nVerification progress: 50.00%\nDifficulty: 1\n\nNetwork: in 1, out 1, total 2\nVersion: 259900\nTime offset (s): 0\nProxies: n/a\nMin tx relay fee rate (BTC/kvB): 0.00001000"
+        "Chain: regtest\nBlocks: 100\nHeaders: 100\nVerification progress: ▒▒▒▒▒▒▒▒▒▒░░░░░░░░░░ 50.0000%\nDifficulty: 1\n\nNetwork: in 1, out 1, total 2\nVersion: 259900\nTime offset (s): 0\nProxies: 127.0.0.1:9050 (ipv4, onion)\nMin tx relay fee rate (BTC/kvB): 0.00001000\n\nWarnings: fee estimation disabled"
     );
     let mut got = methods.lock().unwrap().clone();
     got.sort();
@@ -849,4 +910,33 @@ fn getinfo_prints_a_core_style_summary() {
     );
     let _ = std::fs::remove_dir_all(&dir);
     let _ = h.join();
+}
+
+#[test]
+fn getinfo_rejects_a_command() {
+    let cfg = match parse_args(&os_args(&["rbitcoin-cli", "--getinfo", "getblockcount"])) {
+        Ok(Action::Call(cfg)) => cfg,
+        Ok(_) => panic!("expected Action::Call"),
+        Err(e) => panic!("--getinfo must parse, got: {e}"),
+    };
+    assert_eq!(
+        dispatch_call(&cfg).unwrap_err(),
+        "--getinfo takes no arguments"
+    );
+}
+
+/// `--stdin` appends to `params` without setting a command, so the guard has to
+/// look at both.
+#[test]
+fn getinfo_rejects_stray_parameters() {
+    let mut cfg = match parse_args(&os_args(&["rbitcoin-cli", "--getinfo"])) {
+        Ok(Action::Call(cfg)) => cfg,
+        Ok(_) => panic!("expected Action::Call"),
+        Err(e) => panic!("--getinfo must parse, got: {e}"),
+    };
+    cfg.params.push("getblockcount".to_string());
+    assert_eq!(
+        dispatch_call(&cfg).unwrap_err(),
+        "--getinfo takes no arguments"
+    );
 }

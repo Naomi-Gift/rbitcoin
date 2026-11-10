@@ -42,9 +42,10 @@ const CONVERT_PARAMS: &[(&str, usize, &str, ParamFormat)] = &[
     ("generateblock", 2, "submit", ParamFormat::Json),
     ("generatetoaddress", 0, "nblocks", ParamFormat::Json),
     ("generatetoaddress", 2, "maxtries", ParamFormat::Json),
-    ("generatetodescriptor", 0, "nblocks", ParamFormat::Json),
+    ("generatetodescriptor", 0, "num_blocks", ParamFormat::Json),
     ("generatetodescriptor", 2, "maxtries", ParamFormat::Json),
     ("getblock", 1, "verbosity", ParamFormat::Json),
+    ("getblock", 1, "verbose", ParamFormat::Json),
     ("getblockhash", 0, "height", ParamFormat::Json),
     ("getblockheader", 1, "verbose", ParamFormat::Json),
     (
@@ -64,10 +65,24 @@ const CONVERT_PARAMS: &[(&str, usize, &str, ParamFormat)] = &[
     ("getrawmempool", 0, "verbose", ParamFormat::Json),
     ("getrawmempool", 1, "mempool_sequence", ParamFormat::Json),
     ("getrawtransaction", 1, "verbose", ParamFormat::Json),
+    ("getrawtransaction", 1, "verbosity", ParamFormat::Json),
     ("gettxout", 1, "n", ParamFormat::Json),
     ("gettxout", 2, "include_mempool", ParamFormat::Json),
     ("gettxspendingprevout", 0, "outputs", ParamFormat::Json),
     ("importmempool", 1, "options", ParamFormat::Json),
+    ("importmempool", 2, "use_current_time", ParamFormat::Json),
+    (
+        "importmempool",
+        3,
+        "apply_fee_delta_priority",
+        ParamFormat::Json,
+    ),
+    (
+        "importmempool",
+        4,
+        "apply_unbroadcast_set",
+        ParamFormat::Json,
+    ),
     ("mockscheduler", 0, "delta_seconds", ParamFormat::Json),
     ("prioritisetransaction", 1, "dummy", ParamFormat::Json),
     ("prioritisetransaction", 2, "fee_delta", ParamFormat::Json),
@@ -129,7 +144,7 @@ pub fn usage() -> String {
            -h, --help             this message\n\
            -V, --version          print version\n\
            --stdin                read extra args from stdin, one per line until EOF\n\
-           --rpcwait              retries the connection until the node is up, in a bounded loop\n\
+           --rpcwait              retries a refused connection for up to ~30 seconds\n\
            --named                pass named (name=value) parameters instead of positional\n\
            --getinfo              print a Core-style chain/network summary\n\
          \n\
@@ -364,12 +379,52 @@ fn inet_aton_label(label: &str) -> bool {
     !hex.is_empty() && hex.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
-fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, String> {
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ConnectError {
+    pub message: String,
+    pub transient: bool,
+}
+
+impl ConnectError {
+    pub fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transient: false,
+        }
+    }
+
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            transient: true,
+        }
+    }
+
+    fn from_io(message: impl FnOnce() -> String, e: &std::io::Error) -> Self {
+        use std::io::ErrorKind;
+        let transient = matches!(
+            e.kind(),
+            ErrorKind::ConnectionRefused
+                | ErrorKind::NotFound
+                | ErrorKind::TimedOut
+                | ErrorKind::WouldBlock
+                | ErrorKind::HostUnreachable
+                | ErrorKind::NetworkUnreachable
+        );
+        Self {
+            message: message(),
+            transient,
+        }
+    }
+}
+
+fn connect_tcp(host: &str, port: u16) -> Result<TcpStream, ConnectError> {
     let connect = match host.parse::<IpAddr>() {
         Ok(ip) => TcpStream::connect(SocketAddr::new(ip, port)),
         Err(_) => TcpStream::connect((host, port)),
     };
-    connect.map_err(|e| format!("connect {host}:{port}: {e}"))
+    connect.map_err(|e| ConnectError::from_io(|| format!("connect {host}:{port}: {e}"), &e))
 }
 
 #[doc(hidden)]
@@ -402,7 +457,7 @@ pub fn read_stdin_args(reader: impl BufRead) -> Result<Vec<String>, String> {
 
 #[doc(hidden)]
 pub fn retry_connect<T>(
-    mut attempt: impl FnMut() -> Result<T, String>,
+    mut attempt: impl FnMut() -> Result<T, ConnectError>,
     attempts: u32,
     delay: Duration,
 ) -> Result<T, String> {
@@ -410,7 +465,8 @@ pub fn retry_connect<T>(
     for attempt_num in 0..attempts {
         match attempt() {
             Ok(value) => return Ok(value),
-            Err(e) => last_err = Some(e),
+            Err(e) if !e.transient => return Err(e.message),
+            Err(e) => last_err = Some(e.message),
         }
         if attempt_num + 1 < attempts {
             std::thread::sleep(delay);
@@ -458,16 +514,23 @@ fn param_convert(format: Option<ParamFormat>, raw: &str) -> Result<Value, String
     }
 }
 
+fn is_param_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
 fn named_params(method: &str, params: &[String]) -> Result<Value, String> {
     let mut map = serde_json::Map::new();
+    let mut positional = Vec::new();
     for raw in params {
-        let (name, value) = raw
-            .split_once('=')
-            .ok_or_else(|| "non-named-argument passed to --named".to_string())?;
-        if map.contains_key(name) {
-            return Err(format!("Parameter {name} specified twice"));
+        match raw.split_once('=') {
+            Some((name, value)) if is_param_name(name) => {
+                map.insert(name.to_string(), named_param_value(method, name, value)?);
+            }
+            _ => positional.push(param_value(method, positional.len(), raw)?),
         }
-        map.insert(name.to_string(), named_param_value(method, name, value)?);
+    }
+    if !positional.is_empty() {
+        map.insert("args".to_string(), Value::Array(positional));
     }
     Ok(Value::Object(map))
 }
@@ -526,12 +589,13 @@ pub fn rpc_http(
 }
 
 #[doc(hidden)]
-pub fn connect_unix(path: &Path) -> Result<socket2::Socket, String> {
+pub fn connect_unix(path: &Path) -> Result<socket2::Socket, ConnectError> {
     let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)
-        .map_err(|e| format!("unix socket: {e}"))?;
-    let addr = socket2::SockAddr::unix(path).map_err(|e| format!("unix addr: {e}"))?;
+        .map_err(|e| ConnectError::from_io(|| format!("unix socket: {e}"), &e))?;
+    let addr = socket2::SockAddr::unix(path)
+        .map_err(|e| ConnectError::permanent(format!("unix addr: {e}")))?;
     sock.connect(&addr)
-        .map_err(|e| format!("connect {}: {e}", path.display()))?;
+        .map_err(|e| ConnectError::from_io(|| format!("connect {}: {e}", path.display()), &e))?;
     Ok(sock)
 }
 
@@ -563,13 +627,13 @@ pub fn format_result(v: &Value) -> String {
     }
 }
 
-fn connect_stream(cfg: &CliConfig) -> Result<RpcStream, String> {
+fn connect_stream(cfg: &CliConfig, tcp: Option<&(String, u16)>) -> Result<RpcStream, ConnectError> {
     let sock = socket_path(cfg);
     if cfg.rpc_url.is_none() && (cfg.socket.is_some() || sock.exists()) {
         Ok(RpcStream::Unix(connect_unix(&sock)?))
     } else {
-        let (host, port) = match cfg.rpc_url.as_deref() {
-            Some(u) => parse_rpc_addr(u)?,
+        let (host, port) = match tcp {
+            Some((h, p)) => (h.clone(), *p),
             None => ("127.0.0.1".into(), cfg.network.default_rpc_port()),
         };
         let stream = connect_tcp(&host, port)?;
@@ -597,6 +661,9 @@ fn rpc_call(
 #[doc(hidden)]
 pub fn dispatch_call(cfg: &CliConfig) -> Result<String, String> {
     if cfg.getinfo {
+        if cfg.command.is_some() || !cfg.params.is_empty() {
+            return Err("--getinfo takes no arguments".to_string());
+        }
         return getinfo(cfg);
     }
     let cmd = cfg.command.as_deref().ok_or_else(usage)?;
@@ -632,10 +699,12 @@ fn print_stdout(text: &str) -> ExitCode {
 }
 
 fn connect(cfg: &CliConfig) -> Result<RpcStream, String> {
+    let tcp = cfg.rpc_url.as_deref().map(parse_rpc_addr).transpose()?;
+    let attempt = || connect_stream(cfg, tcp.as_ref());
     if cfg.rpcwait {
-        retry_connect(|| connect_stream(cfg), RPCWAIT_ATTEMPTS, RPCWAIT_DELAY)
+        retry_connect(attempt, RPCWAIT_ATTEMPTS, RPCWAIT_DELAY)
     } else {
-        connect_stream(cfg)
+        attempt().map_err(|e| e.message)
     }
 }
 
@@ -663,8 +732,7 @@ fn format_getinfo(chain: &Value, network: &Value) -> Result<String, String> {
     let headers = getinfo_field(chain, "headers")?.to_string();
     let progress = getinfo_field(chain, "verificationprogress")?
         .as_f64()
-        .ok_or_else(|| "getinfo: verificationprogress not a number".to_string())?
-        * 100.0;
+        .ok_or_else(|| "getinfo: verificationprogress not a number".to_string())?;
     let difficulty = getinfo_field(chain, "difficulty")?.to_string();
     let connections_in = getinfo_field(network, "connections_in")?.to_string();
     let connections_out = getinfo_field(network, "connections_out")?.to_string();
@@ -674,19 +742,92 @@ fn format_getinfo(chain: &Value, network: &Value) -> Result<String, String> {
     let relayfee = getinfo_field(network, "relayfee")?
         .as_f64()
         .ok_or_else(|| "getinfo: relayfee not a number".to_string())?;
+    let bar = if progress < 0.99 {
+        progress_bar(progress)
+    } else {
+        String::new()
+    };
+    let percent = progress * 100.0;
+    let proxies = format_proxies(network);
+    let warnings = format_warnings(network);
     Ok(format!(
         "Chain: {chain_name}\n\
          Blocks: {blocks}\n\
          Headers: {headers}\n\
-         Verification progress: {progress:.2}%\n\
+         Verification progress: {bar}{percent:.4}%\n\
          Difficulty: {difficulty}\n\
          \n\
          Network: in {connections_in}, out {connections_out}, total {connections}\n\
          Version: {version}\n\
          Time offset (s): {timeoffset}\n\
-         Proxies: n/a\n\
-         Min tx relay fee rate (BTC/kvB): {relayfee:.8}"
+         Proxies: {proxies}\n\
+         Min tx relay fee rate (BTC/kvB): {relayfee:.8}\n\
+         \n\
+         Warnings: {warnings}"
     ))
+}
+
+#[doc(hidden)]
+pub fn progress_bar(progress: f64) -> String {
+    const INCREMENT: f64 = 0.05;
+    if !(0.0..=1.0).contains(&progress) {
+        return String::new();
+    }
+    let cells = |ratio: f64| {
+        let mut n = 0usize;
+        while (n as f64) < ratio {
+            n += 1;
+        }
+        n
+    };
+    format!(
+        "{}{} ",
+        "\u{2592}".repeat(cells(progress / INCREMENT)),
+        "\u{2591}".repeat(cells((1.0 - progress) / INCREMENT))
+    )
+}
+
+#[doc(hidden)]
+pub fn format_proxies(network: &Value) -> String {
+    let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+    if let Some(nets) = network.get("networks").and_then(Value::as_array) {
+        for net in nets {
+            let Some(proxy) = net
+                .get("proxy")
+                .and_then(Value::as_str)
+                .filter(|p| !p.is_empty())
+            else {
+                continue;
+            };
+            let name = net.get("name").and_then(Value::as_str).unwrap_or("");
+            match groups.iter().position(|(p, _)| p == proxy) {
+                Some(i) => groups[i].1.push(name.to_string()),
+                None => groups.push((proxy.to_string(), vec![name.to_string()])),
+            }
+        }
+    }
+    if groups.is_empty() {
+        return "n/a".to_string();
+    }
+    let formatted: Vec<String> = groups
+        .iter()
+        .map(|(proxy, names)| format!("{proxy} ({})", names.join(", ")))
+        .collect();
+    formatted.join(", ")
+}
+
+#[doc(hidden)]
+pub fn format_warnings(network: &Value) -> String {
+    let warnings: Vec<&str> = network
+        .get("warnings")
+        .and_then(Value::as_array)
+        .map(|w| w.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    if warnings.is_empty() {
+        "(none)".to_string()
+    } else {
+        warnings.join(", ")
+    }
 }
 
 fn getinfo_field<'a>(v: &'a Value, key: &str) -> Result<&'a Value, String> {
