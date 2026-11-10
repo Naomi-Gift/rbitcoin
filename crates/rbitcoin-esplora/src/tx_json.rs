@@ -8,7 +8,7 @@ use rbitcoin_net::MempoolHub;
 use rbitcoin_primitives::{Fk, Height};
 
 use rbitcoin_query::{ChainView, Query, QueryError, ScriptHashHistoryItem, ScriptHashUtxo};
-use rbitcoin_store::InputRecord;
+use rbitcoin_store::InputParent;
 use serde::Serialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
@@ -190,7 +190,7 @@ pub fn build_tx_json(
     network: Network,
     view: Option<&ChainView>,
 ) -> Result<Value, QueryError> {
-    let (wire, stored_inputs) = match query.reconstruct_tx_with_inputs(tx_fk) {
+    let (wire, stored_txid, parents) = match query.reconstruct_tx_with_inputs(tx_fk) {
         Ok(v) => v,
         Err(rbitcoin_store::StoreError::Pruned { .. }) => {
             return build_tx_json_pruned(query, tx_fk, network, view);
@@ -198,17 +198,12 @@ pub fn build_tx_json(
         Err(e) => return Err(e),
     };
     let status = status_for(query, tx_fk, view)?;
-    let stored_txid = query
-        .store()
-        .txs
-        .body_txid(tx_fk)
-        .unwrap_or_else(|_| wire.compute_txid().to_byte_array());
     tx_json_from_wire(
         query,
         &wire,
         network,
         status,
-        &stored_inputs,
+        &parents,
         stored_txid,
         None,
         None,
@@ -258,9 +253,8 @@ pub fn build_tx_json_pruned(
     network: Network,
     view: Option<&ChainView>,
 ) -> Result<Value, QueryError> {
-    let tx = query.store().get_tx(tx_fk)?;
-    let (_meta, outs) = query.store().get_tx_meta_and_outputs(tx_fk)?;
-    let txid = query.store().txs.body_txid(tx_fk).unwrap_or(tx.txid);
+    let (tx, outs) = query.store().get_tx_meta_and_outputs(tx_fk)?;
+    let txid = tx.txid;
     let status = status_for(query, tx_fk, view)?;
     let vout: Vec<Value> = outs
         .iter()
@@ -333,7 +327,7 @@ pub fn tx_json_from_wire(
     wire: &Transaction,
     network: Network,
     status: Value,
-    stored_inputs: &[InputRecord],
+    stored_inputs: &[InputParent],
     txid_bytes: [u8; 32],
     fee_override: Option<i64>,
     mempool: Option<&MempoolHub>,
@@ -444,7 +438,7 @@ pub fn tx_json_from_wire(
 #[doc(hidden)]
 pub fn prevout_json(
     query: &Query,
-    stored_inputs: &[InputRecord],
+    stored_inputs: &[InputParent],
     idx: usize,
     tin: &bitcoin::TxIn,
     network: Network,

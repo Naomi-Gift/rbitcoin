@@ -237,18 +237,19 @@ impl Query {
         ))
     }
 
-    /// [`Self::reconstruct_tx`] plus the input rows that load already read.
+    /// [`Self::reconstruct_tx`] plus the txid and parent edges that load already read.
     ///
-    /// Callers that need both the wire tx and `InputRecord`s (Esplora vin)
-    /// must not load the body a second time. Those rows are cloned into the
-    /// wire transaction. [`Self::reconstruct_tx`] does not clone them.
+    /// The wire transaction owns the input script and witness. Callers that
+    /// only need the parent fk and vout use the copied [`rbitcoin_store::InputParent`]s.
     pub fn reconstruct_tx_with_inputs(
         &self,
         tx_fk: Fk,
-    ) -> Result<(Transaction, Vec<rbitcoin_store::InputRecord>), QueryError> {
+    ) -> Result<(Transaction, [u8; 32], Vec<rbitcoin_store::InputParent>), QueryError> {
         let (rec, stored_outputs, stored_inputs) = self.filled_body(tx_fk)?;
-        let wire = Self::transaction_from_class_a(rec, stored_outputs, stored_inputs.clone());
-        Ok((wire, stored_inputs))
+        let txid = rec.txid;
+        let parents = stored_inputs.iter().map(|inp| inp.parent).collect();
+        let wire = Self::transaction_from_class_a(rec, stored_outputs, stored_inputs);
+        Ok((wire, txid, parents))
     }
 
     fn filled_body(
@@ -286,10 +287,7 @@ impl Query {
                 },
                 script_sig: ScriptBuf::from_bytes(inp.script_sig),
                 sequence: Sequence::from_consensus(inp.sequence),
-                witness: {
-                    let refs: Vec<&[u8]> = inp.witness.iter().map(|w| w.as_slice()).collect();
-                    Witness::from_slice(&refs)
-                },
+                witness: Witness::from(inp.witness),
             });
         }
         let mut output = Vec::with_capacity(stored_outputs.len());
