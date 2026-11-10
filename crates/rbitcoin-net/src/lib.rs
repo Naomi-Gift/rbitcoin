@@ -106,7 +106,7 @@ pub use rbitcoin_mempool::{
     AcceptError, AcceptResult, CoreDatTx, CoreMempoolDat, SelectBudget, Selected, UtxoProvider,
 };
 pub use reactor::{
-    acquire_armed_store_budget, hold_store_permit, off_pool, off_pool_budgeted,
+    acquire_armed_store_budget, finish_join, hold_store_permit, off_pool, off_pool_budgeted,
     release_store_permit, spawn_with_store_budget, with_store_budget, with_store_budget_waiters,
     BlockingRegion, StorePermitGuard,
 };

@@ -142,9 +142,13 @@ impl HeldBodies {
     }
 
     #[doc(hidden)]
-    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.by_hash.len()
+    }
+
+    #[doc(hidden)]
+    pub fn is_empty(&self) -> bool {
+        self.by_hash.is_empty()
     }
 
     #[doc(hidden)]
@@ -417,9 +421,13 @@ impl HeaderTips {
     }
 
     #[doc(hidden)]
-    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.by_hash.len()
+    }
+
+    #[doc(hidden)]
+    pub fn is_empty(&self) -> bool {
+        self.by_hash.is_empty()
     }
 
     #[doc(hidden)]

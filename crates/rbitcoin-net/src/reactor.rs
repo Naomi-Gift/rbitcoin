@@ -136,6 +136,18 @@ impl Drop for StoreBudgetWait {
     }
 }
 
+/// The child's `Ok` value. A panicked child resumes that payload. Cancel
+/// still aborts the caller.
+pub fn finish_join<T>(joined: Result<T, tokio::task::JoinError>, cancel: &'static str) -> T {
+    match joined {
+        Ok(value) => value,
+        Err(err) => match err.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(err) => panic!("{cancel}: {err}"),
+        },
+    }
+}
+
 /// `tokio::spawn` does not keep the task-local budget. Copy it into the
 /// child so a detached admit still waits for a store permit.
 pub fn spawn_with_store_budget<T: Send + 'static>(

@@ -743,7 +743,9 @@ pub fn stream_g_pages(
                 && session.free_sq() > 0
                 && in_flight < pool_n
             {
-                let slot = free_slots.pop().unwrap();
+                let Some(slot) = free_slots.pop() else {
+                    break;
+                };
                 let pi = next_page;
                 next_page += 1;
                 let page = page_ids[pi];
@@ -778,16 +780,15 @@ pub fn stream_g_pages(
             for (ud, res) in cqes {
                 let (kind, ep, slot) = crate::uring_session::unpack_ud(ud);
                 let slot = slot as usize;
-                if kind != crate::uring_session::KIND_MPHF_G
-                    || ep != epoch
-                    || slot >= pool_n
-                    || slot_page[slot].is_none()
-                {
+                if kind != crate::uring_session::KIND_MPHF_G || ep != epoch || slot >= pool_n {
                     session.poison();
                     return Err(StoreError::Corrupt("invariant: io_uring leftover cqe"));
                 }
+                let Some(pi) = slot_page[slot].take() else {
+                    session.poison();
+                    return Err(StoreError::Corrupt("invariant: io_uring leftover cqe"));
+                };
                 in_flight = in_flight.saturating_sub(1);
-                let pi = slot_page[slot].take().unwrap();
                 let page = page_ids[pi];
                 let need = g_page_need(n_bytes, page);
                 if res < 0 {

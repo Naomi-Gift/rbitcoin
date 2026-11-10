@@ -3967,17 +3967,19 @@ impl MempoolHub {
         tx: Transaction,
     ) -> Result<AcceptResult, AcceptError> {
         let hub = Arc::clone(self);
-        crate::reactor::spawn_with_store_budget(async move {
-            hub.accept_with_utxo_async(
-                tx,
-                TxOrigin::Relay(None),
-                AcceptPath::TestPackageMember,
-                Vec::new(),
-            )
-            .await
-        })
-        .await
-        .expect("tx admit")
+        crate::reactor::finish_join(
+            crate::reactor::spawn_with_store_budget(async move {
+                hub.accept_with_utxo_async(
+                    tx,
+                    TxOrigin::Relay(None),
+                    AcceptPath::TestPackageMember,
+                    Vec::new(),
+                )
+                .await
+            })
+            .await,
+            "tx admit",
+        )
     }
 
     /// [`Self::accept_tx_from_work`] on a task the caller cannot cancel.
@@ -3990,11 +3992,13 @@ impl MempoolHub {
         origin: TxOrigin,
     ) -> Result<AcceptResult, AcceptError> {
         let hub = Arc::clone(self);
-        crate::reactor::spawn_with_store_budget(
-            async move { hub.accept_tx_from_work(tx, origin).await },
+        crate::reactor::finish_join(
+            crate::reactor::spawn_with_store_budget(async move {
+                hub.accept_tx_from_work(tx, origin).await
+            })
+            .await,
+            "tx admit",
         )
-        .await
-        .expect("tx admit")
     }
 
     /// [`Self::accept_tx_defer_trim`] without a blocking thread across scripts.

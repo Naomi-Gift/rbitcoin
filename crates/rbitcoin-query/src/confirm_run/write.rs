@@ -71,6 +71,13 @@ pub fn hold_spindle(query: &Query) -> SpindleScope<'_> {
     scope
 }
 
+/// `Some` returns that batch. `None` is empty.
+pub fn take_queued_batch(
+    queued: &mut Option<Vec<([u8; 32], rbitcoin_primitives::Fk)>>,
+) -> Vec<([u8; 32], rbitcoin_primitives::Fk)> {
+    queued.take().unwrap_or_default()
+}
+
 #[doc(hidden)]
 pub fn submit_queued<'a>(
     query: &'a Query,
@@ -361,7 +368,7 @@ fn write_phase_inner(
     let early_drain = if query.store().datadir_hdd() {
         None
     } else {
-        Some(submit_queued(query, queued.take().unwrap()))
+        Some(submit_queued(query, take_queued_batch(&mut queued)))
     };
 
     let overlap = (|| -> Result<_, ConfirmError> {
@@ -457,7 +464,7 @@ fn write_phase_inner(
     let drain = if let Some(drain) = early_drain {
         drain
     } else {
-        submit_queued(query, queued.take().unwrap_or_default())
+        submit_queued(query, take_queued_batch(&mut queued))
     };
     spindle_mark("join");
     let t_join = Instant::now();
@@ -548,10 +555,14 @@ pub fn finish_post_commit_hashes(
     }
     let drain_max_fk = queued.iter().filter_map(|(_, fk)| fk.get()).max();
     let mut queued = Some(queued);
-    let early_drain = if query.store().datadir_hdd() || queued.as_ref().unwrap().is_empty() {
+    let queued_empty = match queued.as_ref() {
+        Some(batch) => batch.is_empty(),
+        None => true,
+    };
+    let early_drain = if query.store().datadir_hdd() || queued_empty {
         None
     } else {
-        Some(submit_queued(query, queued.take().unwrap()))
+        Some(submit_queued(query, take_queued_batch(&mut queued)))
     };
 
     let annotate_res = {
@@ -575,7 +586,7 @@ pub fn finish_post_commit_hashes(
     let drain = if let Some(drain) = early_drain {
         Some(drain)
     } else {
-        let batch = queued.take().unwrap_or_default();
+        let batch = take_queued_batch(&mut queued);
         if batch.is_empty() {
             None
         } else {

@@ -35,5 +35,9 @@ libc = "0.2"
 name = "suite"
 path = "tests/suite.rs"
 
+[[test]]
+name = "confirm_feed_wait"
+path = "tests/confirm_feed_wait.rs"
+
 [lints]
 workspace = true

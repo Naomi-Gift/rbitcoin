@@ -255,6 +255,18 @@ impl Default for ConfirmFeed {
     }
 }
 
+/// 20ms feed wait. A poisoned mutex returns the guard. The lookup thread
+/// stays up. The `Ok` arm is `wait_timeout`'s guard and does not call
+/// `into_inner`.
+pub(crate) fn wait_feed_timeout<'a>(
+    cv: &std::sync::Condvar,
+    guard: std::sync::MutexGuard<'a, ConfirmFeedInner>,
+) -> std::sync::MutexGuard<'a, ConfirmFeedInner> {
+    cv.wait_timeout(guard, Duration::from_millis(20))
+        .unwrap_or_else(|err| err.into_inner())
+        .0
+}
+
 impl ConfirmFeed {
     pub fn new() -> Self {
         Self {
@@ -440,10 +452,7 @@ impl ConfirmFeed {
     pub fn wait_claims_below(&self, height: u32, stop: impl Fn() -> bool) {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         while g.inflight.iter().any(|&h| h < height) && !stop() {
-            (g, _) = self
-                .cv
-                .wait_timeout(g, Duration::from_millis(20))
-                .unwrap_or_else(|e| e.into_inner());
+            g = wait_feed_timeout(&self.cv, g);
         }
     }
 
@@ -3165,10 +3174,7 @@ pub fn spawn_confirm_engine(
                 }
                 if feed.held() {
                     let g = feed.inner.lock().unwrap_or_else(|err| err.into_inner());
-                    let _ = feed
-                        .cv
-                        .wait_timeout(g, Duration::from_millis(20))
-                        .unwrap_or_else(|err| err.into_inner());
+                    drop(wait_feed_timeout(&feed.cv, g));
                     continue;
                 }
                 if hub.query.take_disconnect(&mut disco_seen).is_some() {
@@ -3192,7 +3198,7 @@ pub fn spawn_confirm_engine(
                     if feed.stopped() {
                         break;
                     }
-                    let (_gg, _) = feed.cv.wait_timeout(g, Duration::from_millis(20)).unwrap();
+                    drop(wait_feed_timeout(&feed.cv, g));
                     confirm_thr_stats::add_lookup_send_wait(&stats, t_wait.elapsed());
                     confirm_thr_stats::add_lookup_claim(&stats, t_wait.elapsed());
                     continue;
@@ -3212,7 +3218,7 @@ pub fn spawn_confirm_engine(
                     if feed.stopped() {
                         break;
                     }
-                    let _ = feed.cv.wait_timeout(g, Duration::from_millis(20)).unwrap();
+                    drop(wait_feed_timeout(&feed.cv, g));
                     confirm_thr_stats::add_lookup_claim(&stats, t_wait.elapsed());
                     continue;
                 }
@@ -3411,7 +3417,7 @@ pub fn spawn_confirm_engine(
                     if feed.stopped() {
                         break;
                     }
-                    let (_gg, _) = feed.cv.wait_timeout(g, Duration::from_millis(20)).unwrap();
+                    drop(wait_feed_timeout(&feed.cv, g));
                     confirm_thr_stats::add_lookup_send_wait(&stats, t_wait.elapsed());
                     confirm_thr_stats::add_lookup_claim(&stats, t_wait.elapsed());
                 }

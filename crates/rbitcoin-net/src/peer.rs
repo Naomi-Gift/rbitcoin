@@ -6754,24 +6754,26 @@ pub async fn on_tx(
             let hub_arc = hub.shared_arc();
             // The blocksonly note shares the admit task. Aborting this
             // session during script verify must not skip the rebroadcast.
-            let admitted = crate::reactor::spawn_with_store_budget(async move {
-                let result = mp_task
-                    .accept_tx_from_work(tx_task, crate::tx_relay::TxOrigin::Relay(from))
-                    .await;
-                if let Ok(r) = &result {
-                    if !mp_task.relay_enabled() {
-                        mp_task.note_unbroadcast(r.txid);
-                        mp_task.rebroadcast_unbroadcast();
-                        mp_task.notify_inv_flush();
-                        if let (Some(h), Some(ph)) = (hub_arc.as_ref(), peers.as_ref()) {
-                            flush_tx_invs(h, ph.as_ref());
+            let admitted = crate::reactor::finish_join(
+                crate::reactor::spawn_with_store_budget(async move {
+                    let result = mp_task
+                        .accept_tx_from_work(tx_task, crate::tx_relay::TxOrigin::Relay(from))
+                        .await;
+                    if let Ok(r) = &result {
+                        if !mp_task.relay_enabled() {
+                            mp_task.note_unbroadcast(r.txid);
+                            mp_task.rebroadcast_unbroadcast();
+                            mp_task.notify_inv_flush();
+                            if let (Some(h), Some(ph)) = (hub_arc.as_ref(), peers.as_ref()) {
+                                flush_tx_invs(h, ph.as_ref());
+                            }
                         }
                     }
-                }
-                result
-            })
-            .await
-            .expect("tx admit");
+                    result
+                })
+                .await,
+                "tx admit",
+            );
             match admitted {
                 Ok(_r) => {
                     mp.resolve_tx_request(&txid, &wtxid, true);
