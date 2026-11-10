@@ -65,6 +65,14 @@ struct OpenPage {
     base: Option<Arc<[u8]>>,
 }
 
+/// A slot `keep` rejected from an image that may already have been copied
+/// onto `spent.body`.
+struct BodyClear {
+    page_off: u64,
+    rel: u16,
+    meta: [u8; SLOT],
+}
+
 struct CommittedPage {
     image: Arc<[u8]>,
     log_off: u64,
@@ -90,6 +98,11 @@ struct CommitSnapshot {
 struct Inner {
     /// Slots confirm has noted since the last freeze.
     open: HashMap<u64, OpenPage>,
+    /// Notes taken while a held commit is filtered. They belong to a later
+    /// checkpoint: this one already sampled its height.
+    later: HashMap<u64, OpenPage>,
+    /// `later` is the directory `note_slots` writes until the snapshot is copied.
+    holding_filter: bool,
     /// The generation the sync thread is composing. Readers still see it.
     frozen: HashMap<u64, OpenPage>,
     committed: HashMap<u64, CommittedPage>,
@@ -183,6 +196,8 @@ impl SpendPageLog {
             commit_io: Mutex::new(()),
             inner: Mutex::new(Inner {
                 open: HashMap::new(),
+                later: HashMap::new(),
+                holding_filter: false,
                 frozen: HashMap::new(),
                 committed: HashMap::new(),
                 cooling: Vec::new(),
@@ -253,6 +268,9 @@ impl SpendPageLog {
         let page_off = abs & !(BODY_PAGE_SIZE - 1);
         let rel = ((abs - page_off) / SLOT as u64) as u16;
         let g = self.lock();
+        if let Some(meta) = page_hit(g.later.get(&page_off), rel) {
+            return Some(meta);
+        }
         if let Some(meta) = page_hit(g.open.get(&page_off), rel) {
             return Some(meta);
         }
@@ -278,27 +296,17 @@ impl SpendPageLog {
                 if (rel as usize) >= (BODY_PAGE_SIZE as usize / SLOT) {
                     return Err(StoreError::Corrupt("spend page slot past page"));
                 }
-                if !g.open.contains_key(&page_off) {
-                    let base = if g.frozen.contains_key(&page_off) {
-                        None
-                    } else {
-                        g.committed.get(&page_off).map(|c| Arc::clone(&c.image))
-                    };
-                    g.open.insert(
-                        page_off,
-                        OpenPage {
-                            slots: Vec::new(),
-                            base,
-                        },
-                    );
-                }
-                let Some(page) = g.open.get_mut(&page_off) else {
-                    return Err(StoreError::Corrupt("spend page directory missing"));
-                };
-                if let Some(slot) = page.slots.iter_mut().find(|(r, _)| *r == rel) {
-                    slot.1 = meta;
+                let base = if g.holding_filter || g.frozen.contains_key(&page_off) {
+                    None
                 } else {
-                    page.slots.push((rel, meta));
+                    g.committed.get(&page_off).map(|c| Arc::clone(&c.image))
+                };
+                let pages = if g.holding_filter {
+                    &mut g.later
+                } else {
+                    &mut g.open
+                };
+                if insert_note(pages, page_off, rel, meta, base)? {
                     g.open_edges = g.open_edges.saturating_add(1);
                     added = true;
                 }
@@ -407,21 +415,34 @@ impl SpendPageLog {
                 g.fold_held = true;
             }
             g.compose_height = Some(height);
+            // Notes taken while `keep` walks the held image are not part of
+            // this height. The walk does not hold the utxo view, so a
+            // replacement block can land here.
+            if g.fold_held {
+                g.holding_filter = true;
+            }
         }
         let _clear_compose = ClearCompose(self);
-        self.explode_held(&mut keep)?;
+        let _release_later = ReleaseLater(self);
+        let mut clears = self.explode_held(&mut keep)?;
         let Some(snap) = self.snapshot_commit() else {
-            return Ok(());
+            self.scrub_open_notes(&mut keep)?;
+            let pages = compose_kept_pages(&mut read_page, published, &[], &clears)?;
+            if pages.is_empty() {
+                return Ok(());
+            }
+            return self.store_pending(height, pages, Vec::new(), Vec::new(), &[]);
         };
         if snap.froze {
             self.pace.notify_room();
         }
-        let (kept, rejected) = filter_kept_pages(&mut keep, snap.pages)?;
-        if kept.is_empty() {
+        let (kept, rejected, more) = filter_kept_pages(&mut keep, snap.pages)?;
+        clears.extend(more);
+        let pages = compose_kept_pages(&mut read_page, published, &kept, &clears)?;
+        if pages.is_empty() {
             self.drop_frozen_pages(&rejected);
             return Ok(());
         }
-        let pages = compose_kept_pages(&mut read_page, published, &kept)?;
         self.scrub_open_notes(&mut keep)?;
         let carried = {
             let g = self.lock();
@@ -508,14 +529,14 @@ impl SpendPageLog {
     /// `keep` runs before any directory change. A `keep` error leaves the
     /// commit file and the committed images where they were. Live slots are
     /// put back into `open` for the next compose.
-    fn explode_held<K>(&self, keep: &mut K) -> Result<(), StoreError>
+    fn explode_held<K>(&self, keep: &mut K) -> Result<Vec<BodyClear>, StoreError>
     where
         K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
     {
         let held: Vec<(u64, Arc<[u8]>)> = {
             let g = self.lock();
             if !g.fold_held {
-                return Ok(());
+                return Ok(Vec::new());
             }
             g.committed
                 .iter()
@@ -523,6 +544,7 @@ impl SpendPageLog {
                 .collect()
         };
         let mut restored: Vec<KeptPage> = Vec::new();
+        let mut cleared: Vec<BodyClear> = Vec::new();
         for (page_off, image) in &held {
             let mut slots = Vec::new();
             let n = image.len() / SLOT;
@@ -531,7 +553,15 @@ impl SpendPageLog {
                     continue;
                 }
                 let meta = slot_from_image(image, rel as u16);
-                if meta == [0u8; SLOT] || !keep(&meta)? {
+                if meta == [0u8; SLOT] {
+                    continue;
+                }
+                if !keep(&meta)? {
+                    cleared.push(BodyClear {
+                        page_off: *page_off,
+                        rel: rel as u16,
+                        meta,
+                    });
                     continue;
                 }
                 slots.push((rel as u16, meta));
@@ -542,7 +572,7 @@ impl SpendPageLog {
         }
         let mut g = self.lock();
         if !g.fold_held {
-            return Ok(());
+            return Ok(Vec::new());
         }
         g.committed.clear();
         g.fold_held = false;
@@ -569,7 +599,7 @@ impl SpendPageLog {
         if empty {
             self.delete_generation_files();
         }
-        Ok(())
+        Ok(cleared)
     }
 
     /// Freeze a new open set, or reuse the snapshot a failed compose left.
@@ -579,17 +609,21 @@ impl SpendPageLog {
     /// edges those later notes added stay counted.
     fn snapshot_commit(&self) -> Option<CommitSnapshot> {
         let mut g = self.lock();
+        g.holding_filter = false;
         let reuse = !g.frozen.is_empty();
         if !reuse && g.open.is_empty() {
             if !g.fold_held {
                 g.cool_through = g.generation;
             }
+            merge_later(&mut g, false);
             return None;
         }
-        if !reuse {
+        let reset_edges = if !reuse {
             g.frozen = std::mem::take(&mut g.open);
-            g.open_edges = 0;
-        }
+            true
+        } else {
+            false
+        };
         let mut pages: SnapshotPages = g
             .frozen
             .iter()
@@ -604,6 +638,7 @@ impl SpendPageLog {
             })
             .collect();
         fold_open_into_snapshot(&mut pages, &g.open, &g.committed);
+        merge_later(&mut g, reset_edges);
         Some(CommitSnapshot {
             pages,
             froze: !reuse,
@@ -802,6 +837,7 @@ impl SpendPageLog {
                 .filter(|(off, page)| {
                     page.generation <= cool_through
                         && !g.open.contains_key(*off)
+                        && !g.later.contains_key(*off)
                         && !g.frozen.contains_key(*off)
                 })
                 .map(|(off, page)| (*off, page.generation, Arc::clone(&page.image)))
@@ -819,7 +855,10 @@ impl SpendPageLog {
                 if g.fold_held {
                     break;
                 }
-                if g.open.contains_key(&off) || g.frozen.contains_key(&off) {
+                if g.open.contains_key(&off)
+                    || g.later.contains_key(&off)
+                    || g.frozen.contains_key(&off)
+                {
                     continue;
                 }
             }
@@ -871,6 +910,7 @@ impl SpendPageLog {
         }
         if g.committed.is_empty()
             && g.open.is_empty()
+            && g.later.is_empty()
             && g.frozen.is_empty()
             && g.pending.is_none()
             && g.compose_height.is_none()
@@ -941,6 +981,19 @@ struct ClearCompose<'a>(&'a SpendPageLog);
 impl Drop for ClearCompose<'_> {
     fn drop(&mut self) {
         self.0.lock().compose_height = None;
+    }
+}
+
+/// Puts notes taken during a held filter back into `open` if `snapshot_commit`
+/// did not.
+struct ReleaseLater<'a>(&'a SpendPageLog);
+
+impl Drop for ReleaseLater<'_> {
+    fn drop(&mut self) {
+        let mut g = self.0.lock();
+        if g.holding_filter || !g.later.is_empty() {
+            merge_later(&mut g, false);
+        }
     }
 }
 
@@ -1025,17 +1078,25 @@ fn carried_pages(
 fn filter_kept_pages<K>(
     keep: &mut K,
     snapshot: SnapshotPages,
-) -> Result<(SnapshotPages, Vec<u64>), StoreError>
+) -> Result<(SnapshotPages, Vec<u64>, Vec<BodyClear>), StoreError>
 where
     K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
 {
     let mut kept = Vec::new();
     let mut rejected = Vec::new();
+    let mut clears = Vec::new();
     for (page_off, mut page) in snapshot {
+        let from_body = page.base.is_none();
         let mut slots = Vec::new();
         for slot in page.slots.drain(..) {
             if keep(&slot.1)? {
                 slots.push(slot);
+            } else if from_body {
+                clears.push(BodyClear {
+                    page_off,
+                    rel: slot.0,
+                    meta: slot.1,
+                });
             }
         }
         page.slots = slots;
@@ -1045,45 +1106,162 @@ where
             kept.push((page_off, page));
         }
     }
-    Ok((kept, rejected))
+    Ok((kept, rejected, clears))
 }
 
 fn compose_kept_pages<F>(
     read_page: &mut F,
     published: u64,
     kept: &[(u64, OpenPage)],
+    clears: &[BodyClear],
 ) -> Result<PageImages, StoreError>
 where
     F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
 {
-    let mut pages = Vec::with_capacity(kept.len());
-    for (page_off, page) in kept {
-        if *page_off >= published {
-            return Err(StoreError::Corrupt(
-                "spend page log composed past the published body",
-            ));
-        }
-        let len = BODY_PAGE_SIZE.min(published - page_off) as usize;
-        let mut buf = if let Some(base) = &page.base {
-            base[..len.min(base.len())].to_vec()
-        } else {
-            read_page(*page_off, len)?
-        };
-        if buf.len() < len {
-            buf.resize(len, 0);
-        }
-        buf.truncate(len);
-        for &(rel, meta) in &page.slots {
-            let i = rel as usize * SLOT;
-            if i + SLOT > buf.len() {
-                return Err(StoreError::Corrupt("spend page slot past published"));
-            }
-            buf[i..i + SLOT].copy_from_slice(&meta);
-        }
-        pages.push((*page_off, Arc::from(buf.into_boxed_slice())));
+    let mut clear_at: HashMap<u64, Vec<(u16, [u8; SLOT])>> = HashMap::new();
+    for clear in clears {
+        clear_at
+            .entry(clear.page_off)
+            .or_default()
+            .push((clear.rel, clear.meta));
     }
-    pages.sort_by_key(|(off, _)| *off);
+    let mut offs: Vec<u64> = kept.iter().map(|(off, _)| *off).collect();
+    for off in clear_at.keys() {
+        if !offs.contains(off) {
+            offs.push(*off);
+        }
+    }
+    offs.sort_unstable();
+    offs.dedup();
+    let kept_at: HashMap<u64, &OpenPage> = kept.iter().map(|(off, page)| (*off, page)).collect();
+    let mut pages = Vec::with_capacity(offs.len());
+    for page_off in offs {
+        if let Some(image) = compose_one_page(
+            &mut *read_page,
+            published,
+            page_off,
+            kept_at.get(&page_off).copied(),
+            clear_at.get(&page_off),
+        )? {
+            pages.push((page_off, image));
+        }
+    }
     Ok(pages)
+}
+
+/// `None` when the page has no kept slot and the body does not still hold a
+/// rejected spend. A matching body slot is zeroed so the next fold clears it.
+fn compose_one_page<F>(
+    read_page: &mut F,
+    published: u64,
+    page_off: u64,
+    kept: Option<&OpenPage>,
+    clears: Option<&Vec<(u16, [u8; SLOT])>>,
+) -> Result<Option<Arc<[u8]>>, StoreError>
+where
+    F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
+{
+    if page_off >= published {
+        return Err(StoreError::Corrupt(
+            "spend page log composed past the published body",
+        ));
+    }
+    let len = BODY_PAGE_SIZE.min(published - page_off) as usize;
+    let base = kept.and_then(|page| page.base.as_ref());
+    let mut buf = if let Some(base) = base {
+        base[..len.min(base.len())].to_vec()
+    } else {
+        read_page(page_off, len)?
+    };
+    if buf.len() < len {
+        buf.resize(len, 0);
+    }
+    buf.truncate(len);
+    if let Some(page) = kept {
+        for &(rel, meta) in &page.slots {
+            write_slot(&mut buf, rel, &meta)?;
+        }
+    }
+    let mut zeroed = false;
+    if base.is_none() {
+        if let Some(clears) = clears {
+            for &(rel, meta) in clears {
+                if kept.is_some_and(|page| page.slots.iter().any(|(r, _)| *r == rel)) {
+                    continue;
+                }
+                if slot_from_image(&buf, rel) == meta {
+                    write_slot(&mut buf, rel, &[0u8; SLOT])?;
+                    zeroed = true;
+                }
+            }
+        }
+    }
+    let keep_page = kept.is_some_and(|page| !page.slots.is_empty()) || zeroed;
+    if !keep_page {
+        return Ok(None);
+    }
+    Ok(Some(Arc::from(buf.into_boxed_slice())))
+}
+
+fn write_slot(buf: &mut [u8], rel: u16, meta: &[u8; SLOT]) -> Result<(), StoreError> {
+    let i = rel as usize * SLOT;
+    if i + SLOT > buf.len() {
+        return Err(StoreError::Corrupt("spend page slot past published"));
+    }
+    buf[i..i + SLOT].copy_from_slice(meta);
+    Ok(())
+}
+
+fn insert_note(
+    pages: &mut HashMap<u64, OpenPage>,
+    page_off: u64,
+    rel: u16,
+    meta: [u8; SLOT],
+    base_if_new: Option<Arc<[u8]>>,
+) -> Result<bool, StoreError> {
+    pages.entry(page_off).or_insert_with(|| OpenPage {
+        slots: Vec::new(),
+        base: base_if_new,
+    });
+    let Some(page) = pages.get_mut(&page_off) else {
+        return Err(StoreError::Corrupt("spend page directory missing"));
+    };
+    if let Some(slot) = page.slots.iter_mut().find(|(r, _)| *r == rel) {
+        slot.1 = meta;
+        return Ok(false);
+    }
+    page.slots.push((rel, meta));
+    Ok(true)
+}
+
+/// Notes taken during a held filter join `open` after the snapshot is copied.
+///
+/// `reset_edges` is the freeze path: `open` was just emptied, so the edge
+/// count starts at the notes that waited in `later`.
+fn merge_later(g: &mut Inner, reset_edges: bool) {
+    g.holding_filter = false;
+    let later = std::mem::take(&mut g.later);
+    if reset_edges {
+        g.open_edges = 0;
+    }
+    for (off, page) in later {
+        let n = page.slots.len() as u64;
+        if let Some(dst) = g.open.get_mut(&off) {
+            let before = dst.slots.len() as u64;
+            overlay_slots(&mut dst.slots, &page.slots);
+            let added = (dst.slots.len() as u64).saturating_sub(before);
+            if reset_edges {
+                g.open_edges = g.open_edges.saturating_add(dst.slots.len() as u64);
+            } else {
+                g.open_edges = g.open_edges.saturating_sub(n.saturating_sub(added));
+            }
+        } else if reset_edges {
+            g.open_edges = g.open_edges.saturating_add(n);
+            g.open.insert(off, page);
+        } else {
+            g.open.insert(off, page);
+        }
+    }
 }
 
 fn page_hit(page: Option<&OpenPage>, rel: u16) -> Option<[u8; SLOT]> {

@@ -14,7 +14,11 @@ Fixed
   not publish a shorter `spent.body` end while confirm is still appending. The
   body copy does not hold the utxo view. A checkpoint below a loaded commit height
   filters that image before fold, even when the held bit was never written.
-  Unlinking a finished generation takes the same lock as a fold hold. A missing or short `spend.pages` file beside a
+  Unlinking a finished generation takes the same lock as a fold hold. A spend
+  noted while that filter walks the image stays out of the checkpoint height
+  already sampled, so a later fold does not seal it at the lower tip. A
+  rejected spend that `spent.body` already holds is zeroed in the next image
+  instead of being copied back. A missing or short `spend.pages` file beside a
   commit that names bytes refuses to open. The next confirm insert waits at
   2,000,000 open edges. A 1 GiB log asks for one extra checkpoint. Neither is a
   knob.

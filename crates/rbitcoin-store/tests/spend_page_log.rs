@@ -613,6 +613,129 @@ fn loaded_commit_above_the_checkpoint_does_not_carry_a_stale_page() {
 }
 
 #[test]
+fn note_during_explode_is_not_folded_at_the_lower_height() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let old = [5u8, 1, 2, 3, 4, 5, 6, 7];
+    let fresh = [6u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, old)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let mut noted = false;
+    log.commit_open(4, 8192, zeros, |meta| {
+        if !noted {
+            noted = true;
+            log.note_slots(&[(4096, fresh)]).unwrap();
+        }
+        Ok(*meta == fresh)
+    })
+    .unwrap();
+    assert!(noted);
+    // The replacement spend is still best-chain. This checkpoint sampled 4.
+    assert_eq!(log.slot(4096), Some(fresh));
+    log.commit_open(4, 8192, zeros, |_| Ok(false)).unwrap();
+    let mut wrote_fresh = false;
+    log.fold_into(
+        |_off, image| {
+            if image.windows(8).any(|w| w == fresh) {
+                wrote_fresh = true;
+            }
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(
+        !wrote_fresh,
+        "a spend noted during explode must not fold at the lower checkpoint"
+    );
+    assert_ne!(log.slot(4096), Some(fresh));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+fn body_with(slots: &[(u64, [u8; 8])]) -> impl Fn(u64, usize) -> Result<Vec<u8>, StoreError> + '_ {
+    move |off, len| {
+        let mut buf = vec![0u8; len];
+        for &(abs, meta) in slots {
+            if abs < off {
+                continue;
+            }
+            let at = (abs - off) as usize;
+            if at + 8 <= buf.len() {
+                buf[at..at + 8].copy_from_slice(&meta);
+            }
+        }
+        Ok(buf)
+    }
+}
+
+#[test]
+fn rejected_spend_already_on_the_body_is_not_folded() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let live = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let stale = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, live), (24, stale)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let planted = [(16, live), (24, stale)];
+    let read = body_with(&planted);
+    log.commit_open(4, 8192, &read, |meta| Ok(meta[0] == 1))
+        .unwrap();
+    assert_eq!(log.slot(16), Some(live));
+    assert_ne!(log.slot(24), Some(stale));
+    log.commit_open(4, 8192, &read, |meta| Ok(meta[0] == 1))
+        .unwrap();
+    log.fold_into(
+        |_off, image| {
+            assert!(
+                !image.windows(8).any(|w| w == stale),
+                "a rejected spend already on the body must not be folded again"
+            );
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn rejected_page_already_on_the_body_is_cleared() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let stale = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, stale)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let planted = [(16, stale)];
+    let read = body_with(&planted);
+    log.commit_open(4, 8192, &read, |_| Ok(false)).unwrap();
+    assert_ne!(log.slot(16), Some(stale));
+    log.commit_open(4, 8192, &read, |_| Ok(false)).unwrap();
+    let mut cleared = false;
+    log.fold_into(
+        |off, image| {
+            assert!(
+                !image.windows(8).any(|w| w == stale),
+                "a rejected page already on the body must not be folded again"
+            );
+            if off == 16 && image.len() >= 8 && image[..8] == [0u8; 8] {
+                cleared = true;
+            }
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert!(
+        cleared,
+        "fold must write zeros over a rejected spend the body already has"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn hold_ignores_a_commit_at_or_below_the_tip() {
     let d = dir();
     let log = SpendPageLog::create(&d);
