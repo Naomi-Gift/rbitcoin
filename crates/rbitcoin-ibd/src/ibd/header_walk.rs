@@ -1190,7 +1190,7 @@ pub(crate) fn drop_dead_path(
             }
         }
     }
-    st.confirm_quiesce = true;
+    st.quiesce_plan();
     st.max_ready_height = st.max_ready_height.min(keep);
     let next = keep.saturating_add(1);
     st.densify_scan_lo = st.densify_scan_lo.min(next);
@@ -1286,7 +1286,7 @@ pub fn rewind_to(st: &mut IbdWorkState, hub: &ChainHub, height: u32, dead: Optio
     recompute_witness(st);
     drop_lead_past_tip(st, hub);
     mark_unproved_if_below_floor(st, hub);
-    st.confirm_quiesce = true;
+    st.quiesce_plan();
     publish_header_tip(st, hub);
     save_adopt(st, hub);
 }

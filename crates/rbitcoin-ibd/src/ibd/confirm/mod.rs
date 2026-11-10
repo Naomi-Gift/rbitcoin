@@ -491,6 +491,19 @@ impl ConfirmFeed {
         self.cv.notify_one();
     }
 
+    /// Drop ready and inflight and bump the epoch. The lead stays reserved.
+    /// A header-walk rewind uses this: the confirmed tip did not move, and
+    /// giving the bytes back lets lookup spend them while the old write
+    /// still commits.
+    pub fn drop_plan(&self) {
+        {
+            let mut g = self.inner.lock().unwrap();
+            g.ready.clear();
+            g.inflight.clear();
+        }
+        self.publish_cleared_plan();
+    }
+
     /// Drop ready + inflight so a rewind cannot commit a stale plan.
     ///
     /// Bumps [`Self::epoch`] so load/scripts/write still holding a pre-rewind
@@ -500,7 +513,8 @@ impl ConfirmFeed {
     /// Reservations above `confirmed_tip` go back to the byte remainder. A
     /// height at or below that tip stays reserved: its Accepted event may
     /// still be waiting, and refunding it lets the next lookup spend those
-    /// bytes again.
+    /// bytes again. Call this when the confirmed tip moved, not when only
+    /// the header walk did.
     pub fn clear(&self, confirmed_tip: u32) {
         let mut g = self.inner.lock().unwrap();
         g.ready.clear();
@@ -518,6 +532,10 @@ impl ConfirmFeed {
             self.lead_bounds_dirty.store(true, Ordering::Release);
         }
         drop(g);
+        self.publish_cleared_plan();
+    }
+
+    fn publish_cleared_plan(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         self.force_single_until.store(u32::MAX, Ordering::Release);
         self.cv.notify_all();

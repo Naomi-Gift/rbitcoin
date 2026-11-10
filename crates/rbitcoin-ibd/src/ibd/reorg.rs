@@ -684,7 +684,7 @@ pub fn commit_header_rewind(
         }
     }
     st.reorg.clear_explore();
-    st.confirm_quiesce = true;
+    st.quiesce_refund();
 }
 
 pub fn apply_header_rewind(

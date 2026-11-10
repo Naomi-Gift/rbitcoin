@@ -7269,6 +7269,90 @@ fn a_promoted_fork_keeps_the_charge_for_a_block_that_stays() {
     );
 }
 
+/// The header walk rewound. The confirmed tip did not. Reservations above
+/// that tip stay spent, and lookup cannot buy the same blocks again.
+#[test]
+fn a_header_rewind_does_not_give_the_lead_back() {
+    use rbitcoin_ibd::ibd::confirm::ConfirmFeed;
+    use rbitcoin_ibd::ibd::events::take_confirm_events;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::time::Instant;
+
+    let (_dir, hub, mut st, gen) = opened("unproven-header-rewind-lead", true);
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10_000), 0, Some(100));
+    assert_eq!(
+        rbitcoin_ibd::ibd::confirm::take_unproven_lead(&feed, Some(&[40]), vec![5]),
+        vec![5]
+    );
+    let hash = mine(gen.block_hash(), 9).block_hash();
+    feed.note(5, hash);
+    let epoch = feed.epoch.load(Ordering::Acquire);
+    rewind_to(&mut st, &hub, 0, None);
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(tx);
+    let write_next = AtomicU32::new(0);
+    let max_ready = AtomicU32::new(0);
+    let mut progress = Instant::now();
+    let _ = take_confirm_events(
+        &mut st,
+        &hub,
+        &rx,
+        &write_next,
+        &max_ready,
+        &mut progress,
+        Some(&feed),
+    );
+    let g = feed.inner.lock().unwrap();
+    assert!(
+        g.lead_reserved.contains_key(&5),
+        "a header rewind does not return a reservation the confirmed tip still holds"
+    );
+    assert_eq!(g.lead_bytes_left, Some(60));
+    assert!(g.ready.is_empty(), "the confirm plan is still dropped");
+    assert!(feed.epoch.load(Ordering::Acquire) > epoch);
+}
+
+/// The confirmed tip moved. Reservations above it come back so the new
+/// chain can spend the lead. The plan is still dropped.
+#[test]
+fn a_confirmed_rewind_returns_reservations_above_the_new_tip() {
+    use rbitcoin_ibd::ibd::confirm::ConfirmFeed;
+    use rbitcoin_ibd::ibd::events::take_confirm_events;
+    use rbitcoin_ibd::ibd::state::ConfirmQuiesce;
+    use std::sync::atomic::AtomicU32;
+    use std::time::Instant;
+
+    let (_dir, hub, mut st, gen) = opened("unproven-confirmed-rewind-lead", true);
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10_000), 0, Some(100));
+    assert_eq!(
+        rbitcoin_ibd::ibd::confirm::take_unproven_lead(&feed, Some(&[40]), vec![5]),
+        vec![5]
+    );
+    feed.note(5, mine(gen.block_hash(), 10).block_hash());
+    st.quiesce_refund();
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(tx);
+    let write_next = AtomicU32::new(0);
+    let max_ready = AtomicU32::new(0);
+    let mut progress = Instant::now();
+    let _ = take_confirm_events(
+        &mut st,
+        &hub,
+        &rx,
+        &write_next,
+        &max_ready,
+        &mut progress,
+        Some(&feed),
+    );
+    let g = feed.inner.lock().unwrap();
+    assert!(g.lead_reserved.is_empty());
+    assert_eq!(g.lead_bytes_left, Some(100));
+    assert!(g.ready.is_empty());
+    assert_eq!(st.confirm_quiesce, ConfirmQuiesce::Live);
+}
+
 /// A rewind already marked this drain stale. An accept for a height above
 /// the new tip is the chain that was left.
 #[test]
@@ -7280,7 +7364,7 @@ fn a_stale_accept_above_the_rewound_tip_does_not_spend_the_lead() {
 
     let (_dir, hub, mut st, _gen) = opened("unproven-stale-accept", true);
     st.header_walk.witness_height = Some(10);
-    st.confirm_quiesce = true;
+    st.confirm_quiesce = rbitcoin_ibd::ibd::state::ConfirmQuiesce::Plan;
     let hash = mine(hub.tip_hash().unwrap(), 4).block_hash();
     let (tx, rx) = std::sync::mpsc::channel();
     tx.send(ConfirmEvent::Accepted {
@@ -7551,7 +7635,10 @@ fn a_rewind_drops_a_match_above_the_new_tip() {
     rewind_to(&mut st, &hub, 0, None);
     assert!(st.header_walk.witness_height.is_none());
     assert!(st.header_walk.lead_class_a.is_empty());
-    assert!(st.confirm_quiesce);
+    assert_eq!(
+        st.confirm_quiesce,
+        rbitcoin_ibd::ibd::state::ConfirmQuiesce::Plan
+    );
 }
 
 /// An empty rewind of the header walk can sit under blocks already confirmed.

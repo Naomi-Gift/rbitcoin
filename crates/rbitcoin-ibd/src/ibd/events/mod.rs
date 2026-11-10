@@ -1270,7 +1270,7 @@ pub fn take_confirm_events(
                 // here runs while the coordinator holds `shared`. A rewind
                 // already marked this drain stale, so a height above the new
                 // tip is the chain that was left and must not be charged.
-                if !st.confirm_quiesce || height <= tip {
+                if st.confirm_quiesce == super::state::ConfirmQuiesce::Live || height <= tip {
                     super::header_walk::note_unproven_class_a(st, height, wire_bytes);
                     if let Some(f) = feed {
                         f.release_lead_reserve(height);
@@ -1310,11 +1310,13 @@ pub fn take_confirm_events(
             }
         }
     }
-    if st.confirm_quiesce {
-        if let Some(f) = feed {
-            f.clear(hub.tip_height().unwrap_or(0));
+    let quiesce = std::mem::replace(&mut st.confirm_quiesce, super::state::ConfirmQuiesce::Live);
+    if let Some(f) = feed {
+        match quiesce {
+            super::state::ConfirmQuiesce::Refund => f.clear(hub.tip_height().unwrap_or(0)),
+            super::state::ConfirmQuiesce::Plan => f.drop_plan(),
+            super::state::ConfirmQuiesce::Live => {}
         }
-        st.confirm_quiesce = false;
     }
     deferred
 }
