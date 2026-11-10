@@ -109,7 +109,7 @@ fn trust_peer_dials_only_that_peer() {
         unresolved.is_empty(),
         "unresolved trust-peer must not dial the peers file"
     );
-    let open = follow_dial_targets(&[], &book, 8, &[]);
+    let open = follow_dial_targets(&[], &book, 8, &[], false);
     assert!(
         !open.is_empty(),
         "the peers file is still a dial target when trust-peer is off"
@@ -117,14 +117,15 @@ fn trust_peer_dials_only_that_peer() {
     let shared = std::sync::Arc::new(std::sync::Mutex::new(book));
     let pinned = rbitcoin_net::NetAddr::Ip(addr.parse().unwrap());
     let trust_book = rbitcoin_ibd::PeerBookSession::new(ibd_shared_peers(true, &shared), &[pinned]);
-    let trust_cands = trust_book
-        .book()
-        .take_dial_candidates_net(8, &Default::default(), &[]);
+    let trust_cands =
+        trust_book
+            .book()
+            .take_dial_candidates_net(8, &Default::default(), &[], false);
     assert_eq!(trust_cands, vec![pinned], "{trust_cands:?}");
     let open_book = rbitcoin_ibd::PeerBookSession::new(ibd_shared_peers(false, &shared), &[]);
     let open_cands = open_book
         .book()
-        .take_dial_candidates_net(8, &Default::default(), &[]);
+        .take_dial_candidates_net(8, &Default::default(), &[], false);
     assert!(
         open_cands
             .iter()
@@ -152,7 +153,10 @@ fn follow_dial_targets_connect_bypasses_diversity() {
         IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
         8333,
     ))];
-    assert_eq!(follow_dial_targets(&connect, &am, 8, &occupied), want);
+    assert_eq!(
+        follow_dial_targets(&connect, &am, 8, &occupied, false),
+        want
+    );
     // Core reports `-connect` peers as `manual`; addrman picks are full relay.
     assert_eq!(follow_dial_type(&connect), PeerConnType::Manual);
     assert_eq!(follow_dial_type(&[]), PeerConnType::OutboundFullRelay);
@@ -363,7 +367,7 @@ fn follow_dial_targets_keeps_i2p_connect() {
         port: 8333,
     };
     let connect = vec![i2p];
-    let got = follow_dial_targets(&connect, &am, 8, &[]);
+    let got = follow_dial_targets(&connect, &am, 8, &[], false);
     assert_eq!(got, vec![i2p]);
 }
 
@@ -379,7 +383,7 @@ fn follow_dial_targets_skips_occupied_group() {
         IpAddr::V4(Ipv4Addr::new(1, 2, 0, 9)),
         8333,
     ))];
-    let got = follow_dial_targets(&[], &am, 1, &occupied);
+    let got = follow_dial_targets(&[], &am, 1, &occupied, false);
     assert_eq!(got, vec![rbitcoin_net::NetAddr::Ip(other)]);
 }
 
@@ -393,9 +397,9 @@ fn follow_dial_targets_picks_addrman_onion() {
     am.set_onion_reachable(true);
     am.set_only_net(vec![rbitcoin_net::OnlyNet::Onion]);
     am.add_addr(onion);
-    assert_eq!(follow_dial_targets(&[], &am, 1, &[]), vec![onion]);
+    assert_eq!(follow_dial_targets(&[], &am, 1, &[], false), vec![onion]);
     assert!(
-        follow_dial_targets(&[], &am, 1, &[onion]).is_empty(),
+        follow_dial_targets(&[], &am, 1, &[onion], true).is_empty(),
         "live onion net must not be re-dialed via 0.0.0.0 hint"
     );
 }
@@ -2258,6 +2262,146 @@ fn refill_skips_an_address_that_is_already_live() {
         got,
         vec![next],
         "the live inbound address must not be the only candidate for the open slot"
+    );
+}
+
+fn onion_book(
+    clearnet: &[SocketAddr],
+    onion: rbitcoin_net::NetAddr,
+) -> Arc<std::sync::Mutex<AddrMan>> {
+    let mut book = AddrMan::new();
+    book.set_onion_reachable(true);
+    for addr in clearnet {
+        book.add(*addr);
+    }
+    book.add_addr(onion);
+    Arc::new(std::sync::Mutex::new(book))
+}
+
+fn dial_strings(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<rbitcoin_net::DialRequest>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    while let Ok(req) = rx.try_recv() {
+        assert_eq!(req.typ, PeerConnType::OutboundFullRelay);
+        out.push(req.target.to_string());
+    }
+    out
+}
+
+/// A one-slot refill with no live outbound onion or I2P peer dials the
+/// overlay row, so a lost onion peer is replaced (#1511).
+#[test]
+fn single_slot_refill_replaces_a_lost_onion_peer() {
+    let peers = rbitcoin_net::PeerHub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    peers.set_dialer(tx);
+    let onion: rbitcoin_net::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    let a: SocketAddr = "45.6.0.1:8333".parse().unwrap();
+    let b: SocketAddr = "45.7.0.1:8333".parse().unwrap();
+    let shared = onion_book(&[a, b], onion);
+    refill_outbound_full_relay(&NodeConfig::default(), &peers, &shared, 1);
+    assert_eq!(
+        dial_strings(&mut rx),
+        vec![onion.to_string()],
+        "with no live overlay outbound, one open slot goes to the onion row"
+    );
+}
+
+/// With an outbound onion peer already live, a one-slot refill stays on
+/// clearnet.
+#[test]
+fn single_slot_refill_stays_clearnet_while_an_onion_peer_is_live() {
+    let peers = rbitcoin_net::PeerHub::new();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    peers.set_dialer(tx);
+    let live: rbitcoin_net::NetAddr =
+        "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:8333"
+            .parse()
+            .unwrap();
+    let onion: rbitcoin_net::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    let placeholder: SocketAddr = "0.0.0.0:8333".parse().unwrap();
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: bitcoin::p2p::PROTOCOL_VERSION,
+        services: bitcoin::p2p::ServiceFlags::NONE,
+        timestamp: 0,
+        receiver: bitcoin::p2p::Address::new(&placeholder, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::Address::new(&placeholder, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 0,
+        user_agent: String::new(),
+        start_height: 0,
+        relay: false,
+    };
+    let _live = peers.register_net(
+        placeholder,
+        live,
+        placeholder,
+        &ver,
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let a: SocketAddr = "45.6.0.1:8333".parse().unwrap();
+    let shared = onion_book(&[a], onion);
+    refill_outbound_full_relay(&NodeConfig::default(), &peers, &shared, 2);
+    assert_eq!(
+        dial_strings(&mut rx),
+        vec![a.to_string()],
+        "a live onion outbound keeps the single slot on clearnet"
+    );
+}
+
+/// Stale rotation picks its replacement before it disconnects the evicted
+/// peer. When that peer is the only onion session, the replacement may be
+/// an overlay row, and the evicted onion is not dialed again.
+#[test]
+fn stale_rotation_replaces_the_only_onion_peer_with_an_overlay() {
+    let peers = rbitcoin_net::PeerHub::new();
+    let live: rbitcoin_net::NetAddr =
+        "vww6ybal4bd7szmgncyruucpgfkqahzddi37ktceo3ah7ngmcopnpyyd.onion:8333"
+            .parse()
+            .unwrap();
+    let onion: rbitcoin_net::NetAddr =
+        "pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion:8333"
+            .parse()
+            .unwrap();
+    let placeholder: SocketAddr = "0.0.0.0:8333".parse().unwrap();
+    let clear: SocketAddr = "45.8.0.1:8333".parse().unwrap();
+    let ver = bitcoin::p2p::message_network::VersionMessage {
+        version: bitcoin::p2p::PROTOCOL_VERSION,
+        services: bitcoin::p2p::ServiceFlags::NONE,
+        timestamp: 0,
+        receiver: bitcoin::p2p::Address::new(&placeholder, bitcoin::p2p::ServiceFlags::NONE),
+        sender: bitcoin::p2p::Address::new(&placeholder, bitcoin::p2p::ServiceFlags::NONE),
+        nonce: 0,
+        user_agent: String::new(),
+        start_height: 0,
+        relay: false,
+    };
+    let evicted = peers.register_net(
+        placeholder,
+        live,
+        placeholder,
+        &ver,
+        false,
+        PeerConnType::OutboundFullRelay,
+    );
+    let _clear = peers.register(clear, clear, &ver, false, PeerConnType::OutboundFullRelay);
+    let mut book = AddrMan::new();
+    book.set_onion_reachable(true);
+    book.add("45.9.0.1:8333".parse().unwrap());
+    book.add_addr(live);
+    book.add_addr(onion);
+    let shared = Arc::new(std::sync::Mutex::new(book));
+    assert_eq!(
+        stale_follow_replacement(&peers, &shared, evicted.id),
+        vec![onion],
+        "evicting the only onion peer frees the overlay slot, not its address"
     );
 }
 

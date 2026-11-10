@@ -9,7 +9,7 @@ use rbitcoin_ibd::{
 };
 use rbitcoin_log::{debug, enabled, info, warn, Level};
 use rbitcoin_net::{
-    default_port, netgroup, sample_reset_serve_perf, socks_dns_seed_dests, AddrMan, AsMap,
+    default_port, netgroup_net, sample_reset_serve_perf, socks_dns_seed_dests, AddrMan, AsMap,
     BlockingRegion, ChainHub, Dialer, MempoolHub, NetAddr, OutboundPass, P2PNode, PeerConnType,
     TipEvent,
 };
@@ -1665,18 +1665,16 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                 continue;
             }
             let ids: Vec<u64> = rows.iter().map(|(id, _)| *id).collect();
-            let addrs: Vec<SocketAddr> = rows.iter().map(|(_, addr)| *addr).collect();
-            let groups: Vec<u64> = addrs
+            let groups: Vec<u64> = rows
                 .iter()
-                .map(|a| netgroup(*a, addrman.asmap()))
+                .map(|(_, net)| netgroup_net(*net, addrman.asmap()))
                 .collect();
             let salt = node.hub.clock.now_secs();
             let Some(evict_id) = rbitcoin_net::pick_stale_follow_evict(&ids, salt, &groups) else {
                 node.peers.note_outbound_pass(OutboundPass::NoSpare);
                 continue;
             };
-            let (occupied, _, _) = outbound_slots(&node.peers);
-            let replacement = outbound_full_relay_candidates(&shared_peers, 1, &occupied);
+            let replacement = stale_follow_replacement(&node.peers, &shared_peers, evict_id);
             if replacement.is_empty() {
                 node.peers.note_outbound_pass(OutboundPass::NoSpare);
                 continue;
@@ -2104,7 +2102,13 @@ pub async fn wait_for_dialable_targets(
                     *addrman = g.clone();
                 }
             }
-            follow_dial_targets(pinned, addrman, candidate_n, occupied)
+            follow_dial_targets(
+                pinned,
+                addrman,
+                candidate_n,
+                occupied,
+                overlay_outbound_live(occupied),
+            )
         };
         let targets = sample();
         if !targets.is_empty() {
@@ -3270,16 +3274,25 @@ pub fn outbound_dial_targets(
     if trust_peer {
         pinned.to_vec()
     } else {
-        follow_dial_targets(pinned, book, max, occupied)
+        follow_dial_targets(pinned, book, max, occupied, overlay_outbound_live(occupied))
     }
 }
 
+/// An onion or I2P net in `occupied` is a live or in-flight outbound: inbound
+/// sessions key by socket and never carry an overlay net.
+fn overlay_outbound_live(occupied: &[rbitcoin_net::NetAddr]) -> bool {
+    occupied.iter().any(|a| a.is_overlay())
+}
+
 /// `--connect` is operator-pinned: no netgroup filter. Otherwise rank + diversity.
+/// `overlay_live` keeps a one-peer batch on clearnet while an onion or I2P
+/// outbound is up.
 pub fn follow_dial_targets(
     connect: &[rbitcoin_net::NetAddr],
     book: &AddrMan,
     max: usize,
     occupied: &[rbitcoin_net::NetAddr],
+    overlay_live: bool,
 ) -> Vec<rbitcoin_net::NetAddr> {
     if !connect.is_empty() {
         connect.to_vec()
@@ -3290,7 +3303,7 @@ pub fn follow_dial_targets(
             .copied()
             .filter_map(rbitcoin_net::NetAddr::socket_addr)
             .collect();
-        book.take_dial_candidates_net(max, &exclude, &socks)
+        book.take_dial_candidates_net(max, &exclude, &socks, overlay_live)
     }
 }
 
@@ -3434,12 +3447,31 @@ pub fn refill_outbound_full_relay(
         return;
     }
     let room = max_out.saturating_sub(live).saturating_sub(pending);
-    let picked = outbound_full_relay_candidates(shared_peers, room, &occupied);
+    let overlay_live = overlay_outbound_live(&occupied);
+    let picked = outbound_full_relay_candidates(shared_peers, room, &occupied, overlay_live);
     if picked.is_empty() {
         peers.note_outbound_pass(OutboundPass::NoSpare);
         return;
     }
     queue_outbound_full_relay(peers, shared_peers, &picked);
+}
+
+/// One full-relay replacement for the stale-tip rotation, picked before
+/// `evict_id` is disconnected. The evicted net stays excluded, but it does
+/// not count as a live overlay: when it is the only onion or I2P session,
+/// the replacement may take the overlay slot.
+#[doc(hidden)]
+pub fn stale_follow_replacement(
+    peers: &rbitcoin_net::PeerHub,
+    shared_peers: &Arc<std::sync::Mutex<AddrMan>>,
+    evict_id: u64,
+) -> Vec<NetAddr> {
+    let (occupied, _, _) = outbound_slots(peers);
+    let evicted = peers.get(evict_id).map(|p| p.net);
+    let overlay_live = occupied
+        .iter()
+        .any(|a| a.is_overlay() && Some(*a) != evicted);
+    outbound_full_relay_candidates(shared_peers, 1, &occupied, overlay_live)
 }
 
 /// Live outbound full-relay nets, every other live session (so a full-relay
@@ -3471,12 +3503,13 @@ fn outbound_full_relay_candidates(
     shared_peers: &Arc<std::sync::Mutex<AddrMan>>,
     room: usize,
     occupied: &[NetAddr],
+    overlay_live: bool,
 ) -> Vec<NetAddr> {
     if room == 0 {
         return Vec::new();
     }
     let book = shared_peers.lock().unwrap_or_else(|e| e.into_inner());
-    follow_dial_targets(&[], &book, room, occupied)
+    follow_dial_targets(&[], &book, room, occupied, overlay_live)
 }
 
 fn queue_outbound_full_relay(
