@@ -3111,3 +3111,24 @@ async fn connect_and_disconnect_log_below_info() {
     assert!(lines.iter().all(|(l, _)| *l == Level::Debug), "{lines:?}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A client causes any socket error by closing or resetting, so that end logs
+/// at DEBUG. A dispatch that panicked is this side's fault and stays at WARN.
+#[tokio::test]
+async fn panicked_electrum_disconnect_logs_at_warn() {
+    use rbitcoin_log::Level;
+    let peer: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
+    let joined = tokio::spawn(async { panic!("handler bug") })
+        .await
+        .expect_err("the task panicked");
+    rbitcoin_log::capture_logs(true);
+    rbitcoin_electrum::server::log_disconnect(peer, &Ok(()));
+    rbitcoin_electrum::server::log_disconnect(peer, &Err(std::io::ErrorKind::UnexpectedEof.into()));
+    rbitcoin_electrum::server::log_disconnect(peer, &Err(std::io::Error::other(joined)));
+    let levels: Vec<Level> = rbitcoin_log::take_logs()
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect();
+    rbitcoin_log::capture_logs(false);
+    assert_eq!(levels, [Level::Debug, Level::Debug, Level::Warn]);
+}

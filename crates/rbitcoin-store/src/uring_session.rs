@@ -182,7 +182,8 @@ pub fn finish_drain_hard_cap(pending: usize) -> Result<(), StoreError> {
 /// Which completion backend [`UringSession`] opens.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionKind {
-    /// Linux io_uring. On Windows this opens IOCP.
+    /// Linux io_uring. Asked for elsewhere, Windows builds IOCP (or the pool
+    /// when IOCP will not open) and other targets build the pool.
     Uring,
     /// Worker-pool completion ring (`RBITCOIN_IO=pool` on Darwin or Linux).
     Pool,
@@ -191,15 +192,10 @@ pub enum SessionKind {
 }
 
 impl SessionKind {
-    /// Engine [`UringSession::try_open_kind`] opens for this kind on this target.
+    /// Engine name, as the startup log prints it.
     pub fn name(self) -> &'static str {
         match self {
-            #[cfg(target_os = "linux")]
             SessionKind::Uring => "io_uring",
-            #[cfg(windows)]
-            SessionKind::Uring => "iocp",
-            #[cfg(not(any(target_os = "linux", windows)))]
-            SessionKind::Uring => "pool",
             SessionKind::Pool => "pool",
             SessionKind::Iocp => "iocp",
         }
@@ -261,7 +257,6 @@ pub struct UringSession {
     pub entries: u32,
     pub pending: UringPending,
     pub epoch: u16,
-    pub kind: SessionKind,
     /// Set on undrained leftover, unexpected CQE, CQ overflow, or wait timeout.
     /// Push and [`Self::begin_batch`] fail closed; [`with_thread_local`] drops the TLS ring.
     pub poisoned: bool,
@@ -337,13 +332,19 @@ impl UringSession {
             entries,
             pending: UringPending::new(),
             epoch: 0,
-            kind,
             poisoned: false,
         })
     }
 
+    /// Engine this session built, which can differ from the kind asked for.
     pub fn kind(&self) -> SessionKind {
-        self.kind
+        match self.backend {
+            #[cfg(target_os = "linux")]
+            SessionBackend::Uring(_) => SessionKind::Uring,
+            SessionBackend::Pool(_) => SessionKind::Pool,
+            #[cfg(windows)]
+            SessionBackend::Iocp(_) => SessionKind::Iocp,
+        }
     }
 
     pub fn in_flight(&self) -> usize {
@@ -714,7 +715,7 @@ impl UringSession {
             "store: io_uring drain slow pending={} waited={:?} thread={thread} kind={:?}",
             self.pending.len(),
             waited,
-            self.kind,
+            self.kind(),
         );
     }
 

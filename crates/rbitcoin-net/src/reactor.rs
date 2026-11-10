@@ -136,6 +136,13 @@ impl Drop for StoreBudgetWait {
     }
 }
 
+/// Whether `e` carries a [`tokio::task::JoinError`]: a task this side spawned
+/// panicked or was cancelled. Socket errors a client can cause are not.
+pub fn is_join_error(e: &std::io::Error) -> bool {
+    e.get_ref()
+        .is_some_and(|inner| inner.is::<tokio::task::JoinError>())
+}
+
 /// The child's `Ok` value. A panicked child resumes that payload. Cancel
 /// still aborts the caller.
 pub fn finish_join<T>(joined: Result<T, tokio::task::JoinError>, cancel: &'static str) -> T {

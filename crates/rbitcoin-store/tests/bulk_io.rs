@@ -17,25 +17,34 @@ fn unset_io_env_opens_a_session_except_on_darwin() {
 use std::io::Write;
 
 #[test]
-fn backend_name_is_the_backend_in_use_not_the_env_text() {
-    // Unset and unknown RBITCOIN_IO both resolve to the platform default.
-    let default = backend_name_for(parse_io_token_str("nonsense"), true);
-    assert_eq!(default, backend_name_for(None, true));
+fn unknown_io_token_takes_the_unset_default() {
+    let unknown = parse_io_token_str("nonsense");
+    assert_eq!(unknown, None);
+    assert_eq!(session_kind_for(unknown), default_session_kind());
+    assert_eq!(session_wanted(unknown), session_wanted(None));
+}
+
+/// `backend_name` is the engine the session probe built, or `pread` when no
+/// session opened. With `RBITCOIN_IO` unset it is the OS default.
+#[test]
+fn backend_name_is_the_session_built_or_pread() {
+    use rbitcoin_store::uring_session::UringSession;
+    let live = backend_name();
+    if io_uring_enabled() {
+        let built = UringSession::try_open(32).expect("the probe opened one");
+        assert_eq!(live, built.kind().name());
+    } else {
+        assert_eq!(live, "pread", "no session means libc pread");
+    }
+    if std::env::var_os("RBITCOIN_IO").is_some() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    assert_eq!(live, "pread", "Darwin defaults to libc pread");
     #[cfg(target_os = "linux")]
-    assert_eq!(default, "io_uring");
+    assert!(matches!(live, "io_uring" | "pread"), "{live}");
     #[cfg(windows)]
-    assert_eq!(default, "iocp");
-    #[cfg(not(any(target_os = "linux", windows)))]
-    assert_eq!(default, "pool");
-    assert_eq!(backend_name_for(Some(IoToken::Pool), true), "pool");
-    assert_eq!(
-        backend_name_for(Some(IoToken::Uring), false),
-        "pread",
-        "a session that will not open falls back to pread"
-    );
-    assert_eq!(backend_name_for(None, false), "pread");
-    assert_eq!(backend_name_for(Some(IoToken::Pread), false), "pread");
-    assert!(["io_uring", "pool", "iocp", "pread"].contains(&backend_name()));
+    assert!(matches!(live, "iocp" | "pool" | "pread"), "{live}");
 }
 
 fn dummy_handle() -> IoHandle {
