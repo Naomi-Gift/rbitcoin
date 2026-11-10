@@ -678,11 +678,14 @@ pub fn plan_header_batch(
         );
     }
     let clock_refused = st.header_walk.clock_refused;
-    // An empty reply is not bad proof. A header that fails its target must
-    // not retire the peer the way a short low-work batch does.
-    let linked = headers.is_empty() || super::header_walk::pow_linked(&headers);
+    // A header that fails its own target is not a short low-work batch.
+    // Retiring the peer here would punish a proof failure. Headers that do
+    // not connect to each other still have a target, and those are stored.
+    let bad_pow = headers
+        .iter()
+        .any(|hdr| hdr.validate_pow(hdr.target()).is_err());
     let plan = plan_header_reply(st, hub, peer, headers);
-    if matches!(plan, HeaderPlan::Done) && !clock_refused && linked {
+    if matches!(plan, HeaderPlan::Done) && !clock_refused && !bad_pow {
         finish_mark(st, hub, peer, &mark);
     }
     (mark, plan)
@@ -720,8 +723,12 @@ pub fn plan_header_reply(
         };
     }
     // Bad proof is not a short low-work batch. Returning `Done` from that
-    // check would retire the peer. The caller skips the miss mark.
-    if !super::header_walk::pow_linked(&headers) {
+    // check would retire the peer. The caller skips the miss mark. A batch
+    // whose headers do not connect is a different case and is still stored.
+    if headers
+        .iter()
+        .any(|hdr| hdr.validate_pow(hdr.target()).is_err())
+    {
         return HeaderPlan::Done;
     }
     if super::header_walk::short_below_floor(st, hub, &headers) {
