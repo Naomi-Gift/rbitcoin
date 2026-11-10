@@ -1008,7 +1008,7 @@ fn peer_blocksonly_and_orphan_tx() {
         let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("blocksonly-orphan");
         let hub = Arc::new(hub);
         hub.ensure_genesis().unwrap();
-        hub.generate_to_script(130, op_true(), vec![]).unwrap();
+        hub.confirm_empty_regtest(130).unwrap();
         let t = hub.tip_header().unwrap().time;
         hub.clock.set_mock(i64::from(t) + 1);
         assert!(!hub.in_ibd(), "blocksonly is not IBD");

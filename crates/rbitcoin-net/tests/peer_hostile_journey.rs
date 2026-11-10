@@ -260,7 +260,7 @@ async fn hostile_peer_session() {
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("hostile-session");
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(200, ScriptBuf::from_bytes(vec![0x51]), vec![])
+    hub.confirm_empty_regtest(200)
         .unwrap();
     let genesis = hub
         .query

@@ -2601,6 +2601,61 @@ impl ChainHub {
         )
     }
 
+    /// Confirm `nblocks` empty regtest blocks through [`rbitcoin_query::confirm_wire_run`].
+    ///
+    /// IBD packs at most 144 blocks into one confirm wave. A long fixture uses
+    /// that wave. [`Self::generate_to_script`] still accepts one block at a time
+    /// on `tip-accept` when the test needs pool txs, assembly stats, or the lane.
+    #[doc(hidden)]
+    pub fn confirm_empty_regtest(&self, nblocks: u32) -> Result<Vec<BlockHash>, NetError> {
+        if nblocks == 0 {
+            return Ok(Vec::new());
+        }
+        if nblocks > Self::GENERATE_MAX_BLOCKS {
+            return Err(NetError::Consensus(format!(
+                "nblocks too large (max {})",
+                Self::GENERATE_MAX_BLOCKS
+            )));
+        }
+        self.ensure_genesis()?;
+        // Same hard cap as `CONFIRM_RUN_MAX_BLOCKS` in the IBD packer.
+        const WAVE: u32 = 144;
+        let mut hashes = Vec::with_capacity(nblocks as usize);
+        let mut left = nblocks;
+        while left > 0 {
+            let n = left.min(WAVE);
+            let tip_h = self
+                .tip_height()
+                .ok_or(NetError::Protocol("confirm: no tip"))?;
+            let mut prev = self
+                .tip_hash()
+                .ok_or(NetError::Protocol("confirm: no tip hash"))?;
+            let base = self.generate_block_time(tip_h)?;
+            let mut blocks = Vec::with_capacity(n as usize);
+            for i in 0..n {
+                let height = tip_h.saturating_add(1).saturating_add(i);
+                let block =
+                    rbitcoin_consensus::mine_empty_regtest(prev, base.saturating_add(i), height);
+                prev = block.block_hash();
+                hashes.push(prev);
+                blocks.push((Height(height), block));
+            }
+            rbitcoin_query::confirm_wire_run(&self.query, &self.params, self.milestone, &blocks)
+                .map_err(NetError::from_confirm)?;
+            let mut confirmed = self.confirmed.write().unwrap();
+            for hash in hashes.iter().skip(hashes.len() - n as usize) {
+                confirmed.insert(*hash);
+            }
+            drop(confirmed);
+            left -= n;
+        }
+        self.ensure_chain_work_prefix()?;
+        // `generate_to_script` seals write-behind indexes before it returns.
+        // A fixture that turned the filter index on needs that same watermark.
+        self.drain_generate_indexes();
+        Ok(hashes)
+    }
+
     /// RPC `generate` / `generateblock`. Same mine as [`Self::generate_to_script`],
     /// and the pool txids in an accepted block are removed before the next
     /// block of this call is mined. A relay-off connect does not remove them.

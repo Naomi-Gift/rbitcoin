@@ -107,14 +107,8 @@ fn proved_headers_still_rewind_a_tip_under_the_floor() {
 fn confirm_past_1024(hub: &ChainHub, time0: u32) -> (BlockHash, BlockHash) {
     hub.ensure_genesis().unwrap();
     let gen = hub.tip_hash().unwrap();
-    let mut prev = gen;
-    let mut time = time0;
-    for height in 1..=1_025u32 {
-        time = time.saturating_add(600);
-        let block = mine(prev, time, height);
-        hub.accept_block(block.clone()).unwrap();
-        prev = block.block_hash();
-    }
+    hub.confirm_empty_regtest(1_025).unwrap();
+    let prev = hub.tip_hash().unwrap();
     let side = distinct_sib(mine(gen, time0.saturating_add(100), 1), prev);
     hub.ensure_header(&side.header).unwrap();
     (prev, side.block_hash())

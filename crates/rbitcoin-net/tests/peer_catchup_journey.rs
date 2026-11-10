@@ -53,7 +53,7 @@ async fn peer_catchup_compact_reorg() {
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
     let (src_dir, src) = rbitcoin_net::chain::tiny_regtest_hub_labeled("catchup-journey-src");
     src.ensure_genesis().unwrap();
-    src.generate_to_script(160, op_true.clone(), vec![]).unwrap();
+    src.confirm_empty_regtest(160).unwrap();
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("catchup-journey-dst");
     hub.ensure_genesis().unwrap();

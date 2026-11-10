@@ -6452,7 +6452,7 @@ async fn tx_inv_over_one_thousand_is_two_messages() {
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("inv-batch");
     hub.ensure_genesis().unwrap();
-    hub.generate_to_script(101, op_true(), vec![]).unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
     let t = hub.tip_header().unwrap().time;
     hub.clock.set_mock(i64::from(t) + 1);
     assert!(!hub.in_ibd(), "tx inv batch pin is not IBD");
@@ -8307,8 +8307,7 @@ fn getcfcheckpt_returns_a_header_every_thousand_heights() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cf-checkpt");
     hub.query.set_block_filter_index(true).unwrap();
     hub.ensure_genesis().unwrap();
-    let script = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(999, script.clone(), vec![]).unwrap();
+    hub.confirm_empty_regtest(999).unwrap();
     assert_eq!(hub.tip_height().unwrap(), 999);
     let (tx, mut rx) = mpsc::unbounded_channel();
     let below = bitcoin::p2p::message_filter::GetCFCheckpt {
@@ -8325,7 +8324,7 @@ fn getcfcheckpt_returns_a_header_every_thousand_heights() {
         }
         other => panic!("expected cfcheckpt, got {other:?}"),
     }
-    hub.generate_to_script(1, script, vec![]).unwrap();
+    hub.confirm_empty_regtest(1).unwrap();
     assert_eq!(hub.tip_height().unwrap(), 1_000);
     assert_eq!(hub.query.basic_filter_hwm().unwrap(), Some(1_000));
     let rows = hub

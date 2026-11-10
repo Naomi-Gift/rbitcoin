@@ -648,8 +648,7 @@ async fn shorter_higher_work_rejected_by_the_store_is_not_fetched(
 fn mine_across_the_work_floor(hub: &rbitcoin_net::chain::ChainHub) {
     let height = hub.tip_height().unwrap();
     assert!(height < 49, "floor cross starts below height 49");
-    hub.generate_to_script(49 - height, op_true(), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(49 - height).unwrap();
     assert_eq!(hub.tip_height(), Some(49));
     assert!(!hub.meets_minimum_chain_work());
     let h49 = hub.tip_hash().unwrap();
@@ -659,7 +658,7 @@ fn mine_across_the_work_floor(hub: &rbitcoin_net::chain::ChainHub) {
         below.is_empty(),
         "getheaders below minchainwork must be empty"
     );
-    let mined = hub.generate_to_script(1, op_true(), vec![]).unwrap();
+    let mined = hub.confirm_empty_regtest(1).unwrap();
     assert_eq!(hub.tip_height(), Some(50));
     assert!(hub.meets_minimum_chain_work());
     let above =
@@ -1184,8 +1183,7 @@ async fn rejected_header_logs_core_reason(hub: &rbitcoin_net::chain::ChainHub) {
         "the CLTV beat starts below activation, tip={tip}"
     );
     if tip < 110 {
-        hub.generate_to_script(110 - tip, op_true(), vec![])
-            .unwrap();
+        hub.confirm_empty_regtest(110 - tip).unwrap();
     }
     let prev = hub.tip_hash().unwrap();
     let time = hub.tip_header().unwrap().time + 1;
@@ -1989,10 +1987,10 @@ async fn peer_header_dos_and_self_announce() {
 
     let (src_dir, src) = rbitcoin_net::chain::tiny_regtest_hub_labeled("hdr-dos-src");
     src.ensure_genesis().unwrap();
-    src.generate_to_script(50, op_true(), vec![]).unwrap();
+    src.confirm_empty_regtest(50).unwrap();
     minchainwork_while_tip_is_short(&hub, &src, &peers).await;
 
-    hub.generate_to_script(5, op_true(), vec![]).unwrap();
+    hub.confirm_empty_regtest(5).unwrap();
     assert_eq!(hub.tip_height(), Some(5));
     header_getdata_decisions(&hub, &peers).await;
     shorter_higher_work_rejected_by_the_store_is_not_fetched(&hub, &peers).await;
@@ -2012,7 +2010,7 @@ async fn peer_header_dos_and_self_announce() {
 
     let tip = hub.tip_height().unwrap();
     if tip < 300 {
-        hub.generate_to_script(300 - tip, op_true(), vec![]).unwrap();
+        hub.confirm_empty_regtest(300 - tip).unwrap();
     }
     ancient_weaker_fork_disconnects(&hub, &peers).await;
     empty_locator_needs_a_body(&hub);
@@ -2619,7 +2617,7 @@ async fn bad_pow_cmpct_does_not_scan_mempool() {
     assert_eq!(follow.ban_score, 0, "a manual peer gathers no score");
     assert!(!manual.stop.load(Ordering::SeqCst));
 
-    hub.generate_to_script(100, op_true(), vec![]).unwrap();
+    hub.confirm_empty_regtest(100).unwrap();
     assert_eq!(hub.tip_height(), Some(101));
     let cb = hub
         .query
@@ -2881,18 +2879,10 @@ async fn full_pending_below_floor_does_not_walk_parents() {
     let mut follow = PeerFollowState::new();
     let batch = MAX_HEADERS_RESULTS as u32;
     let mut prev = hub.tip_hash().unwrap();
-    for _ in 0..(MAX_PENDING_HEADERS as u32 / batch) {
-        let chain = regtest_header_chain(prev, batch);
-        prev = chain.last().unwrap().block_hash();
-        push(
-            &hub,
-            &out_tx,
-            &mut follow,
-            Some(peer.as_ref()),
-            NetworkMessage::Headers(chain),
-        )
-        .await;
-    }
+    // The next `on_headers` is the batch under test. The cap is already in the map.
+    let setup = regtest_header_chain(prev, MAX_PENDING_HEADERS as u32);
+    fill_pending(&mut follow, &setup);
+    prev = setup.last().unwrap().block_hash();
     assert_eq!(follow.pending_headers.len(), MAX_PENDING_HEADERS);
     peer.note_awaiting_headers();
     let before = rbitcoin_query::header_lookup_count();
