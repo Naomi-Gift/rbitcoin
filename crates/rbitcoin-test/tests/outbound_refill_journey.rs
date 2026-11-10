@@ -313,7 +313,7 @@ async fn book_refill(root: &Path, addrs: &[SocketAddr]) {
     for id in &before {
         let _ = rbitcoin_test::jsonrpc::try_jsonrpc(rpc, "disconnectnode", json!(["", id])).await;
     }
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + llvm_cov_wall(20, 90);
     loop {
         let rows = peer_rows(rpc).await;
         let live = full_relay(&rows);
