@@ -5146,6 +5146,8 @@ struct HeadersApply {
     headers_len: usize,
     /// Best-known header-chain work is under `-minimumchainwork`.
     peer_below_floor: bool,
+    /// The last header was new, accepted, connected, and beats our tip work.
+    stamp_block_announcement: bool,
 }
 
 fn classify_headers(
@@ -5171,6 +5173,7 @@ fn classify_headers(
         getheaders: None,
         headers_len: n,
         peer_below_floor: false,
+        stamp_block_announcement: false,
     };
     let mut ignored_below_floor = false;
     if n == 0 {
@@ -5236,7 +5239,12 @@ fn classify_headers(
                 // Core: do not download bodies until the chain meets
                 // `-minimumchainwork` (`p2p_headers_sync_with_minchainwork`).
             } else {
+                // This check is deliberately after the below-floor early path:
+                // that path must not touch the header store or walk parents.
+                let should_stamp =
+                    work_cmp == Some(std::cmp::Ordering::Greater) && !header_is_stored(hub, &last);
                 persist_pending_header_path(hub, &pending, last);
+                apply.stamp_block_announcement = should_stamp && header_is_stored(hub, &last);
                 apply.sync_height = Some(announced_h);
                 let keep = connecting_header_path(hub, &pending, last);
                 let mut requested = requested_before.clone();
@@ -5504,12 +5512,6 @@ pub async fn on_headers(
 ) -> Result<(), NetError> {
     let _ = session.is_some_and(|s| s.take_awaiting_headers());
     let noban = session.is_some_and(|s| s.session_noban());
-    // Core updates this field for the last header in the batch, and only if
-    // it is new to the block index. `already_have` only checks for bodies.
-    let announcement = headers
-        .last()
-        .copied()
-        .and_then(|header| (!header_is_stored(hub, &header.block_hash())).then_some(header));
     let pending = follow.pending_headers.clone();
     let requested = follow.requested_blocks.clone();
     let have_bodies: HashSet<BlockHash> = follow.pending_blocks.keys().copied().collect();
@@ -5519,17 +5521,11 @@ pub async fn on_headers(
     })
     .await?;
     let accepted = !apply.misbehave;
+    let stamp_block_announcement = apply.stamp_block_announcement;
     apply_headers(apply, hub, out_tx, follow, session)?;
-    if accepted {
-        if let (Some(s), Some(header)) = (session, announcement) {
-            let hash = header.block_hash();
-            if header_is_stored(hub, &hash)
-                && header_announcement_connects(hub, &follow.pending_headers, header.prev_blockhash)
-                && announced_work_cmp(hub, &follow.pending_headers, hash)
-                    == Some(std::cmp::Ordering::Greater)
-            {
-                s.note_last_block_announcement();
-            }
+    if accepted && stamp_block_announcement {
+        if let Some(s) = session {
+            s.note_last_block_announcement();
         }
     }
     Ok(())
@@ -5747,7 +5743,6 @@ pub async fn on_cmpctblock(
     if on_cmpctblock_reject_early(hub, follow, session, &hsi, hash)? {
         return Ok(());
     }
-    let announcement_unknown = !header_is_stored(hub, &hash);
     if hsi.header.prev_blockhash.to_byte_array() != [0u8; 32]
         && !hub.knows_header(&hsi.header.prev_blockhash)
     {
@@ -5770,12 +5765,21 @@ pub async fn on_cmpctblock(
         take_requested_block(hub, &mut follow.requested_blocks, &hash);
         return Ok(());
     }
-    if announcement_unknown
+    // Process the compact block's header before trying reconstruction, as Core
+    // does. This also makes the announcement timestamp contingent on the
+    // header actually entering the block index.
+    let announcement_unknown = !header_is_stored(hub, &hash);
+    let should_stamp = announcement_unknown
         && header_announcement_connects(hub, &follow.pending_headers, hsi.header.prev_blockhash)
         && work_of_header_path(hub, &follow.pending_headers, hash)
             .zip(hub.chain_work().ok())
-            .is_some_and(|(announced, tip)| announced > tip)
-    {
+            .is_some_and(|(announced, tip)| announced > tip);
+    let pending = follow.pending_headers.clone();
+    run_header_job(hub, move |hub| {
+        persist_pending_header_path(hub, &pending, hash)
+    })
+    .await?;
+    if should_stamp && header_is_stored(hub, &hash) {
         if let Some(s) = session {
             s.note_last_block_announcement();
         }
@@ -5805,11 +5809,6 @@ async fn on_cmpctblock_header_announce(
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
 ) -> Result<(), NetError> {
-    let pending = follow.pending_headers.clone();
-    run_header_job(hub, move |hub| {
-        persist_pending_header_path(hub, &pending, hash);
-    })
-    .await?;
     if session.is_some_and(|s| s.send_over_budget()) {
         return Ok(());
     }

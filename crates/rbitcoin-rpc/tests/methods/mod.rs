@@ -5901,7 +5901,7 @@ async fn getpeerinfo_last_block_announcement_tracks_new_heavier_headers() {
     let tip = hub.tip_header().unwrap();
 
     let mut heavier = Header {
-        version: Version::TWO,
+        version: Version::from_consensus(4),
         prev_blockhash: tip.block_hash(),
         merkle_root: bitcoin::TxMerkleNode::all_zeros(),
         time: tip.time.saturating_add(1),
