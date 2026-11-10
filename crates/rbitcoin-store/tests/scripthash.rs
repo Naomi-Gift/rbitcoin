@@ -765,41 +765,86 @@ fn create_does_not_write_oa_stub() {
 }
 
 #[test]
-fn leftover_live_oa_main_open_refuses() {
+fn leftover_live_oa_main_open_discards_head() {
     let dir = tmp();
     let t = ScriptHashTable::create_tiny(&dir).unwrap();
-    put_create(&t, rec(script_hash(&[0x01]), 1, 0));
+    let sh = script_hash(&[0x01]);
+    put_create(&t, rec(sh, 1, 0));
     t.flush().unwrap();
     drop(t);
     std::fs::write(dir.join("scripthash.head"), b"leftover-oa").unwrap();
-    match ScriptHashTable::open_tiny(&dir) {
-        Ok(_) => panic!("leftover OA main must refuse"),
-        Err(StoreError::Layout(m)) => {
-            assert!(m.contains("scripthash*"), "{m}");
-            assert!(m.contains("wipe") || m.contains("rematerialize"), "{m}");
-        }
-        Err(e) => panic!("expected Layout, got {e}"),
-    }
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.entries(&sh).unwrap().len(), 1);
+    assert!(!dir.join("scripthash.head").exists());
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn leftover_oa_overflow_seg_open_refuses() {
+fn leftover_oa_overflow_seg_open_discards_seg() {
     let dir = tmp();
     let t = ScriptHashTable::create_tiny(&dir).unwrap();
-    put_create(&t, rec(script_hash(&[0x02]), 1, 0));
+    let sh = script_hash(&[0x02]);
+    put_create(&t, rec(sh, 1, 0));
     t.flush().unwrap();
     drop(t);
     let ovf = dir.join("scripthash.ovf");
     std::fs::create_dir_all(&ovf).unwrap();
     std::fs::write(ovf.join("000000"), b"not-shsr").unwrap();
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert_eq!(t.entries(&sh).unwrap().len(), 1);
+    assert!(!ovf.join("000000").exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A sealed segment this open cannot read stays on disk. Open fails.
+#[cfg(unix)]
+#[test]
+fn leftover_oa_unreadable_shsr_segment_stays() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    drop(t);
+    let seg = dir.join("scripthash.ovf").join("000001");
+    std::fs::write(&seg, b"SHSR").unwrap();
+    std::fs::set_permissions(&seg, std::fs::Permissions::from_mode(0o000)).unwrap();
     match ScriptHashTable::open_tiny(&dir) {
-        Ok(_) => panic!("leftover OA ovf must refuse"),
-        Err(StoreError::Layout(m)) => {
-            assert!(m.contains("scripthash*"), "{m}");
-        }
-        Err(e) => panic!("expected Layout, got {e}"),
+        Err(StoreError::Io { source, .. })
+            if source.kind() == std::io::ErrorKind::PermissionDenied => {}
+        Ok(_) => panic!("an unreadable ovf segment must not be deleted"),
+        Err(other) => panic!("an unreadable ovf segment must fail the open: {other}"),
     }
+    std::fs::set_permissions(&seg, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(std::fs::read(&seg).unwrap(), b"SHSR");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Deleting a lower non-`SHSR` name must not make the next seal reuse the
+/// id of a higher sealed segment.
+#[test]
+fn leftover_oa_hole_does_not_reuse_sealed_segment_id() {
+    let dir = tmp();
+    let t = ScriptHashTable::create_tiny(&dir).unwrap();
+    drop(t);
+    let ovf = dir.join("scripthash.ovf");
+    std::fs::write(ovf.join("000000"), b"not-shsr").unwrap();
+    let kept = ovf.join("000001");
+    let key = [0x11u8; 16];
+    let val = pack8_bytes(&ShHeadValue::inline_one(Fk(7))).unwrap();
+    drop(rbitcoin_store::scripthash_sorted_head::SortedHead::write(&kept, &[(key, val)]).unwrap());
+    let before = std::fs::read(&kept).unwrap();
+    let t = ScriptHashTable::open_tiny(&dir).unwrap();
+    assert!(!ovf.join("000000").exists());
+    assert_eq!(std::fs::read(&kept).unwrap(), before);
+    t.ingest_insert_many(&[([0x22u8; 32], ShHeadValue::inline_one(Fk(9)))])
+        .unwrap();
+    t.seal_ingest().unwrap();
+    assert_eq!(
+        std::fs::read(&kept).unwrap(),
+        before,
+        "the next seal truncated the segment this open kept"
+    );
+    let next = std::fs::read(ovf.join("000002")).unwrap();
+    assert_eq!(&next[..4], b"SHSR");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2597,8 +2642,7 @@ fn reinit_clears_head_when_live_count_already_zero() {
 }
 
 #[test]
-fn open_migrates_legacy_head_when_runs_present() {
-    // Leftover live OA main is refused even when runs exist (wipe + rematerialize).
+fn open_discards_legacy_head_and_keeps_runs() {
     {
         let dir = tmp();
         let _t = ScriptHashTable::create_tiny(&dir).unwrap();
@@ -2610,32 +2654,26 @@ fn open_migrates_legacy_head_when_runs_present() {
         std::fs::create_dir_all(&runs_dir).unwrap();
         std::fs::write(runs_dir.join("000001.run"), b"leftover").unwrap();
 
-        match ScriptHashTable::open_tiny(&dir) {
-            Ok(_) => panic!("leftover OA must refuse"),
-            Err(StoreError::Layout(m)) => {
-                assert!(m.contains("scripthash*"), "{m}");
-            }
-            Err(e) => panic!("expected Layout, got {e}"),
-        }
+        ScriptHashTable::open_tiny(&dir).unwrap();
+        assert!(!dir.join("scripthash.head").exists());
+        assert_eq!(
+            std::fs::read(runs_dir.join("000001.run")).unwrap(),
+            b"leftover"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
 #[test]
-fn open_refuses_legacy_head_without_runs() {
+fn open_discards_legacy_head_without_runs() {
     {
         let dir = tmp();
         let _t = ScriptHashTable::create_tiny(&dir).unwrap();
         drop(_t);
         std::fs::create_dir_all(dir.join("scripthash.head")).unwrap();
         std::fs::write(dir.join("scripthash.head").join("00"), b"leftover-oa").unwrap();
-        match ScriptHashTable::open_tiny(&dir) {
-            Err(StoreError::Layout(m)) => {
-                assert!(m.contains("scripthash*"), "{m}");
-            }
-            Ok(_) => panic!("expected leftover OA refuse"),
-            Err(e) => panic!("unexpected error: {e}"),
-        }
+        ScriptHashTable::open_tiny(&dir).unwrap();
+        assert!(!dir.join("scripthash.head").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -359,14 +359,44 @@ pub fn sealed_ovf_path(dir: &Path, id: u32) -> PathBuf {
     dir.join("scripthash.ovf").join(format!("{id:06}"))
 }
 
-#[doc(hidden)]
-pub fn file_starts_with_shsr(path: &Path) -> bool {
-    let Ok(mut f) = std::fs::File::open(path) else {
-        return false;
-    };
+/// `Ok(true)` is `SHSR`. A short file is not. Any other read error fails the caller.
+fn read_shsr_magic(path: &Path) -> Result<bool, StoreError> {
+    let mut f = std::fs::File::open(path).map_err(|e| StoreError::io(path, e))?;
     let mut magic = [0u8; 4];
     use std::io::Read;
-    matches!(f.read_exact(&mut magic), Ok(())) && magic == *b"SHSR"
+    match f.read_exact(&mut magic) {
+        Ok(()) => Ok(magic == *crate::scripthash_sorted_head::DATA_MAGIC),
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(StoreError::io(path, e)),
+    }
+}
+
+fn six_digit_name(name: &str) -> Option<u32> {
+    if name.len() == 6 && name.chars().all(|c| c.is_ascii_digit()) {
+        name.parse().ok()
+    } else {
+        None
+    }
+}
+
+/// Next L0 id is one past the highest six-digit name, including a hole.
+fn next_sealed_ovf_id(dir: &Path) -> Result<u32, StoreError> {
+    let ovf = dir.join("scripthash.ovf");
+    let rd = match std::fs::read_dir(&ovf) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(StoreError::io(&ovf, e)),
+    };
+    let mut max_id: Option<u32> = None;
+    for ent in rd {
+        let ent = ent.map_err(|e| StoreError::io(&ovf, e))?;
+        let name = ent.file_name();
+        let Some(id) = six_digit_name(&name.to_string_lossy()) else {
+            continue;
+        };
+        max_id = Some(max_id.map_or(id, |cur| cur.max(id)));
+    }
+    Ok(max_id.map_or(0, |id| id.saturating_add(1)))
 }
 
 pub fn sorted_main_shard_path(dir: &Path, shard: usize, n_shards: usize) -> PathBuf {
@@ -542,7 +572,7 @@ pub fn open_sealed_sorted_ovf(dir: &Path) -> Result<Vec<SortedHead>, StoreError>
     let mut out = Vec::new();
     for id in ids {
         let p = sealed_ovf_path(dir, id);
-        if file_starts_with_shsr(&p) {
+        if read_shsr_magic(&p)? {
             out.push(SortedHead::open(p)?);
         }
     }
@@ -569,11 +599,38 @@ pub fn sorted_main_present(dir: &Path, n_shards: usize) -> bool {
 }
 
 #[doc(hidden)]
-pub fn leftover_oa_wipe_msg() -> String {
-    "scripthash leftover live OA index; wipe store/scripthash* (head, body, ovf, \
-     runs, include_hwm, cold_progress, main_sealed, oa_stub) and rematerialize \
-     (--sh-index rebuilds on start)"
-        .into()
+pub fn discard_incomplete_scripthash_head(dir: &Path, n_shards: usize) -> Result<(), StoreError> {
+    if sorted_main_present(dir, n_shards) {
+        return Ok(());
+    }
+    remove_store_path(&dir.join("scripthash.head"))
+}
+
+#[doc(hidden)]
+pub fn discard_leftover_oa_overflow(dir: &Path) -> Result<(), StoreError> {
+    let ovf = dir.join("scripthash.ovf");
+    let Ok(rd) = std::fs::read_dir(&ovf) else {
+        return Ok(());
+    };
+    for ent in rd {
+        let ent = ent.map_err(|e| StoreError::io(&ovf, e))?;
+        let name = ent.file_name();
+        let name = name.to_string_lossy();
+        let path = ent.path();
+        if six_digit_name(&name).is_some() && path.is_file() && !read_shsr_magic(&path)? {
+            std::fs::remove_file(&path).map_err(|e| StoreError::io(&path, e))?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_store_path(path: &Path) -> Result<(), StoreError> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path).map_err(|e| StoreError::io(path, e))?;
+    } else if path.exists() {
+        std::fs::remove_file(path).map_err(|e| StoreError::io(path, e))?;
+    }
+    Ok(())
 }
 
 #[doc(hidden)]
@@ -606,29 +663,6 @@ pub fn sharded_body_n_shards(dir: &Path) -> Result<usize, StoreError> {
         }
     }
     Ok(names.len())
-}
-
-/// Live OA or schema-17 `SHSR` at `scripthash.head` (file or shard dir).
-#[doc(hidden)]
-pub fn leftover_live_oa_main(head_path: &Path) -> bool {
-    head_path.exists()
-}
-
-/// Non-`SHSR` six-digit files under `scripthash.ovf/` (old OA overflow segs).
-#[doc(hidden)]
-pub fn leftover_oa_overflow(dir: &Path) -> bool {
-    let ovf = dir.join("scripthash.ovf");
-    let Ok(rd) = std::fs::read_dir(&ovf) else {
-        return false;
-    };
-    rd.flatten().any(|e| {
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        name.len() == 6
-            && name.chars().all(|c| c.is_ascii_digit())
-            && e.path().is_file()
-            && !file_starts_with_shsr(&e.path())
-    })
 }
 
 #[doc(hidden)]
@@ -941,15 +975,10 @@ impl ScriptHashTable {
     }
 
     pub fn open_with_scale(dir: &std::path::Path, scale: HeadScale) -> Result<Self, StoreError> {
-        let layout = detect_sh_body_layout(dir)?;
-        if leftover_oa_overflow(dir) {
-            return Err(StoreError::Layout(leftover_oa_wipe_msg()));
-        }
-        let head_path = dir.join("scripthash.head");
         let expected = sh_main_shard_count(scale);
-        if leftover_live_oa_main(&head_path) && !sorted_main_present(dir, expected) {
-            return Err(StoreError::Layout(leftover_oa_wipe_msg()));
-        }
+        discard_incomplete_scripthash_head(dir, expected)?;
+        discard_leftover_oa_overflow(dir)?;
+        let layout = detect_sh_body_layout(dir)?;
         unlink_leftover_oa_stub(dir);
         let n_shards = sharded_body_n_shards(dir)?;
         Self::from_layout_and_n_shards(dir, layout, n_shards, scale)
@@ -1850,14 +1879,11 @@ impl ScriptHashTable {
             return Ok(());
         }
         recs.sort_unstable_by_key(|a| a.0);
-        let id = {
-            let g = self.sealed_ovf.lock().unwrap();
-            g.len() as u32
-        };
+        let id = next_sealed_ovf_id(&self.store_dir)?;
         let path = sealed_ovf_path(&self.store_dir, id);
-        if path.exists() && !file_starts_with_shsr(&path) {
+        if path.exists() {
             return Err(StoreError::Corrupt(
-                "scripthash.ovf: seal path occupied by non-sorted segment",
+                "scripthash.ovf: seal path already exists",
             ));
         }
         let sealed = SortedHead::write(&path, &recs)?;
