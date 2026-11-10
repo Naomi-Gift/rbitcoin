@@ -94,9 +94,10 @@ fn eviction_protects_block_tx_ping_and_netgroup() {
     cands.push(cand(10, 101, Some(1.0), 0, 0));
     // The ping, tx, and block cohorts interleave in `connected_at`, which
     // runs against each protect key, so a protect sorted by connection time
-    // keeps a different set. Ping id 18 is older than ids 9 and 10, so the
-    // ping cohort is not the newest eight either.
-    for (i, at) in (11..=18).zip([214, 213, 212, 209, 208, 207, 204, 50]) {
+    // keeps a different set. Ping id 11 is older than ids 9 and 10, so the
+    // ping cohort is not the newest eight either. Id 18, the last ping
+    // protect by key, is newer, so a smaller ping budget leaves it to evict.
+    for (i, at) in (11..=18).zip([50, 214, 213, 212, 209, 208, 207, 204]) {
         cands.push(cand(i, at, Some(0.01), 0, 0));
     }
     for (i, at) in (19..=22).zip([215, 210, 205, 200]) {
