@@ -685,6 +685,8 @@ pub struct TxTable {
     pub prune_seqsigwit_mode: std::sync::atomic::AtomicBool,
     /// `--datadir-hdd`: Class A body stems are one pwrite wave each.
     pub datadir_hdd: std::sync::atomic::AtomicBool,
+    /// Historical spend slots not yet folded into `spent.body`.
+    spend_pages: crate::spend_page_log::SpendPageLog,
     /// Per-fk packed `txout` decodes for an outs reader
     /// ([`Self::get_meta_and_outputs`], and [`Self::get`] through it), the
     /// decode the mempool and block-proposal pins count. [`Self::get_full`] is
@@ -1179,6 +1181,7 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(false),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
+            spend_pages: crate::spend_page_log::SpendPageLog::create(dir),
         })
     }
 
@@ -1415,6 +1418,7 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
+            spend_pages: crate::spend_page_log::SpendPageLog::load(dir)?,
         };
         match input_open_tail(t.input.count(), n_bodies, t.seqsigwit.count()) {
             InputOpenTail::Backfill { from } => {
@@ -2267,25 +2271,43 @@ impl TxTable {
         if abs_edges.is_empty() {
             return Ok(Vec::new());
         }
-        let _sweep = self.spent.advise_random_for_sweep();
         for &(_, _, _, sfk, _) in abs_edges {
             if sfk.is_null() {
                 return Err(StoreError::InvalidFk);
             }
         }
-        if crate::bulk_io::io_uring_enabled() {
-            match crate::spend_annotate_uring::put_spend_batch_by_abs_meta_uring(
-                self, spenders, abs_edges,
-            ) {
-                Ok(cold) => return Ok(cold),
-                Err(e) => {
-                    rbitcoin_log::debug!(
-                        "store: spend annotate uring unavailable ({e}); pwrite fallback"
-                    );
-                }
-            }
+        let backend = crate::spend_annotate_uring::spend_ann_backend();
+        let mut cold = Vec::new();
+        for &(abs, cfk, vout, sfk, vin) in abs_edges {
+            let known = self.current_spend_slot(abs)?;
+            cold.extend(self.put_spend_batch_by_abs_meta_known(
+                spenders,
+                &[(abs, cfk, vout, sfk, vin)],
+                &[known],
+                backend,
+            )?);
         }
-        self.put_spend_batch_by_abs_meta_pwrite(spenders, abs_edges)
+        Ok(cold)
+    }
+
+    fn current_spend_slot(&self, abs: u64) -> Result<(Fk, u8, u32), StoreError> {
+        if let Some(raw) = self.spend_pages.slot(abs) {
+            let (flags, field, vin) = decode_spent_slot(&raw)?;
+            return Ok((field, flags, vin));
+        }
+        let published = self.spent.body_published_len();
+        if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > published {
+            return Ok((Fk::NULL, 0, 0));
+        }
+        let mut buf = [0u8; OutputRecord::SPENT_SLOT_LEN];
+        self.spent.read_prefix_at_published(
+            published,
+            abs,
+            OutputRecord::SPENT_SLOT_LEN as u64,
+            &mut buf,
+        )?;
+        let (flags, field, vin) = decode_spent_slot(&buf)?;
+        Ok((field, flags, vin))
     }
 
     /// Page `pwrite` RMW for [`Self::put_spend_batch_by_abs_meta`].
@@ -2369,21 +2391,26 @@ impl TxTable {
         let body_pub = self.spent.body_published_len();
         let body_path = self.spent.body_file_path();
 
+        let mut out: Vec<Option<SpenderSlot>> = vec![None; abs_offs.len()];
         let mut submitted: Vec<usize> = Vec::with_capacity(abs_offs.len());
         for (i, &off) in abs_offs.iter().enumerate() {
             let end = off.saturating_add(META_LEN as u64);
             if end > body_pub {
                 continue;
             }
+            if let Some(raw) = self.spend_pages.slot(off) {
+                let (flags, field, vin) = decode_spent_slot(&raw)?;
+                out[i] = Some((field, flags, vin));
+                continue;
+            }
             submitted.push(i);
         }
         if submitted.is_empty() {
-            return Ok(vec![None; abs_offs.len()]);
+            return Ok(out);
         }
 
         let live: Vec<u64> = submitted.iter().map(|&i| abs_offs[i]).collect();
         let plan = crate::idx_body_pipeline::plan_spend_slot_peeks(&live);
-        let mut out: Vec<Option<SpenderSlot>> = vec![None; abs_offs.len()];
         let depth = crate::uring_session::DEFAULT_ENTRIES as usize;
         for chunk in plan.chunks(depth.max(1)) {
             read_spend_peek_chunk(
@@ -2433,6 +2460,10 @@ impl TxTable {
         if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
             return Err(StoreError::Corrupt("spent slot OOB"));
         }
+        if let Some(raw) = self.spend_pages.slot(abs) {
+            let (flags, field, vin) = decode_spent_slot(&raw)?;
+            return Ok((flags & output_flags::MULTI_SPENDER != 0, field, vin));
+        }
         self.spent
             .with_bytes_at(abs, OutputRecord::SPENT_SLOT_LEN as u64, |raw| {
                 let (flags, field, vin) = decode_spent_slot(raw)?;
@@ -2456,18 +2487,49 @@ impl TxTable {
         self.spent.with_bytes_at(body_off, body_len, |raw| {
             let mut out = Vec::with_capacity(vouts.len());
             for &v in vouts {
-                let start = (v as usize).saturating_mul(slot);
-                let end = start.saturating_add(slot);
-                if end > raw.len() {
-                    continue;
-                }
-                let Ok((flags, field, vin)) = decode_spent_slot(&raw[start..end]) else {
+                let abs = spent_abs(body_off, v);
+                let decoded = if let Some(logged) = self.spend_pages.slot(abs) {
+                    decode_spent_slot(&logged).ok()
+                } else {
+                    let start = (v as usize).saturating_mul(slot);
+                    let end = start.saturating_add(slot);
+                    if end > raw.len() {
+                        None
+                    } else {
+                        decode_spent_slot(&raw[start..end]).ok()
+                    }
+                };
+                let Some((flags, field, vin)) = decoded else {
                     continue;
                 };
                 out.push((v, flags & output_flags::MULTI_SPENDER != 0, field, vin));
             }
             Ok(out)
         })
+    }
+
+    pub(crate) fn note_historical_spend_slots(
+        &self,
+        slots: &[(u64, [u8; OutputRecord::SPENT_SLOT_LEN])],
+    ) -> Result<(), StoreError> {
+        self.spend_pages.note_slots(slots)
+    }
+
+    pub(crate) fn commit_open_spend_pages(&self, height: u32) -> Result<(), StoreError> {
+        let published = self.spent.body_published_len();
+        self.spend_pages.commit_open(height, published, |off, len| {
+            let mut buf = vec![0u8; len];
+            self.spent
+                .read_prefix_at_published(published, off, len as u64, &mut buf)?;
+            Ok(buf)
+        })
+    }
+
+    pub(crate) fn fold_committed_spend_pages(&self) -> Result<(), StoreError> {
+        self.spend_pages.fold_into(
+            |off, image| self.spent.write_body_abs(off, image),
+            || self.spent.sync_data_only(),
+        )
     }
 
     /// Patch multi + spender_field on create tx output (packed Class A body).

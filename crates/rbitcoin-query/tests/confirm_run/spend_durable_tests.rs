@@ -610,6 +610,137 @@ fn marker_heights(store: &std::path::Path) -> Option<(u32, u32)> {
     ))
 }
 
+fn pay_many(prev: Txid, n: u32, each: Amount) -> Transaction {
+    let outputs = (0..n)
+        .map(|_| TxOut {
+            value: each,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        })
+        .collect();
+    Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: prev,
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: outputs,
+    }
+}
+
+fn spend_vout(prev: Txid, vout: u32, val: Amount) -> Transaction {
+    Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint { txid: prev, vout },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: val,
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    }
+}
+
+fn read_slot(store: &std::path::Path, abs: u64) -> [u8; 8] {
+    use std::io::Read;
+    let mut f = std::fs::File::open(store.join("spent.body")).unwrap();
+    f.seek(SeekFrom::Start(abs)).unwrap();
+    let mut slot = [0u8; 8];
+    f.read_exact(&mut slot).unwrap();
+    slot
+}
+
+/// Two later blocks spend outputs on a full historical page. Readers see both
+/// spends and the unspent neighbor before the spend checkpoint, and the page
+/// bytes on `spent.body` stay the pre-spend image until that checkpoint folds.
+#[test]
+fn historical_page_stays_unwritten_until_spend_checkpoint() {
+    let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled("spend-page-log");
+    q.set_spend_index(true);
+    let params = ChainParams::regtest();
+    let ms = Milestone::NONE;
+    let maturity = params.coinbase_maturity();
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    accept_and_connect_block(&q, &params, Height::GENESIS, &genesis, ms).unwrap();
+    let mut tip = genesis.block_hash();
+    let mut tip_time = genesis.header.time;
+    let b1 = mine(tip, tip_time + 600, 1, Vec::new());
+    let c1 = b1.txdata[0].compute_txid();
+    accept_and_connect_block(&q, &params, Height(1), &b1, ms).unwrap();
+    tip = b1.block_hash();
+    tip_time = b1.header.time;
+    connect_until(&q, &params, ms, &mut tip, &mut tip_time, maturity + 2);
+
+    let created = pay_many(c1, 512, Amount::from_sat(1_000));
+    let created_id = created.compute_txid();
+    let create_block = mine(tip, tip_time + 600, maturity + 3, vec![created]);
+    accept_and_connect_block(&q, &params, Height(maturity + 3), &create_block, ms).unwrap();
+    tip = create_block.block_hash();
+    tip_time = create_block.header.time;
+
+    let create_fk = q
+        .tx_fk_by_txid(created_id.as_byte_array())
+        .unwrap()
+        .unwrap();
+    let (off, _) = q.store().tx_spent_range(create_fk).unwrap();
+    let abs0 = spent_abs(off, 0);
+    let abs1 = spent_abs(off, 1);
+    let abs_neighbor = spent_abs(off, 2);
+    assert!(
+        abs0 < 4096 && abs1 < 4096 && abs_neighbor < 4096,
+        "the spent outputs must sit on the first full page, abs {abs0} {abs1}"
+    );
+    let store = q.store().path().to_path_buf();
+    let before0 = read_slot(&store, abs0);
+    let before1 = read_slot(&store, abs1);
+    let before_n = read_slot(&store, abs_neighbor);
+    assert_eq!(before0, [0u8; 8]);
+    assert_eq!(before1, [0u8; 8]);
+
+    let h0 = maturity + 4;
+    let s0 = spend_vout(created_id, 0, Amount::from_sat(900));
+    let b0 = mine(tip, tip_time + 600, h0, vec![s0]);
+    accept_and_connect_block(&q, &params, Height(h0), &b0, ms).unwrap();
+    tip = b0.block_hash();
+    tip_time = b0.header.time;
+    let h1 = h0 + 1;
+    let s1 = spend_vout(created_id, 1, Amount::from_sat(900));
+    let b1s = mine(tip, tip_time + 600, h1, vec![s1]);
+    accept_and_connect_block(&q, &params, Height(h1), &b1s, ms).unwrap();
+
+    assert!(q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap());
+    assert!(q.is_outpoint_spent(created_id.as_byte_array(), 1).unwrap());
+    assert!(!q.is_outpoint_spent(created_id.as_byte_array(), 2).unwrap());
+    assert_eq!(
+        read_slot(&store, abs0),
+        before0,
+        "a historical spend must not rewrite spent.body before the checkpoint"
+    );
+    assert_eq!(read_slot(&store, abs1), before1);
+    assert_eq!(read_slot(&store, abs_neighbor), before_n);
+
+    q.store().checkpoint_observed_spend().unwrap();
+    assert_ne!(
+        read_slot(&store, abs0),
+        before0,
+        "the checkpoint folds the spent slot onto spent.body"
+    );
+    assert_ne!(read_slot(&store, abs1), before1);
+    assert_eq!(read_slot(&store, abs_neighbor), before_n);
+    assert!(q.is_outpoint_spent(created_id.as_byte_array(), 0).unwrap());
+    assert!(q.is_outpoint_spent(created_id.as_byte_array(), 1).unwrap());
+    let _ = dir;
+}
+
 fn connect_until(
     q: &rbitcoin_query::Query,
     params: &ChainParams,

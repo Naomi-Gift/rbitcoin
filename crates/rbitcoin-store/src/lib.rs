@@ -102,6 +102,8 @@ pub mod spend_annotate_uring;
 #[doc(hidden)]
 pub mod spend_durable;
 #[doc(hidden)]
+pub mod spend_page_log;
+#[doc(hidden)]
 pub mod spender_table;
 #[doc(hidden)]
 pub mod store;

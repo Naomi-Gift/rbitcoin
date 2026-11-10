@@ -390,10 +390,28 @@ fn unknown_meta_annotate_is_one_rmw_per_page() {
         .put_spend_batch_by_abs_meta(&spenders, &edges)
         .unwrap()
         .is_empty());
+    // Page 0 is a full historical page: both slots stay in the directory and
+    // the body bytes stay zero. The last slot is the live tail, so its body
+    // bytes move now. The page-RMW counters stay quiet because neither write
+    // is the old unknown-meta sweep.
     assert_eq!(
         rbitcoin_store::spend_annotate_uring::spend_annotate_counts(),
-        (2, 2)
+        (0, 0)
     );
+    let published = t.spent.body_published_len();
+    let mut slot = [0u8; 8];
+    t.spent
+        .read_prefix_at_published(published, a0, 8, &mut slot)
+        .unwrap();
+    assert_eq!(slot, [0u8; 8]);
+    t.spent
+        .read_prefix_at_published(published, a1, 8, &mut slot)
+        .unwrap();
+    assert_eq!(slot, [0u8; 8]);
+    t.spent
+        .read_prefix_at_published(published, a2, 8, &mut slot)
+        .unwrap();
+    assert_ne!(slot, [0u8; 8]);
     let (off, len) = t.spent_range(fk).unwrap();
     let (m0, f0, v0) = t.get_output_spender_meta_at(off, len, 0).unwrap();
     let (m1, f1, v1) = t.get_output_spender_meta_at(off, len, 1).unwrap();
@@ -401,6 +419,51 @@ fn unknown_meta_annotate_is_one_rmw_per_page() {
     assert!(!m0 && f0 == Fk(10) && v0 == 1);
     assert!(!m1 && f1 == Fk(11) && v1 == 2);
     assert!(!m2 && f2 == Fk(12) && v2 == 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A second spend of a historical slot promotes through the directory.
+///
+/// The body page stays zero. Zeroing that slot on disk still returns the
+/// multi head, and a tail-page slot in the same peek still comes from the body.
+#[test]
+fn historical_second_spend_keeps_both_edges() {
+    let (dir, t, spenders) = temp_table();
+    let (fk, off, len) = put_n_outs(&t, 520, 0x45);
+    let a0 = rbitcoin_store::spent_abs(off, 0);
+    let a_tail = rbitcoin_store::spent_abs(off, 510);
+    assert!(a0 < 4096);
+    assert_ne!(a0 / 4096, a_tail / 4096);
+    assert!(t
+        .put_spend_batch_by_abs_meta(&spenders, &[(a0, fk, 0, Fk(10), 1)])
+        .unwrap()
+        .is_empty());
+    assert!(t
+        .put_spend_batch_by_abs_meta(&spenders, &[(a0, fk, 0, Fk(11), 2)])
+        .unwrap()
+        .is_empty());
+    assert!(t
+        .put_spend_batch_by_abs_meta(&spenders, &[(a_tail, fk, 510, Fk(12), 3)])
+        .unwrap()
+        .is_empty());
+    let published = t.spent.body_published_len();
+    let mut body = [0u8; 8];
+    t.spent
+        .read_prefix_at_published(published, a0, 8, &mut body)
+        .unwrap();
+    assert_eq!(body, [0u8; 8]);
+    t.spent.write_body_abs(a0, &[0u8; 8]).unwrap();
+    let (multi, field, vin) = t.get_output_spender_meta_at(off, len, 0).unwrap();
+    assert!(multi && vin == 0);
+    let (second, second_vin, next) = spenders.get(field).unwrap();
+    assert_eq!((second, second_vin), (Fk(11), 2));
+    let (first, first_vin, end) = spenders.get(next).unwrap();
+    assert_eq!((first, first_vin), (Fk(10), 1));
+    assert!(end.is_null());
+    let bulk = t.get_spender_meta_at_abs_batch(&[a0, a_tail]).unwrap();
+    assert_eq!(bulk[0].unwrap().0, field);
+    assert_ne!(bulk[0].unwrap().1 & output_flags::MULTI_SPENDER, 0);
+    assert_eq!(bulk[1].unwrap().0, Fk(12));
     let _ = std::fs::remove_dir_all(&dir);
 }
 

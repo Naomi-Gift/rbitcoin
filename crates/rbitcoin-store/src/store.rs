@@ -1846,9 +1846,11 @@ impl Store {
         let gen = self
             .spend_reorg_gen
             .load(std::sync::atomic::Ordering::Acquire);
+        self.txs.commit_open_spend_pages(tip)?;
         self.txs.sync_replay_data()?;
         self.spenders.sync_data_only()?;
         self.store_spend_marker(tip, tip, gen)?;
+        self.txs.fold_committed_spend_pages()?;
         Ok(t.elapsed().as_nanos() as u64)
     }
 
@@ -2060,6 +2062,7 @@ impl Store {
         during_sync: impl FnOnce(&Self),
     ) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
+        self.txs.commit_open_spend_pages(height)?;
         self.txs.sync_replay_data()?;
         self.spenders.sync_data_only()?;
         during_sync(self);
@@ -2082,7 +2085,8 @@ impl Store {
         let Some(height) = self.spend_height_within_class_a(height)? else {
             return Ok(());
         };
-        self.store_spend_marker(height, height, gen)
+        self.store_spend_marker(height, height, gen)?;
+        self.txs.fold_committed_spend_pages()
     }
 
     /// [`Self::checkpoint_observed_spend`] with hooks around the two reads

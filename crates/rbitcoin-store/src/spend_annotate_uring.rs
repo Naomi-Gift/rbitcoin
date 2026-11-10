@@ -610,15 +610,38 @@ pub fn put_spend_batch_by_abs_meta_known(
     if writes.is_empty() {
         return Ok(cold);
     }
+    let more = apply_prepared_spend_writes(txs, &writes, backend)?;
+    cold.extend(more);
+    Ok(cold)
+}
 
-    // Random advice for this sweep only. Drop restores NORMAL, including on error.
-    let _sweep = txs.spent.advise_random_for_sweep();
+/// Historical slots land in the page directory. The live tail page stays a
+/// body write, because Class A is still appending that page.
+fn apply_prepared_spend_writes(
+    txs: &TxTable,
+    writes: &[SpentAbsWrite],
+    backend: crate::io_backend::WriteIoBackend,
+) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
+    let published = txs.spent.body_published_len();
+    let mut tail: Vec<SpentAbsWrite> = Vec::new();
+    let mut hist: Vec<(u64, [u8; META_LEN])> = Vec::new();
+    for w in writes {
+        if crate::spend_page_log::is_historical(published, w.0) {
+            hist.push((w.0, w.5));
+        } else {
+            tail.push(*w);
+        }
+    }
+    txs.note_historical_spend_slots(&hist)?;
+    if tail.is_empty() {
+        return Ok(Vec::new());
+    }
     match backend {
         crate::io_backend::WriteIoBackend::Uring => {
-            put_spend_batch_pure_write_uring(txs, &writes, cold)
+            put_spend_batch_pure_write_uring(txs, &tail, Vec::new())
         }
         crate::io_backend::WriteIoBackend::Pwrite => {
-            put_spend_batch_pure_write_pwrite(txs, &writes, cold)
+            put_spend_batch_pure_write_pwrite(txs, &tail, Vec::new())
         }
     }
 }
