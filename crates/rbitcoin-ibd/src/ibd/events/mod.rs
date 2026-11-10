@@ -997,6 +997,15 @@ fn answer_probe(
     if st.header_walk.probe_open != Some(peer) {
         return false;
     }
+    // A failed target is not this peer's chain. Consuming it would leave
+    // them connected and queue them as the next challenge. The reply path
+    // drops that peer.
+    if headers
+        .iter()
+        .any(|hdr| hdr.validate_pow(hdr.target()).is_err())
+    {
+        return false;
+    }
     let tip = hub.tip_height().unwrap_or(0);
     let top = st.header_walk.probe_top;
     if let Some(first) = headers.first() {

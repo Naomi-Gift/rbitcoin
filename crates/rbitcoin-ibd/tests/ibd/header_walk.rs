@@ -86,6 +86,40 @@ fn a_header_that_fails_its_target_lets_the_next_peer_walk() {
     assert_eq!(st.header_walk.walk.peer, Some(1));
 }
 
+/// A probe answered with a header that fails its target drops that peer.
+/// The reply is shaped like a real probe, so it must not stay on the walk
+/// as the next challenge.
+#[test]
+fn a_probe_that_fails_its_target_drops_the_peer() {
+    let (_dir, hub, mut st, gen) = opened("unproven-bad-pow-probe", true);
+    st.header_walk.reserved = Some(0);
+    st.header_walk.probe_open = Some(1);
+    st.header_walk.probe_top = Some((0, gen.block_hash()));
+    note_lane(&mut st, 1);
+    let before = hub.query.store().header_count();
+    let hdr = Header {
+        version: bitcoin::block::Version::from_consensus(4),
+        prev_blockhash: gen.block_hash(),
+        merkle_root: TxMerkleNode::from_byte_array([9; 32]),
+        time: gen.time.saturating_add(1),
+        bits: CompactTarget::from_consensus(0),
+        nonce: 1,
+    };
+    apply(&mut st, &hub, 1, vec![hdr]);
+    assert_eq!(hub.query.store().header_count(), before);
+    assert!(!st.slots[1].alive, "a failed target drops the probed peer");
+    assert_ne!(st.header_walk.challenge, Some(1));
+    assert!(st.header_walk.probe_open.is_none());
+    assert!(st.slots[0].alive);
+    assert!(
+        !st.header_walk.walk_quiet.contains(&1),
+        "bad proof is not the short low-work miss"
+    );
+    assert!(send_getheaders(&mut st, &hub).unwrap());
+    assert_eq!(st.header_walk.reserved, Some(0));
+    assert_eq!(st.header_walk.walk.peer, Some(0));
+}
+
 #[test]
 fn pow_linked_accepts_a_chain_and_rejects_a_bad_link_or_pow() {
     let a = mine(BlockHash::from_byte_array([0; 32]), 1);
