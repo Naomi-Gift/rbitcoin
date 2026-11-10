@@ -405,14 +405,17 @@ fn p2p_start_err(what: &str, e: rbitcoin_net::NetError) -> NodeError {
     ))
 }
 
-/// Core's `NetworkErrorString`: the OS text without Rust's `(os error N)`.
+/// Core's `NetworkErrorString`: `<OS text> (<code>)`, not Rust's
+/// `(os error N)`.
 fn os_error_text(e: &std::io::Error) -> String {
     let text = e.to_string();
     match e.raw_os_error() {
-        Some(n) => text
-            .strip_suffix(&format!(" (os error {n})"))
-            .unwrap_or(&text)
-            .to_owned(),
+        Some(n) => {
+            let os = text
+                .strip_suffix(&format!(" (os error {n})"))
+                .unwrap_or(&text);
+            format!("{os} ({n})")
+        }
         None => text,
     }
 }

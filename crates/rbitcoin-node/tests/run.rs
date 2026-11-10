@@ -1042,8 +1042,9 @@ async fn held_p2p_port_is_the_core_bind_init_error() {
 }
 
 /// Any other bind failure is Core's second bind InitError, with the OS text as
-/// `NetworkErrorString` gives it: no Rust `(os error N)` suffix. 192.0.2.1
-/// (TEST-NET-1) is never a local address, so `bind` fails without root.
+/// `NetworkErrorString` gives it: `<strerror> (<errno>)`, not Rust's
+/// `(os error N)`. 192.0.2.1 (TEST-NET-1) is never a local address, so `bind`
+/// fails without root.
 #[tokio::test]
 async fn unassignable_p2p_address_is_the_core_bind_error_text() {
     let nanos = SystemTime::now()
@@ -1058,8 +1059,23 @@ async fn unassignable_p2p_address_is_the_core_bind_error_text() {
     assert!(matches!(err, rbitcoin_node::NodeError::Init(_)), "{err:?}");
     let msg = err.to_string();
     let head = format!("Error: Unable to bind to {addr} on this computer (bind returned error ");
-    assert!(msg.starts_with(&head) && msg.ends_with(')'), "{msg}");
     assert!(!msg.contains("os error"), "{msg}");
+    let os = msg
+        .strip_prefix(&head)
+        .and_then(|rest| rest.strip_suffix(')'))
+        .unwrap_or_else(|| panic!("{msg}"));
+    let (text, code) = os.rsplit_once(" (").unwrap_or_else(|| panic!("{msg}"));
+    let code: i32 = code
+        .strip_suffix(')')
+        .and_then(|c| c.parse().ok())
+        .unwrap_or_else(|| panic!("{msg}"));
+    assert_eq!(
+        text,
+        std::io::Error::from_raw_os_error(code)
+            .to_string()
+            .trim_end_matches(&format!(" (os error {code})")),
+        "{msg}"
+    );
 }
 
 /// `--proxy --only-net onion` reaches no clearnet seed, so the fixed onion
