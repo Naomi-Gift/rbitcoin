@@ -79,10 +79,10 @@ The BLVM / Orange Paper register (163 ids) is a separate crosswalk:
 [`blvm-consensus-crosswalk.md`](./blvm-consensus-crosswalk.md). It does
 not own these S/H/C rows.
 
-Hornet’s published 34-rule table is a **gap checklist** against this
-matrix, not a second spec. Full ID-by-ID happy/boundary map (Hornet `main`
-`spec.h` @ `151462fa` vs spec.html):
-[`peer-clients.md`](./peer-clients.md) § Hornet block-validation rules.
+Hornet’s published rule table is a gap checklist against this matrix, not a
+second spec. The ID map, and where `spec.h` @ `151462fa` differs from
+spec.html, is [`peer-clients.md`](./peer-clients.md) § Hornet block-validation
+rules.
 Selector: `./scripts/test-hornet-rules.sh` (runs `structure_rule_tests`,
 header version/time, `finality_tests`, `sigop_cost_tests`,
 `consensus_rules`).

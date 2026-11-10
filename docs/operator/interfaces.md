@@ -17,12 +17,12 @@ security model by itself.
 methods return `scripthash index disabled`; the listener still binds.
 
 `server.version[0]` is `rbitcoin-electrs <ver> electrumx` so Cake Wallet
-`getNodeIsElectrs()` will probe silent-payment tweaks and Sparrow and
-BlueWallet will send JSON-RPC batches. Other tweaks clients
-do not need that substring. We are **not** electrs — see `COMPAT.md`.
+`getNodeIsElectrs()` probes silent-payment tweaks, and Sparrow and
+BlueWallet send JSON-RPC batches. Other tweaks clients
+do not need that substring. This node is not electrs. See `COMPAT.md`.
 
-**Not a search-box explorer.** We serve clients that already know their
-scripthashes / txids. Address-prefix autocomplete is out.
+The listener is not a search-box explorer. It serves clients that already
+know their scripthashes or txids. Address-prefix autocomplete is absent.
 **0.8** electrs HTTP drop-in (mempool.space nginx `/api/`): [`COMPAT.md`](../../COMPAT.md).
 
 ```bash
@@ -96,10 +96,11 @@ Re-measure fat keys on the operator host (`rbitcoin-bench --suite casa
 
 ### App DoS floor (always on)
 
-Shared [`ServeLimits`](../../crates/rbitcoin-electrum) defaults (also the future Esplora
-floor). Excess Electrum connections are **rejected immediately** (no hang);
-oversize lines and idle clients fail closed. Excess Esplora requests wait for a
-slot, and the wait counts against the request timeout (**408** when it runs out).
+Shared [`ServeLimits`](../../crates/rbitcoin-electrum/src/server.rs) defaults.
+Electrum and Esplora both use them. Excess Electrum connections are rejected
+at accept. An oversize line and an idle client fail closed. An Esplora request
+that finds the in-flight cap full waits. The wait counts against the request
+timeout (`TimeoutLayer`, status 408). `admit_connection` holds the wait.
 
 | Limit | Default | Role |
 |-------|---------|------|
@@ -222,8 +223,6 @@ the first page; dirty/singleflight; not FIFO/LRU). RAM: [`docs/ibd-memory.md`](.
 
 **Large responses:** `GET /block/:hash/raw` may be multi‑MB; concurrency/timeout from `ServeLimits` still apply.
 **Package broadcast:** body is a JSON array of tx hex (max 25); uses the same libre-relay mempool policy as single `POST /tx`.
-
-DoS knobs share Electrum’s `ServeLimits` defaults (256 conns, 1 MiB body, 120 s timeout).
 
 ### mempool.space
 

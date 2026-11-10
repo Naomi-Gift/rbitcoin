@@ -40,7 +40,7 @@ consensus/script** path.
 | **Security** | [`SECURITY.md`](./SECURITY.md) — **0.9.x** is the published line; support window and signed binaries are 1.0 |
 | **Design** | [`docs/architecture.md`](./docs/architecture.md) — why this node is different |
 | **Develop** | rustup 1.95, no Nix — [`CONTRIBUTING.md`](./CONTRIBUTING.md) |
-| **Coverage** | Live production-file LCOV (badge; last green `master` `coverage` job). Every PR **must not drop** that ratio. Highest published line coverage among bitcoin full nodes — [`TESTING.md`](./TESTING.md) |
+| **Coverage** | Production-file line coverage floor is 91% (`LH*100 >= LF*91`). [`TESTING.md`](./TESTING.md) |
 
 ## Why this node is different
 
@@ -48,12 +48,10 @@ Most full nodes center a **UTXO set + block files** (Bitcoin Core). Most Electru
 backends are **external indexers** of another node. rbitcoin does neither:
 **no UTXO set** (relational archive), **Electrum + txindex in-process**.
 
-- **~200 GiB** hot pin/annotate set (schema 17); **~730 GiB** with the cold append-only files (`seqsigwit` ~486, `txstat` ~11, `input` ~29) —
-  census in [`SCHEMA.md`](./SCHEMA.md), `--sh-index` costs in [`OPERATOR.md`](./OPERATOR.md)
+- Store size is the dated census in [`SCHEMA.md`](./SCHEMA.md). `--sh-index` costs are in [`OPERATOR.md`](./OPERATOR.md)
 - **Under ~30 h** IBD on a laptop-class host with **`--milestone 0`**
 - **Modest RAM** during sync — no multi‑GiB `dbcache` pause
 - **Pure-Rust** consensus/scripts (**no** `libbitcoinconsensus`)
-- **Highest published line coverage** among bitcoin full nodes (live production-file LCOV on the badge; every PR **must not drop** that ratio) — [`TESTING.md`](./TESTING.md)
 - **Reproducible static musl** for ordinary Linux hosts
 
 Core / Fulcrum contrasts: **[`docs/architecture.md`](./docs/architecture.md)**.
