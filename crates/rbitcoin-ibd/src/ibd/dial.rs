@@ -163,13 +163,9 @@ pub fn mature_relative_slow_samples(slots: &[PeerSlot], now_ms: u64) -> Vec<Rela
             continue;
         };
         if bps == 0 {
-            // Chat with getdata outstanding is a real zero. A body still
-            // arriving, or a peer with nothing assigned, is not.
-            let streaming = s
-                .bytes_rx_total
-                .load(Ordering::Relaxed)
-                .saturating_sub(s.rate.bytes_at_progress);
-            if s.in_flight.is_empty() || streaming >= PROGRESS_STEP {
+            // Chat with getdata outstanding is a real zero. A solicited body
+            // still arriving, or a peer with nothing assigned, is not.
+            if s.in_flight.is_empty() || s.solicited_since_progress() >= PROGRESS_STEP {
                 continue;
             }
         }
@@ -817,18 +813,14 @@ pub fn disconnect_stalled_block_peers_at(
     freed
 }
 
-/// Getdata is on the wire, block progress is stale, and the stream has not
-/// moved a body-sized chunk since that progress.
+/// Getdata is on the wire, block progress is stale, and solicited block
+/// bytes have not moved a body-sized chunk since that progress.
 #[doc(hidden)]
 pub fn withholding_blocks(slot: &PeerSlot, now_ms: u64, stall_ms: u64) -> bool {
     if !super::peer_io::getdata_on_wire_stalled(slot, now_ms, stall_ms) {
         return false;
     }
-    let streamed = slot
-        .bytes_rx_total
-        .load(Ordering::Relaxed)
-        .saturating_sub(slot.rate.bytes_at_progress);
-    streamed < PROGRESS_STEP
+    slot.solicited_since_progress() < PROGRESS_STEP
 }
 
 /// Disconnect at most one **clear quarter-median outlier** (warm-up + cluster gate

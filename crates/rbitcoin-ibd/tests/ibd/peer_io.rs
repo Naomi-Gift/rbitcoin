@@ -181,6 +181,36 @@ fn unsolicited_block_does_not_refresh_progress() {
     assert_eq!(slot.rate.progress_ms, marked);
 }
 
+/// The progress baseline is the solicited total. Socket bytes that are not
+/// a requested block stay off that stamp.
+#[test]
+fn block_progress_stamp_records_solicited_bytes() {
+    let step = rbitcoin_ibd::ibd::rate::PROGRESS_STEP;
+    let mut slot = dummy_slot(8);
+    slot.in_flight.insert(BlockHash::from_byte_array([8u8; 32]));
+    slot.bytes_rx_total.store(1, Ordering::Relaxed);
+    slot.solicited_bytes.store(step, Ordering::Relaxed);
+    slot.solicited_ms.store(5_000, Ordering::Relaxed);
+    sample_peer_rates(std::slice::from_mut(&mut slot), 5_000);
+    assert_eq!(slot.rate.progress_ms, 5_000);
+    assert_eq!(
+        slot.rate.bytes_at_progress, step,
+        "a moved solicited clock stamps solicited bytes, not the socket total"
+    );
+
+    slot.bytes_rx_total.store(2, Ordering::Relaxed);
+    slot.solicited_bytes
+        .store(step.saturating_mul(2), Ordering::Relaxed);
+    note_block_progress(std::slice::from_mut(&mut slot), 8);
+    assert_eq!(slot.rate.bytes_at_progress, step.saturating_mul(2));
+
+    slot.bytes_rx_total.store(3, Ordering::Relaxed);
+    slot.solicited_bytes
+        .store(step.saturating_mul(3), Ordering::Relaxed);
+    note_block_rx(std::slice::from_mut(&mut slot), 8, 1_000);
+    assert_eq!(slot.rate.bytes_at_progress, step.saturating_mul(3));
+}
+
 #[test]
 fn socket_bytes_refresh_the_quiet_clock_only() {
     let mut slot = dummy_slot(4);

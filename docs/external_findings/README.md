@@ -115,6 +115,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [109](./109-filter-send-budget.md) | medium | Filter replies and compact blocks under-counted the send budget | fixed | `filter_and_compact_block_replies_charge_their_consensus_payload` |
 | [110](./110-getcfilters-budget.md) | medium | `getcfilters` kept queueing after the send budget | fixed | `getcfilters_stops_after_the_filter_that_crosses_the_send_budget`, `getcfcheckpt_returns_a_header_every_thousand_heights` |
 | [111](./111-pong-send-budget.md) | medium | Pongs were uncharged, and IBD pings were not rate-limited | fixed | `one_charged_pong_carries_the_latest_nonce`, `ibd_pings_coalesce_and_overflow_the_message_window` |
+| [112](./112-stall-solicited-bytes.md) | medium | Stall counted unsolicited socket bytes as block progress | fixed | `disconnect_stalled_drops_a_peer_sending_only_unsolicited_bytes`, `disconnect_stalled_keeps_a_peer_still_sending_a_block`, `relative_slow_zero_throughput_uses_solicited_bytes`, `block_progress_stamp_records_solicited_bytes` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline
 `8f3990f`). Report-local 001–010 are **renumbered** here. Identity/BIP30

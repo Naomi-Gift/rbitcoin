@@ -13,3 +13,8 @@ Fixed
   on a single queued pong. Writing it subtracts that one charge. IBD pings
   past the per-peer message window take the existing misbehavior disconnect.
   A block this node requested still skips that window.
+- **IBD stall counts solicited block bytes.** A peer with getdata on the
+  wire and a stale block clock is withholding when only pings or headers
+  have arrived. Solicited block bytes of 64 KiB since the last progress
+  stamp keep that peer. Relative-slow zero-throughput sampling uses the
+  same delta. A peer that sends no socket bytes stays the quiet case.

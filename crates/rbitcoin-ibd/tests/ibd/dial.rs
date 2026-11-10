@@ -1423,12 +1423,17 @@ fn disconnect_stalled_keeps_a_peer_still_sending_a_block() {
     put_on_wire(&mut slot, h, 0);
     slot.rate.note_rx(0);
     slot.rate.note_any_rx(50_000);
-    slot.bytes_rx_total
+    slot.rate.note_bytes_at_progress(0);
+    slot.solicited_bytes
         .store(rbitcoin_ibd::ibd::rate::PROGRESS_STEP, Ordering::Relaxed);
     let mut inflight = HashMap::new();
     inflight.insert(h, rbitcoin_ibd::ibd::state::InflightReq::new(20));
     let mut cooldown = HashMap::new();
     let mut strikes = HashMap::new();
+    assert!(
+        !withholding_blocks(&slot, 60_000, 30_000),
+        "a solicited body of one progress step is still arriving"
+    );
     disconnect_stalled_block_peers_at(
         std::slice::from_mut(&mut slot),
         &mut inflight,
@@ -1442,6 +1447,54 @@ fn disconnect_stalled_keeps_a_peer_still_sending_a_block() {
     );
     assert!(cooldown.is_empty());
     assert!(inflight.contains_key(&h));
+}
+
+/// Pings and headers move the socket counter and the quiet clock. They do
+/// not count as the block this peer was asked for.
+#[test]
+fn disconnect_stalled_drops_a_peer_sending_only_unsolicited_bytes() {
+    let a = addr(72);
+    let mut slot = dummy_slot(72, a, true);
+    let h = hash_byte(0x72);
+    put_on_wire(&mut slot, h, 0);
+    slot.rate.note_rx(0);
+    slot.rate.note_bytes_at_progress(0);
+    let step = rbitcoin_ibd::ibd::rate::PROGRESS_STEP;
+    slot.bytes_rx_total
+        .store(step.saturating_mul(8), Ordering::Relaxed);
+    slot.solicited_bytes.store(0, Ordering::Relaxed);
+
+    assert!(
+        rbitcoin_ibd::ibd::peer_io::getdata_on_wire_quiet(&slot, 60_000, 30_000),
+        "no socket bytes at all is the quiet case"
+    );
+    slot.rate.note_any_rx(50_000);
+    assert!(
+        !rbitcoin_ibd::ibd::peer_io::getdata_on_wire_quiet(&slot, 60_000, 30_000),
+        "a recent ping is not silence"
+    );
+    assert!(
+        withholding_blocks(&slot, 60_000, 30_000),
+        "socket bytes that are not a requested block are withholding"
+    );
+
+    let mut inflight = HashMap::new();
+    inflight.insert(h, rbitcoin_ibd::ibd::state::InflightReq::new(72));
+    let mut cooldown = HashMap::new();
+    let mut strikes = HashMap::new();
+    disconnect_stalled_block_peers_at(
+        std::slice::from_mut(&mut slot),
+        &mut inflight,
+        &mut rbitcoin_ibd::ibd::body::BodyPresence::new(),
+        &mut cooldown,
+        &mut strikes,
+        Instant::now(),
+        Duration::from_secs(30),
+        60_000,
+        0,
+    );
+    assert!(cooldown.contains_key(&rbitcoin_net::NetAddr::from_socket(a)));
+    assert!(inflight.is_empty());
 }
 
 #[test]
@@ -1758,6 +1811,41 @@ fn mature_relative_slow_samples_uses_ewma_active_ms() {
     let samples = mature_relative_slow_samples(&[young, mature], RELSLOW_ACTIVE_MS);
     assert!(samples.iter().all(|s| s.peer_id != 0));
     assert!(samples.iter().any(|s| s.peer_id == 1));
+}
+
+/// A zero-throughput sample is chat while getdata is outstanding. A body
+/// still arriving is the solicited delta, not every socket byte.
+#[test]
+fn relative_slow_zero_throughput_uses_solicited_bytes() {
+    let h = hash_byte(0x73);
+    let step = rbitcoin_ibd::ibd::rate::PROGRESS_STEP;
+    let mut chat = dummy_slot(73, addr(73), true);
+    chat.in_flight.insert(h);
+    chat.rate.sample(0, 0, true);
+    chat.rate.sample(RELSLOW_ACTIVE_MS, 0, true);
+    chat.rate.note_bytes_at_progress(0);
+    chat.bytes_rx_total
+        .store(step.saturating_mul(4), Ordering::Relaxed);
+    chat.solicited_bytes.store(0, Ordering::Relaxed);
+    let chat_samples = mature_relative_slow_samples(std::slice::from_ref(&chat), RELSLOW_ACTIVE_MS);
+    assert!(
+        chat_samples.iter().any(|s| s.peer_id == 73 && s.bps == 0),
+        "pings with getdata outstanding are a zero sample, got {chat_samples:?}"
+    );
+
+    let mut sending = dummy_slot(74, addr(74), true);
+    sending.in_flight.insert(h);
+    sending.rate.sample(0, 0, true);
+    sending.rate.sample(RELSLOW_ACTIVE_MS, 0, true);
+    sending.rate.note_bytes_at_progress(0);
+    sending.bytes_rx_total.store(0, Ordering::Relaxed);
+    sending.solicited_bytes.store(step, Ordering::Relaxed);
+    let sending_samples =
+        mature_relative_slow_samples(std::slice::from_ref(&sending), RELSLOW_ACTIVE_MS);
+    assert!(
+        sending_samples.iter().all(|s| s.peer_id != 74),
+        "solicited bytes of one progress step are not zero throughput, got {sending_samples:?}"
+    );
 }
 
 /// Frozen high EWMAs from peers that stopped sending must not make a

@@ -366,6 +366,14 @@ impl PeerSlot {
         self.takes_block_requests() && !self.chain.lacks(hash, now_ms)
     }
 
+    /// Solicited block bytes since the last progress stamp. Pings, headers,
+    /// and other socket bytes stay on `bytes_rx_total`.
+    pub fn solicited_since_progress(&self) -> u64 {
+        self.solicited_bytes
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.rate.bytes_at_progress)
+    }
+
     /// Pause block download until `until` and withdraw what this peer owed.
     pub fn pause_block_download(&mut self, until: u64) -> Vec<BlockHash> {
         let now = ibd_mono_ms();
@@ -605,7 +613,6 @@ pub fn sample_peer_rates(slots: &mut [PeerSlot], now_ms: u64) {
         if !s.alive {
             continue;
         }
-        let total = s.bytes_rx_total.load(Ordering::Relaxed);
         let any = s.any_rx_ms.load(Ordering::Relaxed);
         if any > s.rate.any_rx_ms {
             s.rate.any_rx_ms = any;
@@ -620,10 +627,10 @@ pub fn sample_peer_rates(slots: &mut [PeerSlot], now_ms: u64) {
         if asked > s.rate.work_started_ms {
             s.rate.work_started_ms = asked;
         }
-        let bytes = s.solicited_bytes.load(Ordering::Relaxed);
-        s.rate.sample(now_ms, bytes, !s.in_flight.is_empty());
+        let solicited = s.solicited_bytes.load(Ordering::Relaxed);
+        s.rate.sample(now_ms, solicited, !s.in_flight.is_empty());
         if s.rate.progress_ms > progress_before {
-            s.rate.note_bytes_at_progress(total);
+            s.rate.note_bytes_at_progress(solicited);
         }
     }
 }
@@ -632,7 +639,7 @@ pub fn note_block_progress(slots: &mut [PeerSlot], peer: usize) {
     if let Some(s) = slots.iter_mut().find(|s| s.id == peer) {
         s.rate.note_rx(ibd_mono_ms());
         s.rate
-            .note_bytes_at_progress(s.bytes_rx_total.load(Ordering::Relaxed));
+            .note_bytes_at_progress(s.solicited_bytes.load(Ordering::Relaxed));
     }
 }
 
@@ -641,7 +648,7 @@ pub fn note_block_rx(slots: &mut [PeerSlot], peer: usize, wire_bytes: usize) {
         let now = ibd_mono_ms();
         s.rate.note_rx(now);
         s.rate
-            .note_bytes_at_progress(s.bytes_rx_total.load(Ordering::Relaxed));
+            .note_bytes_at_progress(s.solicited_bytes.load(Ordering::Relaxed));
         if wire_bytes > 0 && s.first_data_ms == 0 {
             s.first_data_ms = now;
         }
