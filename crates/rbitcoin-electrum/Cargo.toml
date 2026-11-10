@@ -31,9 +31,16 @@ tokio = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 
+[target.'cfg(unix)'.dev-dependencies]
+libc = "0.2"
+
 [[test]]
 name = "suite"
 path = "tests/suite.rs"
+
+[[test]]
+name = "listener_limits"
+path = "tests/listener_limits.rs"
 
 [lints]
 workspace = true

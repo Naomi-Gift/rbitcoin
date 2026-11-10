@@ -74,19 +74,26 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   Application DoS limits apply on every bind, including a public address.
   The caps are request size, idle timeout, Electrum scripthash subscriptions,
   and broadcast hex length (`ServeLimits`). Electrum rejects a connection
-  past the cap at accept. Esplora's cap is requests in flight. A request
-  that finds the cap full waits. That wait counts against the request
-  timeout and the answer is then 408 (`admit_connection`,
-  `TimeoutLayer`). The numbers are
+  past the cap at accept, and retries a transient accept error instead of
+  dropping the listener. Esplora caps accepted TCP as well as requests in
+  flight (`--esplora-max-inflight`). A further TCP connection is closed.
+  A connection that never sends headers is closed at the idle timeout. A
+  request that finds the in-flight cap full waits. That wait counts against
+  the request timeout and the answer is then 408 (`admit_connection`,
+  `TimeoutLayer`). Health, Esplora, Electrum, and inbound P2P leave a
+  descriptor reserve so the store and RPC can still open files. The numbers are
   [`docs/operator/interfaces.md`](docs/operator/interfaces.md). Esplora is
   opt-in (`--esplora-listen`). Internal electrs HTTP (`/internal/*`) is unix
   listen only, not the public TCP bind. Edge TLS, multi-tenant metering, and API keys
   are still out of process (see [`docs/operator/interfaces.md`](./docs/operator/interfaces.md)).
 - **Health listener:** `--health-listen` is opt-in, read-only, and
   unauthenticated (`/healthz`, `/readyz`, `/progress`, and `/metrics` with
-  `--metrics`). It binds before the store opens. Requests carry no body and
-  time out; `/readyz` and `/metrics` run a capped number of blocking reads
-  and answer 503 past the cap rather than queue. `/progress` is uncapped: it
+  `--metrics`). It binds before the store opens. At most 64 connections are
+  accepted; a further one is closed, and one that sends no headers is closed
+  at the 5s request timeout. Requests carry no body and time out; `/readyz`
+  and `/metrics` run a capped number of blocking reads and answer 503 past
+  the cap rather than queue. `/readyz` is 503 while the Electrum listener
+  has stopped. `/progress` is uncapped: it
   reads in-memory counters under one short lock and reveals the bring-up
   phase (as `/readyz` does) and stage names, counts, and timings.
   `/metrics` reveals peer counts and mempool size; keep the port on

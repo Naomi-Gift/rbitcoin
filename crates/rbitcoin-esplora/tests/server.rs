@@ -27,6 +27,60 @@ use tokio::net::TcpStream;
 
 use rbitcoin_query::testutil::FixtureChain;
 
+/// Esplora caps accepted TCP sockets, not only in-flight requests, and closes
+/// a connection that never sends headers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_cap_esplora_idle_tcp_is_closed() {
+    let (_dir, q) = temp_query("esplora-idle-tcp");
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let mut cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    cfg.limits.max_connections = 4;
+    cfg.limits.idle_timeout = Duration::from_millis(300);
+    let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
+    let addr = handle.local_addr;
+
+    let mut opened = Vec::new();
+    for _ in 0..12 {
+        opened.push(TcpStream::connect(addr).await.expect("connect"));
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let mut held = 0usize;
+    for mut sock in opened {
+        let mut buf = [0u8; 1];
+        let open = match tokio::time::timeout(Duration::from_millis(40), sock.read(&mut buf)).await
+        {
+            Err(_) => true,
+            Ok(Ok(0)) | Ok(Err(_)) => false,
+            Ok(Ok(_)) => true,
+        };
+        if open {
+            held += 1;
+        }
+    }
+    assert!(
+        held <= 4,
+        "esplora held {held} idle TCP connections past the cap of 4"
+    );
+
+    let mut idle = TcpStream::connect(addr).await.expect("one idle client");
+    let closed = tokio::time::timeout(Duration::from_secs(2), async {
+        let mut buf = [0u8; 8];
+        loop {
+            match idle.read(&mut buf).await {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+        }
+    })
+    .await;
+    assert!(
+        closed.is_ok(),
+        "an esplora connection that sent no headers was still open after 2s"
+    );
+    handle.shutdown().await;
+}
+
 /// `store(true)` ends the serve task without waiting out the shutdown poll.
 #[tokio::test]
 async fn esplora_shutdown_wakes_without_the_fifty_ms_poll() {

@@ -1,0 +1,3 @@
+Fixed
+
+- **Idle listeners no longer take every file descriptor.** Health and Esplora cap accepted connections and close one that never sends a request. An inbound peer that stays silent or dribbles bytes during the BIP324 handshake is dropped at the handshake deadline, and one address cannot fill the inbound slots with unfinished handshakes. Electrum logs an accept error and tries again. `/readyz` reports the Electrum listener down when that task has stopped. Listeners leave descriptors for the store and RPC.

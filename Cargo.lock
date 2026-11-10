@@ -1048,6 +1048,7 @@ name = "rbitcoin-electrum"
 version = "0.9.99"
 dependencies = [
  "bitcoin",
+ "libc",
  "rbitcoin-consensus",
  "rbitcoin-log",
  "rbitcoin-net",
@@ -1066,6 +1067,8 @@ dependencies = [
  "axum",
  "bitcoin",
  "http",
+ "hyper",
+ "hyper-util",
  "rbitcoin-consensus",
  "rbitcoin-electrum",
  "rbitcoin-log",
@@ -1143,6 +1146,8 @@ dependencies = [
  "bitcoin",
  "bitcoin_hashes 0.14.101",
  "getrandom 0.4.3",
+ "hyper",
+ "hyper-util",
  "libc",
  "mimalloc",
  "rbitcoin-consensus",

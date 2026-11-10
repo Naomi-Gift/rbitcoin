@@ -1213,37 +1213,36 @@ pub async fn inbound_connect_and_handshake(
         peers.register_connecting(their_addr, bind, true, crate::peers::PeerConnType::Inbound);
     let wire = sess.new_wire();
     sess.attach_tcp_shutdown(tcp_pre);
-    let perms = peers.permission_flags(their_addr, true, bind);
-    let (mut reader, mut writer, wire, tcp_shutdown) =
-        match open_inbound_with_wire(stream, magic, wire, perms).await {
-            Ok(x) => x,
-            Err(NetError::Protocol("magic-prefixed ellswift")) => {
-                while !sess.stop.load(std::sync::atomic::Ordering::SeqCst) {
-                    tokio::time::sleep(Duration::from_millis(50)).await;
+    // One deadline from accept through key exchange and VERSION/VERACK.
+    // A per-read deadline would reset on each drip byte.
+    let limit = Duration::from_secs(peers.peer_timeout_secs());
+    let opened = tokio::time::timeout(limit, async {
+        let perms = peers.permission_flags(their_addr, true, bind);
+        let (mut reader, mut writer, wire, tcp_shutdown) =
+            match open_inbound_with_wire(stream, magic, wire, perms).await {
+                Ok(x) => x,
+                Err(NetError::Protocol("magic-prefixed ellswift")) => {
+                    while !sess.stop.load(Ordering::SeqCst) {
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                    }
+                    return Err(NetError::Timeout);
                 }
-                return Err(NetError::Timeout);
-            }
-            Err(e) => {
-                let _ = peers.disconnect_id(sess.id);
-                return Err(e);
-            }
+                Err(e) => return Err(e),
+            };
+        match &reader {
+            PeerReader::V1(_) => sess.mark_v1_transport(),
+            PeerReader::V2(_) => sess.mark_v2_transport_ready(),
+        }
+        if let Ok(clone) = tcp_shutdown.try_clone() {
+            sess.attach_tcp_shutdown(clone);
+        }
+        let policy = HandshakePolicy {
+            hub: None,
+            peers: Some(peers),
+            session: Some(sess.as_ref()),
+            conn_type: crate::peers::PeerConnType::Inbound,
         };
-    match reader {
-        PeerReader::V1(_) => sess.mark_v1_transport(),
-        PeerReader::V2(_) => sess.mark_v2_transport_ready(),
-    }
-    if let Ok(clone) = tcp_shutdown.try_clone() {
-        sess.attach_tcp_shutdown(clone);
-    }
-    let policy = HandshakePolicy {
-        hub: None,
-        peers: Some(peers),
-        session: Some(sess.as_ref()),
-        conn_type: crate::peers::PeerConnType::Inbound,
-    };
-    let their_version = match tokio::time::timeout(
-        HANDSHAKE_TIMEOUT,
-        application_handshake(
+        let their_version = application_handshake(
             &mut reader,
             &mut writer,
             magic,
@@ -1253,17 +1252,23 @@ pub async fn inbound_connect_and_handshake(
             true,
             user_agent,
             policy,
-        ),
-    )
-    .await
-    {
-        Ok(Ok(v)) => v,
+        )
+        .await?;
+        Ok((their_version, reader, writer, wire, tcp_shutdown))
+    })
+    .await;
+    let (their_version, reader, writer, wire, tcp_shutdown) = match opened {
+        Ok(Ok(opened)) => opened,
         Ok(Err(e)) => {
             let _ = peers.disconnect_id(sess.id);
             return Err(e);
         }
         Err(_) => {
-            rbitcoin_log::debug!("{}", version_handshake_timeout_log(sess.id));
+            if sess.v2_transport_ready() {
+                rbitcoin_log::debug!("{}", crate::v2::v2_handshake_timeout_log(sess.id));
+            } else {
+                rbitcoin_log::debug!("{}", version_handshake_timeout_log(sess.id));
+            }
             let _ = peers.disconnect_id(sess.id);
             return Err(NetError::Timeout);
         }
