@@ -7,7 +7,6 @@ crates/rbitcoin-net/src/cache.rs	1
 crates/rbitcoin-net/src/chain.rs	1
 crates/rbitcoin-net/src/tx_relay.rs	3
 crates/rbitcoin-primitives/src/scriptnum.rs	2
-crates/rbitcoin-query/src/confirm_run/write.rs	3
 crates/rbitcoin-query/src/connect.rs	2
 crates/rbitcoin-query/src/reconstruct.rs	1
 crates/rbitcoin-query/src/regtest_pad.rs	2
