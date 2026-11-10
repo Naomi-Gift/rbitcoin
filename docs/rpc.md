@@ -119,7 +119,11 @@ curl -H "Authorization: Bearer $TOKEN" --data-binary \
 (`10.0.0.1`, `[::1]`); leading zeros and hex forms are rejected. When the flag is omitted and no
 socket is present, the client uses `127.0.0.1` and the network RPC port. Bearer
 comes from `{datadir}/rpc.token` or `--rpc-token-file`. Prints the JSON-RPC
-`result` (strings unquoted).
+`result` (strings unquoted). `--stdin` reads extra arguments from standard input, one per line until EOF,
+appended after the command-line arguments (Core-compatible; for values that
+should not appear in the process list). `--rpcwait` retries a refused connection for up to ~30 seconds.
+`--named` takes `name=value` arguments and sends them as a JSON object instead of a positional array.
+`--getinfo` prints a Core-style chain/network summary (no wallet section).
 
 ```bash
 rbitcoin-cli --datadir datadir getblockcount
