@@ -1,8 +1,9 @@
 # Peer full nodes: Hornet and satd
 
-Date: 2026-09-04. Research snapshot (Hornet `main` @ `151462fa`, satd `master`, public
-docs). Analysis only at write time. Not re-read for the 2026-09-13 0.7 docs
-pass — ranks 4–5 stay here, not quality.md Open.
+Date: 2026-09-04. Research snapshot (satd `master`, public docs). Hornet's
+published spec was re-read at `0e3b0a1b` (2026-06-14). The rest of this page
+was not re-read for the 2026-09-13 0.7 docs pass — ranks 4–5 stay here, not
+quality.md Open.
 
 **Owner of these notes:** this file. Ranked later-consideration items stay
 here. Do **not** copy the tables into [`quality.md`](./quality.md) Open.
@@ -20,7 +21,7 @@ Sources at write time:
 
 | Project | Tree / docs |
 |---------|-------------|
-| **Hornet** | [tobysharp/hornet](https://github.com/tobysharp/hornet) `main` @ [`151462fa`](https://github.com/tobysharp/hornet/commit/151462fa5ceece39c159674886dcfa6cfe9b1234), [docs/overview.md](https://github.com/tobysharp/hornet/blob/main/docs/overview.md), [spec.html](https://hornetnode.org/spec.html), [`spec.h`](https://github.com/tobysharp/hornet/blob/main/src/hornetlib/consensus/rules/spec.h), arXiv [2509.15754](https://arxiv.org/abs/2509.15754) |
+| **Hornet** | Published spec [`0e3b0a1b`](https://github.com/tobysharp/hornet/commit/0e3b0a1b71cd3883e7610446f3eac5c5f0b81ed0) ([spec.html](https://hornetnode.org/spec.html), [`spec.h`](https://github.com/tobysharp/hornet/blob/0e3b0a1b71cd3883e7610446f3eac5c5f0b81ed0/src/hornetlib/consensus/rules/spec.h)). GitHub `main` is [`151462fa`](https://github.com/tobysharp/hornet/commit/151462fa5ceece39c159674886dcfa6cfe9b1234) and is not that spec. [docs/overview.md](https://github.com/tobysharp/hornet/blob/main/docs/overview.md), arXiv [2509.15754](https://arxiv.org/abs/2509.15754) |
 | **satd** | [epochbtc/satd](https://github.com/epochbtc/satd), [CORE_DIFFERENCES.md](https://github.com/epochbtc/satd/blob/master/CORE_DIFFERENCES.md), [E2E_TESTING.md](https://github.com/epochbtc/satd/blob/master/docs/E2E_TESTING.md), [`fuzz/fuzz_targets/block_differential.rs`](https://github.com/epochbtc/satd/blob/master/fuzz/fuzz_targets/block_differential.rs) |
 
 ---
@@ -30,7 +31,7 @@ Sources at write time:
 | | **rbitcoin** | **Hornet** | **satd** |
 |--|--|--|--|
 | Thesis | Relational **archive** (no UTXO), pure-Rust scripts, in-process Electrum/Esplora, map-free Linux IO | **Spec-first** C++ consensus + custom UTXO LSM; IBD as a demo of the spec | **Core drop-in** (UTXO + `blocks/` + `bitcoin.conf`) with extra APIs in one process |
-| Consensus | Independent Rust; Core JSON corpora + [`consensus-tests.md`](./consensus-tests.md); **no** `libbitcoinconsensus` | Named declarative rules in `spec.h` / DSL (published [spec.html](https://hornetnode.org/spec.html) H01–S09; unreleased `spec.h` merges S02 into S03); isolated from storage | Rust engine **plus** C++ `libbitcoinconsensus` shadow |
+| Consensus | Independent Rust; Core JSON corpora + [`consensus-tests.md`](./consensus-tests.md); **no** `libbitcoinconsensus` | Named declarative rules in `spec.h` (published [spec.html](https://hornetnode.org/spec.html), 35 rules, S02 and S03 separate); isolated from storage | Rust engine **plus** C++ `libbitcoinconsensus` shadow |
 | Store | Class A/B/C tables, spent annotations ([`SCHEMA.md`](../SCHEMA.md)) | Age-stratified UTXO LSM, `ChainTree` + sidecars | RocksDB coins + Core-shaped flat files |
 | IBD | Multi-peer, lookup→load→scripts→write ([`concurrency.md`](./concurrency.md)); default mainnet milestone anchored at block 966143 | Single-peer concurrent UTXO pipeline; claims ~15 min assumevalid on 32 cores | “Swarm” parallel download + speculative verify |
 | Wallet APIs | Native Electrum + Esplora; SH optional and can **lag** tip ([`COMPAT.md`](../COMPAT.md)) | None yet | Native Electrum + Esplora + BIP 157; indexes **atomic** with `connect_block` |
@@ -89,11 +90,18 @@ datadir). Casa/Sparrow numbers stay host-only
 ### 3. Hornet block-validation rules ↔ our tests
 
 [hornetnode.org/spec.html](https://hornetnode.org/spec.html) is the published
-table (H01–H06, L01–L13, C01–C07, S01–S09). Hornet `main` `spec.h` @
-`151462fa` is the same graph except **S02 `ValidateInputPrevoutsCreated` is
-folded into S03** (`ValidateInputPrevoutsUnspent`: an input must reference a
-prevout that exists and is still unspent). Wording nits only elsewhere (H02
-“MUST achieve” vs “MUST NOT exceed”; H04 “strictly greater”; H05 `<= now+2h`).
+table (H01–H06, L01–L13, C01–C07, S01–S09). It is rendered from `spec.h` @
+[`0e3b0a1b`](https://github.com/tobysharp/hornet/blob/0e3b0a1b71cd3883e7610446f3eac5c5f0b81ed0/src/hornetlib/consensus/rules/spec.h).
+That file and the page are the same 35 rules. GitHub `main` @
+[`151462fa`](https://github.com/tobysharp/hornet/commit/151462fa5ceece39c159674886dcfa6cfe9b1234)
+is older: S02 is folded into S03, and H02 still says the hash "MUST achieve"
+its target.
+
+Published wording that `151462fa` does not have: H02 says the hash MUST NOT
+exceed its target. H04 says the timestamp MUST be greater than the median of
+its 11 ancestor blocks. H05 says the timestamp MUST NOT exceed
+network-adjusted time plus 2 hours. H06 points at Table 1 for retired
+versions. S01's BIP30 exceptions are Table 2. S02 and S03 are separate rules.
 
 This table is the Hornet checklist. The witness is the matrix ID in
 [`consensus-tests.md`](./consensus-tests.md). Do not copy test names or
@@ -106,8 +114,8 @@ reject strings here. Do not import Hornet DSL. Selector:
 | **H02** | Header hash `<=` claimed target | **H7** |
 | **H03** | `nBits` matches difficulty adjust | **H5**; testnet 20 min gap **H10** |
 | **H04** | `time > MTP(11)` | **H3** |
-| **H05** | `time <= now + 2h` | **H8** |
-| **H06** | Version not retired by BIP34/66/65 | **H9** |
+| **H05** | `time <=` network-adjusted now + 2h | **H8**. We compare wall or mock time |
+| **H06** | Version not retired (Table 1: BIP34/66/65) | **H9** |
 | **L01** | ≥1 transaction | **S1** |
 | **L02** | Merkle root matches unique txid tree | **S6** |
 | **L03** | Stripped size `<= 1_000_000` | **S14** |
@@ -128,9 +136,9 @@ reject strings here. Do not import Hornet DSL. Selector:
 | **C05** | Witness data ⇒ commitment | **S8** |
 | **C06** | Commitment ⇒ 32-byte nonce | **S8** |
 | **C07** | Commitment matches witness merkle + nonce | **S8** |
-| **S01** | BIP30 unique unspent creates | **C37** |
-| **S02** | Prevout exists *(merged into S03 in `spec.h`)* | **C38** |
-| **S03** | Prevout still unspent | **C38** |
+| **S01** | BIP30 unique unspent creates, except Table 2 | **C37** |
+| **S02** | Non-coinbase input spends an output created by a preceding tx | **C42**, **C38** |
+| **S03** | That output was not spent by a preceding tx | **C38** |
 | **S04** | Sigop **cost** `<= 80_000` | Legacy count **S11**. P2SH and witness cost **S12** |
 | **S05** | Coinbase `<=` subsidy + fees | **C22** |
 | **S06** | Tx `out <= in` | **C40** |
