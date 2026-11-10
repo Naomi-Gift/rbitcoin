@@ -3200,7 +3200,6 @@ pub fn verbose_tx_json(
 }
 
 /// Verbose `transaction.get` from a `Transaction` the caller already holds.
-/// Encode the hex once. Do not parse those bytes back into the same struct.
 #[doc(hidden)]
 pub fn verbose_tx_from_tx(
     query: &Query,

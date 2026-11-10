@@ -136,7 +136,6 @@ impl TxPrecompute {
     }
 }
 
-/// The three common midstates exist together or not at all.
 fn pack_precompute(connect: TxConnectPrecompute, mids: Option<[[u8; 32]; 3]>) -> TxPrecompute {
     let Some([sha_prevouts, sha_sequences, sha_outputs]) = mids else {
         return TxPrecompute::Connect(connect);
