@@ -47,32 +47,26 @@ fn put_one(t: &TxTable) -> (Fk, u64, u64) {
 
 #[test]
 fn pure_write_known_null_mmap_and_uring() {
-    for backend in [
-        rbitcoin_store::io_backend::WriteIoBackend::Uring,
-        rbitcoin_store::io_backend::WriteIoBackend::Pwrite,
-    ] {
-        let (dir, t, spenders) = temp_table();
-        let (cfk, off, _len) = put_one(&t);
-        let abs = rbitcoin_store::tx_table::spent_abs(off, 0);
-        let bulk = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
-        let (field, flags, _vin) = bulk[0].expect("meta");
-        assert!(field.is_null());
-        let sfk = Fk(99);
-        let cold = put_spend_batch_by_abs_meta_known(
-            &t,
-            &spenders,
-            &[(abs, cfk, 0, sfk, 0)],
-            &[(field, flags, 0)],
-            backend,
-        )
-        .unwrap();
-        assert!(cold.is_empty());
-        let bulk2 = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
-        let (f2, fl2, _vin) = bulk2[0].unwrap();
-        assert_eq!(f2, sfk);
-        assert_eq!(fl2 & output_flags::MULTI_SPENDER, 0);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    let (dir, t, spenders) = temp_table();
+    let (cfk, off, _len) = put_one(&t);
+    let abs = rbitcoin_store::tx_table::spent_abs(off, 0);
+    let bulk = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
+    let (field, flags, _vin) = bulk[0].expect("meta");
+    assert!(field.is_null());
+    let sfk = Fk(99);
+    let cold = put_spend_batch_by_abs_meta_known(
+        &t,
+        &spenders,
+        &[(abs, cfk, 0, sfk, 0)],
+        &[(field, flags, 0)],
+    )
+    .unwrap();
+    assert!(cold.is_empty());
+    let bulk2 = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
+    let (f2, fl2, _vin) = bulk2[0].unwrap();
+    assert_eq!(f2, sfk);
+    assert_eq!(fl2 & output_flags::MULTI_SPENDER, 0);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Shipped RMW machine annotates the sole spender on the process session.
@@ -112,18 +106,11 @@ fn pure_write_idempotent_skip() {
         &spenders,
         &[(abs, cfk, 0, sfk, 0)],
         &[(field, flags, 0)],
-        rbitcoin_store::io_backend::WriteIoBackend::Pwrite,
     )
     .unwrap();
     // Second time with known field==sfk → skip
-    put_spend_batch_by_abs_meta_known(
-        &t,
-        &spenders,
-        &[(abs, cfk, 0, sfk, 0)],
-        &[(sfk, 0, 0)],
-        rbitcoin_store::io_backend::WriteIoBackend::Pwrite,
-    )
-    .unwrap();
+    put_spend_batch_by_abs_meta_known(&t, &spenders, &[(abs, cfk, 0, sfk, 0)], &[(sfk, 0, 0)])
+        .unwrap();
     let bulk2 = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
     assert_eq!(bulk2[0].unwrap().0, sfk);
     let _ = std::fs::remove_dir_all(&dir);
@@ -161,26 +148,10 @@ fn class_a_same_batch_slot_annotate_is_skip() {
     let abs = rbitcoin_store::tx_table::spent_abs(off, 0);
     let bulk = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
     assert_eq!(bulk[0].unwrap().0, sfk);
-    let cold = put_spend_batch_by_abs_meta_known(
-        &t,
-        &spenders,
-        &[(abs, cfk, 0, sfk, 0)],
-        &[(sfk, 0, 0)],
-        rbitcoin_store::io_backend::WriteIoBackend::Pwrite,
-    )
-    .unwrap();
+    let cold =
+        put_spend_batch_by_abs_meta_known(&t, &spenders, &[(abs, cfk, 0, sfk, 0)], &[(sfk, 0, 0)])
+            .unwrap();
     assert!(cold.is_empty());
-    if rbitcoin_store::bulk_io::io_uring_enabled() {
-        let cold_u = put_spend_batch_by_abs_meta_known(
-            &t,
-            &spenders,
-            &[(abs, cfk, 0, sfk, 0)],
-            &[(sfk, 0, 0)],
-            rbitcoin_store::io_backend::WriteIoBackend::Uring,
-        )
-        .unwrap();
-        assert!(cold_u.is_empty());
-    }
     let bulk2 = t.get_spender_meta_at_abs_batch(&[abs]).unwrap();
     assert_eq!(bulk2[0].unwrap().0, sfk);
     let abs1 = rbitcoin_store::tx_table::spent_abs(off, 1);
@@ -197,34 +168,14 @@ fn pure_write_multi_repeat_same_spend_fk_skips() {
     let a = Fk(11);
     let b = Fk(12);
     let known0 = t.get_spender_meta_at_abs_batch(&[abs]).unwrap()[0].unwrap();
-    put_spend_batch_by_abs_meta_known(
-        &t,
-        &spenders,
-        &[(abs, cfk, 0, a, 0)],
-        &[known0],
-        rbitcoin_store::io_backend::WriteIoBackend::Pwrite,
-    )
-    .unwrap();
+    put_spend_batch_by_abs_meta_known(&t, &spenders, &[(abs, cfk, 0, a, 0)], &[known0]).unwrap();
     let known1 = t.get_spender_meta_at_abs_batch(&[abs]).unwrap()[0].unwrap();
-    put_spend_batch_by_abs_meta_known(
-        &t,
-        &spenders,
-        &[(abs, cfk, 0, b, 0)],
-        &[known1],
-        rbitcoin_store::io_backend::WriteIoBackend::Pwrite,
-    )
-    .unwrap();
+    put_spend_batch_by_abs_meta_known(&t, &spenders, &[(abs, cfk, 0, b, 0)], &[known1]).unwrap();
     let (field, flags, _vin) = t.get_spender_meta_at_abs_batch(&[abs]).unwrap()[0].unwrap();
     assert_ne!(flags & output_flags::MULTI_SPENDER, 0);
     let n0 = spenders.count();
-    put_spend_batch_by_abs_meta_known(
-        &t,
-        &spenders,
-        &[(abs, cfk, 0, b, 0)],
-        &[(field, flags, 0)],
-        rbitcoin_store::io_backend::WriteIoBackend::Pwrite,
-    )
-    .unwrap();
+    put_spend_batch_by_abs_meta_known(&t, &spenders, &[(abs, cfk, 0, b, 0)], &[(field, flags, 0)])
+        .unwrap();
     assert_eq!(spenders.count(), n0, "repeat must not append a list node");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -232,81 +183,70 @@ fn pure_write_multi_repeat_same_spend_fk_skips() {
 /// Two vouts on one page: both land; a third slot on that page is unchanged.
 #[test]
 fn pure_write_two_vouts_same_page_preserves_neighbor() {
-    for backend in [
-        rbitcoin_store::io_backend::WriteIoBackend::Uring,
-        rbitcoin_store::io_backend::WriteIoBackend::Pwrite,
-    ] {
-        let (dir, t, spenders) = temp_table();
-        let (cfk, off, _len) = put_n_outs(&t, 3, 0x22);
-        let abs0 = rbitcoin_store::tx_table::spent_abs(off, 0);
-        let abs1 = rbitcoin_store::tx_table::spent_abs(off, 1);
-        let abs2 = rbitcoin_store::tx_table::spent_abs(off, 2);
-        assert_eq!(
-            abs0 & !0xfff,
-            abs2 & !0xfff,
-            "fixture must keep vout 0 and 2 on one 4 KiB page"
-        );
+    let (dir, t, spenders) = temp_table();
+    let (cfk, off, _len) = put_n_outs(&t, 3, 0x22);
+    let abs0 = rbitcoin_store::tx_table::spent_abs(off, 0);
+    let abs1 = rbitcoin_store::tx_table::spent_abs(off, 1);
+    let abs2 = rbitcoin_store::tx_table::spent_abs(off, 2);
+    assert_eq!(
+        abs0 & !0xfff,
+        abs2 & !0xfff,
+        "fixture must keep vout 0 and 2 on one 4 KiB page"
+    );
 
-        let sentinel = Fk(0x51);
-        let known1 = t.get_spender_meta_at_abs_batch(&[abs1]).unwrap()[0].unwrap();
-        let cold_s = put_spend_batch_by_abs_meta_known(
-            &t,
-            &spenders,
-            &[(abs1, cfk, 1, sentinel, 0)],
-            &[known1],
-            backend,
+    let sentinel = Fk(0x51);
+    let known1 = t.get_spender_meta_at_abs_batch(&[abs1]).unwrap()[0].unwrap();
+    let cold_s =
+        put_spend_batch_by_abs_meta_known(&t, &spenders, &[(abs1, cfk, 1, sentinel, 0)], &[known1])
+            .unwrap();
+    assert!(cold_s.is_empty());
+
+    let known0 = t.get_spender_meta_at_abs_batch(&[abs0]).unwrap()[0].unwrap();
+    let known2 = t.get_spender_meta_at_abs_batch(&[abs2]).unwrap()[0].unwrap();
+    let mut hdr_before = [0u8; rbitcoin_store::file::FILE_HEADER_LEN];
+    let body_pub = t.spent.body_published_len();
+    t.spent
+        .read_prefix_at_published(
+            body_pub,
+            0,
+            rbitcoin_store::file::FILE_HEADER_LEN as u64,
+            &mut hdr_before,
         )
         .unwrap();
-        assert!(cold_s.is_empty());
+    let cold = put_spend_batch_by_abs_meta_known(
+        &t,
+        &spenders,
+        &[(abs0, cfk, 0, Fk(10), 0), (abs2, cfk, 2, Fk(12), 0)],
+        &[known0, known2],
+    )
+    .unwrap();
+    assert!(cold.is_empty());
 
-        let known0 = t.get_spender_meta_at_abs_batch(&[abs0]).unwrap()[0].unwrap();
-        let known2 = t.get_spender_meta_at_abs_batch(&[abs2]).unwrap()[0].unwrap();
-        let mut hdr_before = [0u8; rbitcoin_store::file::FILE_HEADER_LEN];
-        let body_pub = t.spent.body_published_len();
-        t.spent
-            .read_prefix_at_published(
-                body_pub,
-                0,
-                rbitcoin_store::file::FILE_HEADER_LEN as u64,
-                &mut hdr_before,
-            )
-            .unwrap();
-        let cold = put_spend_batch_by_abs_meta_known(
-            &t,
-            &spenders,
-            &[(abs0, cfk, 0, Fk(10), 0), (abs2, cfk, 2, Fk(12), 0)],
-            &[known0, known2],
-            backend,
+    let bulk = t
+        .get_spender_meta_at_abs_batch(&[abs0, abs1, abs2])
+        .unwrap();
+    assert_eq!(bulk[0].unwrap().0, Fk(10));
+    assert_eq!(
+        bulk[1].unwrap().0,
+        sentinel,
+        "neighbor slot must be preserved"
+    );
+    assert_eq!(bulk[2].unwrap().0, Fk(12));
+
+    let mut hdr_after = [0u8; rbitcoin_store::file::FILE_HEADER_LEN];
+    t.spent
+        .read_prefix_at_published(
+            body_pub,
+            0,
+            rbitcoin_store::file::FILE_HEADER_LEN as u64,
+            &mut hdr_after,
         )
         .unwrap();
-        assert!(cold.is_empty());
-
-        let bulk = t
-            .get_spender_meta_at_abs_batch(&[abs0, abs1, abs2])
-            .unwrap();
-        assert_eq!(bulk[0].unwrap().0, Fk(10));
-        assert_eq!(
-            bulk[1].unwrap().0,
-            sentinel,
-            "neighbor slot must be preserved"
-        );
-        assert_eq!(bulk[2].unwrap().0, Fk(12));
-
-        let mut hdr_after = [0u8; rbitcoin_store::file::FILE_HEADER_LEN];
-        t.spent
-            .read_prefix_at_published(
-                body_pub,
-                0,
-                rbitcoin_store::file::FILE_HEADER_LEN as u64,
-                &mut hdr_after,
-            )
-            .unwrap();
-        assert_eq!(
-            hdr_before, hdr_after,
-            "a tail slot write must not rewrite the file header"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    assert_eq!(
+        hdr_before, hdr_after,
+        "a tail slot write must not rewrite the file header"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// A long body pwrite is armed to fail. The tail slot must still land, and the
@@ -314,80 +254,63 @@ fn pure_write_two_vouts_same_page_preserves_neighbor() {
 /// so this fails closed on that path.
 #[test]
 fn tail_slot_write_survives_a_short_page_pwrite() {
-    for backend in [
-        rbitcoin_store::io_backend::WriteIoBackend::Uring,
-        rbitcoin_store::io_backend::WriteIoBackend::Pwrite,
-    ] {
-        let (dir, t, spenders) = temp_table();
-        let (cfk, off, _len) = put_n_outs(&t, 3, 0x22);
-        let abs0 = rbitcoin_store::tx_table::spent_abs(off, 0);
-        let abs1 = rbitcoin_store::tx_table::spent_abs(off, 1);
-        let sentinel = Fk(0x61);
-        let known1 = t.get_spender_meta_at_abs_batch(&[abs1]).unwrap()[0].unwrap();
-        assert!(put_spend_batch_by_abs_meta_known(
-            &t,
-            &spenders,
-            &[(abs1, cfk, 1, sentinel, 0)],
-            &[known1],
-            backend,
-        )
-        .unwrap()
-        .is_empty());
-        let known0 = t.get_spender_meta_at_abs_batch(&[abs0]).unwrap()[0].unwrap();
-        rbitcoin_store::io_handle::arm_short_pwrite(t.spent.body_write_fd());
-        let cold = put_spend_batch_by_abs_meta_known(
-            &t,
-            &spenders,
-            &[(abs0, cfk, 0, Fk(10), 0)],
-            &[known0],
-            backend,
-        )
-        .unwrap();
-        rbitcoin_store::io_handle::disarm_short_pwrite();
-        assert!(
-            cold.is_empty(),
-            "an 8-byte tail slot must not take the long page-write path"
-        );
-        let bulk = t.get_spender_meta_at_abs_batch(&[abs0, abs1]).unwrap();
-        assert_eq!(bulk[0].unwrap().0, Fk(10));
-        assert_eq!(bulk[1].unwrap().0, sentinel);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    let (dir, t, spenders) = temp_table();
+    let (cfk, off, _len) = put_n_outs(&t, 3, 0x22);
+    let abs0 = rbitcoin_store::tx_table::spent_abs(off, 0);
+    let abs1 = rbitcoin_store::tx_table::spent_abs(off, 1);
+    let sentinel = Fk(0x61);
+    let known1 = t.get_spender_meta_at_abs_batch(&[abs1]).unwrap()[0].unwrap();
+    assert!(put_spend_batch_by_abs_meta_known(
+        &t,
+        &spenders,
+        &[(abs1, cfk, 1, sentinel, 0)],
+        &[known1],
+    )
+    .unwrap()
+    .is_empty());
+    let known0 = t.get_spender_meta_at_abs_batch(&[abs0]).unwrap()[0].unwrap();
+    rbitcoin_store::io_handle::arm_short_pwrite(t.spent.body_write_fd());
+    let cold =
+        put_spend_batch_by_abs_meta_known(&t, &spenders, &[(abs0, cfk, 0, Fk(10), 0)], &[known0])
+            .unwrap();
+    rbitcoin_store::io_handle::disarm_short_pwrite();
+    assert!(
+        cold.is_empty(),
+        "an 8-byte tail slot must not take the long page-write path"
+    );
+    let bulk = t.get_spender_meta_at_abs_batch(&[abs0, abs1]).unwrap();
+    assert_eq!(bulk[0].unwrap().0, Fk(10));
+    assert_eq!(bulk[1].unwrap().0, sentinel);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Vouts whose abs straddle a 4 KiB page both persist.
 #[test]
 fn pure_write_two_pages_both_land() {
-    for backend in [
-        rbitcoin_store::io_backend::WriteIoBackend::Uring,
-        rbitcoin_store::io_backend::WriteIoBackend::Pwrite,
-    ] {
-        let (dir, t, spenders) = temp_table();
-        // 512 × 8 B from file offset 16 crosses 4096 (slot 510 starts at 4096).
-        let (cfk, off, _len) = put_n_outs(&t, 512, 0x33);
-        let abs0 = rbitcoin_store::tx_table::spent_abs(off, 0);
-        let abs_last = rbitcoin_store::tx_table::spent_abs(off, 511);
-        assert_ne!(
-            abs0 & !0xfff,
-            abs_last & !0xfff,
-            "fixture must straddle a 4 KiB page"
-        );
-        let k0 = t.get_spender_meta_at_abs_batch(&[abs0]).unwrap()[0].unwrap();
-        let k1 = t.get_spender_meta_at_abs_batch(&[abs_last]).unwrap()[0].unwrap();
-        let cold = put_spend_batch_by_abs_meta_known(
-            &t,
-            &spenders,
-            &[(abs0, cfk, 0, Fk(1), 0), (abs_last, cfk, 511, Fk(2), 0)],
-            &[k0, k1],
-            backend,
-        )
-        .unwrap();
-        assert!(cold.is_empty());
-        let bulk = t.get_spender_meta_at_abs_batch(&[abs0, abs_last]).unwrap();
-        assert_eq!(bulk[0].unwrap().0, Fk(1));
-        assert_eq!(bulk[1].unwrap().0, Fk(2));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
+    let (dir, t, spenders) = temp_table();
+    // 512 × 8 B from file offset 16 crosses 4096 (slot 510 starts at 4096).
+    let (cfk, off, _len) = put_n_outs(&t, 512, 0x33);
+    let abs0 = rbitcoin_store::tx_table::spent_abs(off, 0);
+    let abs_last = rbitcoin_store::tx_table::spent_abs(off, 511);
+    assert_ne!(
+        abs0 & !0xfff,
+        abs_last & !0xfff,
+        "fixture must straddle a 4 KiB page"
+    );
+    let k0 = t.get_spender_meta_at_abs_batch(&[abs0]).unwrap()[0].unwrap();
+    let k1 = t.get_spender_meta_at_abs_batch(&[abs_last]).unwrap()[0].unwrap();
+    let cold = put_spend_batch_by_abs_meta_known(
+        &t,
+        &spenders,
+        &[(abs0, cfk, 0, Fk(1), 0), (abs_last, cfk, 511, Fk(2), 0)],
+        &[k0, k1],
+    )
+    .unwrap();
+    assert!(cold.is_empty());
+    let bulk = t.get_spender_meta_at_abs_batch(&[abs0, abs_last]).unwrap();
+    assert_eq!(bulk[0].unwrap().0, Fk(1));
+    assert_eq!(bulk[1].unwrap().0, Fk(2));
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Same-page pair lands as slot writes. A pwrite longer than 8 bytes is armed
@@ -408,7 +331,6 @@ fn pure_write_same_page_is_one_page_write() {
         &spenders,
         &[(abs0, cfk, 0, Fk(3), 0), (abs2, cfk, 2, Fk(4), 0)],
         &[k0, k2],
-        rbitcoin_store::io_backend::WriteIoBackend::Uring,
     )
     .unwrap();
     assert!(cold.is_empty());

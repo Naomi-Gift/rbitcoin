@@ -43,7 +43,19 @@ Fixed
   keeps the publish, and the next checkpoint writes the next generation
   instead of replacing the file the commit already names. A keep error
   while filtering notes taken during compose leaves those notes in the
-  open directory, and the next checkpoint still publishes them. Startup
+  open directory, and the next checkpoint still publishes them. A spend
+  the directory still serves, or whose body bytes do not match, is written
+  again when annotate would otherwise skip it, so a checkpoint that drops
+  the image cannot leave that best-chain spend unspent. Open drops a commit
+  record at or past the repaired `spent.body` end instead of refusing to
+  start, and cuts a page that straddles that end. Spender overflow is
+  synced before the page commit is renamed. A disconnect holds the fold
+  through the confirmed tip frozen at the checkpoint, not only the snapshot
+  height, and a second disconnect during a deferred publish keeps that hold.
+  The previous image stays readable until the directory swap. A quiet page
+  is copied onto `spent.body` before the next checkpoint carries it, and
+  the page file is streamed. A failed checkpoint waits one second while the
+  edge cap is still armed, and the full ten minutes otherwise. Startup
   replay checkpoints a chunk once the open directory reaches 2,000,000
   edges, and the next checkpoint folds that generation. It does not wait
   for a sync thread.

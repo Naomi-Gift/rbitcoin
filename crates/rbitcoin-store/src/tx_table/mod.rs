@@ -1400,6 +1400,7 @@ impl TxTable {
             }
         };
         let secret = crate::store_secret::StoreSecret::load_existing(dir)?;
+        let spent_body_end = spent.body_published_len();
         let t = Self {
             body,
             seqsigwit,
@@ -1418,7 +1419,7 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
-            spend_pages: crate::spend_page_log::SpendPageLog::load(dir)?,
+            spend_pages: crate::spend_page_log::SpendPageLog::load_clipped(dir, spent_body_end)?,
         };
         match input_open_tail(t.input.count(), n_bodies, t.seqsigwit.count()) {
             InputOpenTail::Backfill { from } => {
@@ -2275,7 +2276,6 @@ impl TxTable {
                 return Err(StoreError::InvalidFk);
             }
         }
-        let backend = crate::spend_annotate_uring::spend_ann_backend();
         let known = self.known_spend_slots(abs_edges)?;
         let body_pub = self.spent.body_published_len();
         let mut cold = Vec::new();
@@ -2295,7 +2295,6 @@ impl TxTable {
                 spenders,
                 &live_edges,
                 &live_known,
-                backend,
             )?);
         }
         Ok(cold)
@@ -2449,22 +2448,37 @@ impl TxTable {
         Ok(out)
     }
 
-    /// Page-RMW spend annotate using structural-known meta.
+    /// Directory spend annotate using structural-known meta.
     ///
     /// `known[i]` is `(field, flags, vin)` at `abs_edges[i].0` from structural spentness.
-    /// Backend: `pwrite` or `uring`. Both read a 4 KiB page, poke the prepared
-    /// slots, and write the page. Returns cold edges (OOB) — production callers
-    /// must treat non-empty as hard error.
+    /// A published slot is inserted into the spend directory. This does not
+    /// read or write a `spent.body` page. Returns cold edges (OOB). Production
+    /// callers must treat non-empty as a hard error.
     pub fn put_spend_batch_by_abs_meta_known(
         &self,
         spenders: &crate::spender_table::SpenderTable,
         abs_edges: &[(u64, Fk, u32, Fk, u32)],
         known: &[(Fk, u8, u32)],
-        backend: crate::io_backend::WriteIoBackend,
     ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
         crate::spend_annotate_uring::put_spend_batch_by_abs_meta_known(
-            self, spenders, abs_edges, known, backend,
+            self, spenders, abs_edges, known,
         )
+    }
+
+    pub(crate) fn spend_log_serves(&self, abs: u64) -> bool {
+        self.spend_pages.slot(abs).is_some()
+    }
+
+    /// True when the published body slot is exactly `(field, flags, vin)`.
+    pub(crate) fn body_slot_matches(
+        &self,
+        abs: u64,
+        field: Fk,
+        flags: u8,
+        vin: u32,
+    ) -> Result<bool, StoreError> {
+        let (got_field, got_flags, got_vin) = self.body_spend_slot(abs)?;
+        Ok(got_field == field && got_flags == flags && got_vin == vin)
     }
 
     /// Read multi + spender_field for create tx output (packed Class A body).
@@ -2584,6 +2598,14 @@ impl TxTable {
 
     pub(crate) fn hold_spend_fold_above(&self, tip: u32) -> Result<(), StoreError> {
         self.spend_pages.hold_fold_above(tip)
+    }
+
+    pub(crate) fn cover_spend_fold_tip(&self, tip: u32) {
+        self.spend_pages.cover_confirmed_tip(tip);
+    }
+
+    pub(crate) fn widen_spend_cool_through(&self) {
+        self.spend_pages.widen_cool_through();
     }
 
     pub(crate) fn copy_cooled_spend_pages(&self) -> Result<(), StoreError> {

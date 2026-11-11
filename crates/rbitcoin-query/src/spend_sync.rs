@@ -8,7 +8,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use rbitcoin_store::{elapsed_after_checkpoint, SPEND_DURABLE_INTERVAL_MS};
+use rbitcoin_store::SPEND_DURABLE_INTERVAL_MS;
+
+/// Park after a failed checkpoint while the edge cap still wants another one.
+/// A full ten-minute park would leave confirm blocked on that cap.
+const SPEND_FAIL_BACKOFF_MS: u64 = 1000;
 
 use crate::Query;
 
@@ -92,15 +96,20 @@ pub fn run(query: Arc<Query>, wake: Arc<(Mutex<bool>, Condvar)>) {
             }
         };
         query.store().relax_spend_pace();
-        // A failed publish stays due. Park one interval so the retry cannot spin.
-        if elapsed_after_checkpoint(elapsed, published) == 0 {
+        if published {
             since_ok = Instant::now();
         } else if !stop {
+            // A failed publish stays due. While the edge cap is armed, wait
+            // one second. Otherwise wait the full interval, even when this
+            // attempt started with a fresh timer.
+            let park = if query.store().spend_checkpoint_early() {
+                SPEND_FAIL_BACKOFF_MS
+            } else {
+                SPEND_DURABLE_INTERVAL_MS
+            };
             let guard = lock.lock().unwrap();
             if !*guard {
-                let _ = cv
-                    .wait_timeout(guard, Duration::from_millis(SPEND_DURABLE_INTERVAL_MS))
-                    .unwrap();
+                let _ = cv.wait_timeout(guard, Duration::from_millis(park)).unwrap();
             }
         }
         if stop {

@@ -100,6 +100,14 @@ struct PendingInstall {
     kept: Vec<KeptPage>,
     /// New file offsets for pages this generation carried forward.
     carried_off: Vec<(u64, u64)>,
+    /// Committed pages this publish replaces. Applied under the utxo view.
+    drop_offs: Vec<u64>,
+    /// When set, install keeps these committed pages plus the new images.
+    keep_only: Option<Vec<u64>>,
+    /// A deferred publish clears the hold only when no later disconnect bumped it.
+    clear_hold: bool,
+    /// `hold_ticks` sampled before `keep`. A later bump wins over `clear_hold`.
+    hold_ticks: u64,
 }
 
 struct CommitSnapshot {
@@ -112,6 +120,15 @@ struct CommitSnapshot {
 enum PublishHold {
     Sample,
     Clear,
+}
+
+/// What install does with the previous directory after the commit is renamed.
+struct PublishPlan {
+    hold: PublishHold,
+    drop_offs: Vec<u64>,
+    keep_only: Option<Vec<u64>>,
+    clear_hold: bool,
+    hold_ticks: u64,
 }
 
 struct Inner {
@@ -138,6 +155,11 @@ struct Inner {
     compose_height: Option<u32>,
     /// Commit height was above the tip. Fold must not copy that image.
     fold_held: bool,
+    /// Confirmed tip sampled when a checkpoint froze. The snapshot height can
+    /// sit below spends already in that image.
+    sealed_tip: Option<u32>,
+    /// Bumped each time a disconnect holds the fold.
+    hold_ticks: u64,
     open_edges: u64,
     log_bytes: u64,
 }
@@ -205,7 +227,19 @@ impl SpendPageLog {
 
     pub fn load(dir: &Path) -> Result<Self, StoreError> {
         let log = Self::empty(dir);
-        log.reload()?;
+        log.reload(None)?;
+        Ok(log)
+    }
+
+    /// Load a commit, then drop pages at or past `body_end`.
+    ///
+    /// Open repairs `spent.body` before this log. A commit composed against
+    /// the longer file names pages the repair removed. Those records are
+    /// gone, not corrupt. A page that straddles `body_end` keeps the prefix.
+    #[doc(hidden)]
+    pub fn load_clipped(dir: &Path, body_end: u64) -> Result<Self, StoreError> {
+        let log = Self::empty(dir);
+        log.reload(Some(body_end))?;
         Ok(log)
     }
 
@@ -226,6 +260,8 @@ impl SpendPageLog {
                 commit_height: None,
                 compose_height: None,
                 fold_held: false,
+                sealed_tip: None,
+                hold_ticks: 0,
                 open_edges: 0,
                 log_bytes: 0,
             }),
@@ -351,20 +387,54 @@ impl SpendPageLog {
         Ok(())
     }
 
-    /// An installed commit, a compose still in flight, or a publish waiting to
-    /// be installed names a height above `tip`. Keep serving those slots, and
-    /// do not fold them. Pending does not invent a commit height: only an
-    /// installed height is lowered to `tip`.
+    /// Remember the confirmed tip this checkpoint is freezing.
+    ///
+    /// A snapshot height can be below blocks whose spends are already in the
+    /// open directory. A later disconnect below this tip holds the fold even
+    /// when the commit file still names the older snapshot.
+    pub fn cover_confirmed_tip(&self, tip: u32) {
+        let mut g = self.lock();
+        if g.fold_held {
+            g.sealed_tip = Some(g.sealed_tip.map(|prev| prev.max(tip)).unwrap_or(tip));
+        } else {
+            g.sealed_tip = Some(tip);
+        }
+    }
+
+    /// Fold quiet pages from the previous generation before the next compose
+    /// copies them into a new `spend.pages` file.
+    ///
+    /// A held generation stays. A compose still in flight stays. Callers fold
+    /// after this returns.
+    pub fn widen_cool_through(&self) {
+        let mut g = self.lock();
+        if g.fold_held || g.compose_height.is_some() || g.pending.is_some() {
+            return;
+        }
+        if g.generation > g.cool_through {
+            g.cool_through = g.generation;
+        }
+    }
+
+    /// An installed commit, a compose still in flight, a publish waiting to
+    /// be installed, or a freeze tip names a height above `tip`. Keep serving
+    /// those slots, and do not fold them. Only an installed commit height is
+    /// lowered to `tip`. A freeze tip above `tip` sets the hold without
+    /// rewriting that height.
     pub fn hold_fold_above(&self, tip: u32) -> Result<(), StoreError> {
         let _io = self.commit_io.lock().unwrap_or_else(|e| e.into_inner());
         let path = self.dir.join(SPEND_PAGES_COMMIT_NAME);
-        let (installed_above, in_flight_above) = {
+        let (installed_above, in_flight_above, sealed_above) = {
             let g = self.lock();
             let in_flight = g.compose_height.is_some_and(|h| h > tip)
                 || g.pending.as_ref().is_some_and(|p| p.height > tip);
-            (g.commit_height.is_some_and(|h| h > tip), in_flight)
+            (
+                g.commit_height.is_some_and(|h| h > tip),
+                in_flight,
+                g.sealed_tip.is_some_and(|h| h > tip),
+            )
         };
-        if !installed_above && !in_flight_above {
+        if !installed_above && !in_flight_above && !sealed_above {
             return Ok(());
         }
         if path.exists() {
@@ -378,15 +448,18 @@ impl SpendPageLog {
             }
         }
         let mut g = self.lock();
-        if g.commit_height.is_some_and(|h| h > tip) {
+        let installed = g.commit_height.is_some_and(|h| h > tip);
+        let sealed = g.sealed_tip.is_some_and(|h| h > tip);
+        let in_flight = g.compose_height.is_some_and(|h| h > tip)
+            || g.pending.as_ref().is_some_and(|p| p.height > tip);
+        if !installed && !sealed && !in_flight {
+            return Ok(());
+        }
+        if installed {
             g.commit_height = Some(tip);
-            g.fold_held = true;
         }
-        if g.compose_height.is_some_and(|h| h > tip)
-            || g.pending.as_ref().is_some_and(|p| p.height > tip)
-        {
-            g.fold_held = true;
-        }
+        g.fold_held = true;
+        g.hold_ticks = g.hold_ticks.saturating_add(1);
         Ok(())
     }
 
@@ -442,7 +515,7 @@ impl SpendPageLog {
         if self.lock().pending.is_some() {
             return Ok(());
         }
-        {
+        let sampled_ticks = {
             let mut g = self.lock();
             if g.commit_height.is_some_and(|committed| committed > height) {
                 g.fold_held = true;
@@ -454,10 +527,11 @@ impl SpendPageLog {
             if g.fold_held {
                 g.holding_filter = true;
             }
-        }
+            g.hold_ticks
+        };
         let _clear_compose = ClearCompose(self);
         let _release_later = ReleaseLater(self);
-        let mut clears = self.explode_held(&mut keep)?;
+        let mut clears = self.explode_held(published, &mut keep)?;
         // Every slot was rejected. The commit file is still the retry record
         // until compose publishes a replacement or decides the body has none.
         let deferred = {
@@ -468,14 +542,29 @@ impl SpendPageLog {
         let Some(snap) = self.snapshot_commit() else {
             self.scrub_open_notes(&mut keep)?;
             let pages = compose_kept_pages(&mut read_page, published, &[], &clears, &stored)?;
-            return self.settle_deferred_clear(height, pages, deferred, &clears);
+            return self.settle_deferred_clear(
+                height,
+                published,
+                pages,
+                deferred,
+                &clears,
+                sampled_ticks,
+            );
         };
         if snap.froze {
             self.pace.notify_room();
         }
-        let (kept, rejected, more) = filter_kept_pages(&mut keep, snap.pages)?;
+        let (mut kept, mut rejected, more) = filter_kept_pages(&mut keep, snap.pages)?;
         clears.extend(more);
         let pages = compose_kept_pages(&mut read_page, published, &kept, &clears, &stored)?;
+        let composed: HashSet<u64> = pages.iter().map(|(off, _)| *off).collect();
+        let unpublished: Vec<u64> = kept
+            .iter()
+            .map(|(off, _)| *off)
+            .filter(|off| !composed.contains(off))
+            .collect();
+        kept.retain(|(off, _)| composed.contains(off));
+        rejected.extend(unpublished);
         if pages.is_empty() {
             self.drop_frozen_pages(&rejected);
             return Ok(());
@@ -490,17 +579,24 @@ impl SpendPageLog {
                 let skip: HashSet<u64> = replaced.iter().copied().collect();
                 carried.retain(|(off, _)| !skip.contains(off));
             }
+            carried.retain(|(off, _)| *off < published);
             carried
         };
-        let hold = if deferred {
-            PublishHold::Clear
-        } else {
-            PublishHold::Sample
-        };
-        self.store_pending(height, pages, rejected, kept, &carried, hold)?;
-        if deferred {
-            self.release_replaced(&replaced);
-        }
+        let (clear_hold, hold) = self.publish_hold(deferred, sampled_ticks);
+        self.store_pending(
+            height,
+            pages,
+            rejected,
+            kept,
+            &carried,
+            PublishPlan {
+                hold,
+                drop_offs: if deferred { replaced } else { Vec::new() },
+                keep_only: None,
+                clear_hold,
+                hold_ticks: sampled_ticks,
+            },
+        )?;
         Ok(())
     }
 
@@ -513,34 +609,55 @@ impl SpendPageLog {
     fn settle_deferred_clear(
         &self,
         height: u32,
+        published: u64,
         pages: PageImages,
         deferred: bool,
         clears: &[BodyClear],
+        sampled_ticks: u64,
     ) -> Result<(), StoreError> {
         let fresh: HashSet<u64> = pages.iter().map(|(off, _)| *off).collect();
         let cleared: HashSet<u64> = clears.iter().map(|clear| clear.page_off).collect();
-        let carried = if deferred {
+        let mut carried = if deferred {
             self.carry_untouched(&fresh, &cleared)
         } else {
             Vec::new()
         };
+        carried.retain(|(off, _)| *off < published);
         if pages.is_empty() && carried.is_empty() {
             if deferred {
                 self.drop_rejected_generation();
             }
             return Ok(());
         }
-        let hold = if deferred {
+        let (clear_hold, hold) = self.publish_hold(deferred, sampled_ticks);
+        self.store_pending(
+            height,
+            pages,
+            Vec::new(),
+            Vec::new(),
+            &carried,
+            PublishPlan {
+                hold,
+                drop_offs: Vec::new(),
+                keep_only: deferred.then(|| carried.iter().map(|(off, _)| *off).collect()),
+                clear_hold,
+                hold_ticks: sampled_ticks,
+            },
+        )?;
+        Ok(())
+    }
+
+    /// `Clear` only when this deferred publish has not seen a disconnect since
+    /// `keep` started. The file bit and the RAM flag both follow that choice,
+    /// and install applies the RAM clear.
+    fn publish_hold(&self, deferred: bool, sampled_ticks: u64) -> (bool, PublishHold) {
+        let clear_hold = deferred && self.lock().hold_ticks == sampled_ticks;
+        let hold = if clear_hold {
             PublishHold::Clear
         } else {
             PublishHold::Sample
         };
-        self.store_pending(height, pages, Vec::new(), Vec::new(), &carried, hold)?;
-        if deferred {
-            let keep: Vec<u64> = carried.iter().map(|(off, _)| *off).collect();
-            self.keep_only(&keep);
-        }
-        Ok(())
+        (clear_hold, hold)
     }
 
     fn forget_held_directory(&self) {
@@ -553,22 +670,6 @@ impl SpendPageLog {
     fn drop_rejected_generation(&self) {
         self.forget_held_directory();
         self.delete_generation_files();
-    }
-
-    /// Drop pages this publish replaced. Carried pages stay, so a zero image
-    /// that was not recomposed is still here for the next fold.
-    fn release_replaced(&self, replaced: &[u64]) {
-        let replaced: HashSet<u64> = replaced.iter().copied().collect();
-        let mut g = self.lock();
-        g.committed.retain(|off, _| !replaced.contains(off));
-        g.fold_held = false;
-    }
-
-    fn keep_only(&self, keep: &[u64]) {
-        let keep: HashSet<u64> = keep.iter().copied().collect();
-        let mut g = self.lock();
-        g.committed.retain(|off, _| keep.contains(off));
-        g.fold_held = false;
     }
 
     fn committed_images(&self) -> HashMap<u64, Arc<[u8]>> {
@@ -616,22 +717,37 @@ impl SpendPageLog {
         let Some(pending) = pending else {
             return Ok(());
         };
-        let kept_by_page: HashMap<u64, HashSet<OpenSlot>> = pending
-            .kept
+        let PendingInstall {
+            generation,
+            height,
+            pages,
+            rejected,
+            kept,
+            carried_off,
+            drop_offs,
+            keep_only,
+            clear_hold,
+            hold_ticks,
+        } = pending;
+        let inserted: HashSet<u64> = pages.iter().map(|(off, _, _)| *off).collect();
+        let kept_by_page: HashMap<u64, HashSet<OpenSlot>> = kept
             .iter()
             .map(|(off, slots)| (*off, slots.iter().copied().collect()))
             .collect();
         {
             let mut g = self.lock();
-            g.generation = pending.generation;
-            if !g.fold_held {
-                g.commit_height = Some(pending.height);
-                g.cool_through = pending.generation.wrapping_sub(1);
+            g.generation = generation;
+            if clear_hold && g.hold_ticks == hold_ticks {
+                g.fold_held = false;
             }
-            for page_off in &pending.rejected {
+            if !g.fold_held {
+                g.commit_height = Some(height);
+                g.cool_through = generation.wrapping_sub(1);
+            }
+            for page_off in &rejected {
                 g.frozen.remove(page_off);
             }
-            for (page_off, image, log_off) in pending.pages {
+            for (page_off, image, log_off) in pages {
                 g.frozen.remove(&page_off);
                 let kept = kept_by_page.get(&page_off);
                 let unchanged = match g.open.get(&page_off) {
@@ -667,14 +783,23 @@ impl SpendPageLog {
                     CommittedPage {
                         image,
                         log_off,
-                        generation: pending.generation,
+                        generation,
                     },
                 );
             }
-            for (page_off, log_off) in pending.carried_off {
+            for (page_off, log_off) in carried_off {
                 if let Some(page) = g.committed.get_mut(&page_off) {
                     page.log_off = log_off;
                 }
+            }
+            if let Some(keep) = keep_only {
+                let keep: HashSet<u64> = keep.into_iter().collect();
+                g.committed
+                    .retain(|off, _| keep.contains(off) || inserted.contains(off));
+            } else if !drop_offs.is_empty() {
+                let drop_offs: HashSet<u64> = drop_offs.into_iter().collect();
+                g.committed
+                    .retain(|off, _| !drop_offs.contains(off) || inserted.contains(off));
             }
         }
         self.pace.notify_room();
@@ -689,7 +814,7 @@ impl SpendPageLog {
     /// old image stays until that compose's rename returns. A zero image is
     /// folded. An image whose slots are all still best-chain stays in
     /// `committed` and is republished from that image, not from the body.
-    fn explode_held<K>(&self, keep: &mut K) -> Result<Vec<BodyClear>, StoreError>
+    fn explode_held<K>(&self, published: u64, keep: &mut K) -> Result<Vec<BodyClear>, StoreError>
     where
         K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
     {
@@ -710,6 +835,9 @@ impl SpendPageLog {
             let n = image.len() / SLOT;
             for rel in 0..n {
                 if *page_off == 0 && rel < 2 {
+                    continue;
+                }
+                if slot_past_published(*page_off, rel as u16, published) {
                     continue;
                 }
                 let meta = slot_from_image(image, rel as u16);
@@ -734,7 +862,9 @@ impl SpendPageLog {
         if !g.fold_held {
             return Ok(Vec::new());
         }
-        Ok(apply_held_explode(&mut g, &held, restored, cleared))
+        Ok(apply_held_explode(
+            &mut g, &held, restored, cleared, published,
+        ))
     }
 
     /// Freeze a new open set, or reuse the snapshot a failed compose left.
@@ -820,9 +950,9 @@ impl SpendPageLog {
         rejected: Vec<u64>,
         kept: SnapshotPages,
         carried: &[(u64, CommittedPage)],
-        hold: PublishHold,
+        plan: PublishPlan,
     ) -> Result<(), StoreError> {
-        let (generation, recs) = self.publish_generation(height, &pages, carried, hold)?;
+        let (generation, recs) = self.publish_generation(height, &pages, carried, plan.hold)?;
         let kept_slots: Vec<KeptPage> = kept
             .iter()
             .map(|(off, page)| (*off, page.slots.clone()))
@@ -850,6 +980,10 @@ impl SpendPageLog {
             rejected,
             kept: kept_slots,
             carried_off,
+            drop_offs: plan.drop_offs,
+            keep_only: plan.keep_only,
+            clear_hold: plan.clear_hold,
+            hold_ticks: plan.hold_ticks,
         });
         Ok(())
     }
@@ -894,27 +1028,30 @@ impl SpendPageLog {
             .map(|(off, page)| (*off, page.log_off, Arc::clone(&page.image)))
             .collect();
         carried_imgs.sort_by_key(|(_, log_off, _)| *log_off);
-        let mut recs: Vec<PageRec> = Vec::new();
-        let mut blob: Vec<u8> = Vec::new();
-        for (page_off, _, image) in &carried_imgs {
-            let log_off = blob.len() as u64;
-            blob.extend_from_slice(image);
-            recs.push((*page_off, log_off, image.len() as u32));
-        }
-        for (page_off, image) in pages {
-            let log_off = blob.len() as u64;
-            blob.extend_from_slice(image);
-            recs.push((*page_off, log_off, image.len() as u32));
-        }
         let generation = self.lock().generation.wrapping_add(1);
         let gen_path = self.dir.join(format!("{SPEND_PAGES_NAME}.{generation}"));
         let pages_path = self.dir.join(SPEND_PAGES_NAME);
         let commit_path = self.dir.join(SPEND_PAGES_COMMIT_NAME);
+        let mut recs: Vec<PageRec> = Vec::new();
+        let mut committed_len = 0u64;
         write_synced_tmp_file(&gen_path, |f| {
             use std::io::Write;
-            f.write_all(&blob).map_err(|e| StoreError::io(&gen_path, e))
+            for (page_off, _, image) in &carried_imgs {
+                let log_off = committed_len;
+                f.write_all(image)
+                    .map_err(|e| StoreError::io(&gen_path, e))?;
+                committed_len = committed_len.saturating_add(image.len() as u64);
+                recs.push((*page_off, log_off, image.len() as u32));
+            }
+            for (page_off, image) in pages {
+                let log_off = committed_len;
+                f.write_all(image)
+                    .map_err(|e| StoreError::io(&gen_path, e))?;
+                committed_len = committed_len.saturating_add(image.len() as u64);
+                recs.push((*page_off, log_off, image.len() as u32));
+            }
+            Ok(())
         })?;
-        let committed_len = blob.len() as u64;
         let held = {
             let g = self.lock();
             match hold {
@@ -1094,7 +1231,7 @@ impl SpendPageLog {
         Ok(())
     }
 
-    fn reload(&self) -> Result<(), StoreError> {
+    fn reload(&self, body_end: Option<u64>) -> Result<(), StoreError> {
         let commit_path = self.dir.join(SPEND_PAGES_COMMIT_NAME);
         if !commit_path.exists() {
             let _ = std::fs::remove_file(self.dir.join(SPEND_PAGES_NAME));
@@ -1143,9 +1280,25 @@ impl SpendPageLog {
         g.open_edges = 0;
         g.committed.clear();
         for rec in parsed.recs {
-            let end = rec.log_off.saturating_add(u64::from(rec.image_len));
+            if body_end.is_some_and(|end| rec.page_off >= end) {
+                continue;
+            }
+            let mut image_len = u64::from(rec.image_len);
+            if let Some(end) = body_end {
+                let room = end.saturating_sub(rec.page_off);
+                if room == 0 {
+                    continue;
+                }
+                if image_len > room {
+                    image_len = room;
+                }
+            }
+            if image_len == 0 {
+                continue;
+            }
             let start = rec.log_off as usize;
-            let image: Arc<[u8]> = Arc::from(file[start..end as usize].to_vec().into_boxed_slice());
+            let take = image_len as usize;
+            let image: Arc<[u8]> = Arc::from(file[start..start + take].to_vec().into_boxed_slice());
             g.committed.insert(
                 rec.page_off,
                 CommittedPage {
@@ -1359,9 +1512,7 @@ where
     F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
 {
     if page_off >= published {
-        return Err(StoreError::Corrupt(
-            "spend page log composed past the published body",
-        ));
+        return Ok(None);
     }
     let len = BODY_PAGE_SIZE.min(published - page_off) as usize;
     let image = kept.and_then(|page| page.base.as_deref()).or(stored);
@@ -1376,15 +1527,23 @@ where
     } else {
         body.clone().unwrap_or_else(|| vec![0u8; len])
     };
+    let mut wrote_kept = false;
     if let Some(page) = kept {
         for &(rel, meta) in &page.slots {
+            if slot_past_published(page_off, rel, published) {
+                continue;
+            }
             write_slot(&mut buf, rel, &meta)?;
+            wrote_kept = true;
         }
     }
     let mut zeroed = false;
     if let Some(body) = body.as_deref() {
         if let Some(clears) = clears {
             for &(rel, meta) in clears {
+                if slot_past_published(page_off, rel, published) {
+                    continue;
+                }
                 if kept.is_some_and(|page| page.slots.iter().any(|(r, _)| *r == rel)) {
                     continue;
                 }
@@ -1402,7 +1561,7 @@ where
         (Some(image), Some(body)) => image_hides_body(page_off, image, body, len),
         _ => false,
     };
-    let keep_page = kept.is_some_and(|page| !page.slots.is_empty()) || zeroed || hides;
+    let keep_page = wrote_kept || zeroed || hides;
     if !keep_page {
         return Ok(None);
     }
@@ -1453,6 +1612,12 @@ fn image_hides_body(page_off: u64, image: &[u8], body: &[u8], len: usize) -> boo
         let rel = rel as u16;
         slot_from_image(image, rel) == [0u8; SLOT] && slot_from_image(body, rel) != [0u8; SLOT]
     })
+}
+
+/// The slot's last byte sits past the published body. It is not a clear.
+fn slot_past_published(page_off: u64, rel: u16, published: u64) -> bool {
+    let end = page_off.saturating_add(u64::from(rel).saturating_add(1).saturating_mul(SLOT as u64));
+    end > published
 }
 
 fn write_slot(buf: &mut [u8], rel: u16, meta: &[u8; SLOT]) -> Result<(), StoreError> {
@@ -1557,11 +1722,12 @@ fn apply_held_explode(
     held: &[(u64, Arc<[u8]>)],
     restored: Vec<KeptPage>,
     cleared: Vec<BodyClear>,
+    published: u64,
 ) -> Vec<BodyClear> {
     if cleared.is_empty() {
         let spend_offs: HashSet<u64> = held
             .iter()
-            .filter(|(off, image)| image_has_spend(*off, image))
+            .filter(|(off, image)| image_has_live_spend(*off, image, published))
             .map(|(off, _)| *off)
             .collect();
         if spend_offs.is_empty() {
@@ -1625,10 +1791,13 @@ fn park_open_slots(g: &mut Inner, page_off: u64, slots: PageSlots) {
     }
 }
 
-fn image_has_spend(page_off: u64, image: &[u8]) -> bool {
+fn image_has_live_spend(page_off: u64, image: &[u8], published: u64) -> bool {
     let n = image.len() / SLOT;
     (0..n).any(|rel| {
         if page_off == 0 && rel < 2 {
+            return false;
+        }
+        if slot_past_published(page_off, rel as u16, published) {
             return false;
         }
         slot_from_image(image, rel as u16) != [0u8; SLOT]

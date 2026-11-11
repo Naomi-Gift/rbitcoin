@@ -525,7 +525,6 @@ pub fn put_spend_batch_by_abs_meta_known(
     spenders: &SpenderTable,
     abs_edges: &[(u64, Fk, u32, Fk, u32)],
     known: &[(Fk, u8, u32)],
-    backend: crate::io_backend::WriteIoBackend,
 ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
     if abs_edges.is_empty() {
         return Ok(Vec::new());
@@ -554,7 +553,18 @@ pub fn put_spend_batch_by_abs_meta_known(
         }
         let (field, flags, field_vin) = known[i];
         match decide_annotate(field, flags, field_vin, sfk, vin, spenders)? {
-            AnnotateOp::Skip => {}
+            AnnotateOp::Skip => {
+                // A directory hit is not proof the body still has this spend.
+                // `keep` can drop or zero the image after this batch already
+                // decided to skip. Write the known slot again when the log
+                // still serves it, or when the body bytes are different.
+                let served = txs.spend_log_serves(abs);
+                let on_body = txs.body_slot_matches(abs, field, flags, field_vin)?;
+                if served || !on_body {
+                    let meta = encode_spent_slot(flags, field, field_vin)?;
+                    writes.push((abs, cfk, vout, sfk, vin, meta));
+                }
+            }
             AnnotateOp::Write(meta) => writes.push((abs, cfk, vout, sfk, vin, meta)),
         }
     }
@@ -562,7 +572,7 @@ pub fn put_spend_batch_by_abs_meta_known(
     if writes.is_empty() {
         return Ok(cold);
     }
-    let more = apply_prepared_spend_writes(txs, &writes, backend)?;
+    let more = apply_prepared_spend_writes(txs, &writes)?;
     cold.extend(more);
     Ok(cold)
 }
@@ -573,7 +583,6 @@ pub fn put_spend_batch_by_abs_meta_known(
 fn apply_prepared_spend_writes(
     txs: &TxTable,
     writes: &[SpentAbsWrite],
-    _backend: crate::io_backend::WriteIoBackend,
 ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
     let published = txs.spent.body_published_len();
     let mut cold = Vec::new();

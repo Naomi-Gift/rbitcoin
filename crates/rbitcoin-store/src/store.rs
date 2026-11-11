@@ -1469,18 +1469,19 @@ impl Store {
             .get_spender_meta_at_abs_batch_backend(abs_offs, backend)
     }
 
-    /// Page-RMW annotate with structural-known meta.
+    /// Directory annotate with structural-known meta.
     ///
     /// `abs_edges`: `(abs_off, create_tx_fk, vout, spending_tx_fk, spending_vin)`.
     /// `known`: parallel `(field, flags, vin)` from structural spentness.
+    /// A published slot is inserted into the spend directory. This does not
+    /// read or write a `spent.body` page.
     pub fn put_spend_batch_by_abs_meta_known(
         &self,
         abs_edges: &[(u64, Fk, u32, Fk, u32)],
         known: &[(Fk, u8, u32)],
-        backend: crate::io_backend::WriteIoBackend,
     ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
         self.txs
-            .put_spend_batch_by_abs_meta_known(&self.spenders, abs_edges, known, backend)
+            .put_spend_batch_by_abs_meta_known(&self.spenders, abs_edges, known)
     }
 
     /// Spentness by create fk (no `tx.head`). Prefer known body range when available.
@@ -1889,9 +1890,9 @@ impl Store {
         let gen = self
             .spend_reorg_gen
             .load(std::sync::atomic::Ordering::Acquire);
+        self.spenders.sync_data_only()?;
         self.publish_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
         self.txs.sync_replay_data()?;
-        self.spenders.sync_data_only()?;
         self.store_spend_marker(tip, tip, gen)?;
         self.fold_sealed_spend_pages()?;
         Ok(t.elapsed().as_nanos() as u64)
@@ -1978,6 +1979,13 @@ impl Store {
         height: u32,
         keep: impl FnMut(&[u8; 8]) -> Result<bool, StoreError>,
     ) -> Result<(), StoreError> {
+        if let Some(h) = self.confirmed.tip_height() {
+            self.txs.cover_spend_fold_tip(h.0);
+        }
+        // Quiet pages from the last generation fold before this compose copies
+        // them into the next `spend.pages` file. A held generation stays.
+        self.txs.widen_spend_cool_through();
+        self.fold_sealed_spend_pages()?;
         self.txs.prepare_open_spend_pages(height, keep)?;
         self.install_prepared_spend_pages()
     }
@@ -2112,6 +2120,7 @@ impl Store {
         after_first_read(self);
         let Some(height) = self.spend_snapshot_height() else {
             let tip = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
+            self.spenders.sync_data_only()?;
             self.publish_open_spend_pages(tip, |meta| self.spend_slot_still_live(meta))?;
             self.fold_sealed_spend_pages()?;
             return Ok(());
@@ -2141,9 +2150,9 @@ impl Store {
         during_sync: impl FnOnce(&Self),
     ) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
+        self.spenders.sync_data_only()?;
         self.publish_open_spend_pages(height, |meta| self.spend_slot_still_live(meta))?;
         self.txs.sync_replay_data()?;
-        self.spenders.sync_data_only()?;
         during_sync(self);
         if self.spend_reorg_gen.load(Ordering::Acquire) != gen {
             return Ok(());

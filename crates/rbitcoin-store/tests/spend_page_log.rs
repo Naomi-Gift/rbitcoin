@@ -1346,22 +1346,15 @@ fn short_tail_is_logged_and_a_slot_past_published_is_corrupt() {
     let d = dir();
     let log = SpendPageLog::create(&d);
     log.note_slots(&[(4096, slot)]).unwrap();
-    let err = log.commit_open(4, 100, zeros, |_| Ok(true)).unwrap_err();
-    assert!(matches!(
-        err,
-        StoreError::Corrupt("spend page log composed past the published body")
-    ));
+    log.commit_open(4, 100, zeros, |_| Ok(true)).unwrap();
+    assert_eq!(log.slot(4096), None, "a page past the body is dropped");
     let _ = std::fs::remove_dir_all(&d);
 
     let d = dir();
     let log = SpendPageLog::create(&d);
     log.note_slots(&[(96, slot)]).unwrap();
-    let err = log.commit_open(4, 100, zeros, |_| Ok(true)).unwrap_err();
-    assert!(matches!(
-        err,
-        StoreError::Corrupt("spend page slot past published")
-    ));
-    assert_eq!(log.slot(96), Some(slot));
+    log.commit_open(4, 100, zeros, |_| Ok(true)).unwrap();
+    assert_eq!(log.slot(96), None, "a slot past the body is dropped");
     let _ = std::fs::remove_dir_all(&d);
 
     let d = dir();
@@ -1862,7 +1855,6 @@ fn reload_drops_pages_without_a_commit_and_serves_a_bad_magic() {
 #[test]
 fn fold_does_not_publish_a_shorter_body_end() {
     use rbitcoin_primitives::Fk;
-    use rbitcoin_store::io_backend::WriteIoBackend;
     use rbitcoin_store::Store;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Arc;
@@ -1911,7 +1903,7 @@ fn fold_does_not_publish_a_shorter_body_end() {
             known.push((Fk(1), 0u8, 0));
         }
         let cold = store
-            .put_spend_batch_by_abs_meta_known(&edges, &known, WriteIoBackend::Pwrite)
+            .put_spend_batch_by_abs_meta_known(&edges, &known)
             .unwrap();
         assert!(cold.is_empty());
         store.checkpoint_observed_spend().unwrap();
@@ -1973,6 +1965,179 @@ fn fold_does_not_publish_a_shorter_body_end() {
     assert!(
         !saw_shrink,
         "fold stored a spent.body end confirm had already grown past"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn reload_drops_a_page_past_the_repaired_body_and_cuts_a_straddle() {
+    let slot = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    let later = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(4096, slot)]).unwrap();
+    log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+    let loaded = SpendPageLog::load_clipped(&d, 4096).unwrap();
+    assert_eq!(loaded.slot(4096), None, "a page at the new end is gone");
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(16, slot), (96, later)]).unwrap();
+    log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+    let loaded = SpendPageLog::load_clipped(&d, 100).unwrap();
+    assert_eq!(loaded.slot(16), Some(slot));
+    assert_eq!(loaded.slot(96), None, "a slot past the cut is gone");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn freeze_tip_above_the_snapshot_holds_the_fold() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    log.cover_confirmed_tip(9);
+    log.hold_fold_above(5).unwrap();
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, _image| {
+            writes += 1;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        writes, 0,
+        "a freeze tip above the disconnect holds the fold"
+    );
+    assert_eq!(log.slot(16), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn second_disconnect_during_deferred_compose_keeps_the_hold() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let rejected = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    let kept = [8u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, rejected), (4096, kept)]).unwrap();
+    log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(1).unwrap();
+    log.commit_open(
+        1,
+        8192,
+        |off, len| {
+            log.hold_fold_above(0)?;
+            zeros(off, len)
+        },
+        |meta| Ok(*meta != rejected),
+    )
+    .unwrap();
+    let buf = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    assert_eq!(u16::from_le_bytes(buf[6..8].try_into().unwrap()), 1);
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, _image| {
+            writes += 1;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        writes, 0,
+        "a second disconnect during compose is not folded"
+    );
+    assert_eq!(log.slot(4096), Some(kept));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn prepare_keeps_the_old_image_until_install() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let rejected = [6u8, 1, 2, 3, 4, 5, 6, 7];
+    let kept = [7u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, rejected), (4096, kept)]).unwrap();
+    log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(1).unwrap();
+    log.prepare_commit(1, 8192, zeros, |meta| Ok(*meta != rejected))
+        .unwrap();
+    assert_eq!(
+        log.slot(16),
+        Some(rejected),
+        "the old image stays until install"
+    );
+    assert_eq!(log.slot(4096), Some(kept));
+    log.install_commit().unwrap();
+    assert_eq!(log.slot(4096), Some(kept));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn skip_rewrites_a_logged_spend_the_body_does_not_hold() {
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::Store;
+    let d = dir();
+    let store = Store::create_tiny(&d).unwrap();
+    let nbytes = 4096usize;
+    let prep = store
+        .txs
+        .spent
+        .prepare_batch_encode(1, nbytes, |_i, buf| {
+            buf.resize(buf.len() + nbytes, 0);
+        })
+        .unwrap()
+        .expect("one spent append");
+    store
+        .txs
+        .spent
+        .write_body_blob_bulk(prep.start, &prep.body_blob)
+        .unwrap();
+    let abs = prep.start;
+    store.txs.spent.finish_prepared(prep).unwrap();
+    store.note_open_spend_slots(&[(abs, [0u8; 8])]).unwrap();
+    let cold = store
+        .put_spend_batch_by_abs_meta_known(&[(abs, Fk(1), 0, Fk(77), 0)], &[(Fk(77), 0, 0)])
+        .unwrap();
+    assert!(cold.is_empty());
+    let got = store.get_spender_meta_at_abs_batch(&[abs]).unwrap();
+    assert_eq!(
+        got[0].unwrap().0,
+        Fk(77),
+        "a zero image must not hide the spend"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    let store = Store::create_tiny(&d).unwrap();
+    let mut blob_prep = store
+        .txs
+        .spent
+        .prepare_batch_encode(1, nbytes, |_i, buf| {
+            buf.resize(buf.len() + nbytes, 0);
+        })
+        .unwrap()
+        .expect("one spent append");
+    blob_prep.body_blob[0..8].copy_from_slice(&[0, 77, 0, 0, 0, 0, 0, 0]);
+    let abs = blob_prep.start;
+    store
+        .txs
+        .spent
+        .write_body_blob_bulk(blob_prep.start, &blob_prep.body_blob)
+        .unwrap();
+    store.txs.spent.finish_prepared(blob_prep).unwrap();
+    let cold = store
+        .put_spend_batch_by_abs_meta_known(&[(abs, Fk(1), 0, Fk(77), 0)], &[(Fk(77), 0, 0)])
+        .unwrap();
+    assert!(cold.is_empty());
+    store.checkpoint_observed_spend().unwrap();
+    assert!(
+        !d.join(SPEND_PAGES_COMMIT_NAME).exists(),
+        "a body that already has the spend is not noted again"
     );
     let _ = std::fs::remove_dir_all(&d);
 }
