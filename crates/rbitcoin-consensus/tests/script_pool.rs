@@ -890,6 +890,7 @@ fn warn_fault_without_keep_fails_the_wave() {
 
 #[test]
 fn park_delay_waits_until_go() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
     let arm = DelayParkArm::arm();
     let entered = thread::spawn(maybe_delay_park);
     wait_until("park delay was not entered", || {
