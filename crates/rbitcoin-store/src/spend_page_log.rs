@@ -1126,12 +1126,17 @@ impl SpendPageLog {
             (held, g.sealed_tip.unwrap_or(height))
         };
         let commit = encode_commit(height, generation, committed_len, &recs, held, sealed_tip);
-        write_commit_file(&commit_path, &commit)?;
+        let dir_synced = write_commit_file(&commit_path, &commit)?;
         {
             let mut g = self.lock();
             g.log_bytes = committed_len;
         }
-        self.finish_pages_rename(&gen_path, &pages_path);
+        // The commit rename is already visible. Renaming this generation
+        // file away before that directory entry is durable can leave the
+        // old commit naming a file that is gone.
+        if dir_synced {
+            self.finish_pages_rename(&gen_path, &pages_path);
+        }
         Ok((generation, recs))
     }
 
@@ -1928,17 +1933,19 @@ fn encode_commit(
 
 /// Rename `bytes` over `path`. The rename is the commit.
 ///
-/// The parent directory is synced afterward. That sync can fail after the
-/// new name is already visible. Returning the error would make the next
-/// checkpoint write the same generation again.
-fn write_commit_file(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+/// `Ok(false)` means the parent-directory sync failed after the new name
+/// is already visible. Returning that as an error would make the next
+/// checkpoint write the same generation again. Callers that rename the
+/// generation file away wait for `Ok(true)`.
+fn write_commit_file(path: &Path, bytes: &[u8]) -> Result<bool, StoreError> {
     write_file_synced_tmp_rename(path, bytes)?;
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
-            let _ = fsync_parent_dir(parent);
-        }
+    let Some(parent) = path.parent() else {
+        return Ok(true);
+    };
+    if parent.as_os_str().is_empty() {
+        return Ok(true);
     }
-    Ok(())
+    Ok(fsync_parent_dir(parent).is_ok())
 }
 
 // llvm-cov drops the counters when this parser is inlined into `reload`.

@@ -55,7 +55,8 @@ Fixed
   That tip is written on the commit. A checkpoint below a loaded commit holds
   the fold before it widens the cool range. Open holds when the commit height
   or that tip is above the chain, not only when the marker is. A directory
-  sync that fails after the commit rename still keeps that generation.
+  sync that fails after the commit rename still keeps that generation, and
+  the generation file stays until that sync succeeds.
   The previous image stays readable until the directory swap. A quiet page
   is copied onto `spent.body` before the next checkpoint carries it, and
   the page file is streamed. A failed checkpoint waits one second while the

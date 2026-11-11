@@ -2300,6 +2300,30 @@ fn directory_sync_failure_after_commit_rename_keeps_the_generation() {
 
 #[cfg(all(unix, debug_assertions))]
 #[test]
+fn directory_sync_failure_leaves_the_generation_file() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let first = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, first)]).unwrap();
+    // The generation file syncs the directory once. The commit sync and the
+    // pages-rename sync are the next two.
+    let _reset = ResetDirSync;
+    rbitcoin_store::file::arm_fail_dir_sync_after(1, 2);
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    rbitcoin_store::file::arm_fail_dir_sync_after(0, 0);
+    assert!(
+        d.join(format!("{SPEND_PAGES_NAME}.1")).is_file(),
+        "a failed commit directory sync must leave the generation file"
+    );
+    assert!(d.join(SPEND_PAGES_COMMIT_NAME).is_file());
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(first));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
 fn directory_sync_failure_during_hold_still_holds() {
     let d = dir();
     let log = SpendPageLog::create(&d);
