@@ -456,8 +456,7 @@ pub fn tx_merkleblock_proof_sync(st: AppState, txid_hex: String) -> Response {
         Err(e) => return store_err(e),
     };
     let txids: Vec<bitcoin::Txid> = ids
-        .iter()
-        .copied()
+        .into_iter()
         .map(bitcoin::Txid::from_byte_array)
         .collect();
     let want = bitcoin::Txid::from_byte_array(txid);
