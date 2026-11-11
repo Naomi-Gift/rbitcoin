@@ -250,7 +250,8 @@ pub fn missing_request(block_hash: BlockHash, missing: &[u64]) -> BlockTransacti
 
 /// Overlay `blocktxn` onto a first-pass [`CmpctPartial`].
 ///
-/// Takes `slots` and `txids`. `missing` stays. A later call sees empty slots.
+/// Takes `slots` and `txids` after the three early returns. `missing` stays.
+/// Those returns leave the partial unchanged.
 ///
 /// `txn.transactions` is 1:1 with `partial.missing` (absolute indexes, request
 /// order). Already-filled slots are kept; the live short-id map is not consulted.
