@@ -856,7 +856,14 @@ def emit_child_init_errors(log_path: Path, prior: int, rules: list) -> None:
             text = f.read().decode("utf-8", errors="replace")
     except OSError:
         text = ""
-    errs = [ln for ln in text.splitlines() if ln.startswith("Error:")]
+    lines = text.splitlines()
+    errs = [ln for ln in lines if ln.startswith("Error:")]
+    # `error!` is a timestamped `ERROR` line, not an `Error:` InitError.
+    # Without this, the test only sees "exited with status 1".
+    if not errs:
+        errs = [ln for ln in lines if " ERROR " in ln or ln.startswith("error:")]
+    if not errs:
+        errs = [ln for ln in lines if ln.strip()][-15:]
     # Core InitError FULL_TEXT for a tip more than 2h ahead of -mocktime.
     if "appears to be from the future" in text:
         print(

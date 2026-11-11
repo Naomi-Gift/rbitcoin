@@ -597,6 +597,29 @@ else
   FAIL=$((FAIL + 1))
 fi
 
+# A real node writes `ERROR` lines itself and the pump does not copy them.
+# The shim must still show that line when the process exits 1.
+FAKE_ERR="$WORKDIR/bin/rbitcoin-node"
+mkdir -p "$WORKDIR/bin"
+printf '%s\n' '#!/bin/sh' \
+  'printf "%s\n" "2026-11-11T17:10:51.000Z ERROR runtime: boom" >>"$RBITCOIN_DEBUG_LOG"' \
+  'exit 1' >"$FAKE_ERR"
+chmod +x "$FAKE_ERR"
+ERR_DD="$WORKDIR/initerr-error-level"
+mkdir -p "$ERR_DD"
+printf 'regtest=1\n' >"$ERR_DD/bitcoin.conf"
+ERR_OUT=""
+if ERR_OUT="$(RBITCOIN_NODE="$FAKE_ERR" "$SHIM" -datadir="$ERR_DD" -regtest 2>&1)"; then
+  echo "not ok - ERROR log line surfaces on early exit (expected failure)"
+  FAIL=$((FAIL + 1))
+elif printf '%s' "$ERR_OUT" | grep -q -- "runtime: boom"; then
+  echo "ok - ERROR log line surfaces on early exit"
+  PASS=$((PASS + 1))
+else
+  echo "not ok - ERROR log line surfaces on early exit (got: $ERR_OUT)"
+  FAIL=$((FAIL + 1))
+fi
+
 # feature_filelock.py starts a second node with the live node's -datadir (same
 # rpcport in bitcoin.conf, leftover .cookie). InitError must win over proxy bind.
 FAKE_LOCK="$WORKDIR/rbitcoin-node-locked"
