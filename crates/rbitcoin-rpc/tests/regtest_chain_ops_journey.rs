@@ -652,6 +652,25 @@ fn chain_ops_index_args_are_core_ints(ctx: &RpcContext) {
         assert_eq!(err["code"], ERR_MISC, "gettxout n={n}: {err}");
         assert_eq!(err["message"], "JSON integer out of range", "gettxout n={n}: {err}");
     }
+    let spender_of = |vout: Value| {
+        let outputs = json!([{ "txid": txid.clone(), "vout": vout }]);
+        dispatch(ctx, "gettxspendingprevout", vec![outputs])
+    };
+    for vout in [json!(4_294_967_296_u64), json!(4_294_967_297_u64), json!(u64::MAX)] {
+        let err = spender_of(vout.clone()).unwrap_err();
+        assert_eq!(err["code"], ERR_INVALID_PARAMETER, "vout={vout}: {err}");
+        assert_eq!(err["message"], "vout out of range", "vout={vout}: {err}");
+    }
+    for vout in [json!(-1), json_num("1.5"), json!("0"), Value::Null] {
+        let err = spender_of(vout).unwrap_err();
+        assert_eq!(err["code"], ERR_INVALID_PARAMS, "{err}");
+        assert_eq!(err["message"], "vout required", "{err}");
+    }
+    for vout in [0, i32::MAX as u32 + 1, u32::MAX] {
+        let row = spender_of(json!(vout)).unwrap();
+        assert_eq!(row, json!([{ "txid": txid.clone(), "vout": vout }]));
+    }
+
     let last_vout = dispatch(ctx, "gettxout", vec![txid, json!(u32::MAX)]).unwrap();
     assert!(last_vout.is_null(), "{last_vout}");
 

@@ -2504,10 +2504,12 @@ pub fn gettxspendingprevout(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
             .get("txid")
             .and_then(|x| x.as_str())
             .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "txid required"))?;
-        let vout =
-            obj.get("vout")
-                .and_then(|x| x.as_u64())
-                .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "vout required"))? as u32;
+        let vout = obj
+            .get("vout")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "vout required"))?;
+        let vout = u32::try_from(vout)
+            .map_err(|_| rpc_error(ERR_INVALID_PARAMETER, "vout out of range"))?;
         let want = parse_hash32_display(txid)?;
         let op = OutPoint {
             txid: Txid::from_byte_array(want),
