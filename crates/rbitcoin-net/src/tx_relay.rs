@@ -420,10 +420,10 @@ pub fn tx_has_bip68_time_lock(tx: &Transaction) -> bool {
     if !rbitcoin_consensus::bip68_active_for_tx(tx) {
         return false;
     }
-    const TYPE_FLAG: u32 = 1 << 22;
     tx.input.iter().any(|inp| {
         let seq = inp.sequence.to_consensus_u32();
-        seq & rbitcoin_consensus::SEQUENCE_LOCKTIME_DISABLE_FLAG == 0 && seq & TYPE_FLAG != 0
+        seq & rbitcoin_consensus::SEQUENCE_LOCKTIME_DISABLE_FLAG == 0
+            && seq & rbitcoin_consensus::SEQUENCE_LOCKTIME_TYPE_FLAG != 0
     })
 }
 
@@ -2403,15 +2403,8 @@ impl MempoolHub {
             .iter()
             .zip(connects)
             .map(|(tx, c)| {
-                if skip.contains(&c.txid)
-                    || !rbitcoin_consensus::tx_precompute::sighash_midstates_for(tx)
-                {
-                    rbitcoin_query::TxPrecompute::Connect(c)
-                } else {
-                    rbitcoin_query::TxPrecompute::Script(
-                        rbitcoin_query::TxScriptPrecompute::from_connect(c, tx),
-                    )
-                }
+                let live = skip.contains(&c.txid);
+                rbitcoin_consensus::tx_precompute::tip_precompute(tx, c, live)
             })
             .collect();
         (std::sync::Arc::from(v), skip)

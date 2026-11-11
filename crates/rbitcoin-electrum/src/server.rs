@@ -3196,24 +3196,13 @@ pub fn verbose_tx_from_tx(
     network: bitcoin::Network,
 ) -> Value {
     let raw = bitcoin::consensus::serialize(tx);
-    verbose_tx_fields(query, &raw, tx, txid, fk, network)
-}
-
-fn verbose_tx_fields(
-    query: &Query,
-    raw: &[u8],
-    tx: &bitcoin::Transaction,
-    txid: &[u8; 32],
-    fk: Option<Fk>,
-    network: bitcoin::Network,
-) -> Value {
     let mut obj = json!({
-        "hex": rbitcoin_primitives::hex_encode(raw),
+        "hex": rbitcoin_primitives::hex_encode(&raw),
         "txid": txid_hex(txid),
         "size": raw.len(),
         "version": tx.version.0,
         "locktime": tx.lock_time.to_consensus_u32(),
-        "hash": hash_hex_rev(bitcoin::hashes::sha256d::Hash::hash(raw).as_byte_array()),
+        "hash": hash_hex_rev(bitcoin::hashes::sha256d::Hash::hash(&raw).as_byte_array()),
         "vin": tx.input.iter().map(verbose_vin).collect::<Vec<_>>(),
         "vout": tx.output.iter().enumerate().map(|(n, o)| verbose_vout(n, o, network)).collect::<Vec<_>>(),
     });

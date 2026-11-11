@@ -301,6 +301,83 @@ fn apply_blocktxn_completes() {
 }
 
 #[test]
+fn apply_cmpct_blocktxn_moves_fill() {
+    let b1 = spend(4);
+    let block = sealed_block(vec![coinbase(), b1.clone()]);
+    let hsi = HeaderAndShortIds::from_block(&block, 2, 2, &[]).unwrap();
+    let empty: HashMap<ShortId, Vec<&Transaction>> = HashMap::new();
+    let partial = must_partial(&hsi, &empty);
+    let mut pc = rbitcoin_net::peer::PendingCmpct {
+        hsi,
+        partial,
+        fill: Some(CmpctFillSets {
+            mempool: [b1.compute_wtxid()].into_iter().collect(),
+            extra: Default::default(),
+            orphan: Default::default(),
+        }),
+        since: std::time::Instant::now(),
+    };
+    let txn = BlockTransactions {
+        block_hash: block.block_hash(),
+        transactions: vec![b1.clone()],
+    };
+    let (got, returned) = rbitcoin_net::peer::apply_cmpct_blocktxn(&mut pc, &txn).unwrap();
+    assert_eq!(got.txdata.len(), 2);
+    let returned = returned.expect("a finished blocktxn returns the fill");
+    assert!(returned.mempool.contains(&b1.compute_wtxid()));
+    assert!(pc.fill.is_none(), "the pending fill is taken, not copied");
+}
+
+#[test]
+fn apply_cmpct_blocktxn_keeps_fill_when_the_body_is_wrong() {
+    let b1 = spend(4);
+    let block = sealed_block(vec![coinbase(), b1]);
+    let hsi = HeaderAndShortIds::from_block(&block, 2, 2, &[]).unwrap();
+    let empty: HashMap<ShortId, Vec<&Transaction>> = HashMap::new();
+    let partial = must_partial(&hsi, &empty);
+    let mut pc = rbitcoin_net::peer::PendingCmpct {
+        hsi,
+        partial,
+        fill: Some(CmpctFillSets::default()),
+        since: std::time::Instant::now(),
+    };
+    let txn = BlockTransactions {
+        block_hash: block.block_hash(),
+        transactions: vec![spend(11)],
+    };
+    assert!(rbitcoin_net::peer::apply_cmpct_blocktxn(&mut pc, &txn).is_err());
+    assert!(pc.fill.is_some(), "a bad blocktxn leaves the fill in place");
+}
+
+#[test]
+fn one_wtxid_list_matches_reconstruct_and_prefill() {
+    let b1 = spend(21);
+    let b2 = spend(22);
+    let block = sealed_block(vec![coinbase(), b1.clone(), b2.clone()]);
+    let hsi = HeaderAndShortIds::from_block(&block, 3, 2, &[]).unwrap();
+    let fill = CmpctFillSets {
+        mempool: [b1.compute_wtxid()].into_iter().collect(),
+        extra: [b2.compute_wtxid()].into_iter().collect(),
+        orphan: Default::default(),
+    };
+    let wtxids = block_wtxids(&block);
+    assert_eq!(
+        reconstruct_stats_from_wtxids(&hsi, &block, &fill, &[2], &wtxids),
+        reconstruct_stats(&hsi, &block, &fill, &[2])
+    );
+    assert_eq!(
+        prefill_indexes_from_wtxids(&block, &fill, &wtxids),
+        prefill_indexes(&block, &fill)
+    );
+    let missing = prefill_indexes_from_wtxids(&block, &fill, &[]);
+    assert_eq!(
+        missing,
+        vec![0, 1, 2],
+        "a missing wtxid is a primary prefill, not a mempool hit"
+    );
+}
+
+#[test]
 fn missing_request_uses_absolute_indexes() {
     let missing = vec![1u64, 3, 5];
     let req = missing_request(BlockHash::from_byte_array([9; 32]), &missing);

@@ -290,7 +290,12 @@ pub fn tx(ctx: &RpcContext, fmt: RestFmt, txid: &str) -> Result<RestReply, RestR
             getrawtransaction(ctx, &params),
         )?));
     };
-    let hit = locate_raw_tx(ctx, want).map_err(|e| tx_missing_reply(txid, e))?;
+    let Some(hit) = locate_raw_tx(ctx, want).map_err(rpc_to_rest)? else {
+        return Err(err(
+            axum::http::StatusCode::NOT_FOUND,
+            &format!("{txid} not found"),
+        ));
+    };
     let tx = hit.tx();
     match wire {
         RestWire::Bin => Ok(bin_body(bitcoin::consensus::serialize(tx))),

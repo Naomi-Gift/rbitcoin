@@ -362,28 +362,27 @@ pub fn tx_json_from_wire(
             vin_obj["witness"] = json!(wit);
         }
 
-        let mut spk_for_inner: Option<Vec<u8>> = None;
         if is_coinbase {
             prev_spks.push(Vec::new());
-        } else if let Some((prev, spk)) =
+        } else if let Some((prev, sats, spk)) =
             prevout_json(query, stored_inputs, i, tin, network, mempool)?
         {
-            if let Some(v) = prev.get("value").and_then(|x| x.as_i64()) {
-                if let Some(acc) = fee_in.as_mut() {
-                    *acc = acc.saturating_add(v);
+            match i64::try_from(sats) {
+                Ok(v) => {
+                    if let Some(acc) = fee_in.as_mut() {
+                        *acc = acc.saturating_add(v);
+                    }
                 }
-            } else {
-                fee_in = None;
+                Err(_) => fee_in = None,
             }
-            spk_for_inner = Some(spk.clone());
             prev_spks.push(spk);
+            if let Some(spk) = prev_spks.last() {
+                attach_inner_scripts(&mut vin_obj, spk, ss, &wit_raw);
+            }
             vin_obj["prevout"] = prev;
         } else {
             fee_in = None;
             prev_spks.push(Vec::new());
-        }
-        if let Some(spk) = spk_for_inner.as_deref() {
-            attach_inner_scripts(&mut vin_obj, spk, ss, &wit_raw);
         }
 
         vin.push(vin_obj);
@@ -443,7 +442,7 @@ pub fn prevout_json(
     tin: &bitcoin::TxIn,
     network: Network,
     mempool: Option<&MempoolHub>,
-) -> Result<Option<(Value, Vec<u8>)>, QueryError> {
+) -> Result<Option<(Value, u64, Vec<u8>)>, QueryError> {
     if let Some(inp) = stored_inputs.get(idx) {
         if !inp.create_fk().is_null() {
             if let Ok(out) = query.tx_output_at_fk(inp.create_fk(), inp.prev_index()) {
@@ -469,9 +468,9 @@ pub fn prevout_json(
     Ok(None)
 }
 
-fn prevout_value(script: Vec<u8>, value: u64, network: Network) -> (Value, Vec<u8>) {
+fn prevout_value(script: Vec<u8>, value: u64, network: Network) -> (Value, u64, Vec<u8>) {
     let json = vout_fields(&script, value, network);
-    (json, script)
+    (json, value, script)
 }
 
 #[doc(hidden)]

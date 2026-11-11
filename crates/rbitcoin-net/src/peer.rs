@@ -3311,14 +3311,17 @@ pub fn log_cmpct_filled(
     fetched: &[u64],
     fill: Option<&crate::compact::CmpctFillSets>,
 ) {
-    let stats = crate::compact::reconstruct_stats(
+    let wtxids = crate::compact::block_wtxids(block);
+    let stats = crate::compact::reconstruct_stats_from_wtxids(
         hsi,
         block,
         fill.unwrap_or(&crate::compact::CmpctFillSets::default()),
         fetched,
+        &wtxids,
     );
     rbitcoin_log::info!("{stats}");
-    if let Some(indexes) = crate::compact::outbound_prefill_indexes(block, fill) {
+    if let Some(fill) = fill {
+        let indexes = crate::compact::prefill_indexes_from_wtxids(block, fill, &wtxids);
         hub.remember_cmpct_prefill(block.block_hash(), block.header.prev_blockhash, indexes);
     }
 }
@@ -3569,9 +3572,9 @@ pub fn apply_cmpct_blocktxn(
     pc: &mut PendingCmpct,
     bt: &BlockTransactions,
 ) -> Result<(Block, Option<crate::compact::CmpctFillSets>), ()> {
-    crate::compact::apply_block_transactions(&pc.hsi, &mut pc.partial, bt)
-        .map(|block| (block, pc.fill.clone()))
-        .map_err(|_| ())
+    let block =
+        crate::compact::apply_block_transactions(&pc.hsi, &mut pc.partial, bt).map_err(|_| ())?;
+    Ok((block, pc.fill.take()))
 }
 
 #[doc(hidden)]

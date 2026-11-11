@@ -120,7 +120,7 @@ pub use block::{
     tx_sigop_cost, validate_block_structure, witness_commitment_script,
     witness_commitment_vout_index, InputIndex, ScriptVerifyFlags, ValidationContext,
     BIP16_EXCEPTION_MAINNET, MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT, MIN_TX_WEIGHT,
-    SEQUENCE_LOCKTIME_DISABLE_FLAG, TAPROOT_EXCEPTION_MAINNET,
+    SEQUENCE_LOCKTIME_DISABLE_FLAG, SEQUENCE_LOCKTIME_TYPE_FLAG, TAPROOT_EXCEPTION_MAINNET,
 };
 pub use clock::{with_now, NodeClock};
 pub use error::{block_reject_log_line, block_reject_reason, script_flag_paren, ConsensusError};

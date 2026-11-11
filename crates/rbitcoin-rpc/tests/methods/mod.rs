@@ -3487,6 +3487,11 @@ fn assert_missing_txid_and_rest(ctx: &RpcContext, txid: &str) -> String {
         let (status, body) = rest_text(ctx, &format!("/rest/tx/{missing}.json"), "");
         assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{body}");
         assert!(body.contains("not found"), "{body}");
+        for ext in ["bin", "hex"] {
+            let (status, body) = rest_text(ctx, &format!("/rest/tx/{missing}.{ext}"), "");
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{body}");
+            assert!(body.contains(&format!("{missing} not found")), "{body}");
+        }
     }
     let (status, body) = rest_text(ctx, &format!("/rest/tx/{txid}.json"), "");
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");

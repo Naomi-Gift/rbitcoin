@@ -1235,7 +1235,6 @@ pub fn structural_bip68(
     if !ctx.params.csv_active_at(ctx.height.0) {
         return Ok(());
     }
-    const TYPE_FLAG: u32 = 1 << 22;
     // Median time is only needed when some input enforces a relative lock.
     let mut prev_mtp_slot: Option<u32> = None;
     let mut si = 0usize;
@@ -1275,7 +1274,7 @@ pub fn structural_bip68(
             prev_heights.push(ch);
             let seq = inp.sequence.to_consensus_u32();
             let need_mtp = seq & rbitcoin_consensus::SEQUENCE_LOCKTIME_DISABLE_FLAG == 0
-                && seq & TYPE_FLAG != 0;
+                && seq & rbitcoin_consensus::SEQUENCE_LOCKTIME_TYPE_FLAG != 0;
             // Height 0 is the genesis coin: one median lookup of block 0.
             // A missing create height is not height 0.
             let mtp = if !need_mtp {

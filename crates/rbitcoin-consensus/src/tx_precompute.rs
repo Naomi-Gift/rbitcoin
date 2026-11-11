@@ -426,6 +426,15 @@ impl TxScriptPrecompute {
     }
 }
 
+/// Connect when `live`, or when the tx has no sighash midstates. Otherwise the script row.
+pub fn tip_precompute(tx: &Transaction, connect: TxConnectPrecompute, live: bool) -> TxPrecompute {
+    if live || !sighash_midstates_for(tx) {
+        TxPrecompute::Connect(connect)
+    } else {
+        TxPrecompute::Script(TxScriptPrecompute::from_connect(connect, tx))
+    }
+}
+
 /// Tip-follow precompute: `from_tx_connect` for live mempool txs, fill midstates otherwise.
 ///
 /// `live_empty` is the no-mempool / empty-graph path — all `from_tx`, no probe.
@@ -441,18 +450,12 @@ pub fn pres_for_tip(
     let mut skip = HashSet::new();
     let mut v = Vec::with_capacity(txs.len());
     for tx in txs {
-        let c = TxPrecompute::from_tx_connect(tx);
-        if is_live(c.txid) {
+        let c = TxPrecompute::from_tx_connect(tx).into_connect();
+        let live = is_live(c.txid);
+        if live {
             skip.insert(c.txid);
-            v.push(c);
-        } else if sighash_midstates_for(tx) {
-            v.push(TxPrecompute::Script(TxScriptPrecompute::from_connect(
-                c.into_connect(),
-                tx,
-            )));
-        } else {
-            v.push(c);
         }
+        v.push(tip_precompute(tx, c, live));
     }
     (Arc::from(v), skip)
 }

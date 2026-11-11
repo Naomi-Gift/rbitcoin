@@ -600,23 +600,25 @@ impl RawTxHit {
 
 /// Mempool hit, otherwise the chain row. No `blockhash`. The caller already
 /// refused the genesis coinbase.
-pub(crate) fn locate_raw_tx(ctx: &RpcContext, want: [u8; 32]) -> Result<RawTxHit, Value> {
+pub(crate) fn locate_raw_tx(ctx: &RpcContext, want: [u8; 32]) -> Result<Option<RawTxHit>, Value> {
     if let Some(mp) = ctx.mempool.as_ref() {
         let tid = Txid::from_byte_array(want);
         if let Some(tx) = mp.get_tx(&tid) {
-            return Ok(RawTxHit::Mempool(tx));
+            return Ok(Some(RawTxHit::Mempool(tx)));
         }
     }
-    let fk = ctx
+    let Some(fk) = ctx
         .query
         .tx_fk_by_txid(&want)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, RAW_TX_NOT_FOUND))?;
+    else {
+        return Ok(None);
+    };
     let tx = ctx
         .query
         .reconstruct_tx(fk)
         .map_err(|e| map_query(e, RAW_TX_PRUNED))?;
-    Ok(RawTxHit::Chain { tx, fk })
+    Ok(Some(RawTxHit::Chain { tx, fk }))
 }
 
 pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -636,7 +638,10 @@ pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, 
         return getrawtransaction_in_block(ctx, want, verbosity, hash);
     }
 
-    match locate_raw_tx(ctx, want)? {
+    let Some(hit) = locate_raw_tx(ctx, want)? else {
+        return Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, RAW_TX_NOT_FOUND));
+    };
+    match hit {
         RawTxHit::Mempool(tx) => {
             if verbosity == 0 {
                 return Ok(json!(serialize_hex(&tx)));

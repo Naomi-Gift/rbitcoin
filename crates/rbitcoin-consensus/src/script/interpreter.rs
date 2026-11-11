@@ -1021,9 +1021,9 @@ pub fn csv_locktime_mask(type_bit: u32) -> u32 {
 pub fn sequence_csv_ok(seq: Sequence, csv: u32) -> bool {
     let seq_n = seq.to_consensus_u32();
     if seq_n & crate::SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
-        return false; // SEQUENCE_LOCKTIME_DISABLE_FLAG on input
+        return false;
     }
-    let type_bit = 1 << 22;
+    let type_bit = crate::SEQUENCE_LOCKTIME_TYPE_FLAG;
     let mask = csv_locktime_mask(type_bit);
     let seq_masked = seq_n & mask;
     let csv_masked = csv & mask;

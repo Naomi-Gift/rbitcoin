@@ -395,8 +395,8 @@ pub async fn tx_raw(State(st): State<AppState>, Path(txid_hex): Path<String>) ->
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        match st.query.get_tx_by_txid(&txid) {
-            Ok(Some((fk, _))) => match st.query.tx_wire_bytes(fk) {
+        match st.query.tx_fk_by_txid(&txid) {
+            Ok(Some(fk)) => match st.query.tx_wire_bytes(fk) {
                 Ok(raw) => (
                     StatusCode::OK,
                     [(header::CONTENT_TYPE, "application/octet-stream")],
@@ -2038,7 +2038,7 @@ pub fn mempool_indexes(st: &AppState, sh: &[u8; 32], id: &[u8; 32]) -> bool {
 
 #[doc(hidden)]
 pub fn txid_on_chain(st: &AppState, id: &[u8; 32]) -> bool {
-    st.query.get_tx_by_txid(id).ok().flatten().is_some()
+    st.query.tx_fk_by_txid(id).ok().flatten().is_some()
 }
 
 /// Mempool JSON that stays on this `/txs` page.
@@ -2079,7 +2079,7 @@ pub fn push_mempool_tx_json(
     fee: i64,
     out: &mut Vec<Value>,
 ) {
-    if let Ok(Some((fk, _))) = st.query.get_tx_by_txid(&txid) {
+    if let Ok(Some(fk)) = st.query.tx_fk_by_txid(&txid) {
         if let Ok(v) = build_tx_json(&st.query, fk, st.network, None) {
             out.push(v);
             return;
@@ -2125,7 +2125,7 @@ pub fn parse_after_txid_query(q: AfterTxidQuery) -> Result<Option<[u8; 32]>, Res
 pub fn txid_is_known(st: &AppState, id: &[u8; 32]) -> bool {
     let tid = Txid::from_byte_array(*id);
     st.mempool.as_ref().is_some_and(|m| m.contains(&tid))
-        || st.query.get_tx_by_txid(id).ok().flatten().is_some()
+        || st.query.tx_fk_by_txid(id).ok().flatten().is_some()
 }
 
 #[derive(Deserialize)]

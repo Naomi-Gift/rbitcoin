@@ -341,15 +341,6 @@ pub fn finish_with_txids(
         return Err(Vec::new());
     }
     let (root, mutated) = rbitcoin_store::merkle_root_mutated(leaves);
-    finish_checked(header, txdata, root, mutated)
-}
-
-fn finish_checked(
-    header: Header,
-    txdata: Vec<Transaction>,
-    root: [u8; 32],
-    mutated: bool,
-) -> Result<Block, Vec<u64>> {
     let block = Block { header, txdata };
     if root != block.header.merkle_root.to_byte_array()
         || mutated
@@ -465,12 +456,29 @@ pub fn reconstruct_getdata_stats(hash: BlockHash, missing_n: usize) -> CmpctReco
     }
 }
 
+/// One wtxid per transaction, in block order.
+pub fn block_wtxids(block: &Block) -> Vec<Wtxid> {
+    block.txdata.iter().map(|tx| tx.compute_wtxid()).collect()
+}
+
 /// Classify a completed reconstruct: fill sources plus `blocktxn` fetch size.
 pub fn reconstruct_stats(
     hsi: &HeaderAndShortIds,
     block: &Block,
     fill: &CmpctFillSets,
     fetched_indexes: &[u64],
+) -> CmpctReconstructStats {
+    let wtxids = block_wtxids(block);
+    reconstruct_stats_from_wtxids(hsi, block, fill, fetched_indexes, &wtxids)
+}
+
+/// Same classification as [`reconstruct_stats`], using wtxids already hashed.
+pub fn reconstruct_stats_from_wtxids(
+    hsi: &HeaderAndShortIds,
+    block: &Block,
+    fill: &CmpctFillSets,
+    fetched_indexes: &[u64],
+    wtxids: &[Wtxid],
 ) -> CmpctReconstructStats {
     let prefilled: HashSet<usize> = prefilled_absolute_indexes(hsi)
         .into_iter()
@@ -484,11 +492,11 @@ pub fn reconstruct_stats(
     };
     for (abs, tx) in block.txdata.iter().enumerate() {
         let bytes = tx_wire_len(tx);
-        let wtxid = tx.compute_wtxid();
+        let wtxid = wtxids.get(abs);
         if prefilled.contains(&abs) {
             stats.prefill_n += 1;
             stats.prefill_bytes += bytes;
-            if fill.mempool.contains(&wtxid) {
+            if wtxid.is_some_and(|id| fill.mempool.contains(id)) {
                 stats.redundant_prefill_n += 1;
                 stats.redundant_prefill_bytes += bytes;
             }
@@ -499,13 +507,16 @@ pub fn reconstruct_stats(
             stats.fetched_bytes += bytes;
             continue;
         }
-        if fill.mempool.contains(&wtxid) {
+        let Some(wtxid) = wtxid else {
+            continue;
+        };
+        if fill.mempool.contains(wtxid) {
             stats.mempool_n += 1;
             stats.mempool_bytes += bytes;
-        } else if fill.extra.contains(&wtxid) {
+        } else if fill.extra.contains(wtxid) {
             stats.extra_n += 1;
             stats.extra_bytes += bytes;
-        } else if fill.orphan.contains(&wtxid) {
+        } else if fill.orphan.contains(wtxid) {
             stats.orphan_n += 1;
             stats.orphan_bytes += bytes;
         }
@@ -520,14 +531,27 @@ pub const EXTRA_PREFILL_BUDGET: usize = 10 * 1024;
 ///
 /// Packs greedily up to [`EXTRA_PREFILL_BUDGET`] additional witness bytes.
 pub fn prefill_indexes(block: &Block, fill: &CmpctFillSets) -> Vec<usize> {
+    let wtxids = block_wtxids(block);
+    prefill_indexes_from_wtxids(block, fill, &wtxids)
+}
+
+/// Same indexes as [`prefill_indexes`], using wtxids already hashed.
+pub fn prefill_indexes_from_wtxids(
+    block: &Block,
+    fill: &CmpctFillSets,
+    wtxids: &[Wtxid],
+) -> Vec<usize> {
     let mut primary = Vec::new();
     let mut extra = Vec::new();
-    for (i, tx) in block.txdata.iter().enumerate().skip(1) {
-        let w = tx.compute_wtxid();
-        if fill.mempool.contains(&w) {
+    for (i, _tx) in block.txdata.iter().enumerate().skip(1) {
+        let Some(w) = wtxids.get(i) else {
+            primary.push(i);
+            continue;
+        };
+        if fill.mempool.contains(w) {
             continue;
         }
-        if fill.extra.contains(&w) {
+        if fill.extra.contains(w) {
             extra.push(i);
         } else {
             primary.push(i);
