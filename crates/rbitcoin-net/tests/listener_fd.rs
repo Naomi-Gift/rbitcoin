@@ -4,6 +4,8 @@
 use rbitcoin_consensus::{ChainParams, Milestone};
 #[cfg(unix)]
 use rbitcoin_net::listen::listener_fd_reserve;
+#[cfg(unix)]
+use rbitcoin_net::peers::MAX_INCOMPLETE_INBOUND_PER_ADDR;
 use rbitcoin_net::service::P2PNode;
 use rbitcoin_query::Query;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -78,12 +80,6 @@ impl Drop for Restore {
     }
 }
 
-/// Unfinished inbound handshakes the node allows from one address. Every
-/// connection here comes from 127.0.0.1, the one loopback address macOS
-/// configures.
-#[cfg(unix)]
-const UNFINISHED_PER_ADDR: usize = 8;
-
 /// Filling the P2P listener must stop while descriptors remain.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -108,8 +104,9 @@ async fn listener_cap_fd_reserve_leaves_room() {
     )
     .await
     .unwrap();
-    // Room over the reserve for a few connections, fewer than one address
-    // may hold, so the reserve and not the address cap refuses the rest.
+    // Every client connects from 127.0.0.1, the one loopback address macOS
+    // configures. Leave room over the reserve for fewer connections than one
+    // address may hold, so the reserve and not the address cap refuses.
     let open = open_fds();
     let mut tight = open + 48;
     while tight - open < listener_fd_reserve(tight) + 16 {
@@ -125,7 +122,7 @@ async fn listener_cap_fd_reserve_leaves_room() {
 
     let mut held = Vec::new();
     let mut refused = 0u32;
-    for _ in 0..UNFINISHED_PER_ADDR * 2 {
+    for _ in 0..MAX_INCOMPLETE_INBOUND_PER_ADDR * 2 {
         let connect = tokio::net::TcpStream::connect(node.local_addr);
         let mut sock = match tokio::time::timeout(Duration::from_millis(400), connect).await {
             Ok(Ok(sock)) => sock,
@@ -159,7 +156,7 @@ async fn listener_cap_fd_reserve_leaves_room() {
     }
     let left = tight.saturating_sub(open_fds());
     assert!(
-        !held.is_empty() && held.len() < UNFINISHED_PER_ADDR && left >= reserve,
+        !held.is_empty() && held.len() < MAX_INCOMPLETE_INBOUND_PER_ADDR && left >= reserve,
         "listener filled the table: {left} fds left of reserve {reserve}, held {}, refused {refused}",
         held.len()
     );
