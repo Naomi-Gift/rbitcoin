@@ -3472,6 +3472,65 @@ fn relay_admit_erases_the_parked_copy() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core's `MempoolAcceptedTx` is peer relay only. A multi-tx
+/// `testmempoolaccept` member commits with no peer, so the parked copy of
+/// it stays parked under its peer.
+#[test]
+fn test_package_member_leaves_its_parked_copy() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let parent = spend_true(cbs[7], 10_000, ScriptBuf::from_bytes(vec![0x51]));
+    let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9980_0000);
+    hub.accept_tx_from(&parent, TxOrigin::Local)
+        .expect("the parent pays for itself");
+    assert!(hub.lock_write().orphanage.insert_from(
+        child.clone(),
+        BTreeSet::from([parent.compute_txid()]),
+        Some(4),
+    ));
+    hub.accept_test_package_member(&child)
+        .expect("its parent is pooled");
+    assert_eq!(
+        hub.lock_read()
+            .orphanage
+            .announcers_of(&child.compute_wtxid()),
+        vec![4],
+        "a test member does not erase the parked copy"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core's `ProcessValidTx` erases a relayed 1p1c parent's parked copy by
+/// wtxid, as it does the child's.
+#[test]
+fn peer_anchor_pair_erases_the_parents_parked_copy() {
+    let (_store, q, cbs) = pad_cbs(12);
+    for (round, on_async) in [false, true].into_iter().enumerate() {
+        let dir = tmp();
+        let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+        let parent = zero_fee_anchor(cbs[round * 2]);
+        let child = spend_anchor(&parent, cbs[round * 2 + 1], 50_000);
+        from_peer(&hub, &parent, 7, on_async).expect_err("alone");
+        assert!(hub.lock_write().orphanage.insert_from(
+            parent.clone(),
+            BTreeSet::from([Txid::from_byte_array([0x5b; 32])]),
+            Some(9),
+        ));
+        from_peer(&hub, &child, 8, on_async).expect("1p1c");
+        assert!(hub.contains(&parent.compute_txid()));
+        assert!(
+            !hub.lock_read()
+                .orphanage
+                .contains_wtxid(&parent.compute_wtxid()),
+            "the admitted parent leaves the orphanage"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A child already in the orphan pool is still a package member.
 /// `submitpackage` and Electrum use this hub path.
 #[test]

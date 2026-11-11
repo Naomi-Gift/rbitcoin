@@ -6845,16 +6845,13 @@ pub async fn on_tx(
                 maybe_force_relay_recent_reject(hub, session, mp, txid, wtxid);
                 return Ok(());
             }
-            // Core `ReceivedTx`: a parked wtxid is already had, so it is not
-            // validated again.
-            if !trusted {
-                if let Some(parked) = mp.try_orphan_tx_wtxid(&wtxid) {
-                    mp.resolve_tx_request(&txid, &wtxid, false);
-                    if let Some(s) = session {
-                        note_parked_announcer(mp, s, &parked);
-                    }
-                    return Ok(());
-                }
+            // Core `ReceivedTx`: a parked wtxid is already had, so it is
+            // dropped unvalidated and its sender is no new announcer. One the
+            // mempool holds too goes on to the duplicate handling below.
+            if !trusted && mp.try_orphan_missing(&wtxid).is_some() && !mp.try_contains(&txid) {
+                mp.resolve_tx_request(&txid, &wtxid, false);
+                maybe_force_relay_recent_reject(hub, session, mp, txid, wtxid);
+                return Ok(());
             }
             if trusted {
                 mp.set_trusted_session(from);

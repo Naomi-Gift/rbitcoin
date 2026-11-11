@@ -703,6 +703,13 @@ impl TxOrigin {
             TxOrigin::Relay(from) => from,
         }
     }
+
+    /// Origin of a 1p1c parent paired with a child from `self`. The parent
+    /// is a relayed body from the extra pool, never this node's own submit:
+    /// it carries the child's peer, or no peer for a local child.
+    fn pair_parent(self) -> TxOrigin {
+        TxOrigin::Relay(self.peer())
+    }
 }
 
 /// Broadcast unit for mempool accepts (P2P inv, Electrum status, Esplora WS).
@@ -2715,10 +2722,11 @@ impl MempoolHub {
         }
     }
 
-    /// Runs under the write lock that commits `result`. A relay admit erases
-    /// the parked copy of the same wtxid, as Core's `MempoolAcceptedTx`. A
-    /// local admit is marked local and leaves the orphanage alone, as Core's
-    /// RPC does.
+    /// Runs under the write lock that commits `result`. A tx a peer relayed
+    /// erases the parked copy of the same wtxid, as Core's `MempoolAcceptedTx`
+    /// on the peer path. A local admit is marked local. Neither it nor an
+    /// admit with no peer (a `testmempoolaccept` member, a `mempool.dat`
+    /// load) touches the orphanage, as in Core.
     fn note_committed(
         &self,
         g: &mut ActiveMempool,
@@ -2731,9 +2739,10 @@ impl MempoolHub {
         };
         match origin {
             TxOrigin::Local => self.local_origin.lock().unwrap().mark(r.txid),
-            TxOrigin::Relay(_) => {
+            TxOrigin::Relay(Some(_)) => {
                 g.orphanage.remove_wtxid(&tx.compute_wtxid());
             }
+            TxOrigin::Relay(None) => {}
         }
     }
 
@@ -3310,9 +3319,12 @@ impl MempoolHub {
         })
     }
 
-    /// A parked child whose pair failed hard leaves the orphanage, as Core
-    /// erases an orphan rejected for anything but missing inputs. One that
-    /// only failed as a pair keeps waiting.
+    /// A parked child whose pair failed hard (its wtxid is now a recent
+    /// reject) leaves the orphanage. Core erases a package member for any
+    /// result but missing inputs, a fee failure included. Here a child whose
+    /// pair only failed softly stays parked until its parent enters the
+    /// mempool or it expires, and the remembered pair key stops the same
+    /// pair being tried again before the next block.
     fn drop_rejected_orphan(&self, child: &Transaction) {
         let wtxid = child.compute_wtxid();
         if self.try_recent_reject(&wtxid) {
@@ -3352,7 +3364,9 @@ impl MempoolHub {
         let sample_p = self.sample_chain_coins(parent, utxo);
         let parent_commit = {
             let mut g = self.lock_write();
-            Self::commit_rechecked(&mut g, parent, prep_p, utxo, true, &sample_p)
+            let committed = Self::commit_rechecked(&mut g, parent, prep_p, utxo, true, &sample_p);
+            self.note_committed(&mut g, parent, origin.pair_parent(), &committed.result);
+            committed
         };
         let (parent_res, prevouts_p) = match parent_commit.result {
             Ok(r) => (r, parent_commit.prevouts),
@@ -4358,7 +4372,9 @@ impl MempoolHub {
             utxo.note_spender(&child_note);
             let sample = hub.sample_chain_coins(&parent_c, &utxo);
             let mut g = hub.lock_write();
-            Self::commit_rechecked(&mut g, &parent_c, prep_p, &utxo, true, &sample)
+            let committed = Self::commit_rechecked(&mut g, &parent_c, prep_p, &utxo, true, &sample);
+            hub.note_committed(&mut g, &parent_c, origin.pair_parent(), &committed.result);
+            committed
         })
         .await;
         let (parent_res, prevouts_p) = match parent_commit.result {
