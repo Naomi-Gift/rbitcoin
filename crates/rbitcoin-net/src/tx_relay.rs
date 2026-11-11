@@ -704,9 +704,9 @@ impl TxOrigin {
         }
     }
 
-    /// Origin of a 1p1c parent paired with a child from `self`. The parent
-    /// is a relayed body from the extra pool, never this node's own submit:
-    /// it carries the child's peer, or no peer for a local child.
+    /// Origin of a 1p1c parent admitted on behalf of `self`. The parent is a
+    /// relayed body from the extra pool, never this node's own submit: it
+    /// carries the peer of `self`, or no peer for a local submit.
     fn pair_parent(self) -> TxOrigin {
         TxOrigin::Relay(self.peer())
     }
