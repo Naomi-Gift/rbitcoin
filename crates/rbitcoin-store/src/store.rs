@@ -1100,16 +1100,14 @@ impl Store {
 
     /// Append Class A rows from shared pin Arc + inputs (no outs reclone).
     ///
-    /// `pin` is `(TxRecord, outs)`. `spent_overlay` is per-item `(vout, spend_fk, vin)`
-    /// (empty = all zeros).
+    /// `pin` is `(TxRecord, outs)`. `spent` is the exact `spent.body` image.
     pub fn put_tx_full_batch_from_pins<P: crate::tx_table::PackedCreate>(
         &self,
         items: &[(P, Vec<crate::InputRecord>)],
         index: bool,
-        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        spent: crate::tx_table::SpentBodyImage,
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
-        self.txs
-            .put_full_batch_from_pins(items, index, spent_overlay)
+        self.txs.put_full_batch_from_pins(items, index, spent)
     }
 
     #[allow(clippy::too_many_arguments)] // same wave as append_stems_one_wave
@@ -1119,7 +1117,7 @@ impl Store {
         &self,
         pins: &[&P],
         index: bool,
-        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        spent: crate::tx_table::SpentBodyImage,
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
         input_edges: &[Vec<crate::input::InputEdge>],
@@ -1129,7 +1127,7 @@ impl Store {
         self.txs.put_pins_encoded(
             pins,
             index,
-            spent_overlay,
+            spent,
             txstat,
             header_ranges,
             input_edges,

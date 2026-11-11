@@ -165,7 +165,7 @@ fn put_full_batch_from_pins_roundtrip() {
     let outs = vec![OutputRecord::unspent(7, vec![0x51])];
     let pin = std::sync::Arc::new((tx, outs));
     let (fks, loc) = t
-        .put_full_batch_from_pins(&[(pin, ins)], true, &[])
+        .put_full_batch_from_pins(&[(pin, ins)], true, SpentBodyImage::zeros(&[1]))
         .unwrap();
     assert_eq!(loc.len(), 1);
     assert_eq!(loc[0].txout, t.body_range(fks[0]).unwrap());
@@ -614,7 +614,7 @@ fn put_full_batch_roundtrips_one_output() {
     let outs = vec![OutputRecord::unspent(7, vec![0x51])];
     let pin = std::sync::Arc::new((tx, outs));
     let (fks, _loc) = t
-        .put_full_batch_from_pins(&[(pin, ins)], true, &[])
+        .put_full_batch_from_pins(&[(pin, ins)], true, SpentBodyImage::zeros(&[1]))
         .unwrap();
     assert_eq!(fks.len(), 1);
     let (tx, got_ins, got_outs) = t.get_full(fks[0]).unwrap();
@@ -662,12 +662,12 @@ fn put_full_batch_from_pins_same_batch_spent_slot() {
         script_sig: vec![0x01],
         witness: vec![],
     }];
-    let overlay = [vec![(0u32, Fk(2), 0)], vec![]];
+    let overlay = SpentBodyImage::from_pairs(&[2, 1], &[vec![(0u32, Fk(2), 0)], vec![]]).unwrap();
     let (fks, loc) = t
         .put_full_batch_from_pins(
             &[(parent_pin, parent_ins), (child_pin, child_ins)],
             false,
-            &overlay,
+            overlay,
         )
         .unwrap();
     assert_eq!(fks, vec![Fk(1), Fk(2)]);
@@ -4823,47 +4823,49 @@ fn spent_slot_vin_at_2pow16_is_corrupt() {
 }
 
 #[test]
-fn encode_spent_slots_overlays_one_vout() {
-    let mut buf = Vec::new();
-    encode_spent_slots(3, &[(1, Fk(9), 3)], &mut buf).unwrap();
-    assert_eq!(buf.len(), 24);
-    let (f0, field0, v0) = decode_spent_slot(&buf[0..8]).unwrap();
-    assert_eq!(f0, 0);
-    assert!(field0.is_null());
-    assert_eq!(v0, 0);
-    let (f1, field1, v1) = decode_spent_slot(&buf[8..16]).unwrap();
-    assert_eq!(f1, 0);
-    assert_eq!(field1, Fk(9));
-    assert_eq!(v1, 3);
-    let (f2, field2, _v2) = decode_spent_slot(&buf[16..24]).unwrap();
-    assert_eq!(f2, 0);
-    assert!(field2.is_null());
-}
-
-#[test]
-fn encode_spent_slots_empty_matches_zeros() {
-    let mut a = Vec::new();
-    let mut b = Vec::new();
-    encode_spent_zeros(4, &mut a);
-    encode_spent_slots(4, &[], &mut b).unwrap();
-    assert_eq!(a, b);
-}
-
-#[test]
-fn encode_spent_slots_vout_oob_is_corrupt() {
-    let mut buf = Vec::new();
-    match encode_spent_slots(1, &[(1, Fk(2), 0)], &mut buf) {
-        Err(StoreError::Corrupt(m)) => assert!(m.contains("vout"), "{m}"),
-        other => panic!("expected Corrupt vout, got {other:?}"),
+fn spent_body_image_starts_follow_an_aligned_cursor() {
+    let starts = rbitcoin_store::var_table::exact_body_starts(16, &[16, 8], 24).unwrap();
+    assert_eq!(starts, vec![16, 32]);
+    match rbitcoin_store::var_table::exact_body_starts(17, &[16, 8], 24) {
+        Err(StoreError::Corrupt(m)) => assert!(m.contains("cursor"), "{m}"),
+        other => panic!("expected Corrupt, got {other:?}"),
     }
 }
 
 #[test]
-fn encode_spent_slots_duplicate_vout_last_wins() {
-    let mut buf = Vec::new();
-    encode_spent_slots(1, &[(0, Fk(1), 0), (0, Fk(2), 1)], &mut buf).unwrap();
-    assert_eq!(decode_spent_slot(&buf).unwrap().1, Fk(2));
-    assert_eq!(decode_spent_slot(&buf).unwrap().2, 1);
+fn spent_body_image_keeps_the_lower_fk() {
+    let mut image = SpentBodyImage::zeros(&[2, 1]);
+    assert_eq!(image.offs(), &[0, 16, 24]);
+    assert_eq!(image.bytes().len(), 24);
+    assert!(image.bytes().iter().all(|&b| b == 0));
+
+    image.place(0, 1, Fk(9), 3).unwrap();
+    let want = encode_spent_slot(0, Fk(9), 3).unwrap();
+    assert_eq!(&image.bytes()[8..16], &want);
+    assert!(image.bytes()[0..8].iter().all(|&b| b == 0));
+    assert!(image.bytes()[16..24].iter().all(|&b| b == 0));
+
+    let before = image.bytes().to_vec();
+    image.place(0, 1, Fk(4), 1).unwrap();
+    let (_, fk, vin) = decode_spent_slot(&image.bytes()[8..16]).unwrap();
+    assert_eq!((fk, vin), (Fk(4), 1));
+    image.place(0, 1, Fk(8), 7).unwrap();
+    let (_, fk, vin) = decode_spent_slot(&image.bytes()[8..16]).unwrap();
+    assert_eq!((fk, vin), (Fk(4), 1), "higher fk must not replace");
+    image.place(0, 1, Fk(4), 2).unwrap();
+    let (_, fk, vin) = decode_spent_slot(&image.bytes()[8..16]).unwrap();
+    assert_eq!((fk, vin), (Fk(4), 1), "equal fk keeps the first vin");
+
+    let snap = image.bytes().to_vec();
+    match image.place(0, 2, Fk(1), 0) {
+        Err(StoreError::Corrupt(m)) => assert!(m.contains("vout"), "{m}"),
+        other => panic!("expected Corrupt vout, got {other:?}"),
+    }
+    assert!(image.place(0, 1, Fk(1u64 << 40), 0).is_err());
+    assert!(image.place(0, 1, Fk(1), 1u32 << 16).is_err());
+    assert!(image.place(2, 0, Fk(1), 0).is_err());
+    assert_eq!(image.bytes(), &snap);
+    assert_ne!(before, snap);
 }
 
 #[test]

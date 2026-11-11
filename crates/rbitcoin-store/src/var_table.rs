@@ -47,6 +47,36 @@ pub fn next_aligned_tx_start(cursor: u64) -> u64 {
     cursor.saturating_add(7) & !7u64
 }
 
+/// File starts for an exact body image. `cursor` is the spent file end.
+pub fn exact_body_starts(
+    cursor: u64,
+    record_lens: &[u64],
+    blob_len: usize,
+) -> Result<Vec<u64>, StoreError> {
+    if !cursor.is_multiple_of(8) {
+        return Err(StoreError::Corrupt("spent body cursor"));
+    }
+    let mut starts = Vec::with_capacity(record_lens.len());
+    let mut sum = 0u64;
+    for &len in record_lens {
+        if len == 0 || !len.is_multiple_of(8) {
+            return Err(StoreError::Corrupt("spent overlay n_out"));
+        }
+        starts.push(
+            cursor
+                .checked_add(sum)
+                .ok_or(StoreError::Corrupt("spent overlay n_out"))?,
+        );
+        sum = sum
+            .checked_add(len)
+            .ok_or(StoreError::Corrupt("spent overlay n_out"))?;
+    }
+    if sum != blob_len as u64 {
+        return Err(StoreError::Corrupt("spent overlay n_out"));
+    }
+    Ok(starts)
+}
+
 pub struct VarTable {
     pub body: TableFile,
     pub count: AtomicU64,
@@ -409,6 +439,44 @@ impl VarTable {
             fks,
             base_count,
         }))
+    }
+
+    /// Prepared append whose body is `body_blob` itself.
+    ///
+    /// `cursor` must already be 8-aligned. Each record length is a non-zero
+    /// multiple of 8 and the lengths sum to `blob_len`. No pad is inserted.
+    pub fn prepare_exact_body(
+        &self,
+        record_lens: &[u64],
+        body_blob: Vec<u8>,
+    ) -> Result<PreparedAppend, StoreError> {
+        let n = record_lens.len();
+        if n == 0 {
+            return Err(StoreError::Corrupt("spent overlay n_out"));
+        }
+        let base_count = self.count.load(Ordering::Acquire);
+        let start = self.body.logical_len().max(FILE_HEADER_LEN as u64);
+        let starts = exact_body_starts(start, record_lens, body_blob.len())?;
+        if self.count.load(Ordering::Acquire) != base_count {
+            return Err(StoreError::Corrupt("var put_batch_encode race"));
+        }
+        let (_c, body_end) = self.published_meta();
+        if let Some(&s0) = starts.first() {
+            if s0 < body_end {
+                return Err(StoreError::Corrupt(
+                    "tx body starts inside published body_end \
+                     (refusing Class A double-append)",
+                ));
+            }
+        }
+        let fks = (0..n).map(|i| Fk(base_count + 1 + i as u64)).collect();
+        Ok(PreparedAppend {
+            start,
+            body_blob,
+            starts,
+            fks,
+            base_count,
+        })
     }
 
     pub fn body_write_fd(&self) -> IoHandle {

@@ -149,7 +149,12 @@ fn class_a_same_batch_slot_annotate_is_skip() {
     let ins = vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])];
     let sfk = Fk(9);
     let (fks, _loc) = t
-        .put_full_batch_from_pins(&[(pin, ins)], false, &[vec![(0u32, sfk, 0)]])
+        .put_full_batch_from_pins(
+            &[(pin, ins)],
+            false,
+            rbitcoin_store::tx_table::SpentBodyImage::from_pairs(&[2], &[vec![(0u32, sfk, 0)]])
+                .unwrap(),
+        )
         .unwrap();
     let cfk = fks[0];
     let (off, _) = t.spent_range(cfk).unwrap();
