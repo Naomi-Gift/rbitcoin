@@ -81,8 +81,9 @@ pub fn listener_fd_reserve(soft: u64) -> u64 {
 
 /// `true` when one more accepted socket still leaves the listener reserve.
 ///
-/// The new fd is already in the process count. A failed `getrlimit` or fd
-/// count, an unlimited soft limit, and every non-unix target fail open.
+/// The new fd is already in the process count. Counting fds needs a
+/// descriptor, so a failed count refuses the socket. A failed `getrlimit`,
+/// an unlimited soft limit, and every non-unix target fail open.
 pub fn listener_fd_room() -> bool {
     #[cfg(unix)]
     {
@@ -108,7 +109,7 @@ fn fd_room_unix() -> bool {
         return true;
     }
     let Some(open) = open_fd_count() else {
-        return true;
+        return false;
     };
     let soft = rlim.rlim_cur;
     soft.saturating_sub(open) >= listener_fd_reserve(soft)

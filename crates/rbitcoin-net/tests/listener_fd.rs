@@ -4,7 +4,29 @@
 use rbitcoin_consensus::{ChainParams, Milestone};
 use rbitcoin_net::service::P2PNode;
 use rbitcoin_query::Query;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
+
+/// `setrlimit` is process-wide. One test holds this for its whole body.
+struct LimitGuard;
+
+impl Drop for LimitGuard {
+    fn drop(&mut self) {
+        FD_LIMIT_BUSY.store(false, Ordering::SeqCst);
+    }
+}
+
+static FD_LIMIT_BUSY: AtomicBool = AtomicBool::new(false);
+
+fn hold_fd_limit() -> LimitGuard {
+    while FD_LIMIT_BUSY
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    LimitGuard
+}
 
 #[cfg(unix)]
 fn nofile() -> (u64, u64) {
@@ -58,6 +80,7 @@ impl Drop for Restore {
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn listener_cap_fd_reserve_leaves_room() {
+    let _limit = hold_fd_limit();
     let (soft, hard) = nofile();
     let n = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -136,6 +159,43 @@ async fn listener_cap_fd_reserve_leaves_room() {
     drop(held);
     node.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Counting fds needs a descriptor. A full table must refuse the socket.
+#[cfg(unix)]
+#[test]
+fn listener_fd_room_refuses_when_the_count_cannot_open() {
+    let _limit = hold_fd_limit();
+    let (soft, hard) = nofile();
+    let _restore = Restore { soft, hard };
+    let open = open_fds();
+    let tight = open.saturating_add(48).min(hard);
+    assert!(
+        tight > open + 8,
+        "soft {soft} hard {hard} open {open} cannot fill the table"
+    );
+    set_nofile_soft(tight, hard);
+    let mut held = Vec::new();
+    let mut full = None;
+    for _ in 0..(tight as usize + 8) {
+        match std::fs::File::open("/dev/null") {
+            Ok(f) => held.push(f),
+            Err(e) => {
+                full = Some(e);
+                break;
+            }
+        }
+    }
+    let err = full.expect("the descriptor table never filled");
+    assert!(
+        matches!(err.raw_os_error(), Some(23 | 24)),
+        "filling the table returned {err}"
+    );
+    assert!(
+        !rbitcoin_net::listen::listener_fd_room(),
+        "a full descriptor table still had listener room"
+    );
+    drop(held);
 }
 
 #[cfg(not(unix))]
