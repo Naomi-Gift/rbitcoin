@@ -618,32 +618,10 @@ pub fn encode_seqsigwit_with_secret(
     encode_input_run_secret(inputs, out, secret);
 }
 
-/// Encode a `spent.body` run (`8 × n_out` bytes) with optional sole-spender overlays.
-///
-/// Duplicate `vout` last-wins. `vout >= n_out`, `fk ≥ 2^40`, or `vin ≥ 2^16` is Corrupt.
-pub fn encode_spent_slots(
-    n_out: u32,
-    pairs: &[(u32, Fk, u32)],
-    out: &mut Vec<u8>,
-) -> Result<(), StoreError> {
-    let n = (n_out as usize).saturating_mul(OutputRecord::SPENT_SLOT_LEN);
-    let start = out.len();
-    out.resize(start.saturating_add(n), 0);
-    for &(vout, fk, vin) in pairs {
-        if vout >= n_out {
-            return Err(StoreError::Corrupt("spent overlay vout"));
-        }
-        let slot = encode_spent_slot(0, fk, vin)?;
-        let off =
-            start.saturating_add((vout as usize).saturating_mul(OutputRecord::SPENT_SLOT_LEN));
-        out[off..off + OutputRecord::SPENT_SLOT_LEN].copy_from_slice(&slot);
-    }
-    Ok(())
-}
-
-/// Encode a zeroed `spent.body` run (`8 × n_out` bytes).
+/// Append a zeroed `spent.body` run (`8 × n_out` bytes).
 pub fn encode_spent_zeros(n_out: u32, out: &mut Vec<u8>) {
-    encode_spent_slots(n_out, &[], out).expect("empty spent overlay");
+    let n = (n_out as usize).saturating_mul(OutputRecord::SPENT_SLOT_LEN);
+    out.resize(out.len().saturating_add(n), 0);
 }
 
 /// Published `spent.body` span for one create (`8 × n_out`).

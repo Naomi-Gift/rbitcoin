@@ -4823,50 +4823,6 @@ fn spent_slot_vin_at_2pow16_is_corrupt() {
 }
 
 #[test]
-fn encode_spent_slots_overlays_one_vout() {
-    let mut buf = Vec::new();
-    encode_spent_slots(3, &[(1, Fk(9), 3)], &mut buf).unwrap();
-    assert_eq!(buf.len(), 24);
-    let (f0, field0, v0) = decode_spent_slot(&buf[0..8]).unwrap();
-    assert_eq!(f0, 0);
-    assert!(field0.is_null());
-    assert_eq!(v0, 0);
-    let (f1, field1, v1) = decode_spent_slot(&buf[8..16]).unwrap();
-    assert_eq!(f1, 0);
-    assert_eq!(field1, Fk(9));
-    assert_eq!(v1, 3);
-    let (f2, field2, _v2) = decode_spent_slot(&buf[16..24]).unwrap();
-    assert_eq!(f2, 0);
-    assert!(field2.is_null());
-}
-
-#[test]
-fn encode_spent_slots_empty_matches_zeros() {
-    let mut a = Vec::new();
-    let mut b = Vec::new();
-    encode_spent_zeros(4, &mut a);
-    encode_spent_slots(4, &[], &mut b).unwrap();
-    assert_eq!(a, b);
-}
-
-#[test]
-fn encode_spent_slots_vout_oob_is_corrupt() {
-    let mut buf = Vec::new();
-    match encode_spent_slots(1, &[(1, Fk(2), 0)], &mut buf) {
-        Err(StoreError::Corrupt(m)) => assert!(m.contains("vout"), "{m}"),
-        other => panic!("expected Corrupt vout, got {other:?}"),
-    }
-}
-
-#[test]
-fn encode_spent_slots_duplicate_vout_last_wins() {
-    let mut buf = Vec::new();
-    encode_spent_slots(1, &[(0, Fk(1), 0), (0, Fk(2), 1)], &mut buf).unwrap();
-    assert_eq!(decode_spent_slot(&buf).unwrap().1, Fk(2));
-    assert_eq!(decode_spent_slot(&buf).unwrap().2, 1);
-}
-
-#[test]
 fn spent_body_image_starts_follow_an_aligned_cursor() {
     let starts = rbitcoin_store::var_table::exact_body_starts(16, &[16, 8], 24).unwrap();
     assert_eq!(starts, vec![16, 32]);
@@ -4901,7 +4857,10 @@ fn spent_body_image_keeps_the_lower_fk() {
     assert_eq!((fk, vin), (Fk(4), 1), "equal fk keeps the first vin");
 
     let snap = image.bytes().to_vec();
-    assert!(image.place(0, 2, Fk(1), 0).is_err());
+    match image.place(0, 2, Fk(1), 0) {
+        Err(StoreError::Corrupt(m)) => assert!(m.contains("vout"), "{m}"),
+        other => panic!("expected Corrupt vout, got {other:?}"),
+    }
     assert!(image.place(0, 1, Fk(1u64 << 40), 0).is_err());
     assert!(image.place(0, 1, Fk(1), 1u32 << 16).is_err());
     assert!(image.place(2, 0, Fk(1), 0).is_err());
