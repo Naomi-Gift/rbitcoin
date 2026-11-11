@@ -856,7 +856,14 @@ def emit_child_init_errors(log_path: Path, prior: int, rules: list) -> None:
             text = f.read().decode("utf-8", errors="replace")
     except OSError:
         text = ""
-    errs = [ln for ln in text.splitlines() if ln.startswith("Error:")]
+    lines = text.splitlines()
+    errs = [ln for ln in lines if ln.startswith("Error:")]
+    # `error!` is a timestamped `ERROR` line, not an `Error:` InitError.
+    # Without this, the test only sees "exited with status 1".
+    if not errs:
+        errs = [ln for ln in lines if " ERROR " in ln or ln.startswith("error:")]
+    if not errs:
+        errs = [ln for ln in lines if ln.strip()][-15:]
     # Core InitError FULL_TEXT for a tip more than 2h ahead of -mocktime.
     if "appears to be from the future" in text:
         print(
@@ -910,6 +917,30 @@ def main(argv: list[str] | None = None) -> int:
     child_env = os.environ.copy()
     child_env["RBITCOIN_RPC_WAIT_TIP_IDLE"] = "1"
     child_env["RBITCOIN_RPC_PACKAGE_DIALECT"] = "1"
+    # A stand-in RBITCOIN_NODE (shell script) does not honor this. The pump
+    # still copies its stdout. The real node writes the file itself.
+    node_writes_debug_log = os.path.basename(cmd[0]) in {
+        "rbitcoin-node",
+        "rbitcoin-node.exe",
+    }
+    if node_writes_debug_log:
+        child_env["RBITCOIN_DEBUG_LOG"] = str(log_path)
+
+    def _append_log(data: bytes) -> None:
+        try:
+            fcntl.flock(log_f.fileno(), fcntl.LOCK_EX)
+            log_f.write(data)
+            log_f.flush()
+        finally:
+            fcntl.flock(log_f.fileno(), fcntl.LOCK_UN)
+
+    def _node_plain_log_line(text: str) -> bool:
+        # `2026-11-11T16:46:02.469Z INFO …` — already flushed to debug.log.
+        if len(text) < 22 or text[4] != "-" or text[7] != "-" or text[10] != "T":
+            return False
+        z = text.find("Z ")
+        return 20 <= z <= 30
+
     try:
         child = subprocess.Popen(
             cmd,
@@ -926,11 +957,13 @@ def main(argv: list[str] | None = None) -> int:
     def _pump() -> None:
         assert child.stdout is not None
         for raw in iter(child.stdout.readline, b""):
-            log_f.write(raw)
             text = raw.decode("utf-8", errors="replace")
+            # Plain log lines are already in debug.log. Still copy panics
+            # and `Error:` init text, which the node prints with eprintln.
+            if not node_writes_debug_log or not _node_plain_log_line(text):
+                _append_log(raw)
             for mapped in apply_line(text, rules):
-                log_f.write((mapped + "\n").encode())
-            log_f.flush()
+                _append_log((mapped + "\n").encode())
             if log_stdout and raw:
                 try:
                     sys.stdout.buffer.write(raw)

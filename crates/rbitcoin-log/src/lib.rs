@@ -5,6 +5,13 @@
 //!
 //! Format: `2026-07-15T19:21:03.456Z  INFO message…`
 //!
+//! When `RBITCOIN_DEBUG_LOG` is set, the plain line is appended to that file
+//! and flushed before stderr, and before [`log_at`] returns. The functional
+//! harness points it at `debug.log` so a test that reads the file as the
+//! socket closes sees a line this call just wrote. A missing env, an empty
+//! path, or a path that cannot be opened stays stderr-only until
+//! `reset_debug_log`.
+//!
 //! [`progress`] keeps live done/total for long stages, readable at any level.
 
 #![forbid(unsafe_code)]
@@ -18,9 +25,84 @@ pub use api_log::PARAMS_MAX;
 pub use api_log::{api_call, close_api_log, init_api_log};
 
 use std::fmt;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static DEBUG_LOG: Mutex<Option<File>> = Mutex::new(None);
+/// Set once the env is missing, empty, or the file cannot be opened.
+/// Later lines do not lock the environment or call `open` again.
+static DEBUG_LOG_OFF: AtomicBool = AtomicBool::new(false);
+
+/// Drop the cached `RBITCOIN_DEBUG_LOG` file and read the env again.
+/// Tests delete the path.
+#[doc(hidden)]
+pub fn reset_debug_log() {
+    let mut slot = DEBUG_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    DEBUG_LOG_OFF.store(false, Ordering::Relaxed);
+    *slot = None;
+}
+
+/// Open the debug-log file once. `false` means later lines stay on stderr.
+fn debug_log_sink_ready() -> bool {
+    if DEBUG_LOG_OFF.load(Ordering::Relaxed) {
+        return false;
+    }
+    let mut slot = DEBUG_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    if DEBUG_LOG_OFF.load(Ordering::Relaxed) {
+        return false;
+    }
+    if slot.is_some() {
+        return true;
+    }
+    let Ok(path) = std::env::var("RBITCOIN_DEBUG_LOG") else {
+        DEBUG_LOG_OFF.store(true, Ordering::Relaxed);
+        return false;
+    };
+    if path.is_empty() {
+        DEBUG_LOG_OFF.store(true, Ordering::Relaxed);
+        return false;
+    }
+    match OpenOptions::new().create(true).append(true).open(&path) {
+        Ok(file) => {
+            *slot = Some(file);
+            true
+        }
+        Err(_) => {
+            DEBUG_LOG_OFF.store(true, Ordering::Relaxed);
+            false
+        }
+    }
+}
+
+fn append_debug_log(line: &str) {
+    if DEBUG_LOG_OFF.load(Ordering::Relaxed) {
+        return;
+    }
+    let mut slot = DEBUG_LOG.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(file) = slot.as_mut() else {
+        return;
+    };
+    let locked = file.lock().is_ok();
+    let _ = writeln!(file, "{line}");
+    let _ = file.flush();
+    if locked {
+        let _ = file.unlock();
+    }
+}
+
+fn write_stderr(level: Level, style: Style, ts: &str, message: &EscapedMessage<'_>) {
+    let mut stderr = io::stderr().lock();
+    let bold = matches!(style, Style::Bold) && io::IsTerminal::is_terminal(&stderr);
+    if bold {
+        let _ = writeln!(stderr, "{ts} {level:<5} \x1b[1m{message}\x1b[0m");
+    } else {
+        let _ = writeln!(stderr, "{ts} {level:<5} {message}");
+    }
+    let _ = stderr.flush();
+}
 
 /// Log severity. Higher numeric values are more verbose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -224,14 +306,13 @@ pub fn log_at_style(level: Level, style: Style, args: fmt::Arguments<'_>) {
     let message = args.to_string();
     let message = EscapedMessage(&message);
     let ts = format_timestamp(SystemTime::now());
-    let mut stderr = io::stderr().lock();
-    let bold = matches!(style, Style::Bold) && io::IsTerminal::is_terminal(&stderr);
-    if bold {
-        let _ = writeln!(stderr, "{ts} {level:<5} \x1b[1m{message}\x1b[0m");
-    } else {
-        let _ = writeln!(stderr, "{ts} {level:<5} {message}");
+    // File first. A full stderr pipe must not delay the line a test reads
+    // from debug.log before this call returns and the peer is dropped.
+    if debug_log_sink_ready() {
+        let plain = format!("{ts} {level:<5} {message}");
+        append_debug_log(&plain);
     }
-    let _ = stderr.flush();
+    write_stderr(level, style, &ts, &message);
 }
 
 #[macro_export]
