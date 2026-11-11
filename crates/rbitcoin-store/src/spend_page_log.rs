@@ -588,7 +588,7 @@ impl SpendPageLog {
         };
         let _clear_compose = ClearCompose(self);
         let _release_later = ReleaseLater(self);
-        let mut clears = self.explode_held(published, &mut keep)?;
+        let mut clears = self.explode_held(published, sampled_ticks, &mut keep)?;
         // Every slot was rejected. The commit file is still the retry record
         // until compose publishes a replacement or decides the body has none.
         let deferred = {
@@ -879,7 +879,12 @@ impl SpendPageLog {
     /// old image stays until that compose's rename returns. A zero image is
     /// folded. An image whose slots are all still best-chain stays in
     /// `committed` and is republished from that image, not from the body.
-    fn explode_held<K>(&self, published: u64, keep: &mut K) -> Result<Vec<BodyClear>, StoreError>
+    fn explode_held<K>(
+        &self,
+        published: u64,
+        sampled_ticks: u64,
+        keep: &mut K,
+    ) -> Result<Vec<BodyClear>, StoreError>
     where
         K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
     {
@@ -928,7 +933,12 @@ impl SpendPageLog {
             return Ok(Vec::new());
         }
         Ok(apply_held_explode(
-            &mut g, &held, restored, cleared, published,
+            &mut g,
+            &held,
+            restored,
+            cleared,
+            published,
+            sampled_ticks,
         ))
     }
 
@@ -1146,8 +1156,13 @@ impl SpendPageLog {
         // RAM height behind the same lock the hold uses.
         let _io = self.commit_io.lock().unwrap_or_else(|e| e.into_inner());
         let _ = std::fs::remove_file(self.dir.join(SPEND_PAGES_COMMIT_NAME));
-        let _ = std::fs::remove_file(self.dir.join(SPEND_PAGES_NAME));
-        self.remove_page_sidecars();
+        // The commit unlink has to be durable before the page files go. A
+        // crash that keeps the commit and loses the page file reloads the
+        // new records against an older image, or refuses to open.
+        if fsync_parent_dir(&self.dir).is_ok() {
+            let _ = std::fs::remove_file(self.dir.join(SPEND_PAGES_NAME));
+            self.remove_page_sidecars();
+        }
         let mut g = self.lock();
         g.log_bytes = 0;
         g.commit_height = None;
@@ -1787,7 +1802,9 @@ fn body_fold_span(page_off: u64, image: &[u8]) -> (u64, &[u8]) {
 /// the body. An image that still has a spend, and no rejected slot, moves
 /// those slots into `open` but stays in `committed`. Compose copies that
 /// image, so a zero on the page is kept, and this checkpoint does not fold
-/// it. A rejected slot leaves the old image in place and clears `base` so
+/// it. The hold stays until the publish after the second `keep`. Clearing
+/// it here lets a disconnect during the first `keep` fold the old image.
+/// A rejected slot leaves the old image in place and clears `base` so
 /// compose reads the body. A frozen note on the same page keeps the live slots.
 fn apply_held_explode(
     g: &mut Inner,
@@ -1795,6 +1812,7 @@ fn apply_held_explode(
     restored: Vec<KeptPage>,
     cleared: Vec<BodyClear>,
     published: u64,
+    sampled_ticks: u64,
 ) -> Vec<BodyClear> {
     if cleared.is_empty() {
         let spend_offs: HashSet<u64> = held
@@ -1803,11 +1821,13 @@ fn apply_held_explode(
             .map(|(off, _)| *off)
             .collect();
         if spend_offs.is_empty() {
-            g.fold_held = false;
+            // No slot was walked. A disconnect that landed anyway must keep
+            // the hold, or the next checkpoint folds this image.
+            if g.hold_ticks == sampled_ticks {
+                g.fold_held = false;
+            }
             return Vec::new();
         }
-        g.fold_held = false;
-        g.commit_height = None;
         for (page_off, slots) in restored {
             if spend_offs.contains(&page_off) {
                 park_open_slots(g, page_off, slots);

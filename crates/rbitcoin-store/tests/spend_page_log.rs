@@ -2322,6 +2322,78 @@ fn directory_sync_failure_leaves_the_generation_file() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+#[test]
+fn disconnect_during_held_keep_is_not_folded() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(1).unwrap();
+    let mut seen = 0u32;
+    log.commit_open(1, 8192, zeros, |_| {
+        seen += 1;
+        if seen == 1 {
+            log.hold_fold_above(1).unwrap();
+            return Ok(true);
+        }
+        Ok(false)
+    })
+    .unwrap();
+    assert_eq!(log.slot(16), Some(slot));
+    log.widen_for_checkpoint(1);
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, _image| {
+            writes += 1;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        writes, 0,
+        "a disconnect during the held keep must not fold the old image"
+    );
+    assert!(d.join(SPEND_PAGES_COMMIT_NAME).is_file());
+    assert_eq!(log.slot(16), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn directory_sync_failure_keeps_the_page_file_after_fold() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    let _reset = ResetDirSync;
+    // Leave spend.pages.1 in place. The fold's directory sync is the one
+    // that fails, after the commit unlink.
+    rbitcoin_store::file::arm_fail_dir_sync_after(1, 2);
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    rbitcoin_store::file::arm_fail_dir_sync_after(0, 0);
+    let gen = d.join(format!("{SPEND_PAGES_NAME}.1"));
+    assert!(gen.is_file());
+    let commit = d.join(SPEND_PAGES_COMMIT_NAME);
+    let commit_bytes = std::fs::read(&commit).unwrap();
+    log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+    rbitcoin_store::file::arm_fail_dir_sync_after(0, 1);
+    log.fold_into(|_off, _image| Ok(()), || Ok(())).unwrap();
+    rbitcoin_store::file::arm_fail_dir_sync_after(0, 0);
+    assert!(
+        gen.is_file(),
+        "a failed directory sync after the commit unlink must leave the page file"
+    );
+    if !commit.is_file() {
+        std::fs::write(&commit, &commit_bytes).unwrap();
+    }
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[cfg(all(unix, debug_assertions))]
 #[test]
 fn directory_sync_failure_during_hold_still_holds() {

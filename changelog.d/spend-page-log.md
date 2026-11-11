@@ -56,7 +56,10 @@ Fixed
   the fold before it widens the cool range. Open holds when the commit height
   or that tip is above the chain, not only when the marker is. A directory
   sync that fails after the commit rename still keeps that generation, and
-  the generation file stays until that sync succeeds.
+  the generation file stays until that sync succeeds. A disconnect during
+  the held keep does not clear that hold, so the next checkpoint does not
+  fold the old image. The fold deletes the commit, syncs the directory,
+  and only then deletes the page files.
   The previous image stays readable until the directory swap. A quiet page
   is copied onto `spent.body` before the next checkpoint carries it, and
   the page file is streamed. A failed checkpoint waits one second while the
