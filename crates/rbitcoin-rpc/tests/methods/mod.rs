@@ -61,6 +61,17 @@ fn open_ctx(dir: &TempDir) -> RpcContext {
     }
 }
 
+#[test]
+fn genesis_coinbase_txid_reads_the_query_once_set() {
+    let dir = TempDir::labeled("rpc-genesis-cb").expect("temp dir");
+    let ctx = open_ctx(&dir);
+    let network = rbitcoin_consensus::ChainParams::regtest().genesis_coinbase_txid;
+    assert_eq!(genesis_coinbase_txid(&ctx), network);
+    let marked = [0x11; 32];
+    ctx.query.set_genesis_coinbase_txid(marked);
+    assert_eq!(genesis_coinbase_txid(&ctx), marked);
+}
+
 /// Genesis plus empty blocks `1..=102` (genesis time + 600s). `collect_coinbases`
 /// does not change those block bytes, so the height-102 mempool tests share one pad.
 struct Empty102Pad {
@@ -3476,6 +3487,11 @@ fn assert_missing_txid_and_rest(ctx: &RpcContext, txid: &str) -> String {
         let (status, body) = rest_text(ctx, &format!("/rest/tx/{missing}.json"), "");
         assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{body}");
         assert!(body.contains("not found"), "{body}");
+        for ext in ["bin", "hex"] {
+            let (status, body) = rest_text(ctx, &format!("/rest/tx/{missing}.{ext}"), "");
+            assert_eq!(status, axum::http::StatusCode::NOT_FOUND, "{body}");
+            assert!(body.contains(&format!("{missing} not found")), "{body}");
+        }
     }
     let (status, body) = rest_text(ctx, &format!("/rest/tx/{txid}.json"), "");
     assert_eq!(status, axum::http::StatusCode::OK, "{body}");
@@ -9292,7 +9308,11 @@ fn shipped_rpc_reads_cover_fallback_and_reject_arms() {
     assert!(body.trim().len() > 20, "{body}");
     let tx_bin = dispatch_rest(&ctx, &format!("/rest/tx/{child_txid}.bin"), "", &[]);
     assert_eq!(tx_bin.status, axum::http::StatusCode::OK);
-    assert!(!tx_bin.body.is_empty());
+    assert_eq!(
+        tx_bin.body,
+        rbitcoin_primitives::hex_decode(body.trim()).unwrap(),
+        "REST bin bytes are the hex body"
+    );
 
     let height2 = dispatch(&ctx, "getblockhash", vec![json!(2)]).unwrap();
     let coinbase = dispatch(&ctx, "getblock", vec![height2, json!(1)]).unwrap();

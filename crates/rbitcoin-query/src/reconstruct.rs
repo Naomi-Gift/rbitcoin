@@ -229,14 +229,41 @@ impl Query {
 
     /// Reconstruct a consensus `Transaction` from Class A rows (no stored raw).
     pub fn reconstruct_tx(&self, tx_fk: Fk) -> Result<Transaction, QueryError> {
-        let (rec, stored_outputs, mut stored_inputs) = self.load_body_from_store(tx_fk)?;
-        let mut cache = U64Map::default();
-        self.fill_input_prev_txids_cached(&mut stored_inputs, &mut cache)?;
+        let (rec, stored_outputs, stored_inputs) = self.filled_body(tx_fk)?;
         Ok(Self::transaction_from_class_a(
             rec,
             stored_outputs,
             stored_inputs,
         ))
+    }
+
+    /// [`Self::reconstruct_tx`] plus the txid and parent edges that load already read.
+    pub fn reconstruct_tx_with_inputs(
+        &self,
+        tx_fk: Fk,
+    ) -> Result<(Transaction, [u8; 32], Vec<rbitcoin_store::InputParent>), QueryError> {
+        let (rec, stored_outputs, stored_inputs) = self.filled_body(tx_fk)?;
+        let txid = rec.txid;
+        let parents = stored_inputs.iter().map(|inp| inp.parent).collect();
+        let wire = Self::transaction_from_class_a(rec, stored_outputs, stored_inputs);
+        Ok((wire, txid, parents))
+    }
+
+    fn filled_body(
+        &self,
+        tx_fk: Fk,
+    ) -> Result<
+        (
+            TxRecord,
+            Vec<OutputRecord>,
+            Vec<rbitcoin_store::InputRecord>,
+        ),
+        QueryError,
+    > {
+        let (rec, stored_outputs, mut stored_inputs) = self.load_body_from_store(tx_fk)?;
+        let mut cache = U64Map::default();
+        self.fill_input_prev_txids_cached(&mut stored_inputs, &mut cache)?;
+        Ok((rec, stored_outputs, stored_inputs))
     }
 
     #[doc(hidden)]
@@ -257,10 +284,7 @@ impl Query {
                 },
                 script_sig: ScriptBuf::from_bytes(inp.script_sig),
                 sequence: Sequence::from_consensus(inp.sequence),
-                witness: {
-                    let refs: Vec<&[u8]> = inp.witness.iter().map(|w| w.as_slice()).collect();
-                    Witness::from_slice(&refs)
-                },
+                witness: Witness::from(inp.witness),
             });
         }
         let mut output = Vec::with_capacity(stored_outputs.len());

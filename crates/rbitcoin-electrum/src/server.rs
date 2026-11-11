@@ -2788,7 +2788,7 @@ pub fn dispatch_pinned(
                 .and_then(|a| a.get(1))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            if let Some((fk, _rec)) = query.get_tx_by_txid(&txid).map_err(|e| e.to_string())? {
+            if let Some(fk) = query.tx_fk_by_txid(&txid).map_err(|e| e.to_string())? {
                 let confirmed_ok = if is_asof {
                     let view = pinned.ok_or_else(|| "asof not on chain".to_string())?;
                     query
@@ -2799,16 +2799,24 @@ pub fn dispatch_pinned(
                     true
                 };
                 if confirmed_ok {
-                    let raw = query.tx_wire_bytes(fk).map_err(|e| {
+                    let map_missing = |e: StoreError| {
                         if matches!(e, StoreError::Pruned { .. }) {
                             "pruned".to_string()
                         } else {
                             e.to_string()
                         }
-                    })?;
+                    };
                     if verbose {
-                        return Ok(verbose_tx_json(query, &raw, &txid, Some(fk), chain.network));
+                        let tx = query.reconstruct_tx(fk).map_err(map_missing)?;
+                        return Ok(verbose_tx_from_tx(
+                            query,
+                            &tx,
+                            &txid,
+                            Some(fk),
+                            chain.network,
+                        ));
                     }
+                    let raw = query.tx_wire_bytes(fk).map_err(map_missing)?;
                     return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
                 }
             }
@@ -2817,10 +2825,10 @@ pub fn dispatch_pinned(
                     use bitcoin::hashes::Hash;
                     let tid = bitcoin::Txid::from_byte_array(txid);
                     if let Some(tx) = mp.get_tx(&tid) {
-                        let raw = bitcoin::consensus::serialize(&tx);
                         if verbose {
-                            return Ok(verbose_tx_json(query, &raw, &txid, None, chain.network));
+                            return Ok(verbose_tx_from_tx(query, &tx, &txid, None, chain.network));
                         }
+                        let raw = bitcoin::consensus::serialize(&tx);
                         return Ok(json!(rbitcoin_primitives::hex_encode(&raw)));
                     }
                 }
@@ -3230,31 +3238,24 @@ pub fn id_from_pos(query: &Query, params: &Value) -> Result<Value, String> {
 /// Electrs-shaped verbose `transaction.get`. `fk` Some = confirmed (header
 /// stamp); None = mempool (`confirmations: 0`, no block fields).
 #[doc(hidden)]
-pub fn verbose_tx_json(
+pub fn verbose_tx_from_tx(
     query: &Query,
-    raw: &[u8],
+    tx: &bitcoin::Transaction,
     txid: &[u8; 32],
     fk: Option<Fk>,
     network: bitcoin::Network,
 ) -> Value {
+    let raw = bitcoin::consensus::serialize(tx);
     let mut obj = json!({
-        "hex": rbitcoin_primitives::hex_encode(raw),
+        "hex": rbitcoin_primitives::hex_encode(&raw),
         "txid": txid_hex(txid),
         "size": raw.len(),
+        "version": tx.version.0,
+        "locktime": tx.lock_time.to_consensus_u32(),
+        "hash": hash_hex_rev(bitcoin::hashes::sha256d::Hash::hash(&raw).as_byte_array()),
+        "vin": tx.input.iter().map(verbose_vin).collect::<Vec<_>>(),
+        "vout": tx.output.iter().enumerate().map(|(n, o)| verbose_vout(n, o, network)).collect::<Vec<_>>(),
     });
-    if let Ok(tx) = bitcoin::consensus::deserialize::<bitcoin::Transaction>(raw) {
-        obj["version"] = json!(tx.version.0);
-        obj["locktime"] = json!(tx.lock_time.to_consensus_u32());
-        obj["hash"] = json!(hash_hex_rev(&tx.compute_wtxid().to_byte_array()));
-        obj["vin"] = Value::Array(tx.input.iter().map(verbose_vin).collect());
-        obj["vout"] = Value::Array(
-            tx.output
-                .iter()
-                .enumerate()
-                .map(|(n, o)| verbose_vout(n, o, network))
-                .collect(),
-        );
-    }
     match fk {
         Some(fk) => {
             if let Ok(Some(h)) = query.store().tx_height_get(fk) {

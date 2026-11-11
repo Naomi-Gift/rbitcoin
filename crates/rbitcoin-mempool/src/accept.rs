@@ -364,7 +364,7 @@ pub fn check_mempool_structural(
     if !rbitcoin_consensus::is_final_tx(tx, next_height, tip.mtp) {
         return Err(AcceptError::NotFinal);
     }
-    if rbitcoin_consensus::bip68_active_for_tx(tx) {
+    if rbitcoin_consensus::tx_has_relative_lock(tx) {
         let mut prev_heights = Vec::with_capacity(tx.input.len());
         let mut prev_mtps = Vec::with_capacity(tx.input.len());
         for i in 0..tx.input.len() {
@@ -1185,9 +1185,11 @@ impl ActiveMempool {
         let txid = tx.compute_txid();
         // Core CheckTransaction: repeated inputs after the outputs and before
         // null prevouts, and before any value sum (Finding 011: phantom fee).
-        let mut seen = BTreeSet::new();
-        if !tx.input.iter().all(|inp| seen.insert(inp.previous_output)) {
-            return Err(duplicate_inputs(waive, txid));
+        if tx.input.len() >= 2 {
+            let mut seen = BTreeSet::new();
+            if !tx.input.iter().all(|inp| seen.insert(inp.previous_output)) {
+                return Err(duplicate_inputs(waive, txid));
+            }
         }
         if tx.is_coinbase() {
             return Err(AcceptError::Coinbase);

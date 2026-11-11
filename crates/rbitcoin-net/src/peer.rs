@@ -3322,14 +3322,17 @@ pub fn log_cmpct_filled(
     fetched: &[u64],
     fill: Option<&crate::compact::CmpctFillSets>,
 ) {
-    let stats = crate::compact::reconstruct_stats(
+    let wtxids = crate::compact::block_wtxids(block);
+    let stats = crate::compact::reconstruct_stats_from_wtxids(
         hsi,
         block,
         fill.unwrap_or(&crate::compact::CmpctFillSets::default()),
         fetched,
+        &wtxids,
     );
     rbitcoin_log::info!("{stats}");
-    if let Some(indexes) = crate::compact::outbound_prefill_indexes(block, fill) {
+    if let Some(fill) = fill {
+        let indexes = crate::compact::prefill_indexes_from_wtxids(block, fill, &wtxids);
         hub.remember_cmpct_prefill(block.block_hash(), block.header.prev_blockhash, indexes);
     }
 }
@@ -3577,12 +3580,12 @@ pub fn queue_due_tx_invs(
 #[doc(hidden)]
 #[allow(clippy::result_unit_err)] // a short blocktxn is (); the caller scores the peer
 pub fn apply_cmpct_blocktxn(
-    pc: &PendingCmpct,
+    pc: &mut PendingCmpct,
     bt: &BlockTransactions,
 ) -> Result<(Block, Option<crate::compact::CmpctFillSets>), ()> {
-    crate::compact::apply_block_transactions(&pc.hsi, &pc.partial, bt)
-        .map(|block| (block, pc.fill.clone()))
-        .map_err(|_| ())
+    let block =
+        crate::compact::apply_block_transactions(&pc.hsi, &mut pc.partial, bt).map_err(|_| ())?;
+    Ok((block, pc.fill.take()))
 }
 
 #[doc(hidden)]
@@ -6553,11 +6556,11 @@ pub async fn on_blocktxn(
         misbehaving(&mut follow.ban_score, session);
         return Ok(());
     }
-    let Some(pc) = follow.pending_cmpct.remove(&hash) else {
+    let Some(mut pc) = follow.pending_cmpct.remove(&hash) else {
         follow.ban_score = follow.ban_score.saturating_add(5);
         return Ok(());
     };
-    match apply_cmpct_blocktxn(&pc, bt) {
+    match apply_cmpct_blocktxn(&mut pc, bt) {
         Ok((block, fill)) => {
             on_blocktxn_got_block(hub, out_tx, follow, session, &pc, hash, block, fill).await
         }

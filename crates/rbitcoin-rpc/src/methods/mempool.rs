@@ -356,7 +356,7 @@ fn raw_tx_block(ctx: &RpcContext, hash: [u8; 32]) -> Result<RawTxBlock, Value> {
 
 fn fk_in_block(ctx: &RpcContext, fks: &[Fk], want: &[u8; 32]) -> Result<Option<Fk>, Value> {
     let misc = |e: rbitcoin_query::QueryError| rpc_error(ERR_MISC, e.to_string());
-    if let Some((fk, _)) = ctx.query.get_tx_by_txid(want).map_err(misc)? {
+    if let Some(fk) = ctx.query.tx_fk_by_txid(want).map_err(misc)? {
         if fks.contains(&fk) {
             return Ok(Some(fk));
         }
@@ -530,6 +530,7 @@ pub(crate) fn insert_vin_prevouts(obj: &mut Value, prevouts: &[Value]) {
 fn finish_verbose_tx(
     ctx: &RpcContext,
     tx: &Transaction,
+    txid: &[u8; 32],
     fk: Fk,
     block: Option<Fk>,
     verbosity: u32,
@@ -539,12 +540,12 @@ fn finish_verbose_tx(
     if verbosity >= 2 {
         if let Some((fee, prevouts)) = raw_tx_prevouts(ctx, tx, fk, block, UndoRead::Prevouts)? {
             extra.insert("fee".into(), sat_btc_json(fee));
-            let mut obj = tx_to_json(tx, Some(Value::Object(extra)), net);
+            let mut obj = tx_to_json(tx, Some(txid), Some(Value::Object(extra)), net);
             insert_vin_prevouts(&mut obj, &prevouts);
             return Ok(obj);
         }
     }
-    Ok(tx_to_json(tx, Some(Value::Object(extra)), net))
+    Ok(tx_to_json(tx, Some(txid), Some(Value::Object(extra)), net))
 }
 
 fn getrawtransaction_in_block(
@@ -581,7 +582,43 @@ fn getrawtransaction_in_block(
     } else {
         extra.insert("confirmations".into(), json!(0));
     }
-    finish_verbose_tx(ctx, &tx, fk, Some(block.header_fk), verbosity, extra)
+    finish_verbose_tx(ctx, &tx, &want, fk, Some(block.header_fk), verbosity, extra)
+}
+
+pub(crate) enum RawTxHit {
+    Mempool(Transaction),
+    Chain { tx: Transaction, fk: Fk },
+}
+
+impl RawTxHit {
+    pub(crate) fn tx(&self) -> &Transaction {
+        match self {
+            Self::Mempool(tx) | Self::Chain { tx, .. } => tx,
+        }
+    }
+}
+
+/// Mempool hit, otherwise the chain row. No `blockhash`. The caller already
+/// refused the genesis coinbase.
+pub(crate) fn locate_raw_tx(ctx: &RpcContext, want: [u8; 32]) -> Result<Option<RawTxHit>, Value> {
+    if let Some(mp) = ctx.mempool.as_ref() {
+        let tid = Txid::from_byte_array(want);
+        if let Some(tx) = mp.get_tx(&tid) {
+            return Ok(Some(RawTxHit::Mempool(tx)));
+        }
+    }
+    let Some(fk) = ctx
+        .query
+        .tx_fk_by_txid(&want)
+        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let tx = ctx
+        .query
+        .reconstruct_tx(fk)
+        .map_err(|e| map_query(e, RAW_TX_PRUNED))?;
+    Ok(Some(RawTxHit::Chain { tx, fk }))
 }
 
 pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
@@ -601,47 +638,50 @@ pub fn getrawtransaction(ctx: &RpcContext, params: &RpcParams) -> Result<Value, 
         return getrawtransaction_in_block(ctx, want, verbosity, hash);
     }
 
-    if let Some(mp) = ctx.mempool.as_ref() {
-        let tid = Txid::from_byte_array(want);
-        if let Some(tx) = mp.get_tx(&tid) {
+    let Some(hit) = locate_raw_tx(ctx, want)? else {
+        return Err(rpc_error(ERR_INVALID_ADDRESS_OR_KEY, RAW_TX_NOT_FOUND));
+    };
+    match hit {
+        RawTxHit::Mempool(tx) => {
             if verbosity == 0 {
                 return Ok(json!(serialize_hex(&tx)));
             }
             let mut extra = json!({ "in_mempool": true });
-            if let Some(weight) = mp.get_live_adjusted_weight(&tid) {
+            if let Some(weight) = ctx
+                .mempool
+                .as_ref()
+                .and_then(|mp| mp.get_live_adjusted_weight(&Txid::from_byte_array(want)))
+            {
                 extra["vsize_adjusted"] = json!(rbitcoin_consensus::policy::vbytes_ceil(weight));
             }
-            return Ok(tx_to_json(&tx, Some(extra), rpc_btc_network(ctx.network)));
+            Ok(tx_to_json(
+                &tx,
+                Some(&want),
+                Some(extra),
+                rpc_btc_network(ctx.network),
+            ))
+        }
+        RawTxHit::Chain { tx, fk } => {
+            if verbosity == 0 {
+                return Ok(json!(serialize_hex(&tx)));
+            }
+            let mut extra = serde_json::Map::new();
+            extra.insert("in_mempool".into(), json!(false));
+            // The resolver falls back to an unconnected Class A row (reorg orphan,
+            // invalidateblock, never-connected archive). It has no active-chain block,
+            // so it gets the plain object, without confirmations or block fields.
+            if let Some((header, height, tip)) = confirmed_tx_header(ctx, fk)? {
+                extra.insert(
+                    "confirmations".into(),
+                    json!(tip.saturating_sub(height).saturating_add(1)),
+                );
+                extra.insert("blockhash".into(), json!(hash_hex_display(&header.hash)));
+                extra.insert("blocktime".into(), json!(header.timestamp));
+                extra.insert("time".into(), json!(header.timestamp));
+            }
+            finish_verbose_tx(ctx, &tx, &want, fk, None, verbosity, extra)
         }
     }
-
-    let (fk, _) = ctx
-        .query
-        .get_tx_by_txid(&want)
-        .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| rpc_error(ERR_INVALID_ADDRESS_OR_KEY, RAW_TX_NOT_FOUND))?;
-    let tx = ctx
-        .query
-        .reconstruct_tx(fk)
-        .map_err(|e| map_query(e, RAW_TX_PRUNED))?;
-    if verbosity == 0 {
-        return Ok(json!(serialize_hex(&tx)));
-    }
-    let mut extra = serde_json::Map::new();
-    extra.insert("in_mempool".into(), json!(false));
-    // The resolver falls back to an unconnected Class A row (reorg orphan,
-    // invalidateblock, never-connected archive). It has no active-chain block,
-    // so it gets the plain object, without confirmations or block fields.
-    if let Some((header, height, tip)) = confirmed_tx_header(ctx, fk)? {
-        extra.insert(
-            "confirmations".into(),
-            json!(tip.saturating_sub(height).saturating_add(1)),
-        );
-        extra.insert("blockhash".into(), json!(hash_hex_display(&header.hash)));
-        extra.insert("blocktime".into(), json!(header.timestamp));
-        extra.insert("time".into(), json!(header.timestamp));
-    }
-    finish_verbose_tx(ctx, &tx, fk, None, verbosity, extra)
 }
 
 /// Header of the active block that still holds `fk`, plus that height and the tip.
@@ -2523,7 +2563,7 @@ pub fn getorphantxs(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
         let weight = s.tx.weight().to_wu();
         let mut row = json!({
             "txid": hash_hex_display(&s.tx.compute_txid().to_byte_array()),
-            "wtxid": hash_hex_display(&s.tx.compute_wtxid().to_byte_array()),
+            "wtxid": hash_hex_display(bitcoin::hashes::sha256d::Hash::hash(&raw).as_byte_array()),
             "bytes": raw.len(),
             "vsize": s.tx.vsize(),
             "vsize_bip141": s.tx.vsize(),
@@ -2531,7 +2571,7 @@ pub fn getorphantxs(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value
             "from": s.announcers,
         });
         if verbosity == 2 {
-            row["hex"] = json!(serialize_hex(&s.tx));
+            row["hex"] = json!(rbitcoin_primitives::hex_encode(&raw));
         }
         out.push(row);
     }

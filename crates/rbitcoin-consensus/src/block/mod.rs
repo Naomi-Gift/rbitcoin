@@ -1402,6 +1402,12 @@ pub fn check_block_on_parent(
     Ok(())
 }
 
+/// BIP68 sequence disable bit. A set bit means that input has no relative lock.
+pub const SEQUENCE_LOCKTIME_DISABLE_FLAG: u32 = 1 << 31;
+
+/// BIP68 time-lock bit. A set bit means the relative lock counts 512-second units.
+pub const SEQUENCE_LOCKTIME_TYPE_FLAG: u32 = 1 << 22;
+
 /// BIP68 / CSV version gate: Core compares `nVersion` as **unsigned**
 /// (`uint32_t >= 2`). rust-bitcoin exposes `Version(i32)`; cast explicitly so
 /// `0xFFFFFFFF` enforces locks (not signed `-1 < 2`).
@@ -1410,6 +1416,15 @@ pub fn check_block_on_parent(
 #[inline]
 pub fn bip68_active_for_tx(tx: &Transaction) -> bool {
     (tx.version.0 as u32) >= 2
+}
+
+/// BIP68 can lock an input: the version gate holds, and one sequence has the disable bit clear.
+pub fn tx_has_relative_lock(tx: &Transaction) -> bool {
+    bip68_active_for_tx(tx)
+        && tx
+            .input
+            .iter()
+            .any(|inp| inp.sequence.to_consensus_u32() & SEQUENCE_LOCKTIME_DISABLE_FLAG == 0)
 }
 
 /// BIP68 relative locks when `tx.version` as u32 ≥ 2.
@@ -1428,8 +1443,6 @@ pub fn sequence_locks_satisfied(
     if !bip68_active_for_tx(tx) {
         return true;
     }
-    const DISABLE: u32 = 1 << 31;
-    const TYPE_FLAG: u32 = 1 << 22;
     const MASK: u32 = 0x0000_ffff;
     const GRANULARITY: u32 = 9;
 
@@ -1437,7 +1450,7 @@ pub fn sequence_locks_satisfied(
     let mut min_time: i64 = -1;
     for (i, inp) in tx.input.iter().enumerate() {
         let seq = inp.sequence.to_consensus_u32();
-        if seq & DISABLE != 0 {
+        if seq & SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
             continue;
         }
         // A missing height slice is unresolved. Height 0 is the genesis coin.
@@ -1446,7 +1459,7 @@ pub fn sequence_locks_satisfied(
             return false;
         };
         let rel = (seq & MASK) as i64;
-        if seq & TYPE_FLAG != 0 {
+        if seq & SEQUENCE_LOCKTIME_TYPE_FLAG != 0 {
             let Some(&raw_mtp) = prev_coin_mtps.get(i) else {
                 return false;
             };

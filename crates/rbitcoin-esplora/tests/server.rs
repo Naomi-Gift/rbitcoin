@@ -190,9 +190,12 @@ fn coinbase(h: u32, prev: Fk, parent_hash: Option<[u8; 32]>) -> (HeaderRecord, T
     let timestamp = h + 1;
     let bits = 0x207fffff;
     let nonce = h;
-    let mut merkle = [0u8; 32];
-    merkle[0..4].copy_from_slice(&h.to_le_bytes());
-    merkle[5] = 0xab;
+    let mut txid = [0u8; 32];
+    txid[0..4].copy_from_slice(&h.to_le_bytes());
+    txid[31] = 0xcb;
+    // One coinbase, so the header root is that txid. A proof built from the
+    // stored header then matches `extract_matches`.
+    let merkle = rbitcoin_store::merkle_root_from_txids(&[txid]);
     let hash = match parent_hash {
         None => merkle,
         Some(ph) => {
@@ -210,9 +213,6 @@ fn coinbase(h: u32, prev: Fk, parent_hash: Option<[u8; 32]>) -> (HeaderRecord, T
         size: 0,
         weight: 0,
     };
-    let mut txid = [0u8; 32];
-    txid[0..4].copy_from_slice(&h.to_le_bytes());
-    txid[31] = 0xcb;
     let ta = TxApply {
         tx: TxRecord {
             txid,
@@ -231,6 +231,38 @@ fn coinbase(h: u32, prev: Fk, parent_hash: Option<[u8; 32]>) -> (HeaderRecord, T
         outputs: vec![OutputRecord::unspent(50_0000_0000, vec![0x51])],
     };
     (header, ta)
+}
+
+#[tokio::test]
+async fn merkleblock_proof_keeps_a_stored_root_that_does_not_match() {
+    use bitcoin::consensus::encode::deserialize;
+    use bitcoin::hashes::Hash;
+    use bitcoin::MerkleBlock;
+
+    let (_dir, q) = temp_query("mb-bad-root");
+    let (mut header, ta) = coinbase(0, Fk::NULL, None);
+    header.merkle_root = [0xab; 32];
+    header.hash = [0xab; 32];
+    let txid = ta.tx.txid;
+    q.connect_block(Height(0), &header, std::slice::from_ref(&ta))
+        .unwrap();
+    let q = Arc::new(q);
+    let st = join_only_state(
+        Arc::clone(&q),
+        Arc::new(Mutex::new(rbitcoin_esplora::server::JoinCache::default())),
+    );
+    let resp = handlers::tx_merkleblock_proof_sync(st, block_hash_hex(&txid));
+    assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    let bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let body = String::from_utf8(bytes.to_vec()).unwrap();
+    let mb: MerkleBlock =
+        deserialize(&rbitcoin_primitives::hex_decode(body.trim()).unwrap()).unwrap();
+    assert_eq!(mb.header.merkle_root.to_byte_array(), [0xab; 32]);
+    let mut matches = Vec::new();
+    let mut indexes = Vec::new();
+    assert!(mb.extract_matches(&mut matches, &mut indexes).is_err());
 }
 
 fn header_value(text: &str, name: &str) -> Option<String> {
@@ -1007,6 +1039,11 @@ async fn block_raw_summary_status_and_mempool_routes() {
     assert_eq!(
         matches[0],
         bitcoin::Txid::from_byte_array(coinbase_txids[0])
+    );
+    let stored = q.wire_header_at_height(Height(0)).unwrap();
+    assert_eq!(
+        mb.header, stored,
+        "merkleblock proof header is the stored block"
     );
 
     let (st, body) = http_get(addr, "/mempool/txids").await;

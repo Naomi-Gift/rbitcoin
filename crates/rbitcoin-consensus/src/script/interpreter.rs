@@ -979,7 +979,7 @@ pub fn eval_script(
                         if csv < 0 {
                             return Err(ConsensusError::Script("CSV negative".into()));
                         }
-                        if csv as u32 & (1 << 31) != 0 {
+                        if csv as u32 & crate::SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
                             // disabled bit → NOP (before version gate)
                             continue;
                         }
@@ -1020,10 +1020,10 @@ pub fn csv_locktime_mask(type_bit: u32) -> u32 {
 #[doc(hidden)]
 pub fn sequence_csv_ok(seq: Sequence, csv: u32) -> bool {
     let seq_n = seq.to_consensus_u32();
-    if seq_n & (1 << 31) != 0 {
-        return false; // SEQUENCE_LOCKTIME_DISABLE_FLAG on input
+    if seq_n & crate::SEQUENCE_LOCKTIME_DISABLE_FLAG != 0 {
+        return false;
     }
-    let type_bit = 1 << 22;
+    let type_bit = crate::SEQUENCE_LOCKTIME_TYPE_FLAG;
     let mask = csv_locktime_mask(type_bit);
     let seq_masked = seq_n & mask;
     let csv_masked = csv & mask;

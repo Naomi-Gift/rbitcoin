@@ -136,27 +136,44 @@ impl TxPrecompute {
     }
 }
 
-fn pack_precompute(
-    connect: TxConnectPrecompute,
-    sha_prevouts: Option<[u8; 32]>,
-    sha_sequences: Option<[u8; 32]>,
-    sha_outputs: Option<[u8; 32]>,
-) -> TxPrecompute {
-    match (sha_prevouts, sha_sequences, sha_outputs) {
-        (Some(sha_prevouts), Some(sha_sequences), Some(sha_outputs)) => {
-            TxPrecompute::Script(TxScriptPrecompute {
-                connect,
-                sha_prevouts,
-                sha_sequences,
-                sha_outputs,
-                sha_amounts: None,
-                sha_scriptpubkeys: None,
-                prevouts_d: OnceLock::new(),
-                sequences_d: OnceLock::new(),
-                outputs_d: OnceLock::new(),
-            })
+fn pack_precompute(connect: TxConnectPrecompute, mids: Option<[[u8; 32]; 3]>) -> TxPrecompute {
+    let Some([sha_prevouts, sha_sequences, sha_outputs]) = mids else {
+        return TxPrecompute::Connect(connect);
+    };
+    TxPrecompute::Script(TxScriptPrecompute {
+        connect,
+        sha_prevouts,
+        sha_sequences,
+        sha_outputs,
+        sha_amounts: None,
+        sha_scriptpubkeys: None,
+        prevouts_d: OnceLock::new(),
+        sequences_d: OnceLock::new(),
+        outputs_d: OnceLock::new(),
+    })
+}
+
+struct MidEngines {
+    prev: sha256::HashEngine,
+    seq: sha256::HashEngine,
+    out: sha256::HashEngine,
+}
+
+impl MidEngines {
+    fn new() -> Self {
+        Self {
+            prev: sha256::Hash::engine(),
+            seq: sha256::Hash::engine(),
+            out: sha256::Hash::engine(),
         }
-        _ => TxPrecompute::Connect(connect),
+    }
+
+    fn finish(self) -> [[u8; 32]; 3] {
+        [
+            sha256::Hash::from_engine(self.prev).to_byte_array(),
+            sha256::Hash::from_engine(self.seq).to_byte_array(),
+            sha256::Hash::from_engine(self.out).to_byte_array(),
+        ]
     }
 }
 
@@ -181,29 +198,24 @@ impl TxPrecompute {
         let has_witness = uses_segwit_serialization(tx);
         let sighash = sighash && has_witness && !tx.is_coinbase();
         let wtxid = sha256d::Hash::hash(wire).to_byte_array();
-        let (txid, base_size, [sha_prevouts, sha_sequences, sha_outputs]) =
-            if has_witness && !flag_zero_tx(tx, wire) {
-                let spans = witness_wire(tx, wire)?;
-                if sighash {
-                    let (txid, mids) = hash_wire_sighash(tx, &spans)?;
-                    (txid, spans.base_len(), mids)
-                } else {
-                    (
-                        hash_witness_txid(&spans),
-                        spans.base_len(),
-                        [None, None, None],
-                    )
-                }
-            } else if sighash {
-                let spans = legacy_spans(tx, wire)?;
+        let (txid, base_size, mids) = if has_witness && !flag_zero_tx(tx, wire) {
+            let spans = witness_wire(tx, wire)?;
+            if sighash {
                 let (txid, mids) = hash_wire_sighash(tx, &spans)?;
-                if txid != wtxid {
-                    return None;
-                }
-                (txid, wire.len(), mids)
+                (txid, spans.base_len(), Some(mids))
             } else {
-                (wtxid, wire.len(), [None, None, None])
-            };
+                (hash_witness_txid(&spans), spans.base_len(), None)
+            }
+        } else if sighash {
+            let spans = legacy_spans(tx, wire)?;
+            let (txid, mids) = hash_wire_sighash(tx, &spans)?;
+            if txid != wtxid {
+                return None;
+            }
+            (txid, wire.len(), Some(mids))
+        } else {
+            (wtxid, wire.len(), None)
+        };
         let (sigops, out_sum) = sigops_and_out_sum(tx);
         Some(pack_precompute(
             TxConnectPrecompute {
@@ -215,9 +227,7 @@ impl TxPrecompute {
                 out_sum,
                 has_witness,
             },
-            sha_prevouts,
-            sha_sequences,
-            sha_outputs,
+            mids,
         ))
     }
 
@@ -226,14 +236,12 @@ impl TxPrecompute {
         let has_witness = uses_segwit_serialization(tx);
         let sighash = sighash && has_witness && !tx.is_coinbase();
         if !has_witness {
-            return Self::from_tx_legacy_one_engine(tx, sighash);
+            return Self::from_tx_legacy_one_engine(tx);
         }
 
         let mut txid_eng = sha256d::Hash::engine();
         let mut wtxid_eng = sha256d::Hash::engine();
-        let mut sha_prev = sighash.then(sha256::Hash::engine);
-        let mut sha_seq = sighash.then(sha256::Hash::engine);
-        let mut sha_out = sighash.then(sha256::Hash::engine);
+        let mut mids = sighash.then(MidEngines::new);
         let mut base_size = 0usize;
         let mut total_size = 0usize;
         let mut sigops = 0u64;
@@ -250,18 +258,14 @@ impl TxPrecompute {
         for txin in &tx.input {
             base_size += enc(&mut txid_eng, &txin.previous_output);
             total_size += enc(&mut wtxid_eng, &txin.previous_output);
-            if let Some(ref mut e) = sha_prev {
-                let _ = txin.previous_output.consensus_encode(e);
-            }
-
             base_size += enc(&mut txid_eng, &txin.script_sig);
             total_size += enc(&mut wtxid_eng, &txin.script_sig);
             sigops = sigops.saturating_add(script_sigop_count(txin.script_sig.as_bytes(), false));
-
             base_size += enc(&mut txid_eng, &txin.sequence);
             total_size += enc(&mut wtxid_eng, &txin.sequence);
-            if let Some(ref mut e) = sha_seq {
-                let _ = txin.sequence.consensus_encode(e);
+            if let Some(e) = mids.as_mut() {
+                let _ = txin.previous_output.consensus_encode(&mut e.prev);
+                let _ = txin.sequence.consensus_encode(&mut e.seq);
             }
         }
 
@@ -271,8 +275,8 @@ impl TxPrecompute {
         for txout in &tx.output {
             base_size += enc(&mut txid_eng, txout);
             total_size += enc(&mut wtxid_eng, txout);
-            if let Some(ref mut e) = sha_out {
-                let _ = txout.consensus_encode(e);
+            if let Some(e) = mids.as_mut() {
+                let _ = txout.consensus_encode(&mut e.out);
             }
             sigops =
                 sigops.saturating_add(script_sigop_count(txout.script_pubkey.as_bytes(), false));
@@ -297,19 +301,14 @@ impl TxPrecompute {
                 out_sum,
                 has_witness,
             },
-            sha_prev.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
-            sha_seq.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
-            sha_out.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
+            mids.map(MidEngines::finish),
         )
     }
 
     /// Non-witness tx: stripped == wire, so one SHA256d engine (wtxid = txid).
     #[doc(hidden)]
-    pub fn from_tx_legacy_one_engine(tx: &Transaction, sighash: bool) -> Self {
+    pub fn from_tx_legacy_one_engine(tx: &Transaction) -> Self {
         let mut eng = sha256d::Hash::engine();
-        let mut sha_prev = sighash.then(sha256::Hash::engine);
-        let mut sha_seq = sighash.then(sha256::Hash::engine);
-        let mut sha_out = sighash.then(sha256::Hash::engine);
         let mut base_size = 0usize;
         let mut sigops = 0u64;
         let mut out_sum = 0u64;
@@ -319,23 +318,14 @@ impl TxPrecompute {
         base_size += enc(&mut eng, &n_in);
         for txin in &tx.input {
             base_size += enc(&mut eng, &txin.previous_output);
-            if let Some(ref mut e) = sha_prev {
-                let _ = txin.previous_output.consensus_encode(e);
-            }
             base_size += enc(&mut eng, &txin.script_sig);
             sigops = sigops.saturating_add(script_sigop_count(txin.script_sig.as_bytes(), false));
             base_size += enc(&mut eng, &txin.sequence);
-            if let Some(ref mut e) = sha_seq {
-                let _ = txin.sequence.consensus_encode(e);
-            }
         }
         let n_out = VarInt(tx.output.len() as u64);
         base_size += enc(&mut eng, &n_out);
         for txout in &tx.output {
             base_size += enc(&mut eng, txout);
-            if let Some(ref mut e) = sha_out {
-                let _ = txout.consensus_encode(e);
-            }
             sigops =
                 sigops.saturating_add(script_sigop_count(txout.script_pubkey.as_bytes(), false));
             out_sum = out_sum.saturating_add(txout.value.to_sat());
@@ -352,9 +342,7 @@ impl TxPrecompute {
                 out_sum,
                 has_witness: false,
             },
-            sha_prev.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
-            sha_seq.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
-            sha_out.map(|e| sha256::Hash::from_engine(e).to_byte_array()),
+            None,
         )
     }
 }
@@ -438,6 +426,15 @@ impl TxScriptPrecompute {
     }
 }
 
+/// Connect when `live`, or when the tx has no sighash midstates. Otherwise the script row.
+pub fn tip_precompute(tx: &Transaction, connect: TxConnectPrecompute, live: bool) -> TxPrecompute {
+    if live || !sighash_midstates_for(tx) {
+        TxPrecompute::Connect(connect)
+    } else {
+        TxPrecompute::Script(TxScriptPrecompute::from_connect(connect, tx))
+    }
+}
+
 /// Tip-follow precompute: `from_tx_connect` for live mempool txs, fill midstates otherwise.
 ///
 /// `live_empty` is the no-mempool / empty-graph path — all `from_tx`, no probe.
@@ -453,18 +450,12 @@ pub fn pres_for_tip(
     let mut skip = HashSet::new();
     let mut v = Vec::with_capacity(txs.len());
     for tx in txs {
-        let c = TxPrecompute::from_tx_connect(tx);
-        if is_live(c.txid) {
+        let c = TxPrecompute::from_tx_connect(tx).into_connect();
+        let live = is_live(c.txid);
+        if live {
             skip.insert(c.txid);
-            v.push(c);
-        } else if sighash_midstates_for(tx) {
-            v.push(TxPrecompute::Script(TxScriptPrecompute::from_connect(
-                c.into_connect(),
-                tx,
-            )));
-        } else {
-            v.push(c);
         }
+        v.push(tip_precompute(tx, c, live));
     }
     (Arc::from(v), skip)
 }
@@ -572,10 +563,10 @@ pub const OUTPOINT_LEN: usize = 36;
 #[doc(hidden)]
 pub const SEQUENCE_LEN: usize = 4;
 
-/// Single SHA-256 of prevouts, sequences, and outputs. `None` is the connect
-/// path that skipped sighash.
+/// Single SHA-256 of prevouts, sequences, and outputs, together.
+/// The connect path that skipped sighash does not build this.
 #[doc(hidden)]
-pub type SighashMidstates = [Option<[u8; 32]>; 3];
+pub type SighashMidstates = [[u8; 32]; 3];
 
 /// Txid from the non-witness slices, and BIP143/341 single-SHA midstates from
 /// the same bytes. Outpoint is the first 36 bytes of each input; sequence is
@@ -613,9 +604,9 @@ pub fn hash_wire_sighash(
     Some((
         sha256d::Hash::from_engine(txid_eng).to_byte_array(),
         [
-            Some(sha256::Hash::from_engine(sha_prev).to_byte_array()),
-            Some(sha256::Hash::from_engine(sha_seq).to_byte_array()),
-            Some(sha256::Hash::from_engine(sha_out).to_byte_array()),
+            sha256::Hash::from_engine(sha_prev).to_byte_array(),
+            sha256::Hash::from_engine(sha_seq).to_byte_array(),
+            sha256::Hash::from_engine(sha_out).to_byte_array(),
         ],
     ))
 }

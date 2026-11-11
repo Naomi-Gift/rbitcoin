@@ -3070,6 +3070,39 @@ async fn client_stop_wakes_without_the_hundred_ms_poll() {
     let _ = dir;
 }
 
+/// Mempool verbose fields match the encoded transaction.
+#[test]
+fn mempool_verbose_tx_fields_match_the_encoded_tx() {
+    use bitcoin::hashes::Hash;
+    let (_dir, query) = tmp_store();
+    let tx = bitcoin::Transaction {
+        version: bitcoin::transaction::Version::TWO,
+        lock_time: bitcoin::absolute::LockTime::ZERO,
+        input: vec![bitcoin::TxIn {
+            previous_output: bitcoin::OutPoint::null(),
+            script_sig: bitcoin::ScriptBuf::from_bytes(vec![0x01, 0x02]),
+            sequence: bitcoin::Sequence::MAX,
+            witness: bitcoin::Witness::from_slice(&[b"abcd" as &[u8]]),
+        }],
+        output: vec![bitcoin::TxOut {
+            value: bitcoin::Amount::from_sat(50),
+            script_pubkey: bitcoin::ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let raw = bitcoin::consensus::serialize(&tx);
+    let txid = tx.compute_txid().to_byte_array();
+    let network = bitcoin::Network::Regtest;
+    let from_tx = verbose_tx_from_tx(&query, &tx, &txid, None, network);
+    assert_eq!(from_tx["hex"], rbitcoin_primitives::hex_encode(&raw));
+    assert_eq!(from_tx["confirmations"], 0);
+    assert_eq!(from_tx["vin"][0]["sequence"], 0xffff_ffffu32);
+    assert_eq!(
+        from_tx["hash"].as_str().unwrap(),
+        hash_hex_rev(&tx.compute_wtxid().to_byte_array())
+    );
+    assert_ne!(from_tx["hash"], from_tx["txid"]);
+}
+
 mod surface_tests;
 
 /// Any client can open connections, so connect and disconnect log at DEBUG.

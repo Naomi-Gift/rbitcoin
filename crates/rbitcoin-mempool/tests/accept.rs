@@ -185,6 +185,70 @@ fn bip68_time_lock_uses_coin_create_mtp() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A disabled sequence on one input does not skip a relative lock on another.
+#[test]
+fn bip68_one_disabled_sequence_does_not_skip_a_locking_input() {
+    let dir = tmp_dir();
+    let open = OutPoint {
+        txid: Txid::from_byte_array([0x31; 32]),
+        vout: 0,
+    };
+    let locked = OutPoint {
+        txid: Txid::from_byte_array([0x32; 32]),
+        vout: 0,
+    };
+    let coin = |op: OutPoint, map: &mut HashMap<OutPoint, Coin>| {
+        map.insert(
+            op,
+            Coin {
+                txout: TxOut {
+                    value: Amount::from_sat(50_000),
+                    script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+                },
+                create_height: 10,
+                create_mtp: 1_000_000,
+                is_coinbase: false,
+                create_fk: None,
+            },
+        );
+    };
+    let mut map = HashMap::new();
+    coin(open, &mut map);
+    coin(locked, &mut map);
+    let utxos = MapUtxoProvider { map };
+    let mut tx = spend_tx(open, 90_000);
+    tx.version = Version::TWO;
+    tx.input[0].sequence = Sequence::MAX;
+    tx.input.push(TxIn {
+        previous_output: locked,
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::from_consensus((1 << 22) | 2),
+        witness: Witness::new(),
+    });
+    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
+    let err = mp
+        .accept_tx(
+            &tx,
+            &utxos,
+            ChainTipCtx {
+                height: 20,
+                mtp: 1_001_000,
+            },
+        )
+        .unwrap_err();
+    assert!(matches!(err, AcceptError::NonBip68Final), "got {err}");
+    mp.accept_tx(
+        &tx,
+        &utxos,
+        ChainTipCtx {
+            height: 20,
+            mtp: 1_002_000,
+        },
+    )
+    .expect("the locking input is final at this median");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Stage timers are recorded on a successful chain-spend accept.
 #[test]
 fn accept_records_stage_us_on_success() {

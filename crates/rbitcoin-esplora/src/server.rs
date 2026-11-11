@@ -1406,8 +1406,8 @@ pub async fn tx_full(State(st): State<AppState>, Path(txid_hex): Path<String>) -
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        match st.query.get_tx_by_txid(&txid) {
-            Ok(Some((fk, _))) => match build_tx_json(&st.query, fk, st.network, None) {
+        match st.query.tx_fk_by_txid(&txid) {
+            Ok(Some(fk)) => match build_tx_json(&st.query, fk, st.network, None) {
                 Ok(v) => json_reply_here(v),
                 Err(e) => store_err(e),
             },
@@ -1436,8 +1436,8 @@ pub async fn tx_hex(State(st): State<AppState>, Path(txid_hex): Path<String>) ->
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        match st.query.get_tx_by_txid(&txid) {
-            Ok(Some((fk, _))) => match st.query.tx_wire_bytes(fk) {
+        match st.query.tx_fk_by_txid(&txid) {
+            Ok(Some(fk)) => match st.query.tx_wire_bytes(fk) {
                 Ok(raw) => plain_ok(rbitcoin_primitives::hex_encode(&(raw))),
                 Err(e) => store_err(e),
             },

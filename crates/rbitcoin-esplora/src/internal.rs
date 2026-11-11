@@ -129,7 +129,7 @@ pub fn entry_json(st: &AppState, mp: &MempoolHub, e: &MempoolTxSnapEntry) -> Opt
 #[cfg(unix)]
 #[doc(hidden)]
 pub fn confirmed_or_mempool_tx(st: &AppState, id: &[u8; 32]) -> Option<Value> {
-    if let Ok(Some((fk, _))) = st.query.get_tx_by_txid(id) {
+    if let Ok(Some(fk)) = st.query.tx_fk_by_txid(id) {
         return build_tx_json(&st.query, fk, st.network, None).ok();
     }
     mempool_tx_json(st, id)
