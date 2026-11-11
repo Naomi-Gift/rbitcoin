@@ -718,19 +718,24 @@ impl ArchiveWritePlan {
         }
     }
 
-    /// Per-packed-row `(vout, spend_fk)` for creates in this plan (Class A overlay).
+    /// Exact `spent.body` bytes for creates in this plan (Class A overlay).
     ///
-    /// Coinbase / external parents are omitted — those slots stay zero until
-    /// annotate after tip.
-    ///
-    /// One entry per `vout`: the lowest `spend_fk`, which is the first spender
+    /// Coinbase / external parents stay zero until annotate after tip.
+    /// One slot per vout: the lowest `spend_fk`, which is the first spender
     /// in chain order (plans append in height order). A later spender of the
     /// same output is a double spend that structural rejects, and the
     /// rejected write keeps this Class A. The slot must still name the first.
-    pub fn same_batch_spent_overlay(&self) -> Vec<Vec<(u32, Fk, u32)>> {
-        let mut overlay: Vec<Vec<(u32, Fk, u32)>> = vec![Vec::new(); self.packed.len()];
-        if overlay.is_empty() {
-            return overlay;
+    pub fn same_batch_spent_overlay(
+        &self,
+    ) -> Result<rbitcoin_store::tx_table::SpentBodyImage, StoreError> {
+        let n_outs: Vec<u32> = self
+            .packed
+            .iter()
+            .map(|(pin, _)| pin.packed_n_out())
+            .collect();
+        let mut image = rbitcoin_store::tx_table::SpentBodyImage::zeros(&n_outs);
+        if image.create_count() == 0 {
+            return Ok(image);
         }
         let mut idx: crate::U64Map<usize> = crate::U64Map::default();
         for (i, fk) in self.planned_fks.iter().enumerate() {
@@ -746,14 +751,10 @@ impl ArchiveWritePlan {
                 let Some(&i) = idx.get(&cid) else {
                     continue;
                 };
-                overlay[i].push((e.vout, e.spend_fk, e.vin));
+                image.place(i, e.vout, e.spend_fk, e.vin)?;
             }
         }
-        for row in overlay.iter_mut().filter(|r| r.len() > 1) {
-            row.sort_unstable_by_key(|&(vout, fk, _)| (vout, fk.0));
-            row.dedup_by_key(|&mut (vout, _, _)| vout);
-        }
-        overlay
+        Ok(image)
     }
 
     /// Drop stamp staging (ranges + txid reverse) after pin.
@@ -1894,13 +1895,7 @@ impl Query {
         let reserve_ns = t.elapsed().as_nanos() as u64;
 
         let t = Instant::now();
-        let pairs = plan.same_batch_spent_overlay();
-        let n_outs: Vec<u32> = plan
-            .packed
-            .iter()
-            .map(|(pin, _)| pin.packed_n_out())
-            .collect();
-        let overlay = rbitcoin_store::tx_table::SpentBodyImage::from_pairs(&n_outs, &pairs)?;
+        let overlay = plan.same_batch_spent_overlay()?;
         let txstat = stamp_txstat_rows(&plan)?;
         let txstat_ns = t.elapsed().as_nanos() as u64;
         self.confirm_stats().note_write_txstat(txstat_ns);

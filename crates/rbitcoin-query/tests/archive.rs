@@ -125,16 +125,34 @@ fn spent_overlay_names_the_first_spender_of_a_vout() {
         let mut plan = size_plan(1, false);
         plan.append(size_plan(2, false));
         plan.append(size_plan(3, false));
+        plan.packed[0].0 = rbitcoin_query::CreatePinInner::records(
+            TxRecord {
+                txid: [1; 32],
+                version: 1,
+                locktime: 0,
+                input_count: 0,
+                output_count: 2,
+            },
+            vec![
+                OutputRecord::unspent(1, vec![0x51]),
+                OutputRecord::unspent(1, vec![0x51]),
+            ],
+        );
         plan.planned_fks = vec![Fk(1), Fk(2), Fk(later)];
         plan.edges.insert(2, vec![edge(2, 0, 0)]);
         plan.edges
             .insert(later, vec![edge(later, 0, 0), edge(later, 1, 1)]);
-        let overlay = plan.same_batch_spent_overlay();
-        assert_eq!(
-            overlay[0],
-            [(0, Fk(2), 0), (1, Fk(later), 1)],
-            "later spender fk {later}"
-        );
+        let image = plan.same_batch_spent_overlay().expect("overlay");
+        let slot = |vout: u32| {
+            let off = image.offs()[0] + (vout as usize) * OutputRecord::SPENT_SLOT_LEN;
+            let (_flags, fk, vin) = rbitcoin_store::tx_table::decode_spent_slot(
+                &image.bytes()[off..off + OutputRecord::SPENT_SLOT_LEN],
+            )
+            .expect("slot");
+            (vout, fk, vin)
+        };
+        assert_eq!(slot(0), (0, Fk(2), 0), "later spender fk {later}");
+        assert_eq!(slot(1), (1, Fk(later), 1), "later spender fk {later}");
     }
 }
 

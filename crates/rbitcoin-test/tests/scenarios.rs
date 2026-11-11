@@ -3399,11 +3399,23 @@ fn pin_wire_prep_ahead_cross_batch(
     assert!(plan_a.edges[&plan_a.planned_fks[0].0][0]
         .create_fk
         .is_null());
-    let same_batch: Vec<_> = plan_a
-        .same_batch_spent_overlay()
-        .into_iter()
-        .flatten()
-        .collect();
+    let image = plan_a.same_batch_spent_overlay().expect("overlay");
+    let mut same_batch = Vec::new();
+    for w in image.offs().windows(2) {
+        let mut off = w[0];
+        let mut vout = 0u32;
+        while off + rbitcoin_store::OutputRecord::SPENT_SLOT_LEN <= w[1] {
+            let (_flags, fk, vin) = rbitcoin_store::tx_table::decode_spent_slot(
+                &image.bytes()[off..off + rbitcoin_store::OutputRecord::SPENT_SLOT_LEN],
+            )
+            .expect("slot");
+            if !fk.is_null() {
+                same_batch.push((vout, fk, vin));
+            }
+            off += rbitcoin_store::OutputRecord::SPENT_SLOT_LEN;
+            vout += 1;
+        }
+    }
     assert_eq!(
         same_batch,
         [(0, plan_a.planned_fks[2], 0)],
