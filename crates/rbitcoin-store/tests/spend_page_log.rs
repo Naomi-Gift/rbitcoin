@@ -2141,3 +2141,186 @@ fn skip_rewrites_a_logged_spend_the_body_does_not_hold() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn widen_holds_a_loaded_commit_above_the_checkpoint() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    loaded.widen_for_checkpoint(4);
+    let mut writes = 0u32;
+    loaded
+        .fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        writes, 0,
+        "a loaded commit above this checkpoint is not folded"
+    );
+    assert_eq!(loaded.slot(16), Some(slot));
+    loaded.widen_for_checkpoint(9);
+    loaded
+        .fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        writes, 0,
+        "the hold from the higher commit stays until the image is filtered"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    loaded.widen_for_checkpoint(3);
+    let mut writes = 0u32;
+    loaded
+        .fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(writes, 1, "a commit at this checkpoint still folds");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn reloaded_freeze_tip_holds_the_fold() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.cover_confirmed_tip(9);
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    loaded.hold_fold_above(5).unwrap();
+    loaded.widen_cool_through();
+    let mut writes = 0u32;
+    loaded
+        .fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(writes, 0, "a reloaded freeze tip still holds the fold");
+    assert_eq!(loaded.slot(16), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.cover_confirmed_tip(9);
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    let commit = d.join(SPEND_PAGES_COMMIT_NAME);
+    let buf = std::fs::read(&commit).unwrap();
+    std::fs::write(&commit, &buf[..buf.len() - 4]).unwrap();
+    let loaded = SpendPageLog::load(&d).unwrap();
+    loaded.hold_fold_above(5).unwrap();
+    loaded.widen_cool_through();
+    let mut writes = 0u32;
+    loaded
+        .fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(
+        writes, 1,
+        "a commit with no freeze tip uses its snapshot height"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(all(unix, debug_assertions))]
+struct ResetDirSync;
+
+#[cfg(all(unix, debug_assertions))]
+impl Drop for ResetDirSync {
+    fn drop(&mut self) {
+        rbitcoin_store::file::arm_fail_dir_sync_after(0, 0);
+    }
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn directory_sync_failure_after_commit_rename_keeps_the_generation() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let first = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, first)]).unwrap();
+    // The generation file syncs the directory once. The commit sync is next.
+    let _reset = ResetDirSync;
+    rbitcoin_store::file::arm_fail_dir_sync_after(1, 1);
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    rbitcoin_store::file::arm_fail_dir_sync_after(0, 0);
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(first));
+    let second = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    loaded.note_slots(&[(4096, second)]).unwrap();
+    loaded.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+    let commit = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    let generation = u32::from_le_bytes(commit[12..16].try_into().unwrap());
+    assert_eq!(
+        generation, 2,
+        "a failed directory sync must not reuse generation 1"
+    );
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(first));
+    assert_eq!(loaded.slot(4096), Some(second));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(all(unix, debug_assertions))]
+#[test]
+fn directory_sync_failure_during_hold_still_holds() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+    let _reset = ResetDirSync;
+    rbitcoin_store::file::arm_fail_dir_sync_after(0, 1);
+    log.hold_fold_above(1).unwrap();
+    rbitcoin_store::file::arm_fail_dir_sync_after(0, 0);
+    log.widen_cool_through();
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, _image| {
+            writes += 1;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(writes, 0, "a failed directory sync still holds the fold");
+    assert_eq!(log.slot(16), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+}

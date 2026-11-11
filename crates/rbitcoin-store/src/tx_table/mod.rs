@@ -2558,12 +2558,18 @@ impl TxTable {
         self.spend_pages.note_slots(slots)
     }
 
-    pub(crate) fn prepare_open_spend_pages<K>(&self, height: u32, keep: K) -> Result<(), StoreError>
+    pub(crate) fn prepare_open_spend_pages<K, B>(
+        &self,
+        height: u32,
+        keep: K,
+        before_freeze: B,
+    ) -> Result<(), StoreError>
     where
         K: FnMut(&[u8; OutputRecord::SPENT_SLOT_LEN]) -> Result<bool, StoreError>,
+        B: FnOnce(&crate::spend_page_log::SpendPageLog),
     {
         let published = self.spent.body_published_len();
-        self.spend_pages.prepare_commit(
+        self.spend_pages.prepare_commit_in(
             height,
             published,
             |off, len| {
@@ -2573,6 +2579,7 @@ impl TxTable {
                 Ok(buf)
             },
             keep,
+            before_freeze,
         )
     }
 
@@ -2600,12 +2607,12 @@ impl TxTable {
         self.spend_pages.hold_fold_above(tip)
     }
 
-    pub(crate) fn cover_spend_fold_tip(&self, tip: u32) {
-        self.spend_pages.cover_confirmed_tip(tip);
+    pub(crate) fn widen_for_checkpoint(&self, height: u32) {
+        self.spend_pages.widen_for_checkpoint(height);
     }
 
-    pub(crate) fn widen_spend_cool_through(&self) {
-        self.spend_pages.widen_cool_through();
+    pub(crate) fn spend_log_above(&self, tip: u32) -> bool {
+        self.spend_pages.above_tip(tip)
     }
 
     pub(crate) fn copy_cooled_spend_pages(&self) -> Result<(), StoreError> {

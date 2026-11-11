@@ -10,7 +10,7 @@
 //! crash lands between the commit rename and the pages rename.
 
 use crate::error::StoreError;
-use crate::file::{fsync_parent_dir, write_synced_tmp_file, write_synced_tmp_rename};
+use crate::file::{fsync_parent_dir, write_file_synced_tmp_rename, write_synced_tmp_file};
 use crate::tx_table::BODY_PAGE_SIZE;
 use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
 use std::collections::{HashMap, HashSet};
@@ -156,8 +156,11 @@ struct Inner {
     /// Commit height was above the tip. Fold must not copy that image.
     fold_held: bool,
     /// Confirmed tip sampled when a checkpoint froze. The snapshot height can
-    /// sit below spends already in that image.
+    /// sit below spends already in that image. Written after the page list.
     sealed_tip: Option<u32>,
+    /// Snapshot taken while the caller held the utxo view. `prepare_commit`
+    /// publishes this instead of freezing again.
+    staged_freeze: Option<Option<CommitSnapshot>>,
     /// Bumped each time a disconnect holds the fold.
     hold_ticks: u64,
     open_edges: u64,
@@ -261,6 +264,7 @@ impl SpendPageLog {
                 compose_height: None,
                 fold_held: false,
                 sealed_tip: None,
+                staged_freeze: None,
                 hold_ticks: 0,
                 open_edges: 0,
                 log_bytes: 0,
@@ -401,6 +405,32 @@ impl SpendPageLog {
         }
     }
 
+    /// A loaded commit above `height` must not be folded. The held bit may
+    /// still be clear. Call this before [`Self::widen_cool_through`].
+    pub fn hold_loaded_commit_above(&self, height: u32) {
+        let mut g = self.lock();
+        if g.commit_height.is_some_and(|committed| committed > height) {
+            g.fold_held = true;
+        }
+    }
+
+    /// Hold a commit above `height`, then widen the cool range.
+    ///
+    /// The quiet-page fold runs after this returns. A held generation stays.
+    pub fn widen_for_checkpoint(&self, height: u32) {
+        self.hold_loaded_commit_above(height);
+        self.widen_cool_through();
+    }
+
+    /// True when a disconnect to `tip` must hold the fold.
+    ///
+    /// The commit height and the freeze tip both count. The spend marker can
+    /// still be at or below `tip`.
+    pub fn above_tip(&self, tip: u32) -> bool {
+        let g = self.lock();
+        g.commit_height.is_some_and(|h| h > tip) || g.sealed_tip.is_some_and(|h| h > tip)
+    }
+
     /// Fold quiet pages from the previous generation before the next compose
     /// copies them into a new `spend.pages` file.
     ///
@@ -444,7 +474,9 @@ impl SpendPageLog {
                 if installed_above {
                     buf[8..12].copy_from_slice(&tip.to_le_bytes());
                 }
-                write_synced_tmp_rename(&path, &buf)?;
+                // The rename is already visible. A directory sync error must
+                // not skip the RAM hold, or this process still folds.
+                write_commit_file(&path, &buf)?;
             }
         }
         let mut g = self.lock();
@@ -505,12 +537,37 @@ impl SpendPageLog {
         &self,
         height: u32,
         published: u64,
-        mut read_page: F,
-        mut keep: K,
+        read_page: F,
+        keep: K,
     ) -> Result<(), StoreError>
     where
         F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
         K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
+    {
+        self.prepare_commit_in(height, published, read_page, keep, |log| log.freeze_open())
+    }
+
+    /// Freeze `open` while the caller holds the utxo view.
+    ///
+    /// [`Self::prepare_commit_in`] publishes this snapshot. A note that arrives
+    /// after the view is released waits for the next checkpoint.
+    pub(crate) fn freeze_open(&self) {
+        let snap = self.snapshot_commit();
+        self.lock().staged_freeze = Some(snap);
+    }
+
+    pub(crate) fn prepare_commit_in<F, K, B>(
+        &self,
+        height: u32,
+        published: u64,
+        mut read_page: F,
+        mut keep: K,
+        before_freeze: B,
+    ) -> Result<(), StoreError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
+        K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
+        B: FnOnce(&Self),
     {
         if self.lock().pending.is_some() {
             return Ok(());
@@ -539,7 +596,15 @@ impl SpendPageLog {
             g.fold_held && !g.committed.is_empty()
         };
         let stored = self.committed_images();
-        let Some(snap) = self.snapshot_commit() else {
+        // The caller covers the freeze tip and freezes `open` while it holds
+        // the utxo view. Notes taken during the quiet fold are already in
+        // `open`. A note after this waits for the next checkpoint.
+        before_freeze(self);
+        let snap = match self.lock().staged_freeze.take() {
+            Some(snap) => snap,
+            None => self.snapshot_commit(),
+        };
+        let Some(snap) = snap else {
             self.scrub_open_notes(&mut keep)?;
             let pages = compose_kept_pages(&mut read_page, published, &[], &clears, &stored)?;
             return self.settle_deferred_clear(
@@ -1052,15 +1117,16 @@ impl SpendPageLog {
             }
             Ok(())
         })?;
-        let held = {
+        let (held, sealed_tip) = {
             let g = self.lock();
-            match hold {
+            let held = match hold {
                 PublishHold::Sample => g.fold_held,
                 PublishHold::Clear => false,
-            }
+            };
+            (held, g.sealed_tip.unwrap_or(height))
         };
-        let commit = encode_commit(height, generation, committed_len, &recs, held);
-        write_synced_tmp_rename(&commit_path, &commit)?;
+        let commit = encode_commit(height, generation, committed_len, &recs, held, sealed_tip);
+        write_commit_file(&commit_path, &commit)?;
         {
             let mut g = self.lock();
             g.log_bytes = committed_len;
@@ -1276,6 +1342,7 @@ impl SpendPageLog {
         g.cool_through = 0;
         g.commit_height = Some(parsed.height);
         g.fold_held = parsed.fold_held;
+        g.sealed_tip = Some(parsed.sealed_tip);
         g.log_bytes = parsed.committed_len;
         g.open_edges = 0;
         g.committed.clear();
@@ -1824,6 +1891,9 @@ struct ParsedCommit {
     generation: u32,
     committed_len: u64,
     fold_held: bool,
+    /// Confirmed tip frozen with this snapshot. Older commits omit the
+    /// trailer and are read as the snapshot height.
+    sealed_tip: u32,
     recs: Vec<CommitRec>,
 }
 
@@ -1833,8 +1903,10 @@ fn encode_commit(
     committed_len: u64,
     recs: &[(u64, u64, u32)],
     fold_held: bool,
+    sealed_tip: u32,
 ) -> Vec<u8> {
-    let mut buf = vec![0u8; COMMIT_HEAD + recs.len() * COMMIT_REC];
+    let tail = COMMIT_HEAD + recs.len() * COMMIT_REC;
+    let mut buf = vec![0u8; tail + 4];
     buf[..4].copy_from_slice(&STORE_MAGIC);
     buf[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
     if fold_held {
@@ -1850,7 +1922,23 @@ fn encode_commit(
         buf[at + 8..at + 16].copy_from_slice(&log_off.to_le_bytes());
         buf[at + 16..at + 20].copy_from_slice(&image_len.to_le_bytes());
     }
+    buf[tail..tail + 4].copy_from_slice(&sealed_tip.to_le_bytes());
     buf
+}
+
+/// Rename `bytes` over `path`. The rename is the commit.
+///
+/// The parent directory is synced afterward. That sync can fail after the
+/// new name is already visible. Returning the error would make the next
+/// checkpoint write the same generation again.
+fn write_commit_file(path: &Path, bytes: &[u8]) -> Result<(), StoreError> {
+    write_file_synced_tmp_rename(path, bytes)?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = fsync_parent_dir(parent);
+        }
+    }
+    Ok(())
 }
 
 // llvm-cov drops the counters when this parser is inlined into `reload`.
@@ -1875,6 +1963,11 @@ fn parse_commit(buf: &[u8]) -> Result<ParsedCommit, StoreError> {
     if buf.len() < need {
         return Err(StoreError::Corrupt("spend.pages.commit short"));
     }
+    let sealed_tip = if buf.len() >= need + 4 {
+        u32::from_le_bytes(buf[need..need + 4].try_into().unwrap())
+    } else {
+        height
+    };
     let mut recs = Vec::with_capacity(n);
     for i in 0..n {
         let at = COMMIT_HEAD + i * COMMIT_REC;
@@ -1889,6 +1982,7 @@ fn parse_commit(buf: &[u8]) -> Result<ParsedCommit, StoreError> {
         generation,
         committed_len,
         fold_held,
+        sealed_tip,
         recs,
     })
 }

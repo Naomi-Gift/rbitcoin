@@ -52,6 +52,10 @@ Fixed
   synced before the page commit is renamed. A disconnect holds the fold
   through the confirmed tip frozen at the checkpoint, not only the snapshot
   height, and a second disconnect during a deferred publish keeps that hold.
+  That tip is written on the commit. A checkpoint below a loaded commit holds
+  the fold before it widens the cool range. Open holds when the commit height
+  or that tip is above the chain, not only when the marker is. A directory
+  sync that fails after the commit rename still keeps that generation.
   The previous image stays readable until the directory swap. A quiet page
   is copied onto `spent.body` before the next checkpoint carries it, and
   the page file is streamed. A failed checkpoint waits one second while the

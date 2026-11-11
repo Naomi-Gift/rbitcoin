@@ -1970,6 +1970,14 @@ impl Store {
         self.txs.spend_checkpoint_early()
     }
 
+    /// The page-log commit or its freeze tip names a height above `tip`.
+    ///
+    /// Open uses this when the spend marker is not above the tip. The marker
+    /// can lag the commit, and the freeze tip can sit above the snapshot height.
+    pub fn spend_log_above(&self, tip: u32) -> bool {
+        self.txs.spend_log_above(tip)
+    }
+
     pub fn relax_spend_pace(&self) {
         self.txs.relax_spend_pace();
     }
@@ -1979,14 +1987,21 @@ impl Store {
         height: u32,
         keep: impl FnMut(&[u8; 8]) -> Result<bool, StoreError>,
     ) -> Result<(), StoreError> {
-        if let Some(h) = self.confirmed.tip_height() {
-            self.txs.cover_spend_fold_tip(h.0);
-        }
-        // Quiet pages from the last generation fold before this compose copies
-        // them into the next `spend.pages` file. A held generation stays.
-        self.txs.widen_spend_cool_through();
+        // A loaded commit above this checkpoint is held before the quiet
+        // pages are copied. The freeze tip is read under the utxo view, after
+        // that copy and after the keep walk, so a note already in `open` is
+        // inside the tip a later disconnect holds.
+        self.txs.widen_for_checkpoint(height);
         self.fold_sealed_spend_pages()?;
-        self.txs.prepare_open_spend_pages(height, keep)?;
+        let publish = &self.utxo_publish;
+        let view = &self.utxo_view;
+        let confirmed = &self.confirmed;
+        self.txs.prepare_open_spend_pages(height, keep, |log| {
+            let _g = hold_view(publish, view);
+            let tip = confirmed.tip_height().map(|h| h.0).unwrap_or(height);
+            log.cover_confirmed_tip(tip);
+            log.freeze_open();
+        })?;
         self.install_prepared_spend_pages()
     }
 

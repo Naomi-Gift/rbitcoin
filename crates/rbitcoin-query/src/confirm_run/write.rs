@@ -637,7 +637,9 @@ pub fn replay_spend_annotations(query: &Query) -> Result<u32, ConfirmError> {
         .store()
         .spend_annotated_through()
         .map_err(ConfirmError::from)?;
-    if annotated.is_some_and(|h| h > tip) {
+    // The page-log commit can name a higher height than the marker, and its
+    // freeze tip can sit above both. Hold before replay folds that image.
+    if annotated.is_some_and(|h| h > tip) || query.store().spend_log_above(tip) {
         query
             .store()
             .clamp_spend_durable()
