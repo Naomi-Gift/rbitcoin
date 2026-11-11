@@ -1322,7 +1322,7 @@ fn fill_same_batch_abs_from_append_loc_ram() {
                 (std::sync::Arc::clone(&child_pin), child_ins),
             ],
             false,
-            &[],
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[1, 1]),
         )
         .unwrap();
     assert_eq!(fks[0], Fk(1));
@@ -1520,7 +1520,11 @@ fn structural_same_batch_overlay_skips_meta_pread() {
         script_sig: vec![],
         witness: vec![],
     }];
-    let overlay = [vec![(0u32, Fk(2), 0)], vec![]];
+    let overlay = rbitcoin_store::tx_table::SpentBodyImage::from_pairs(
+        &[2, 1],
+        &[vec![(0u32, Fk(2), 0)], vec![]],
+    )
+    .unwrap();
     let (fks, loc) = q
         .store()
         .put_tx_full_batch_from_pins(
@@ -1529,7 +1533,7 @@ fn structural_same_batch_overlay_skips_meta_pread() {
                 (std::sync::Arc::clone(&child_pin), child_ins),
             ],
             false,
-            &overlay,
+            overlay,
         )
         .unwrap();
     assert_eq!(fks, vec![Fk(1), Fk(2)]);
@@ -1695,7 +1699,7 @@ fn structural_scratch_second_block_does_not_replay_first_slots() {
                 vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
             )],
             false,
-            &[],
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[2]),
         )
         .unwrap();
     let mut bp = BatchParents::new();
@@ -1841,7 +1845,7 @@ fn post_commit_spend_index_off_leaves_slots_unwritten() {
                 )],
             )],
             false,
-            &[],
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[1]),
         )
         .unwrap();
     let create_fk = fks[0];
@@ -1890,7 +1894,7 @@ fn fill_just_written_survives_until_last_started_write() {
                 )],
             )],
             false,
-            &[],
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[1]),
         )
         .unwrap();
     q.set_lookup_started_hi(Some(496));
@@ -1968,7 +1972,7 @@ fn fill_stamp_spent_hole_from_write_tls() {
                 )],
             )],
             false,
-            &[],
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[1]),
         )
         .unwrap();
     let mut inflight = InFlight::new();
@@ -2044,7 +2048,7 @@ fn pin_and_ensure_from_pin_loc_without_tls() {
                 vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
             )],
             false,
-            &[],
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[1]),
         )
         .unwrap();
     parent_pin.set_loc(loc[0]);
@@ -3411,7 +3415,7 @@ fn structural_run_clears_reused_scratch_between_batches() {
                 vec![InputRecord::coinbase(u32::MAX, vec![0x01], vec![])],
             )],
             false,
-            &[],
+            rbitcoin_store::tx_table::SpentBodyImage::zeros(&[1]),
         )
         .unwrap();
     let mut bp = BatchParents::new();

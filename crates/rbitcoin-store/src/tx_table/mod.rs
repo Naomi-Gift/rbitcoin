@@ -2802,10 +2802,6 @@ impl TxTable {
             .iter()
             .map(|(_tx, ins, _outs)| 16 + ins.iter().map(|i| i.encoded_len()).sum::<usize>())
             .sum();
-        let est_spent: usize = items
-            .iter()
-            .map(|(_tx, _ins, outs)| 16 + outs.len() * OutputRecord::SPENT_SLOT_LEN)
-            .sum();
         let base = self.body.count();
         if (!self.prune_seqsigwit_mode() && self.seqsigwit.count() != base)
             || self.spent.count() != base
@@ -2818,18 +2814,21 @@ impl TxTable {
             return Err(StoreError::Corrupt("invariant: create n_out"));
         }
         let n_outs: Vec<u32> = items.iter().map(|(_, _, o)| o.len() as u32).collect();
+        let spent_image = SpentBodyImage::zeros(&n_outs);
+        let spent = self
+            .spent
+            .prepare_exact_body(&spent_image.record_lens(), spent_image.into_bytes())?;
         let (fks, _loc) = self.append_stems_one_wave(
             items.len(),
             est_out,
             est_seqsigwit,
-            est_spent,
             &n_outs,
             |i, buf| {
                 let (tx, ins, outs) = &items[i];
                 encode_packed_tx_with_secret(tx, ins, outs, buf, Some(&self.secret));
             },
             |i, buf| encode_seqsigwit_with_secret(&items[i].1, buf, Some(&self.secret)),
-            |i, buf| encode_spent_zeros(items[i].2.len() as u32, buf),
+            spent,
         )?;
         let ids: Vec<[u8; 32]> = items.iter().map(|(tx, _, _)| tx.txid).collect();
         self.txids.append_batch(base, &ids)?;
@@ -2854,25 +2853,23 @@ impl TxTable {
     /// Like [`Self::put_full_batch_indexed`], but outs live in a shared pin
     /// ([`PackedCreate`]). Encode borrows pin fields — no outs deep clone.
     ///
-    /// `spent_overlay` is per-item `(vout, spend_fk, vin)` sole spenders written into
-    /// the Class A spent stem. Empty slice = all zeros. Non-empty must be one
-    /// inner vec per item.
+    /// `spent` is the exact `spent.body` image for this append (`8 × n_out` per create).
     pub fn put_full_batch_from_pins<P: PackedCreate>(
         &self,
         items: &[(P, Vec<InputRecord>)],
         index: bool,
-        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        spent: SpentBodyImage,
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
         let rows: Vec<crate::txstat::TxStatRow> =
             items.iter().map(|_| txstat_placeholder()).collect();
-        self.put_full_batch_from_pins_with_txstat(items, index, spent_overlay, &rows, &[])
+        self.put_full_batch_from_pins_with_txstat(items, index, spent, &rows, &[])
     }
 
     pub fn put_full_batch_from_pins_with_txstat<P: PackedCreate>(
         &self,
         items: &[(P, Vec<InputRecord>)],
         index: bool,
-        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        spent: SpentBodyImage,
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
@@ -2887,7 +2884,7 @@ impl TxTable {
         self.put_pins_with_edges(
             &pins,
             index,
-            spent_overlay,
+            spent,
             txstat,
             header_ranges,
             &edges,
@@ -2904,7 +2901,7 @@ impl TxTable {
         &self,
         pins: &[&P],
         index: bool,
-        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        spent: SpentBodyImage,
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
         input_edges: &[Vec<crate::input::InputEdge>],
@@ -2914,7 +2911,7 @@ impl TxTable {
         self.put_pins_with_edges(
             pins,
             index,
-            spent_overlay,
+            spent,
             txstat,
             header_ranges,
             input_edges,
@@ -2929,7 +2926,7 @@ impl TxTable {
         &self,
         pins: &[&P],
         index: bool,
-        spent_overlay: &[Vec<(u32, Fk, u32)>],
+        spent: SpentBodyImage,
         txstat: &[crate::txstat::TxStatRow],
         header_ranges: &[(Fk, Fk, u32)],
         input_edges: &[Vec<crate::input::InputEdge>],
@@ -2945,14 +2942,10 @@ impl TxTable {
         if input_edges.len() != pins.len() {
             return Err(StoreError::Corrupt("input edge batch length"));
         }
-        if !spent_overlay.is_empty() && spent_overlay.len() != pins.len() {
+        if spent.create_count() != pins.len() {
             return Err(StoreError::Corrupt("spent overlay length"));
         }
         let est_out: usize = pins.iter().map(|pin| pin.packed_outs_est()).sum();
-        let est_spent: usize = pins
-            .iter()
-            .map(|pin| 16 + spent_record_len(pin.packed_n_out()) as usize)
-            .sum();
         let base = self.body.count();
         if (!self.prune_seqsigwit_mode() && self.seqsigwit.count() != base)
             || self.spent.count() != base
@@ -2961,35 +2954,30 @@ impl TxTable {
         {
             return Err(StoreError::Corrupt("Class A stem count mismatch on append"));
         }
+        let mut n_outs = Vec::with_capacity(pins.len());
         for (i, pin) in pins.iter().enumerate() {
             let n_out = pin.packed_n_out();
             if n_out == 0 {
                 return Err(StoreError::Corrupt("invariant: create n_out"));
             }
-            let pairs = spent_overlay.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-            for &(vout, fk, vin) in pairs {
-                if vout >= n_out {
-                    return Err(StoreError::Corrupt("spent overlay vout"));
-                }
-                encode_spent_slot(0, fk, vin)?;
+            if spent.n_out(i) != n_out {
+                return Err(StoreError::Corrupt("spent overlay n_out"));
             }
+            n_outs.push(n_out);
         }
-        let n_outs: Vec<u32> = pins.iter().map(|pin| pin.packed_n_out()).collect();
+        let spent = self
+            .spent
+            .prepare_exact_body(&spent.record_lens(), spent.into_bytes())?;
         let (fks, loc) = self.append_stems_one_wave(
             pins.len(),
             est_out,
             est_seqsigwit,
-            est_spent,
             &n_outs,
             |i, buf| {
                 pins[i].encode_txout_body(buf, Some(&self.secret));
             },
             encode_in,
-            |i, buf| {
-                let n_out = pins[i].packed_n_out();
-                let pairs = spent_overlay.get(i).map(|v| v.as_slice()).unwrap_or(&[]);
-                encode_spent_slots(n_out, pairs, buf).expect("spent overlay prechecked");
-            },
+            spent,
         )?;
         let ids: Vec<[u8; 32]> = pins.iter().map(|pin| pin.packed_txid()).collect();
         self.txids.append_batch(base, &ids)?;
@@ -3043,20 +3031,16 @@ impl TxTable {
         n: usize,
         est_out: usize,
         est_seqsigwit: usize,
-        est_spent: usize,
         n_outs: &[u32],
         encode_out: impl FnMut(usize, &mut Vec<u8>),
         encode_in: impl FnMut(usize, &mut Vec<u8>),
-        encode_sp: impl FnMut(usize, &mut Vec<u8>),
+        p_sp: crate::var_table::PreparedAppend,
     ) -> Result<(Vec<Fk>, Vec<crate::create_loc::CreateLocPair>), StoreError> {
-        if n_outs.len() != n {
+        if n_outs.len() != n || p_sp.starts.len() != n {
             return Err(StoreError::Corrupt("invariant: create n_out"));
         }
         let Some(p_out) = self.body.prepare_batch_encode(n, est_out, encode_out)? else {
             return Ok((Vec::new(), Vec::new()));
-        };
-        let Some(p_sp) = self.spent.prepare_batch_encode(n, est_spent, encode_sp)? else {
-            return Err(StoreError::Corrupt("Class A spent prepare empty"));
         };
         let (recs, loc) = class_a_loc_pairs(n, n_outs, &p_out, &p_sp);
         let staged_loc = self.create_loc.stage(&recs)?;

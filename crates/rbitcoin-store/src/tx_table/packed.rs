@@ -885,6 +885,39 @@ impl SpentBodyImage {
         self.bytes
     }
 
+    pub fn create_count(&self) -> usize {
+        self.offs.len().saturating_sub(1)
+    }
+
+    pub fn n_out(&self, create: usize) -> u32 {
+        let end_i = create.saturating_add(1);
+        if end_i >= self.offs.len() {
+            return 0;
+        }
+        ((self.offs[end_i].saturating_sub(self.offs[create])) / OutputRecord::SPENT_SLOT_LEN) as u32
+    }
+
+    pub fn record_lens(&self) -> Vec<u64> {
+        self.offs
+            .windows(2)
+            .map(|w| (w[1].saturating_sub(w[0])) as u64)
+            .collect()
+    }
+
+    /// Place each pair. An empty `rows` is an all-zero image of `n_outs`.
+    pub fn from_pairs(n_outs: &[u32], rows: &[Vec<(u32, Fk, u32)>]) -> Result<Self, StoreError> {
+        if !rows.is_empty() && rows.len() != n_outs.len() {
+            return Err(StoreError::Corrupt("spent overlay length"));
+        }
+        let mut image = Self::zeros(n_outs);
+        for (i, row) in rows.iter().enumerate() {
+            for &(vout, fk, vin) in row {
+                image.place(i, vout, fk, vin)?;
+            }
+        }
+        Ok(image)
+    }
+
     /// Write a sole spender. A slot that already names an equal or lower fk stays.
     pub fn place(&mut self, create: usize, vout: u32, fk: Fk, vin: u32) -> Result<(), StoreError> {
         let end_i = create.saturating_add(1);

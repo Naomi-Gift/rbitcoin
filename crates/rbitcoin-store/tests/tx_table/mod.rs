@@ -165,7 +165,7 @@ fn put_full_batch_from_pins_roundtrip() {
     let outs = vec![OutputRecord::unspent(7, vec![0x51])];
     let pin = std::sync::Arc::new((tx, outs));
     let (fks, loc) = t
-        .put_full_batch_from_pins(&[(pin, ins)], true, &[])
+        .put_full_batch_from_pins(&[(pin, ins)], true, SpentBodyImage::zeros(&[1]))
         .unwrap();
     assert_eq!(loc.len(), 1);
     assert_eq!(loc[0].txout, t.body_range(fks[0]).unwrap());
@@ -614,7 +614,7 @@ fn put_full_batch_roundtrips_one_output() {
     let outs = vec![OutputRecord::unspent(7, vec![0x51])];
     let pin = std::sync::Arc::new((tx, outs));
     let (fks, _loc) = t
-        .put_full_batch_from_pins(&[(pin, ins)], true, &[])
+        .put_full_batch_from_pins(&[(pin, ins)], true, SpentBodyImage::zeros(&[1]))
         .unwrap();
     assert_eq!(fks.len(), 1);
     let (tx, got_ins, got_outs) = t.get_full(fks[0]).unwrap();
@@ -662,12 +662,12 @@ fn put_full_batch_from_pins_same_batch_spent_slot() {
         script_sig: vec![0x01],
         witness: vec![],
     }];
-    let overlay = [vec![(0u32, Fk(2), 0)], vec![]];
+    let overlay = SpentBodyImage::from_pairs(&[2, 1], &[vec![(0u32, Fk(2), 0)], vec![]]).unwrap();
     let (fks, loc) = t
         .put_full_batch_from_pins(
             &[(parent_pin, parent_ins), (child_pin, child_ins)],
             false,
-            &overlay,
+            overlay,
         )
         .unwrap();
     assert_eq!(fks, vec![Fk(1), Fk(2)]);
@@ -4864,6 +4864,16 @@ fn encode_spent_slots_duplicate_vout_last_wins() {
     encode_spent_slots(1, &[(0, Fk(1), 0), (0, Fk(2), 1)], &mut buf).unwrap();
     assert_eq!(decode_spent_slot(&buf).unwrap().1, Fk(2));
     assert_eq!(decode_spent_slot(&buf).unwrap().2, 1);
+}
+
+#[test]
+fn spent_body_image_starts_follow_an_aligned_cursor() {
+    let starts = rbitcoin_store::var_table::exact_body_starts(16, &[16, 8], 24).unwrap();
+    assert_eq!(starts, vec![16, 32]);
+    match rbitcoin_store::var_table::exact_body_starts(17, &[16, 8], 24) {
+        Err(StoreError::Corrupt(m)) => assert!(m.contains("cursor"), "{m}"),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
 }
 
 #[test]

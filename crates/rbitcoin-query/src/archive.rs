@@ -1894,7 +1894,13 @@ impl Query {
         let reserve_ns = t.elapsed().as_nanos() as u64;
 
         let t = Instant::now();
-        let overlay = plan.same_batch_spent_overlay();
+        let pairs = plan.same_batch_spent_overlay();
+        let n_outs: Vec<u32> = plan
+            .packed
+            .iter()
+            .map(|(pin, _)| pin.packed_n_out())
+            .collect();
+        let overlay = rbitcoin_store::tx_table::SpentBodyImage::from_pairs(&n_outs, &pairs)?;
         let txstat = stamp_txstat_rows(&plan)?;
         let txstat_ns = t.elapsed().as_nanos() as u64;
         self.confirm_stats().note_write_txstat(txstat_ns);
@@ -1905,7 +1911,7 @@ impl Query {
         let (got_tx_fks, loc) = self.store.put_tx_pins_encoded(
             &pins,
             /*index=*/ false,
-            &overlay,
+            overlay,
             &txstat,
             &plan.per_header_ranges,
             &edge_rows,
