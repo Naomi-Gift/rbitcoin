@@ -502,6 +502,22 @@ fn batched_annotate_keeps_the_logged_slot_and_the_cold_tail() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A published slot with no directory note and reserved flags fails the batch.
+#[test]
+fn batched_annotate_refuses_a_corrupt_body_slot() {
+    let (dir, t, spenders) = temp_table();
+    let (fk, off, _len) = put_one(&t);
+    let abs = rbitcoin_store::spent_abs(off, 0);
+    t.spent
+        .write_body_abs(abs, &[0xff, 0, 0, 0, 0, 0, 0, 0])
+        .unwrap();
+    let err = t
+        .put_spend_batch_by_abs_meta(&spenders, &[(abs, fk, 0, Fk(10), 1)])
+        .unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt(_)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A second spend of a historical slot promotes through the directory.
 ///
 /// The body page stays zero, including the short tail. Zeroing a logged slot

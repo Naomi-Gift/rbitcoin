@@ -2303,9 +2303,9 @@ impl TxTable {
 
     /// One directory-or-body read for the whole batch.
     ///
-    /// A slot past the published body is `(NULL, 0, 0)`, the same answer
-    /// [`Self::current_spend_slot`] returns without reading. A short or
-    /// undecodable in-range slot falls back to that read so the error stays.
+    /// A slot past the published body is `(NULL, 0, 0)` and is not read. A
+    /// short or undecodable in-range slot is read again here so that error
+    /// still fails the annotate.
     fn known_spend_slots(
         &self,
         abs_edges: &[(u64, Fk, u32, Fk, u32)],
@@ -2319,21 +2319,15 @@ impl TxTable {
             known.push(match slot {
                 Some((field, flags, vin)) => (field, flags, vin),
                 None if past => (Fk::NULL, 0, 0),
-                None => self.current_spend_slot(edge.0)?,
+                None => self.body_spend_slot(edge.0)?,
             });
         }
         Ok(known)
     }
 
-    fn current_spend_slot(&self, abs: u64) -> Result<(Fk, u8, u32), StoreError> {
-        if let Some(raw) = self.spend_pages.slot(abs) {
-            let (flags, field, vin) = decode_spent_slot(&raw)?;
-            return Ok((field, flags, vin));
-        }
+    /// Body slot at `abs`. The batch peek already skipped a directory hit.
+    fn body_spend_slot(&self, abs: u64) -> Result<(Fk, u8, u32), StoreError> {
         let published = self.spent.body_published_len();
-        if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > published {
-            return Ok((Fk::NULL, 0, 0));
-        }
         let mut buf = [0u8; OutputRecord::SPENT_SLOT_LEN];
         self.spent.read_prefix_at_published(
             published,
