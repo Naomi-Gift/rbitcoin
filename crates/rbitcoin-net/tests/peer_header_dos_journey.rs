@@ -3025,7 +3025,7 @@ fn getheaders_serves_cached_bodies_when_the_store_has_no_tip() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("cache-serve");
     assert!(hub.tip_height().is_none());
     let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
-    hub.cache.push_best(genesis.clone()).unwrap();
+    hub.cache.push_best(0, genesis.clone());
     let mut prev = genesis.block_hash();
     let mut time = genesis.header.time;
     let mut hashes = vec![prev];
@@ -3034,7 +3034,7 @@ fn getheaders_serves_cached_bodies_when_the_store_has_no_tip() {
         let block = rbitcoin_consensus::mine_regtest_paying(prev, time, h, op_true(), vec![]);
         prev = block.block_hash();
         hashes.push(prev);
-        hub.cache.push_best(block).unwrap();
+        hub.cache.push_best(h, block);
     }
     let stop = hashes[2];
     let served = headers_reply_for_getheaders(
