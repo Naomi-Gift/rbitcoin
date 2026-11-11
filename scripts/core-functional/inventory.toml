@@ -526,9 +526,7 @@ analog = "core_analogs::analog_milestone_and_mempool_persist"
 
 [[test]]
 name = "mempool_reorg.py"
-status = "skip"
-reason = "node-behavior"
-analog = "follow-up #1483: getdata reply before the pong for a later ping"
+status = "run"
 
 [[test]]
 name = "mempool_resurrect.py"
@@ -637,15 +635,11 @@ status = "run"
 
 [[test]]
 name = "p2p_compactblocks.py"
-status = "skip"
-reason = "node-behavior"
-analog = "follow-up #1483: getblocktxn before the pong for a later ping; then the in-flight invalid cmpctblock case"
+status = "run"
 
 [[test]]
 name = "p2p_compactblocks_blocksonly.py"
-status = "skip"
-reason = "node-behavior"
-analog = "follow-up #1483: getdata before the pong for a later ping"
+status = "run"
 
 [[test]]
 name = "p2p_compactblocks_hb.py"
@@ -753,9 +747,7 @@ status = "run"
 
 [[test]]
 name = "p2p_leak_tx.py"
-status = "skip"
-reason = "node-behavior"
-analog = "follow-up #1483: tx reply before the pong for a later ping"
+status = "run"
 
 [[test]]
 name = "p2p_message_capture.py"

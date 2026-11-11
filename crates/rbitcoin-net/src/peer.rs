@@ -1698,13 +1698,14 @@ pub fn rand_nonce() -> u64 {
 /// A dedicated writer drains outbound messages while the reader keeps draining
 /// the encrypted channel. `meta` labels the peer for logs and optionally tracks
 /// live outbound follow count.
-/// Control (ping/pong/`sendcmpct`) first, then full bodies, then headers/inv.
+/// Ping and `sendcmpct` first, then bodies, then headers and inv.
+/// A pong is last in the batch. It must not pass a reply already queued
+/// for an earlier message from this peer.
 #[doc(hidden)]
 pub fn outbound_write_rank(out: &PeerOut) -> u8 {
     match out {
-        PeerOut::Msg(
-            NetworkMessage::Ping(_) | NetworkMessage::Pong(_) | NetworkMessage::SendCmpct(_),
-        ) => 0,
+        PeerOut::Msg(NetworkMessage::Ping(_) | NetworkMessage::SendCmpct(_)) => 0,
+        PeerOut::Msg(NetworkMessage::Pong(_)) => 3,
         PeerOut::Encoded(_)
         | PeerOut::Served(_)
         | PeerOut::Msg(NetworkMessage::Block(_))
@@ -2623,9 +2624,10 @@ pub async fn peer_session_with(
                         // Close to free this session's asks. A second strike refuses the address.
                         return Err(rate_limit_disconnect(session.as_deref()));
                     }
-                    // Ping/pong stays on this task when nothing is queued. A
-                    // frame already in `decode_q` must be applied first, or a
-                    // later pong updates the clock ahead of an earlier block.
+                    // A ping or pong already in `decode_q` is applied with those
+                    // frames. A later pong must not move the clock ahead of an
+                    // earlier block. A ping on an empty queue is an ordinary
+                    // message: `on_ping` queues its pong after earlier replies.
                     if (frame.is_ping() || frame.is_pong()) && !decode_q.is_empty() {
                         let n = frame.payload_len();
                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -2645,12 +2647,6 @@ pub async fn peer_session_with(
                             },
                         )
                         .await?;
-                        continue;
-                    }
-                    if frame.is_ping() {
-                        if let Some(n) = frame.ping_nonce() {
-                            queue_pong(session.as_deref(), &out_tx, n)?;
-                        }
                         continue;
                     }
                     if frame.is_pong() {

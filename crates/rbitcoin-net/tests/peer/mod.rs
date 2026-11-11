@@ -4653,6 +4653,65 @@ async fn ping_timeout_applies_a_minute_after_the_last_block() {
     );
 }
 
+/// A witness-block `getdata`, then a ping, on a live session. The block
+/// must be on the wire before that ping's pong. Core's `send_and_ping`
+/// returns on the pong and treats the earlier reply as already received.
+#[tokio::test(flavor = "current_thread")]
+async fn getdata_reply_precedes_pong_for_a_later_ping() {
+    let mut t = paused_serve(
+        "reply-before-pong",
+        1,
+        &["/rbitcoin:test(reply-before-pong)/"],
+    )
+    .await;
+    let hash = *t.hashes.last().expect("mined block");
+    let nonce = 0x1483_u64;
+    let (raw, _) = &mut t.clients[0];
+    write_peer_msg(raw, getdata_msg(&[hash])).await;
+    write_peer_msg(raw, NetworkMessage::Ping(nonce)).await;
+    let mut saw_block = false;
+    let mut order = Vec::new();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    while tokio::time::Instant::now() < deadline {
+        let msg = match tokio::time::timeout(Duration::from_secs(3), next_peer_msg(raw)).await {
+            Ok(Ok(msg)) => msg,
+            Ok(Err(e)) => {
+                order.push(format!("read-error:{e}"));
+                break;
+            }
+            Err(_) => {
+                order.push("idle".to_string());
+                break;
+            }
+        };
+        match msg {
+            NetworkMessage::Block(block) if block.block_hash() == hash => {
+                saw_block = true;
+                order.push("block".to_string());
+            }
+            NetworkMessage::Pong(n) if n == nonce => {
+                order.push("pong".to_string());
+                break;
+            }
+            NetworkMessage::Ping(n) => order.push(format!("ping:{n}")),
+            NetworkMessage::Headers(h) => order.push(format!("headers:{}", h.len())),
+            NetworkMessage::GetHeaders(_) => order.push("getheaders".to_string()),
+            NetworkMessage::Inv(v) => order.push(format!("inv:{}", v.len())),
+            NetworkMessage::SendCmpct(_) => order.push("sendcmpct".to_string()),
+            NetworkMessage::FeeFilter(_) => order.push("feefilter".to_string()),
+            NetworkMessage::NotFound(_) => order.push("notfound".to_string()),
+            other => order.push(format!("{other:?}").chars().take(40).collect()),
+        }
+    }
+    raw.close();
+    t.node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&t.dir);
+    assert!(
+        saw_block,
+        "the getdata block must arrive before the pong for the later ping; order={order:?}"
+    );
+}
+
 /// Sends `msg`, then a ping; returns once the pong shows `msg` was read.
 async fn send_and_sync(raw: &mut V2PlainSession, msg: NetworkMessage, nonce: u64) {
     write_peer_msg(raw, msg).await;
