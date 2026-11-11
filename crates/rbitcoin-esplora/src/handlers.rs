@@ -2330,7 +2330,7 @@ pub async fn post_txs_test(
                         "txid": txid,
                         "wtxid": wtxid,
                         "allowed": true,
-                        "vsize": r.weight / 4,
+                        "vsize": rbitcoin_consensus::policy::vbytes_ceil(r.weight),
                         "fees": { "base": r.fee_sat as f64 / 100_000_000.0 },
                     }));
                 }
