@@ -11,6 +11,9 @@ use axum::routing::{get, post};
 use axum::Router;
 use bitcoin::consensus::Encodable;
 use bitcoin::Network;
+use hyper::server::conn::http1;
+use hyper_util::rt::{TokioIo, TokioTimer};
+use hyper_util::service::TowerToHyperService;
 use rbitcoin_electrum::ServeLimits;
 use rbitcoin_net::MempoolHub;
 use rbitcoin_net::RequestMeter;
@@ -20,6 +23,7 @@ use rbitcoin_store::StoreError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -992,6 +996,114 @@ pub fn bind_unix_mode(
     Ok(listener)
 }
 
+trait CappedAccept: Send + 'static {
+    type Io: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static;
+    type Addr: std::fmt::Debug + Send + 'static;
+    fn accept_one(
+        &mut self,
+    ) -> impl Future<Output = std::io::Result<(Self::Io, Self::Addr)>> + Send;
+}
+
+impl CappedAccept for tokio::net::TcpListener {
+    type Io = tokio::net::TcpStream;
+    type Addr = SocketAddr;
+    fn accept_one(
+        &mut self,
+    ) -> impl Future<Output = std::io::Result<(Self::Io, Self::Addr)>> + Send {
+        tokio::net::TcpListener::accept(self)
+    }
+}
+
+#[cfg(unix)]
+impl CappedAccept for tokio::net::UnixListener {
+    type Io = tokio::net::UnixStream;
+    type Addr = tokio::net::unix::SocketAddr;
+    fn accept_one(
+        &mut self,
+    ) -> impl Future<Output = std::io::Result<(Self::Io, Self::Addr)>> + Send {
+        tokio::net::UnixListener::accept(self)
+    }
+}
+
+/// Accepted sockets include requests waiting on the in-flight gate, so this
+/// is above `--esplora-max-inflight`. A connection past it is closed.
+pub fn esplora_accept_cap(max_inflight: usize) -> usize {
+    max_inflight
+        .max(1)
+        .saturating_mul(8)
+        .min(Semaphore::MAX_PERMITS)
+}
+
+/// Accept loop for TCP and unix. Caps sockets, closes one that never sends
+/// headers, and leaves the accept task as soon as `shutdown` is stored.
+fn spawn_capped<L: CappedAccept>(
+    mut listener: L,
+    app: Router,
+    max_conn: usize,
+    header_timeout: Duration,
+    shutdown: Arc<EsploraStop>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        let sem = Arc::new(Semaphore::new(max_conn.max(1)));
+        struct StopConns(Vec<JoinHandle<()>>);
+        impl Drop for StopConns {
+            fn drop(&mut self) {
+                for task in self.0.drain(..) {
+                    task.abort();
+                }
+            }
+        }
+        let mut conns = StopConns(Vec::new());
+        loop {
+            let wake = shutdown.notified();
+            if shutdown.load() {
+                break;
+            }
+            tokio::select! {
+                biased;
+                _ = wake => break,
+                accepted = CappedAccept::accept_one(&mut listener) => {
+                    match accepted {
+                        Ok((io, peer)) => {
+                            conns.0.retain(|t| !t.is_finished());
+                            if !rbitcoin_net::listen::listener_fd_room() {
+                                rbitcoin_log::warn!(
+                                    "esplora: reject {peer:?} (descriptor reserve)"
+                                );
+                                drop(io);
+                                continue;
+                            }
+                            let Ok(permit) = sem.clone().try_acquire_owned() else {
+                                rbitcoin_log::warn!(
+                                    "esplora: reject {peer:?} (at max connections={max_conn})"
+                                );
+                                drop(io);
+                                continue;
+                            };
+                            let service = TowerToHyperService::new(app.clone());
+                            conns.0.push(tokio::spawn(async move {
+                                let _permit = permit;
+                                let mut http = http1::Builder::new();
+                                http.timer(TokioTimer::new())
+                                    .header_read_timeout(header_timeout);
+                                let _ = http.serve_connection(TokioIo::new(io), service).await;
+                            }));
+                        }
+                        Err(e) => {
+                            if rbitcoin_net::service::accept_error_ends_listen(&e) {
+                                rbitcoin_log::warn!("esplora: accept ended: {e}");
+                                break;
+                            }
+                            rbitcoin_log::warn!("esplora: accept retry: {e}");
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
 /// Start Esplora **plain HTTP** on `config.listen`.
 ///
 /// TLS is external (reverse proxy). App [`ServeLimits`] always apply
@@ -1198,21 +1310,13 @@ pub async fn run_esplora(
         EsploraListen::Tcp(addr) => {
             let listener = rbitcoin_net::listen::bind_tcp(addr)?;
             let local_addr = listener.local_addr()?;
-            let task = tokio::spawn(async move {
-                let make = app.into_make_service_with_connect_info::<SocketAddr>();
-                let serve = axum::serve(listener, make).with_graceful_shutdown(async move {
-                    loop {
-                        let wake = shutdown_c.notified();
-                        if shutdown_c.load() {
-                            break;
-                        }
-                        wake.await;
-                    }
-                });
-                if let Err(e) = serve.await {
-                    rbitcoin_log::warn!("esplora: serve ended: {e}");
-                }
-            });
+            let task = spawn_capped(
+                listener,
+                app,
+                esplora_accept_cap(max_conn),
+                idle,
+                shutdown_c,
+            );
             Ok(EsploraHandle {
                 local_addr,
                 socket_path: None,
@@ -1231,20 +1335,13 @@ pub async fn run_esplora(
             }
             let _ = std::fs::remove_file(&path);
             let listener = bind_unix_mode(&path, 0o660)?;
-            let task = tokio::spawn(async move {
-                let serve = axum::serve(listener, app).with_graceful_shutdown(async move {
-                    loop {
-                        let wake = shutdown_c.notified();
-                        if shutdown_c.load() {
-                            break;
-                        }
-                        wake.await;
-                    }
-                });
-                if let Err(e) = serve.await {
-                    rbitcoin_log::warn!("esplora: serve ended: {e}");
-                }
-            });
+            let task = spawn_capped(
+                listener,
+                app,
+                esplora_accept_cap(max_conn),
+                idle,
+                shutdown_c,
+            );
             Ok(EsploraHandle {
                 local_addr: SocketAddr::from(([127, 0, 0, 1], 0)),
                 socket_path: Some(path),

@@ -66,3 +66,62 @@ fn set_exclusive_addr_use(socket: &TcpSocket) -> io::Result<()> {
     }
     Ok(())
 }
+
+/// Descriptors kept back from listeners so the store and RPC can still open
+/// files. Above 1280 this is 1024. At or below that it is one eighth of the
+/// soft limit, and at least 32, so a 1024 limit does not refuse every accept.
+#[cfg(unix)]
+pub fn listener_fd_reserve(soft: u64) -> u64 {
+    if soft > 1024 + 256 {
+        1024
+    } else {
+        (soft / 8).max(32)
+    }
+}
+
+/// `true` when one more accepted socket still leaves the listener reserve.
+///
+/// The new fd is already in the process count. Counting fds needs a
+/// descriptor, so a failed count refuses the socket. A failed `getrlimit`,
+/// an unlimited soft limit, and every non-unix target fail open.
+pub fn listener_fd_room() -> bool {
+    #[cfg(unix)]
+    {
+        fd_room_unix()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
+#[cfg(unix)]
+fn fd_room_unix() -> bool {
+    let mut rlim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `rlim` is a local the call writes.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rlim) } != 0 {
+        return true;
+    }
+    if rlim.rlim_cur == libc::RLIM_INFINITY {
+        return true;
+    }
+    let Some(open) = open_fd_count() else {
+        return false;
+    };
+    let soft = rlim.rlim_cur;
+    soft.saturating_sub(open) >= listener_fd_reserve(soft)
+}
+
+#[cfg(unix)]
+fn open_fd_count() -> Option<u64> {
+    let dir = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let n = std::fs::read_dir(dir).ok()?.count() as u64;
+    Some(n.saturating_sub(1))
+}

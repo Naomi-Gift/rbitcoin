@@ -530,6 +530,18 @@ pub fn spawn_inbound_accept(
                         drop(stream);
                         continue;
                     }
+                    if !crate::listen::listener_fd_room() {
+                        rbitcoin_log::warn!("p2p: reject inbound {peer_addr} (descriptor reserve)");
+                        drop(stream);
+                        continue;
+                    }
+                    let Some(incomplete) = peers.try_reserve_incomplete(peer_addr.ip()) else {
+                        rbitcoin_log::info!(
+                            "p2p: reject inbound {peer_addr} (incomplete handshakes)"
+                        );
+                        drop(stream);
+                        continue;
+                    };
                     let permit = match inbound_sem.clone().try_acquire_owned() {
                         Ok(p) => p,
                         Err(_) => {
@@ -569,20 +581,20 @@ pub fn spawn_inbound_accept(
                         tokio::sync::oneshot::channel::<tokio::task::AbortHandle>();
                     let h = tokio::spawn(async move {
                         let _session_slot = permit;
-                        let (_ver, reader, writer, tcp_shutdown, sess) =
-                            match inbound_connect_and_handshake(
-                                stream, magic, our, peer_addr, height, &ua, &peers, our,
-                            )
-                            .await
-                            {
-                                Ok(x) => x,
-                                Err(e) => {
-                                    rbitcoin_log::debug!(
-                                        "p2p: inbound handshake {peer_addr} failed: {e}"
-                                    );
-                                    return;
-                                }
-                            };
+                        let handshake = inbound_connect_and_handshake(
+                            stream, magic, our, peer_addr, height, &ua, &peers, our,
+                        )
+                        .await;
+                        drop(incomplete);
+                        let (_ver, reader, writer, tcp_shutdown, sess) = match handshake {
+                            Ok(x) => x,
+                            Err(e) => {
+                                rbitcoin_log::debug!(
+                                    "p2p: inbound handshake {peer_addr} failed: {e}"
+                                );
+                                return;
+                            }
+                        };
                         sess.attach_tcp_shutdown(tcp_shutdown);
                         if !peers.make_room_for_tx_relay_inbound(&sess, max_inbound) {
                             rbitcoin_log::debug!(
@@ -651,18 +663,24 @@ pub struct PreparedOutbound {
 
 /// A transient accept error should not stop the listen loop.
 ///
-/// `ConnectionAborted` is a peer that vanished during accept.
-/// `Interrupted` is a signal. `EMFILE` / `ENFILE` (24 / 23) clear once a
-/// socket is closed. Anything else, including a closed listener, ends accept.
+/// A reset peer, a signal, and a full socket table clear once a descriptor
+/// or buffer frees. A closed listener does not.
 #[doc(hidden)]
 pub fn accept_error_ends_listen(err: &std::io::Error) -> bool {
     if matches!(
         err.kind(),
-        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
     ) {
         return false;
     }
-    !matches!(err.raw_os_error(), Some(23 | 24))
+    // ENFILE/EMFILE, EPERM, ENOMEM, ENOBUFS, and the Windows socket-table
+    // and buffer errors. A bad listener fd is not in this set.
+    !matches!(
+        err.raw_os_error(),
+        Some(1 | 12 | 23 | 24 | 105 | 10024 | 10050 | 10055)
+    )
 }
 
 /// How often a down `--connect` / `addnode` target is tried again.

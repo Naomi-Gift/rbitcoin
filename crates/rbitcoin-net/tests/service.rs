@@ -640,6 +640,86 @@ async fn proxied_name_connect_gets_the_socks_bound() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A silent inbound peer, and one that sends a byte every few hundred
+/// milliseconds during key exchange, must not hold an inbound slot past one
+/// peer-timeout. One address must not fill the inbound table with sockets
+/// that have not finished the handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_cap_silent_inbound_releases_the_slot() {
+    use tokio::io::AsyncWriteExt;
+    let n = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("rbitcoin-inbound-deadline-{n}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let node = P2PNode::start_with_agent(
+        "127.0.0.1:0".parse().unwrap(),
+        Query::open_or_create_tiny(&dir).unwrap(),
+        ChainParams::regtest(),
+        Milestone::NONE,
+        "/rbitcoin:0.1.0(deadline)/".into(),
+        rbitcoin_net::DEFAULT_MAX_INBOUND,
+        rbitcoin_net::REDIAL_INTERVAL_TEST,
+    )
+    .await
+    .unwrap();
+    node.peers.set_peer_timeout_secs(1);
+    let mut silent = tokio::net::TcpStream::connect(node.local_addr)
+        .await
+        .unwrap();
+    let mut drip = tokio::net::TcpStream::connect(node.local_addr)
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    let mut saw_row = false;
+    let mut cleared = false;
+    while started.elapsed() < Duration::from_secs(3) {
+        if !node.peers.snapshot().is_empty() {
+            saw_row = true;
+        }
+        let _ = drip.write_all(&[0x11]).await;
+        if saw_row && node.peers.snapshot().is_empty() {
+            cleared = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(saw_row, "the silent inbound never took a slot");
+    assert!(
+        cleared && started.elapsed() < Duration::from_secs(2),
+        "unfinished handshakes still held slots after {:?}",
+        started.elapsed()
+    );
+    let _ = silent.shutdown().await;
+    drop(silent);
+    drop(drip);
+
+    node.peers.set_peer_timeout_secs(30);
+    let mut parked = Vec::new();
+    for _ in 0..24 {
+        parked.push(
+            tokio::net::TcpStream::connect(node.local_addr)
+                .await
+                .unwrap(),
+        );
+    }
+    let cap = rbitcoin_net::peers::MAX_INCOMPLETE_INBOUND_PER_ADDR;
+    let wait = std::time::Instant::now();
+    let mut saw = 0usize;
+    while wait.elapsed() < Duration::from_secs(2) {
+        let n = node.peers.snapshot().len();
+        assert!(n <= cap, "one address held {n} unfinished handshakes");
+        saw = saw.max(n);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(saw > 0, "no unfinished handshake took a slot");
+    drop(parked);
+    node.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn outbound_connect_timeout_is_eight_seconds() {
     assert_eq!(OUTBOUND_CONNECT_TIMEOUT, Duration::from_secs(8));
@@ -657,6 +737,30 @@ fn accept_retries_a_full_fd_table_and_stops_on_a_dead_listener() {
     assert!(!accept_error_ends_listen(&emfile));
     assert!(!accept_error_ends_listen(&enfile));
     assert!(accept_error_ends_listen(&dead));
+    let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "rst");
+    let wsaemfile = std::io::Error::from_raw_os_error(10024);
+    let wsaenobufs = std::io::Error::from_raw_os_error(10055);
+    let wsaenetdown = std::io::Error::from_raw_os_error(10050);
+    let eperm = std::io::Error::from_raw_os_error(1);
+    let enobufs = std::io::Error::from_raw_os_error(105);
+    let enomem = std::io::Error::from_raw_os_error(12);
+    let ebadf = std::io::Error::from_raw_os_error(9);
+    assert!(!accept_error_ends_listen(&reset));
+    assert!(!accept_error_ends_listen(&wsaemfile));
+    assert!(!accept_error_ends_listen(&wsaenobufs));
+    assert!(!accept_error_ends_listen(&wsaenetdown));
+    assert!(!accept_error_ends_listen(&eperm));
+    assert!(!accept_error_ends_listen(&enobufs));
+    assert!(!accept_error_ends_listen(&enomem));
+    assert!(accept_error_ends_listen(&ebadf));
+}
+
+#[test]
+fn inbound_handshake_limit_cannot_exceed_sixty_seconds() {
+    use rbitcoin_net::peer::{inbound_handshake_limit, HANDSHAKE_TIMEOUT};
+    assert_eq!(inbound_handshake_limit(1), Duration::from_secs(1));
+    assert_eq!(inbound_handshake_limit(60), HANDSHAKE_TIMEOUT);
+    assert_eq!(inbound_handshake_limit(3600), HANDSHAKE_TIMEOUT);
 }
 
 #[tokio::test]

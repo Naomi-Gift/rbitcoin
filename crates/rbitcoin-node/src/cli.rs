@@ -420,7 +420,7 @@ Block filters: --block-filter-index (default off) builds BIP158 basic filters. I
   --max-sh-creates N refuses an unpaged Electrum/Esplora join with more than N creates (default 10000; 0 = unlimited). A paged history request is still served.\n\
   --heavy-sh-creates N runs unpaged Electrum/Esplora joins with more than N creates one at a time across the node (default 10000; 0 = no limit). Lighter joins stay parallel.\n\
   --electrum-max-subs N caps blockchain.scripthash.subscribe per Electrum connection (default 10000; >= 1). Wallets subscribe every address up to their gap limit.\n\
-  --esplora-max-inflight N caps Esplora requests in flight across the whole listener (default 256; >= 1). Further requests wait for a slot; the wait counts against the request timeout (408).\n\
+  --esplora-max-inflight N caps Esplora requests in flight across the whole listener (default 256; >= 1). Accepted TCP is 8× that, and a further socket is closed. A socket that sends no headers is closed at the idle timeout. A request that finds the in-flight cap full waits; the wait counts against the request timeout (408).\n\
   --store-read-budget N caps concurrent API store reads across RPC, REST, Electrum, Esplora, and BlindBit (N >= 1). Omitted or 0 uses the default: 1 when --datadir-hdd is set, otherwise one less than the core count, minimum 1. An explicit N overrides --datadir-hdd. Waiters do not hold a blocking-pool thread.\n\
   --esplora-block-template enables GET /block-template (GBT template JSON; default off).\n\
   --electrum-onion (default off) ADD_ONION for --electrum-listen. Needs --tor-control and a TCP listen on 127.0.0.1 or 0.0.0.0.\n\
@@ -436,7 +436,8 @@ Silent payments: --sp-tweaks (default off) writes/serves the thin BIP-352 tweak 
   --sp-tweaks-dust SATS omits served P2TR outs with value <= SATS (default 1000; 0 = all; 546 = Cake electrs).\n\
 Health: --health-listen [ADDR] serves GET /healthz, GET /readyz, and GET /progress (JSON:\n\
   the running index build, rebuild, or backfill stage, at any log level) from the first\n\
-  second of startup (default 127.0.0.1:9332). Unauthenticated; keep it on loopback or a\n\
+  second of startup (default 127.0.0.1:9332). At most 64 connections; one that sends\n\
+  nothing is closed after 5s. Unauthenticated; keep it on loopback or a\n\
   probe-only network. --metrics adds Prometheus GET /metrics there (needs --health-listen).\n\
 SV2: --sv2-tp-listen ADDR serves the Stratum v2 Template Distribution Protocol (Noise over TCP; default off).\n\
   Requires --sv2-tp-authority-sec KEY (secp256k1 secret, 64 hex or key-utils base58check; argv exposes it) or --sv2-tp-authority-sec-file PATH\n\

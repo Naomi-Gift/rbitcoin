@@ -1349,6 +1349,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             &node.hub,
             &params,
             &mempool,
+            &status.electrum_listen,
         )
         .await,
     );
@@ -1509,6 +1510,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                             &node.hub,
                             &params,
                             &mempool,
+                            &status.electrum_listen,
                         )
                         .await,
                     );
@@ -2915,6 +2917,7 @@ pub async fn start_electrum_if_ready(
     hub: &ChainHub,
     params: &rbitcoin_consensus::ChainParams,
     mempool: &std::sync::Arc<MempoolHub>,
+    electrum_listen: &std::sync::Arc<std::sync::atomic::AtomicU8>,
 ) -> Result<
     (
         Vec<ElectrumHandle>,
@@ -2943,6 +2946,7 @@ pub async fn start_electrum_if_ready(
     ecfg.max_scripthash_subs = electrum_max_subs;
     ecfg.tweaks_min_dust = tweaks_min_dust;
     ecfg.onion_tcp = Arc::clone(&onion_tcp);
+    ecfg.listen_state = Some(Arc::clone(electrum_listen));
     ecfg.batch_window = rbitcoin_electrum::batch_window(crate::cli::blocking_pool_size());
     let max_conn = ecfg.limits.max_connections;
     let max_line = ecfg.limits.max_request_bytes;

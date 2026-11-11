@@ -110,7 +110,7 @@ Clean smoke:
 | `--esplora-i2p[=0\|1]` | `esplora_i2p=` | **off** — I2P destination for Esplora (`{datadir}/i2p/esplora.priv`). Needs `--i2p-sam` and a TCP `--esplora-listen` on `127.0.0.1` or `0.0.0.0` |
 | `--health-listen [ADDR]` | `health_listen=` | disabled; omit ADDR → `127.0.0.1:9332`. Unauthenticated `GET /healthz`, `/readyz`, and `/progress`, bound before the store opens ([Health probes and metrics](#health-probes-and-metrics)). A bind failure stops the node |
 | `--metrics[=0\|1]` | `metrics=` | **off** — Prometheus `GET /metrics` on the health listener. Refused without `--health-listen` |
-| `--esplora-max-inflight N` | `esplora_max_inflight=` | **256** — Esplora requests in flight across the whole listener (>= 1, at most tokio's semaphore limit). Further requests wait for a slot rather than being refused; the wait counts against the 120 s request timeout (**408**). One wallet rescan can fill it; raise it for a busy public listener. |
+| `--esplora-max-inflight N` | `esplora_max_inflight=` | **256** — Esplora requests in flight across the whole listener (>= 1, at most tokio's semaphore limit). Accepted TCP is 8× that, and a further socket is closed. A socket that sends no headers is closed at the idle timeout. Further requests wait for a slot rather than being refused; the wait counts against the 120 s request timeout (**408**). One wallet rescan can fill it; raise it for a busy public listener. |
 | `--esplora-block-template` | `esplora_block_template=` | **off** — `GET /block-template` is 404; on = GBT JSON (same as RPC template mode) |
 | `--rpc` | `rpc=` | **off** — unix JSON-RPC `{datadir}/rpc.sock` (mode 0600) |
 | `--rpc-listen [ADDR]` | `rpc_listen=` | disabled — implies `--rpc`; omit ADDR → `127.0.0.1` and Core-matching RPC port |
@@ -498,6 +498,7 @@ probe-only network.
 | `catch-up` | Initial block download |
 | `indexing` | Tip-mode entry (scripthash materialize), follow peers, listeners |
 | `stopping` | Shutdown flush |
+| `electrum listener down` | The Electrum accept task stopped without a clean shutdown |
 | `initial block download` | Same value as RPC `getblockchaininfo.initialblockdownload` (`--max-tip-age`, `--min-chain-work`). Latches off after the first exit, as in Core |
 | `tip stale (last block Ns ago)` | The non-latching half of that check: the tip block is older than `--max-tip-age` (default 24h). This still fires after IBD has latched off, so a node that later loses every peer stops being ready |
 | `tip N blocks behind headers` | `headers - blocks` is over 6 |

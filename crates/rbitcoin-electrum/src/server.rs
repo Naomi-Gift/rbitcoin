@@ -15,7 +15,7 @@ use rbitcoin_store::StoreError;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -147,7 +147,17 @@ pub struct ElectrumConfig {
     /// Read-only batch items one connection may have in flight
     /// ([`batch_window`]). The node sets it from its blocking pool.
     pub batch_window: usize,
+    /// `Some` is [`LISTEN_OFF`], [`LISTEN_UP`], or [`LISTEN_DOWN`]. The accept
+    /// task writes it. `None` leaves the caller's flag alone.
+    pub listen_state: Option<Arc<AtomicU8>>,
 }
+
+/// Electrum accept task has not been started.
+pub const LISTEN_OFF: u8 = 0;
+/// Electrum accept loop is running.
+pub const LISTEN_UP: u8 = 1;
+/// Electrum accept loop stopped without a shutdown request.
+pub const LISTEN_DOWN: u8 = 2;
 
 impl ElectrumConfig {
     pub fn for_params(listen: SocketAddr, params: &ChainParams) -> Self {
@@ -164,6 +174,7 @@ impl ElectrumConfig {
             tweaks_min_dust: crate::tweaks::DEFAULT_TWEAKS_MIN_DUST,
             onion_tcp: Arc::new(OnceLock::new()),
             batch_window: batch_window(MIN_BLOCKING_POOL),
+            listen_state: None,
         }
     }
 
@@ -292,7 +303,32 @@ pub async fn run_electrum(
     let clients: Arc<Mutex<Vec<JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
     let clients_c = clients.clone();
 
+    let listen_state = config.listen_state.clone();
     let task = tokio::spawn(async move {
+        struct ListenMark {
+            state: Option<Arc<AtomicU8>>,
+            stop: Arc<ElectrumStop>,
+        }
+        impl Drop for ListenMark {
+            fn drop(&mut self) {
+                let Some(state) = &self.state else {
+                    return;
+                };
+                let next = if self.stop.load() {
+                    LISTEN_OFF
+                } else {
+                    LISTEN_DOWN
+                };
+                state.store(next, Ordering::SeqCst);
+            }
+        }
+        if let Some(state) = &listen_state {
+            state.store(LISTEN_UP, Ordering::SeqCst);
+        }
+        let _mark = ListenMark {
+            state: listen_state,
+            stop: Arc::clone(&shutdown_c),
+        };
         loop {
             let wake = shutdown_c.notified();
             if shutdown_c.load() {
@@ -304,6 +340,13 @@ pub async fn run_electrum(
                 accept = listener.accept() => {
             match accept {
                 Ok((stream, peer)) => {
+                    if !rbitcoin_net::listen::listener_fd_room() {
+                        rbitcoin_log::warn!(
+                            "electrum: reject {peer} (descriptor reserve)"
+                        );
+                        drop(stream);
+                        continue;
+                    }
                     let Ok(permit) = conn_sem.clone().try_acquire_owned() else {
                         rbitcoin_log::warn!(
                             "electrum: reject {peer} (at max_connections={max_conn})"
@@ -332,7 +375,14 @@ pub async fn run_electrum(
                     g.retain(|t| !t.is_finished());
                     g.push(h);
                 }
-                Err(_) => break,
+                Err(e) => {
+                    if rbitcoin_net::service::accept_error_ends_listen(&e) {
+                        rbitcoin_log::warn!("electrum: accept ended: {e}");
+                        break;
+                    }
+                    rbitcoin_log::warn!("electrum: accept retry: {e}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
             }
                 }
             }
