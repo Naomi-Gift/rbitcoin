@@ -4867,6 +4867,39 @@ fn encode_spent_slots_duplicate_vout_last_wins() {
 }
 
 #[test]
+fn spent_body_image_keeps_the_lower_fk() {
+    let mut image = SpentBodyImage::zeros(&[2, 1]);
+    assert_eq!(image.offs(), &[0, 16, 24]);
+    assert_eq!(image.bytes().len(), 24);
+    assert!(image.bytes().iter().all(|&b| b == 0));
+
+    image.place(0, 1, Fk(9), 3).unwrap();
+    let want = encode_spent_slot(0, Fk(9), 3).unwrap();
+    assert_eq!(&image.bytes()[8..16], &want);
+    assert!(image.bytes()[0..8].iter().all(|&b| b == 0));
+    assert!(image.bytes()[16..24].iter().all(|&b| b == 0));
+
+    let before = image.bytes().to_vec();
+    image.place(0, 1, Fk(4), 1).unwrap();
+    let (_, fk, vin) = decode_spent_slot(&image.bytes()[8..16]).unwrap();
+    assert_eq!((fk, vin), (Fk(4), 1));
+    image.place(0, 1, Fk(8), 7).unwrap();
+    let (_, fk, vin) = decode_spent_slot(&image.bytes()[8..16]).unwrap();
+    assert_eq!((fk, vin), (Fk(4), 1), "higher fk must not replace");
+    image.place(0, 1, Fk(4), 2).unwrap();
+    let (_, fk, vin) = decode_spent_slot(&image.bytes()[8..16]).unwrap();
+    assert_eq!((fk, vin), (Fk(4), 1), "equal fk keeps the first vin");
+
+    let snap = image.bytes().to_vec();
+    assert!(image.place(0, 2, Fk(1), 0).is_err());
+    assert!(image.place(0, 1, Fk(1u64 << 40), 0).is_err());
+    assert!(image.place(0, 1, Fk(1), 1u32 << 16).is_err());
+    assert!(image.place(2, 0, Fk(1), 0).is_err());
+    assert_eq!(image.bytes(), &snap);
+    assert_ne!(before, snap);
+}
+
+#[test]
 fn spent_span_matches_slot_len_times_n_out() {
     for n_out in [0u32, 1, 4, 500] {
         let mut buf = Vec::new();

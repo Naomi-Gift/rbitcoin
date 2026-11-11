@@ -849,6 +849,66 @@ pub fn decode_spent_slot(raw: &[u8]) -> Result<(u8, Fk, u32), StoreError> {
     Ok((flags, field, vin))
 }
 
+/// Exact `spent.body` image for one Class A append: `8 × n_out` zeros per create.
+///
+/// `offs[i]` is the byte start of create `i`. `offs` is one longer than the
+/// create count and `offs[last] == bytes.len()`.
+pub struct SpentBodyImage {
+    bytes: Vec<u8>,
+    offs: Vec<usize>,
+}
+
+impl SpentBodyImage {
+    pub fn zeros(n_outs: &[u32]) -> Self {
+        let mut offs = Vec::with_capacity(n_outs.len().saturating_add(1));
+        offs.push(0);
+        let mut n = 0usize;
+        for &n_out in n_outs {
+            n = n.saturating_add((n_out as usize).saturating_mul(OutputRecord::SPENT_SLOT_LEN));
+            offs.push(n);
+        }
+        Self {
+            bytes: vec![0u8; n],
+            offs,
+        }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    pub fn offs(&self) -> &[usize] {
+        &self.offs
+    }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+
+    /// Write a sole spender. A slot that already names an equal or lower fk stays.
+    pub fn place(&mut self, create: usize, vout: u32, fk: Fk, vin: u32) -> Result<(), StoreError> {
+        let end_i = create.saturating_add(1);
+        if end_i >= self.offs.len() {
+            return Err(StoreError::Corrupt("spent overlay create"));
+        }
+        let start = self.offs[create];
+        let end = self.offs[end_i];
+        let n_out = end.saturating_sub(start) / OutputRecord::SPENT_SLOT_LEN;
+        if (vout as usize) >= n_out {
+            return Err(StoreError::Corrupt("spent overlay vout"));
+        }
+        let slot = encode_spent_slot(0, fk, vin)?;
+        let off = start + (vout as usize) * OutputRecord::SPENT_SLOT_LEN;
+        let (_flags, existing, _vin) =
+            decode_spent_slot(&self.bytes[off..off + OutputRecord::SPENT_SLOT_LEN])?;
+        if !existing.is_null() && fk.0 >= existing.0 {
+            return Ok(());
+        }
+        self.bytes[off..off + OutputRecord::SPENT_SLOT_LEN].copy_from_slice(&slot);
+        Ok(())
+    }
+}
+
 /// Spent abs for `vout` given the create's `spent.body` range start.
 #[inline]
 pub fn spent_abs(spent_off: u64, vout: u32) -> u64 {
