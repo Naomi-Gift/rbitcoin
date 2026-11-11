@@ -877,6 +877,7 @@ fn warn_fault_without_keep_fails_the_wave() {
     fn warn(_: &u32) -> Result<(), ConsensusError> {
         Err(ConsensusError::BadTx("not final"))
     }
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
     let err = start_for_each_owned((0..2u32).collect(), warn)
         .unwrap()
         .expect("wave")
@@ -889,6 +890,7 @@ fn warn_fault_without_keep_fails_the_wave() {
 
 #[test]
 fn park_delay_waits_until_go() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
     let arm = DelayParkArm::arm();
     let entered = thread::spawn(maybe_delay_park);
     wait_until("park delay was not entered", || {
