@@ -1847,7 +1847,8 @@ fn cpfp_heavy_child(op: OutPoint) -> (Transaction, Transaction) {
 }
 
 /// A parent-then-child package must admit a child that was already parked
-/// on that parent, and a failed package must leave that child parked.
+/// on that parent, and a failed package must leave that child parked. The
+/// admitted child stays parked too, as Core's RPC package leaves it.
 #[test]
 fn package_admits_its_parked_child() {
     let dir = tmp_dir();
@@ -1907,7 +1908,8 @@ fn package_admits_its_parked_child() {
         mp.graph.contains(&sibling_id),
         "a parked sibling that is not in the package must still be admitted"
     );
-    assert_eq!(mp.orphan_count(), 0);
+    assert!(mp.orphanage.contains_wtxid(&child.compute_wtxid()));
+    assert_eq!(mp.orphan_count(), 1, "only the package member stays parked");
     let _ = std::fs::remove_dir_all(&dir);
 
     let dir = tmp_dir();
@@ -3469,7 +3471,7 @@ fn promote_keeps_the_announcer_of_a_multi_parent_orphan() {
     mp.accept_tx(&parent_a, &utxos, TIP_OK)
         .expect("first parent");
     assert_eq!(
-        mp.orphanage.announcers_of(&child_id),
+        mp.orphanage.announcers_of(&child.compute_wtxid()),
         vec![4],
         "the repark must keep the announcing peer"
     );
@@ -3521,16 +3523,16 @@ fn disconnect_while_the_orphan_is_out_is_not_reparked() {
     missing.insert(parent_a.compute_txid());
     missing.insert(parent_b.compute_txid());
     mp.park_orphan_from(&child, missing.clone(), Some(4));
-    mp.orphanage.add_announcer(&child_id, 8);
-    let _taken = mp.orphanage.take_children_of(&parent_a.compute_txid());
+    mp.orphanage.add_announcer(&child.compute_wtxid(), 8);
+    let _taken = mp.take_orphan_children(parent_a.compute_txid());
     mp.orphanage.erase_for_peer(4);
     let _ = mp.park_announced(&child, missing.clone(), &[4, 8]);
     assert_eq!(
-        mp.orphanage.announcers_of(&child_id),
+        mp.orphanage.announcers_of(&child.compute_wtxid()),
         vec![8],
         "only the peer that is still connected is restored"
     );
-    let _taken = mp.orphanage.take_children_of(&parent_b.compute_txid());
+    let _taken = mp.take_orphan_children(parent_b.compute_txid());
     mp.orphanage.erase_for_peer(8);
     let _ = mp.park_announced(&child, missing, &[8]);
     assert!(
@@ -3581,16 +3583,17 @@ fn older_promote_forget_does_not_clear_a_newer_take() {
     missing.insert(parent_a.compute_txid());
     missing.insert(parent_b.compute_txid());
     mp.park_orphan_from(&child, missing.clone(), Some(4));
-    let first = mp.orphanage.take_children_of(&parent_a.compute_txid());
+    let first = mp.take_orphan_children(parent_a.compute_txid());
     let old_gen = first[0].taken_gen;
     let _ = mp.park_announced(&child, missing.clone(), &[4]);
-    let second = mp.orphanage.take_children_of(&parent_b.compute_txid());
+    let second = mp.take_orphan_children(parent_b.compute_txid());
     assert_eq!(
         second.len(),
         1,
         "the second promote took the reparked child"
     );
-    mp.orphanage.forget_taken_gen(&child_id, old_gen);
+    mp.orphanage
+        .forget_taken_gen(&child.compute_wtxid(), old_gen);
     mp.orphanage.erase_for_peer(4);
     let _ = mp.park_announced(&child, missing, &[4]);
     assert!(
@@ -3641,12 +3644,12 @@ fn package_lift_disconnect_is_not_reparked() {
     missing.insert(parent_a.compute_txid());
     missing.insert(parent_b.compute_txid());
     mp.park_orphan_from(&child, missing.clone(), Some(4));
-    mp.orphanage.add_announcer(&child_id, 8);
+    mp.orphanage.add_announcer(&child.compute_wtxid(), 8);
     let lifted = mp.lift_parked_member(&child).unwrap();
     mp.orphanage.erase_for_peer(4);
     let _ = mp.park_announced(&lifted.tx, missing.clone(), &lifted.announcers);
     assert_eq!(
-        mp.orphanage.announcers_of(&child_id),
+        mp.orphanage.announcers_of(&child.compute_wtxid()),
         vec![8],
         "a disconnect during a package lift drops that peer"
     );
@@ -3678,9 +3681,15 @@ fn package_admit_drops_the_inflight_row() {
     let mut missing = BTreeSet::new();
     missing.insert(parent.compute_txid());
     mp.park_orphan_from(&child, missing, Some(4));
-    mp.accept_package(&[parent, child], &utxos, TIP_OK)
+    mp.accept_package(&[parent, child.clone()], &utxos, TIP_OK)
         .expect("package admits the parked child");
     assert!(mp.graph.contains(&child_id));
+    assert_eq!(
+        mp.orphanage.announcers_of(&child.compute_wtxid()),
+        vec![4],
+        "the admitted child stays parked under its peer"
+    );
+    mp.orphanage.erase_for_peer(4);
     assert!(
         !mp.orphanage.has_announcer(4),
         "an admitted lift must not keep the peer in the in-flight map"

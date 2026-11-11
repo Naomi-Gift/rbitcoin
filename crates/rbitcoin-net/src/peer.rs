@@ -5139,14 +5139,9 @@ pub fn on_inv_txid(
     if mp.try_recent_reject_txid(txid) {
         return None;
     }
-    let in_orphan = mp.try_orphan_missing(txid).is_some();
-    if mp.try_contains(txid) && !in_orphan {
-        if let Some(s) = session {
-            let _ = mp.add_orphan_announcer(txid, s.id);
-        }
-        if !asks_back_local_tx(mp, session, txid) {
-            return None;
-        }
+    if mp.try_contains(txid) && !mp.try_orphan_txid(txid) && !asks_back_local_tx(mp, session, txid)
+    {
+        return None;
     }
     if let Some(s) = session {
         match mp.note_inv_tx_requested(s.id, txid.to_byte_array(), s.inbound, s.clock_now(), false)
@@ -5213,7 +5208,7 @@ pub fn on_inv_wtxid(
         return Some(Inventory::WTx(*wtxid));
     }
     let s = session?;
-    let _ = mp.add_orphan_announcer_wtxid(wtxid, s.id);
+    let _ = mp.add_orphan_announcer(wtxid, s.id);
     if let Some(tx) = mp.try_orphan_tx_wtxid(wtxid) {
         let missing = mp.orphan_getdata_parents(&tx);
         mp.schedule_orphan_parents(&missing, s.id, s.inbound, s.clock_now());
@@ -6903,17 +6898,17 @@ pub async fn on_tx(
                         TxAcceptLog::Park(_missing) => {
                             rbitcoin_log::debug!("txrelay: park {txid} missingorspent");
                             for p in &extra_from {
-                                let _ = mp.add_orphan_announcer(&txid, *p);
+                                let _ = mp.add_orphan_announcer(&wtxid, *p);
                             }
-                            if mp.try_orphan_missing(&txid).is_some() {
+                            if mp.try_orphan_missing(&wtxid).is_some() {
                                 schedule_orphan_parent_getdata(mp, tx, session, &extra_from);
                             }
                         }
                         TxAcceptLog::ParentFetch(_missing) => {
                             for p in &extra_from {
-                                let _ = mp.add_orphan_announcer(&txid, *p);
+                                let _ = mp.add_orphan_announcer(&wtxid, *p);
                             }
-                            if mp.try_orphan_missing(&txid).is_some() {
+                            if mp.try_orphan_missing(&wtxid).is_some() {
                                 schedule_orphan_parent_getdata(mp, tx, session, &extra_from);
                             }
                         }

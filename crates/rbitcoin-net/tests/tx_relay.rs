@@ -2787,7 +2787,7 @@ fn accept_from_peer_erase_drops_orphan() {
         .unwrap_err();
     assert!(matches!(err, AcceptError::Orphaned { .. }), "{err}");
     assert_eq!(hub.orphan_snapshot()[0].announcers, vec![4]);
-    hub.add_orphan_announcer(&tx.compute_txid(), 8);
+    hub.add_orphan_announcer(&tx.compute_wtxid(), 8);
     assert_eq!(hub.orphan_snapshot()[0].announcers, vec![4, 8]);
     hub.erase_orphans_for_peer(4);
     assert_eq!(hub.orphan_count(), 1);
@@ -3365,6 +3365,57 @@ fn accept_package_does_not_park_orphan_member() {
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
+/// Core `p2p_orphan_handling.py` `test_orphan_in_mempool`: two witnesses of
+/// one child both wait. An RPC package leaves them parked. The peer's resent
+/// parent erases them once their txid is in the mempool.
+#[test]
+fn orphan_witnesses_wait_until_a_resent_parent_finds_their_txid_pooled() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let parent = spend_true(cbs[11], 0, ScriptBuf::from_bytes(vec![0x51]));
+    let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9990_0000);
+    let malleate = |tx: &Transaction| {
+        let mut bad = tx.clone();
+        bad.input[0].witness = Witness::from_slice(&[[1u8]]);
+        bad
+    };
+    let parent_bad = malleate(&parent);
+    let child_bad = malleate(&child);
+    let peer = TxOrigin::Relay(Some(4));
+    hub.accept_tx_from(&parent_bad, peer)
+        .expect_err("a 0-fee parent");
+    for tx in [&child, &child_bad] {
+        let err = hub.accept_tx_from(tx, peer).unwrap_err();
+        assert!(matches!(err, AcceptError::Orphaned { .. }), "{err:?}");
+    }
+    let parked = |tx: &Transaction| {
+        hub.lock_read()
+            .orphanage
+            .contains_wtxid(&tx.compute_wtxid())
+    };
+    assert!(
+        parked(&child) && parked(&child_bad),
+        "both witnesses of the child wait"
+    );
+
+    let rows = hub.submit_package_rpc(&[parent.clone(), child.clone()]);
+    assert!(rows.iter().all(|r| r.result.is_ok()), "{rows:?}");
+    assert!(
+        parked(&child) && parked(&child_bad),
+        "an RPC package leaves both orphans parked"
+    );
+
+    let _ = hub.accept_tx_from(&parent_bad, peer);
+    assert!(
+        !parked(&child) && !parked(&child_bad),
+        "the resent parent erases the peer's orphans whose txid is pooled"
+    );
+    assert!(hub.try_contains(&child.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A child already in the orphan pool is still a package member.
 /// `submitpackage` and Electrum use this hub path.
 #[test]
@@ -3422,7 +3473,7 @@ fn hub_package_admits_its_parked_child() {
         );
     }
     assert!(
-        hub.add_orphan_announcer(&child_id, 4),
+        hub.add_orphan_announcer(&child.compute_wtxid(), 4),
         "the parked child takes the peer"
     );
     let accepted = hub
@@ -3431,6 +3482,14 @@ fn hub_package_admits_its_parked_child() {
     assert_eq!(accepted.len(), 2);
     assert!(hub.try_contains(&parent_id));
     assert!(hub.try_contains(&child_id));
+    assert_eq!(
+        hub.lock_read()
+            .orphanage
+            .announcers_of(&child.compute_wtxid()),
+        vec![4],
+        "the admitted child stays parked under its peer, as Core's RPC package leaves it"
+    );
+    hub.erase_orphans_for_peer(4);
     assert!(
         !hub.lock_write().orphanage.has_announcer(4),
         "admitting the lifted child must drop its in-flight peer"
@@ -3513,7 +3572,7 @@ fn failed_package_does_not_park_child_under_a_live_parent() {
         let mut g = hub.lock_write();
         g.park_orphan_from(&child, missing, Some(4));
     }
-    hub.add_orphan_announcer(&child_id, 8);
+    hub.add_orphan_announcer(&child.compute_wtxid(), 8);
     let dummy = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -3577,7 +3636,7 @@ fn failed_package_does_not_park_child_under_a_live_parent() {
         let mut g = hub.lock_write();
         g.park_orphan_from(&child, missing, Some(4));
     }
-    hub.add_orphan_announcer(&child_id, 8);
+    hub.add_orphan_announcer(&child.compute_wtxid(), 8);
     let dummy = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -5968,13 +6027,12 @@ async fn add_orphan_announcer_does_not_panic_on_tokio_worker() {
         .accept_tx_from(&tx, TxOrigin::Relay(Some(4)))
         .unwrap_err();
     assert!(matches!(err, AcceptError::Orphaned { .. }), "{err}");
-    let txid = tx.compute_txid();
     let wtxid = tx.compute_wtxid();
     let join = tokio::spawn(async move {
         let name = std::thread::current().name().unwrap_or("").to_string();
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assert!(hub.add_orphan_announcer(&txid, 8));
-            assert!(hub.add_orphan_announcer_wtxid(&wtxid, 9));
+            assert!(hub.add_orphan_announcer(&wtxid, 8));
+            assert!(hub.add_orphan_announcer(&wtxid, 9));
             hub.erase_orphans_for_peer(4);
             hub.erase_orphans_for_peer(8);
             hub.erase_orphans_for_peer(9);

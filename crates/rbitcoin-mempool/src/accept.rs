@@ -1206,7 +1206,7 @@ impl ActiveMempool {
         }
         // Already parked: soft re-announce of the same orphan.
         if report_orphans {
-            if let Some(missing) = self.orphanage.missing_of(&txid).cloned() {
+            if let Some(missing) = self.orphanage.missing_of(&wtxid).cloned() {
                 return Err(AcceptError::Orphaned {
                     txid,
                     missing,
@@ -1367,17 +1367,16 @@ impl ActiveMempool {
         if self.graph.get(&txid).is_some() {
             return AcceptError::Duplicate(txid);
         }
-        if let Some(parked) = self.orphanage.missing_of(&txid).cloned() {
-            if self.orphanage.contains_wtxid(&tx.compute_wtxid()) {
-                if let Some(peer) = from {
-                    self.orphanage.add_announcer(&txid, peer);
-                }
-                return AcceptError::Orphaned {
-                    txid,
-                    missing: parked,
-                    fresh: false,
-                };
+        let wtxid = tx.compute_wtxid();
+        if let Some(parked) = self.orphanage.missing_of(&wtxid).cloned() {
+            if let Some(peer) = from {
+                self.orphanage.add_announcer(&wtxid, peer);
             }
+            return AcceptError::Orphaned {
+                txid,
+                missing: parked,
+                fresh: false,
+            };
         }
         if missing.is_empty() {
             return AcceptError::MissingPrevout(tx.input[0].previous_output);
@@ -1398,7 +1397,15 @@ impl ActiveMempool {
 
     /// Take orphans waiting on `parent` (hub promote outside the write lock).
     pub fn take_orphan_children(&mut self, parent: Txid) -> Vec<OrphanSnapshot> {
-        self.orphanage.take_children_of(&parent)
+        self.orphanage
+            .take_children_of(&parent, |t| self.graph.contains(t))
+    }
+
+    /// Core `Find1P1CPackage`: erase `peer`'s orphans of `parent` whose txid
+    /// is already in the mempool. Neither can enter.
+    pub fn erase_pooled_orphans(&mut self, parent: &Txid, peer: u64) {
+        self.orphanage
+            .erase_pooled_children(parent, peer, |t| self.graph.contains(t))
     }
 
     /// Drop orphans that are themselves in `block_txids`.
@@ -1741,12 +1748,7 @@ impl ActiveMempool {
             }
             return Err(AcceptError::Policy("txn-same-nonwitness-data-in-mempool"));
         }
-        if self.orphanage.contains(&txid) {
-            let missing = self
-                .orphanage
-                .missing_of(&txid)
-                .cloned()
-                .unwrap_or_default();
+        if let Some(missing) = self.orphanage.missing_of(&prep.wtxid).cloned() {
             return Err(AcceptError::Orphaned {
                 txid,
                 missing,
@@ -1867,7 +1869,7 @@ impl ActiveMempool {
             match self.accept_tx_with(&child.tx, utxos, tip, 0, true, None, SiblingEviction::On) {
                 Ok(r) => {
                     self.orphanage
-                        .forget_taken_gen(&child.tx.compute_txid(), child.taken_gen);
+                        .forget_taken_gen(&child.tx.compute_wtxid(), child.taken_gen);
                     self.push_orphan_children(r.txid, &mut queue);
                 }
                 Err(e) => {
@@ -1875,7 +1877,7 @@ impl ActiveMempool {
                         let _ = self.park_announced(&child.tx, missing, &child.announcers);
                     } else {
                         self.orphanage
-                            .forget_taken_gen(&child.tx.compute_txid(), child.taken_gen);
+                            .forget_taken_gen(&child.tx.compute_wtxid(), child.taken_gen);
                     }
                     for id in self.restore_conflicts(utxos, tip, RestoreOrphans::Defer) {
                         self.push_orphan_children(id, &mut queue);
@@ -1888,7 +1890,7 @@ impl ActiveMempool {
     /// Orphans of `parent`, earlier children still ahead of later ones.
     #[doc(hidden)]
     pub fn push_orphan_children(&mut self, parent: Txid, queue: &mut VecDeque<OrphanSnapshot>) {
-        for child in self.orphanage.take_children_of(&parent).into_iter().rev() {
+        for child in self.take_orphan_children(parent).into_iter().rev() {
             queue.push_front(child);
         }
     }
@@ -2147,7 +2149,7 @@ impl ActiveMempool {
                     self.restore_undone(utxos, tip);
                     self.rollback_accepted_package(&accepted, utxos, tip);
                     for item in self.repark_lifted(&lifted, utxos, tip, &|_| 0, None) {
-                        let id = item.tx.compute_txid();
+                        let id = item.tx.compute_wtxid();
                         // A put-back after the failed package: it does not
                         // evict the child the rollback just restored.
                         match self.accept_tx_with(
@@ -2178,10 +2180,9 @@ impl ActiveMempool {
                 }
             }
         }
-        // Every lifted member was admitted. A newer take keeps its own generation.
+        // Every lifted member was admitted, and stays parked as Core leaves it.
         for item in &lifted {
-            self.orphanage
-                .forget_taken_gen(&item.tx.compute_txid(), item.taken_gen);
+            self.keep_admitted_parked(item);
         }
         let ids: Vec<Txid> = accepted.iter().map(|r| r.txid).collect();
         for id in ids {
@@ -2208,7 +2209,7 @@ impl ActiveMempool {
             .by_parent
             .get(&pid)?
             .iter()
-            .filter_map(|id| self.orphanage.by_txid.get(id))
+            .filter_map(|id| self.orphanage.by_wtxid.get(id))
             .filter(|e| {
                 e.missing.len() == 1 && policy::spends_dust_of(parent, &e.tx) && !tried(&e.tx)
             });
@@ -2233,10 +2234,10 @@ impl ActiveMempool {
     /// still parked, even when its parents are already in the mempool.
     /// The announcing peers come along so a failed package can put them back.
     pub fn lift_parked_member(&mut self, tx: &Transaction) -> Option<LiftedOrphan> {
-        let id = tx.compute_txid();
+        let id = tx.compute_wtxid();
         self.orphanage.missing_of(&id)?;
         let announcers = self.orphanage.announcers_of(&id);
-        let parked = self.orphanage.take_txid(&id)?;
+        let parked = self.orphanage.remove_wtxid(&id)?;
         let taken_gen = self.orphanage.note_taken(id, &announcers);
         Some(LiftedOrphan {
             tx: parked,
@@ -2264,8 +2265,9 @@ impl ActiveMempool {
         let mut ready = Vec::new();
         for item in lifted {
             let txid = item.tx.compute_txid();
+            let wtxid = item.tx.compute_wtxid();
             if self.graph.contains(&txid) {
-                self.orphanage.forget_taken_gen(&txid, item.taken_gen);
+                self.orphanage.forget_taken_gen(&wtxid, item.taken_gen);
                 continue;
             }
             match self.prepare_admit(
@@ -2287,7 +2289,7 @@ impl ActiveMempool {
                     announcers: item.announcers.clone(),
                     taken_gen: item.taken_gen,
                 }),
-                Err(_) => self.orphanage.forget_taken_gen(&txid, item.taken_gen),
+                Err(_) => self.orphanage.forget_taken_gen(&wtxid, item.taken_gen),
             }
         }
         ready
@@ -2303,26 +2305,57 @@ impl ActiveMempool {
         missing: BTreeSet<Txid>,
         announcers: &[u64],
     ) -> AcceptError {
-        let txid = tx.compute_txid();
-        // A disconnect while this orphan was out of `by_txid` edited the
-        // in-flight record. The slice from the take is already stale.
-        let live = match self.orphanage.claim_taken(&txid) {
-            Some(crate::orphanage::TakenClaim::Drop) => {
-                return AcceptError::Orphaned {
-                    txid,
-                    missing,
-                    fresh: false,
-                };
-            }
-            Some(crate::orphanage::TakenClaim::Keep(peers)) => peers,
-            None => announcers.to_vec(),
+        let Some(live) = self.live_announcers(tx, announcers) else {
+            return AcceptError::Orphaned {
+                txid: tx.compute_txid(),
+                missing,
+                fresh: false,
+            };
         };
         let first = live.first().copied();
         let err = self.park_orphan_from(tx, missing, first);
+        let wtxid = tx.compute_wtxid();
         for peer in live.iter().skip(1) {
-            self.orphanage.add_announcer(&txid, *peer);
+            self.orphanage.add_announcer(&wtxid, *peer);
         }
         err
+    }
+
+    /// Park a lifted package member the package admitted, under its parents
+    /// in the mempool. Core's RPC package leaves the orphanage alone, so
+    /// the orphan stays until a resent parent, a block, or expiry erases it.
+    pub fn keep_admitted_parked(&mut self, item: &LiftedOrphan) {
+        let Some(live) = self.live_announcers(&item.tx, &item.announcers) else {
+            return;
+        };
+        let parents: BTreeSet<Txid> = item
+            .tx
+            .input
+            .iter()
+            .map(|i| i.previous_output.txid)
+            .filter(|t| self.graph.contains(t))
+            .collect();
+        let mut peers = live.into_iter();
+        if self
+            .orphanage
+            .insert_from(item.tx.clone(), parents, peers.next())
+        {
+            let wtxid = item.tx.compute_wtxid();
+            for peer in peers {
+                self.orphanage.add_announcer(&wtxid, peer);
+            }
+        }
+    }
+
+    /// Announcers of a taken orphan. A disconnect while it was out of the
+    /// orphanage edited the in-flight record, so the slice from the take is
+    /// stale. `None` when the last announcer left.
+    fn live_announcers(&mut self, tx: &Transaction, announcers: &[u64]) -> Option<Vec<u64>> {
+        match self.orphanage.claim_taken(&tx.compute_wtxid()) {
+            Some(crate::orphanage::TakenClaim::Drop) => None,
+            Some(crate::orphanage::TakenClaim::Keep(peers)) => Some(peers),
+            None => Some(announcers.to_vec()),
+        }
     }
 
     #[doc(hidden)]

@@ -84,7 +84,7 @@ fn one_peer_cannot_fill_the_orphanage() {
     let mut exact_miss = BTreeSet::new();
     exact_miss.insert(txid_n(4));
     assert!(alone.insert_from(exact, exact_miss, Some(9)));
-    let peer2_kept = o.announcers_of(&tx2.compute_txid()).contains(&2);
+    let peer2_kept = o.announcers_of(&tx2.compute_wtxid()).contains(&2);
     assert!(peer2_kept, "peer 2 must keep its orphan");
 }
 
@@ -98,8 +98,9 @@ fn shared_announcer_eviction_keeps_the_other_peer() {
     miss.insert(parent);
     let tx_a = make_orphan(parent, 1);
     let tid = tx_a.compute_txid();
+    let wid = tx_a.compute_wtxid();
     assert!(o.insert_from(tx_a, miss.clone(), Some(1)));
-    assert!(o.add_announcer(&tid, 2));
+    assert!(o.add_announcer(&wid, 2));
     for i in 0..80u8 {
         let mut tx = make_orphan(parent, i.wrapping_add(3));
         tx.input[0].witness = Witness::from_slice(&[vec![i.wrapping_add(3); 20_000]]);
@@ -111,8 +112,8 @@ fn shared_announcer_eviction_keeps_the_other_peer() {
         o.contains(&tid),
         "peer 1's orphan must survive peer 2's reserve"
     );
-    assert!(o.announcers_of(&tid).contains(&1));
-    let kids = o.take_children_of(&parent);
+    assert!(o.announcers_of(&wid).contains(&1));
+    let kids = o.take_children_of(&parent, |_| false);
     assert!(
         kids.iter().any(|tx| tx.tx.compute_txid() == tid),
         "the parent still delivers peer 1's orphan"
@@ -131,9 +132,9 @@ fn insert_and_take_by_parent() {
     assert!(o.insert_from(tx, miss, None));
     assert!(o.contains(&tid));
     assert!(o.contains_wtxid(&wtxid));
-    assert_eq!(o.missing_of(&tid).map(|s| s.len()), Some(1));
+    assert_eq!(o.missing_of(&wtxid).map(|s| s.len()), Some(1));
     assert_eq!(o.len(), 1);
-    let kids = o.take_children_of(&p);
+    let kids = o.take_children_of(&p, |_| false);
     assert_eq!(kids.len(), 1);
     assert!(o.is_empty());
     assert!(!o.contains_wtxid(&wtxid));
@@ -174,9 +175,9 @@ fn reject_oversize_duplicate_and_remove() {
     assert!(o.insert_from(tx.clone(), miss.clone(), None));
     assert!(!o.insert_from(tx.clone(), miss.clone(), None));
     let tid = tx.compute_txid();
-    o.remove_txid(&tid);
+    o.remove_wtxid(&tx.compute_wtxid());
     assert!(!o.contains(&tid));
-    assert!(o.take_children_of(&txid_n(99)).is_empty());
+    assert!(o.take_children_of(&txid_n(99), |_| false).is_empty());
     // Count-cap eviction (with_limits floors max_weight at MAX_ORPHAN_TX_WEIGHT).
     let mut o2 = Orphanage::with_limits(DEFAULT_ORPHAN_MAX_WEIGHT, 3);
     for i in 0..8u8 {
@@ -207,11 +208,11 @@ fn announcers_and_erase_for_peer() {
     assert!(o.insert_from(tx.clone(), miss, Some(3)));
     assert!(o.has_announcer(3));
     assert!(!o.has_announcer(9));
-    assert_eq!(o.announcers_of(&tid), vec![3]);
-    assert!(o.add_announcer_wtxid(&wtxid, 9));
-    assert_eq!(o.announcers_of(&tid), vec![3, 9]);
+    assert_eq!(o.announcers_of(&wtxid), vec![3]);
+    assert!(o.add_announcer(&wtxid, 9));
+    assert_eq!(o.announcers_of(&wtxid), vec![3, 9]);
     o.erase_for_peer(3);
-    assert_eq!(o.announcers_of(&tid), vec![9]);
+    assert_eq!(o.announcers_of(&wtxid), vec![9]);
     assert!(o.contains(&tid));
     o.erase_for_peer(9);
     assert!(!o.contains(&tid));
@@ -296,9 +297,9 @@ fn orphan_counters_limits_and_child_take() {
 
     let mut linked = Orphanage::with_limits(DEFAULT_ORPHAN_MAX_WEIGHT, 4);
     let body = make_orphan(parent, 4);
-    let id = body.compute_txid();
+    let id = body.compute_wtxid();
     assert!(linked.insert_from_at(body, miss.clone(), None, 0));
-    let taken = linked.take_children_of(&parent);
+    let taken = linked.take_children_of(&parent, |_| false);
     assert_eq!(taken.len(), 1);
     assert!(
         !linked
