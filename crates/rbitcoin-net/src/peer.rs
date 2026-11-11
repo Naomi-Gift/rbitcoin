@@ -1732,48 +1732,29 @@ pub fn take_outbound_write_batch(
     batch
 }
 
-struct SessionPongEmit<'a> {
-    writer: &'a mut PeerWriter,
-}
-
-impl PongEmit for SessionPongEmit<'_> {
-    #[allow(clippy::manual_async_fn)]
-    fn emit(&mut self, msg: NetworkMessage) -> impl Future<Output = Result<(), ()>> + Send + '_ {
-        async { self.writer.write_msg_offload(msg).await.map_err(|_| ()) }
-    }
-}
-
-/// Writes one pong. The future may borrow `self` until it is awaited.
-#[doc(hidden)]
-pub trait PongEmit {
-    /// `Send` so the spawned writer task can await the write.
-    #[allow(clippy::manual_async_fn)]
-    fn emit(&mut self, msg: NetworkMessage) -> impl Future<Output = Result<(), ()>> + Send + '_;
-}
-
-/// Write pongs that arrived while `written` was on the wire.
+/// Nonce to put on a pong already taken into a write batch.
 ///
-/// Each extra nonce is charged on its own. A ping during an extra write is
-/// emitted next. The pending slot is clear when this returns `Ok`.
+/// A ping that arrives after the batch was taken must not change it. That
+/// ping's pong is queued later, behind replies already waiting on the channel.
 #[doc(hidden)]
-pub async fn write_extra_pongs<E: PongEmit>(
-    session: &crate::peers::LivePeer,
-    written: u64,
-    emit: &mut E,
-) -> Result<(), ()> {
-    let mut next = session.finish_pong_write(written);
-    while let Some(extra) = next {
-        let msg = NetworkMessage::Pong(extra);
-        let extra_n = crate::peers::outbound_msg_bytes(&msg);
-        session.note_send_queued(extra_n);
-        let failed = emit.emit(msg).await.is_err();
-        session.note_out_written(false, extra_n);
-        if failed {
-            return Err(());
-        }
-        next = session.finish_pong_write(extra);
+pub fn pong_nonce_for_batch(snapshot: Option<u64>, queued: u64) -> u64 {
+    snapshot.unwrap_or(queued)
+}
+
+/// Queue one pong for a ping that arrived while `written` was on the wire.
+///
+/// The message goes on the session channel, behind a reply queued before
+/// this call. It is not written inside the batch that just finished.
+#[doc(hidden)]
+pub fn requeue_later_pong(session: &crate::peers::LivePeer, written: u64) {
+    let Some(extra) = session.finish_pong_write(written) else {
+        return;
+    };
+    if !session.queue_msg(NetworkMessage::Pong(extra)) {
+        // The claim inside `finish_pong_write` would otherwise stick with
+        // no message on the channel, and the next ping would not queue.
+        let _ = session.finish_pong_write(extra);
     }
-    Ok(())
 }
 
 pub async fn run_writer_task(
@@ -1782,12 +1763,15 @@ pub async fn run_writer_task(
     writer_session: Option<Arc<crate::peers::LivePeer>>,
 ) {
     while let Some(first) = out_rx.recv().await {
+        // Freeze the nonce for this batch. A ping that lands while a body
+        // in the batch is still on the wire keeps its own later pong.
+        let nonce_at_take = writer_session.as_ref().map(|s| s.pong_nonce());
         for out in take_outbound_write_batch(first, &mut out_rx) {
             let n = crate::peers::outbound_queued_bytes(&out);
             let serve_slot = out.holds_serve_slot();
             let (out, pong_written) = match out {
                 PeerOut::Msg(NetworkMessage::Pong(queued)) => {
-                    let nonce = pong_nonce_for_write(writer_session.as_deref(), queued);
+                    let nonce = pong_nonce_for_batch(nonce_at_take, queued);
                     (PeerOut::Msg(NetworkMessage::Pong(nonce)), Some(nonce))
                 }
                 other => (other, None),
@@ -1805,12 +1789,7 @@ pub async fn run_writer_task(
                 return;
             }
             if let (Some(s), Some(written)) = (&writer_session, pong_written) {
-                let mut emit = SessionPongEmit {
-                    writer: &mut writer,
-                };
-                if write_extra_pongs(s, written, &mut emit).await.is_err() {
-                    return;
-                }
+                requeue_later_pong(s, written);
             }
         }
     }

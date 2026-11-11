@@ -6,3 +6,6 @@ Fixed
   pong after replies already waiting on that peer, including a `tx` for an
   earlier `getdata`, a `getblocktxn` for a compact block that is missing
   transactions, and a `getdata` after `headers` from a high-bandwidth peer.
+  A ping that arrives while that batch is being written does not rewrite
+  the pong already in the batch. Its pong is queued behind replies already
+  waiting.
