@@ -116,10 +116,11 @@ pub fn verify_tx_scripts_with_flags(
 pub use block::validate_block_structure_hashed;
 pub use block::{
     bip34_height_script, bip68_active_for_tx, block_has_witness, block_mutated_without_coinbase,
-    block_subsidy, check_block_wire, is_final_tx, sequence_locks_satisfied, tx_sigop_cost,
-    validate_block_structure, witness_commitment_script, witness_commitment_vout_index, InputIndex,
-    ScriptVerifyFlags, ValidationContext, BIP16_EXCEPTION_MAINNET, MAX_BLOCK_TX_COUNT,
-    MAX_BLOCK_WEIGHT, MIN_TX_WEIGHT, TAPROOT_EXCEPTION_MAINNET,
+    block_subsidy, check_block_wire, is_final_tx, sequence_locks_satisfied, tx_has_relative_lock,
+    tx_sigop_cost, validate_block_structure, witness_commitment_script,
+    witness_commitment_vout_index, InputIndex, ScriptVerifyFlags, ValidationContext,
+    BIP16_EXCEPTION_MAINNET, MAX_BLOCK_TX_COUNT, MAX_BLOCK_WEIGHT, MIN_TX_WEIGHT,
+    SEQUENCE_LOCKTIME_DISABLE_FLAG, TAPROOT_EXCEPTION_MAINNET,
 };
 pub use clock::{with_now, NodeClock};
 pub use error::{block_reject_log_line, block_reject_reason, script_flag_paren, ConsensusError};

@@ -459,6 +459,70 @@ fn tip_script_pres_skips_only_matching_wtxid() {
     let _ = std::fs::remove_dir_all(&mdir);
 }
 
+#[test]
+fn tip_script_pres_leaves_a_legacy_tx_on_connect() {
+    use rbitcoin_mempool::TxEntry;
+    let dir = tmp();
+    let mdir = tmp();
+    let q = Query::open_or_create_tiny(&dir).unwrap();
+    let hub = MempoolHub::open(&mdir, Arc::new(q)).unwrap();
+    let live = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array([3u8; 32]),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::MAX,
+            witness: Witness::from_slice(&[vec![0x01]]),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(1000),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    hub.lock_write().graph.insert(
+        TxEntry {
+            txid: live.compute_txid(),
+            wtxid: live.compute_wtxid(),
+            fee_sat: 1,
+            weight: live.weight().to_wu(),
+            sigop_cost: 0,
+            slot: 0,
+            parents: BTreeSet::new(),
+            children: BTreeSet::new(),
+        },
+        &live,
+    );
+    let legacy = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: Txid::from_byte_array([4u8; 32]),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::from_bytes(vec![0x51]),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(500),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let (pres, skip) = hub.tip_script_pres(std::slice::from_ref(&legacy));
+    assert!(skip.is_empty());
+    assert!(
+        pres[0].sha_prevouts().is_none(),
+        "a legacy tx must not start the sighash engines"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(&mdir);
+}
+
 /// Spend `prev` to one OP_TRUE output of `value`.
 fn spend_vout(prev: OutPoint, value: u64) -> Transaction {
     let mut tx = spend_true(prev.txid, 0, ScriptBuf::from_bytes(vec![0x51]));

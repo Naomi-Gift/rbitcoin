@@ -417,14 +417,13 @@ impl MempoolTxSnapshot {
 /// BIP68 time-form relative lock (`SEQUENCE_LOCKTIME_TYPE_FLAG`, disable unset).
 #[doc(hidden)]
 pub fn tx_has_bip68_time_lock(tx: &Transaction) -> bool {
-    if (tx.version.0 as u32) < 2 {
+    if !rbitcoin_consensus::bip68_active_for_tx(tx) {
         return false;
     }
-    const DISABLE: u32 = 1 << 31;
     const TYPE_FLAG: u32 = 1 << 22;
     tx.input.iter().any(|inp| {
         let seq = inp.sequence.to_consensus_u32();
-        seq & DISABLE == 0 && seq & TYPE_FLAG != 0
+        seq & rbitcoin_consensus::SEQUENCE_LOCKTIME_DISABLE_FLAG == 0 && seq & TYPE_FLAG != 0
     })
 }
 
@@ -2372,7 +2371,7 @@ impl MempoolHub {
         self.lock_read().live_count()
     }
 
-    /// Tip confirm: connect-only pres for live graph txs, full midstates otherwise.
+    /// Tip confirm. A live tx, a legacy tx, and a coinbase stay connect-only.
     pub fn tip_script_pres(
         &self,
         txs: &[Transaction],
@@ -2404,7 +2403,9 @@ impl MempoolHub {
             .iter()
             .zip(connects)
             .map(|(tx, c)| {
-                if skip.contains(&c.txid) {
+                if skip.contains(&c.txid)
+                    || !rbitcoin_consensus::tx_precompute::sighash_midstates_for(tx)
+                {
                     rbitcoin_query::TxPrecompute::Connect(c)
                 } else {
                     rbitcoin_query::TxPrecompute::Script(

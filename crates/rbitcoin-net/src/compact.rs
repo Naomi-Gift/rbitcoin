@@ -329,6 +329,8 @@ pub fn block_txid_merkle(txdata: &[Transaction]) -> Option<([u8; 32], bool)> {
 }
 
 /// Merkle check from txids already hashed while the slots were filled.
+///
+/// `leaves[i]` is the txid of `txdata[i]`.
 #[doc(hidden)]
 pub fn finish_with_txids(
     header: Header,

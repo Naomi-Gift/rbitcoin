@@ -3070,9 +3070,9 @@ async fn client_stop_wakes_without_the_hundred_ms_poll() {
     let _ = dir;
 }
 
-/// Mempool verbose JSON is the wire JSON of the same transaction.
+/// Mempool verbose fields match the encoded transaction.
 #[test]
-fn mempool_verbose_tx_matches_serialized_json() {
+fn mempool_verbose_tx_fields_match_the_encoded_tx() {
     use bitcoin::hashes::Hash;
     let (_dir, query) = tmp_store();
     let tx = bitcoin::Transaction {

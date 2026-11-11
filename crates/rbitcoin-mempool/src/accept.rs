@@ -364,13 +364,7 @@ pub fn check_mempool_structural(
     if !rbitcoin_consensus::is_final_tx(tx, next_height, tip.mtp) {
         return Err(AcceptError::NotFinal);
     }
-    const BIP68_DISABLE: u32 = 1 << 31;
-    if rbitcoin_consensus::bip68_active_for_tx(tx)
-        && tx
-            .input
-            .iter()
-            .any(|inp| inp.sequence.to_consensus_u32() & BIP68_DISABLE == 0)
-    {
+    if rbitcoin_consensus::tx_has_relative_lock(tx) {
         let mut prev_heights = Vec::with_capacity(tx.input.len());
         let mut prev_mtps = Vec::with_capacity(tx.input.len());
         for i in 0..tx.input.len() {
