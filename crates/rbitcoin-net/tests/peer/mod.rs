@@ -2990,22 +2990,28 @@ fn recent_reject_is_not_requested_from_other_peers() {
     use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
     use tokio::runtime::Builder;
 
-    let coinbase = Transaction {
-        version: TxVersion::ONE,
+    // Rejected before its inputs are looked up, as Core's CheckTransaction
+    // does, so its child finds a recent-reject parent rather than a coin.
+    let spend = TxIn {
+        previous_output: OutPoint {
+            txid: bitcoin::Txid::from_byte_array([9; 32]),
+            vout: 0,
+        },
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::MAX,
+        witness: Witness::new(),
+    };
+    let parent = Transaction {
+        version: TxVersion::TWO,
         lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint::null(),
-            script_sig: ScriptBuf::from_bytes(vec![0x00, 0x01]),
-            sequence: Sequence::MAX,
-            witness: Witness::new(),
-        }],
+        input: vec![spend.clone(), spend],
         output: vec![TxOut {
-            value: Amount::from_sat(50),
+            value: Amount::from_sat(10_000),
             script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
         }],
     };
-    let txid = coinbase.compute_txid();
-    let wtxid = coinbase.compute_wtxid();
+    let txid = parent.compute_txid();
+    let wtxid = parent.compute_wtxid();
 
     let rt = Builder::new_current_thread().enable_all().build().unwrap();
     rt.block_on(async {
@@ -3077,17 +3083,42 @@ fn recent_reject_is_not_requested_from_other_peers() {
             "an unknown tx is requested"
         );
 
+        // A segwit child of the rejected parent: its txid is not its wtxid, so
+        // only the txid entry it inherits from the parent can match an inv by
+        // txid.
+        let child = Transaction {
+            version: TxVersion::TWO,
+            lock_time: LockTime::ZERO,
+            input: vec![TxIn {
+                previous_output: OutPoint { txid, vout: 0 },
+                script_sig: ScriptBuf::new(),
+                sequence: Sequence::MAX,
+                witness: Witness::from_slice(&[[1u8]]),
+            }],
+            output: vec![TxOut {
+                value: Amount::from_sat(10_000),
+                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+            }],
+        };
+        let child_txid = child.compute_txid();
+        assert_ne!(
+            child_txid.to_byte_array(),
+            child.compute_wtxid().to_byte_array()
+        );
+
         let (out_tx, _out_rx) = mpsc::unbounded_channel();
         let mut follow = PeerFollowState::new();
-        handle_peer_frame(
-            frame_for(NetworkMessage::Tx(coinbase)),
-            &hub,
-            &out_tx,
-            &mut follow,
-            Some(sender.as_ref()),
-        )
-        .await
-        .unwrap();
+        for tx in [parent, child] {
+            handle_peer_frame(
+                frame_for(NetworkMessage::Tx(tx)),
+                &hub,
+                &out_tx,
+                &mut follow,
+                Some(sender.as_ref()),
+            )
+            .await
+            .unwrap();
+        }
 
         assert_eq!(
             getdata_for(&hub, &by_txid, Inventory::Transaction(txid)).await,
@@ -3098,6 +3129,11 @@ fn recent_reject_is_not_requested_from_other_peers() {
             getdata_for(&hub, &by_wtxid, Inventory::WTx(wtxid)).await,
             vec![],
             "a rejected tx is not requested by wtxid"
+        );
+        assert_eq!(
+            getdata_for(&hub, &by_txid, Inventory::Transaction(child_txid)).await,
+            vec![],
+            "the segwit child of a rejected tx is not requested by txid"
         );
         let _ = std::fs::remove_dir_all(dir);
     });

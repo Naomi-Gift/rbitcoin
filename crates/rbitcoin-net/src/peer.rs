@@ -5124,9 +5124,10 @@ pub fn on_inv_txid(
         return None;
     }
     let mp = hub.mempool()?;
-    // Core `AlreadyHaveTx`: a recent reject is not asked for again, from this
-    // peer or another. A child of a rejected parent is noted here by txid.
-    if mp.try_recent_reject(&bitcoin::Wtxid::from_byte_array(txid.to_byte_array())) {
+    // Core `AlreadyHaveTx` (without the reconsiderable set): a recent reject
+    // is not asked for again, from this peer or another. The child of a
+    // rejected parent is in the set by txid.
+    if mp.try_recent_reject_txid(txid) {
         return None;
     }
     let in_orphan = mp.try_orphan_missing(txid).is_some();

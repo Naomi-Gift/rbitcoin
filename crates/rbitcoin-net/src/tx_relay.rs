@@ -2575,6 +2575,18 @@ impl MempoolHub {
             .is_some_and(|g| g.contains(wtxid))
     }
 
+    /// Core keys `m_lazy_recent_rejects` by txid as well as wtxid. A txid is
+    /// held in the same set: it equals the wtxid of a tx with no witness.
+    #[doc(hidden)]
+    pub fn note_recent_reject_txid(&self, txid: Txid) {
+        self.note_recent_reject(Wtxid::from_byte_array(txid.to_byte_array()));
+    }
+
+    /// [`Self::try_recent_reject`] for a txid.
+    pub fn try_recent_reject_txid(&self, txid: &Txid) -> bool {
+        self.try_recent_reject(&Wtxid::from_byte_array(txid.to_byte_array()))
+    }
+
     /// Confirmed tip snapshot for mempool structural checks (height + BIP113 MTP).
     #[doc(hidden)]
     pub fn chain_tip_ctx(&self) -> ChainTipCtx {
@@ -2970,14 +2982,9 @@ impl MempoolHub {
                     return self.finish_accept_err(us, e);
                 }
                 if let AcceptError::Orphaned { missing, .. } = &e {
-                    if missing
-                        .iter()
-                        .any(|p| self.try_recent_reject(&Wtxid::from_byte_array(p.to_byte_array())))
-                    {
+                    if missing.iter().any(|p| self.try_recent_reject_txid(p)) {
                         self.note_recent_reject(tx.compute_wtxid());
-                        self.note_recent_reject(Wtxid::from_byte_array(
-                            tx.compute_txid().to_byte_array(),
-                        ));
+                        self.note_recent_reject_txid(tx.compute_txid());
                         let us = t0.elapsed().as_micros() as u64;
                         self.meter_accept_stages(lock_us, stages);
                         return self.finish_accept_err(
@@ -3735,6 +3742,17 @@ impl MempoolHub {
         let kept = rec == Some(rbitcoin_mempool::AcceptFailureRecord::Extra);
         if is_hard_recent_reject(e) && !kept {
             self.note_recent_reject(tx.compute_wtxid());
+            // Core `fRejectedParents`: a child of a rejected parent is rejected
+            // by txid too. A consensus-invalid parent makes the child
+            // `MissingPrevout` here rather than an orphan.
+            if matches!(e, AcceptError::MissingPrevout(_))
+                && tx
+                    .input
+                    .iter()
+                    .any(|i| self.try_recent_reject_txid(&i.previous_output.txid))
+            {
+                self.note_recent_reject_txid(tx.compute_txid());
+            }
         }
         if let Some(rec) = rec {
             let mut g = self.lock_write();
@@ -4149,9 +4167,7 @@ impl MempoolHub {
             let hub = Arc::clone(self);
             let missing_rej = missing.clone();
             let recent = crate::reactor::off_pool(move || {
-                missing_rej
-                    .iter()
-                    .any(|p| hub.try_recent_reject(&Wtxid::from_byte_array(p.to_byte_array())))
+                missing_rej.iter().any(|p| hub.try_recent_reject_txid(p))
             })
             .await;
             if recent {
@@ -4159,9 +4175,7 @@ impl MempoolHub {
                 let tx_r = tx.clone();
                 return crate::reactor::off_pool(move || {
                     hub.note_recent_reject(tx_r.compute_wtxid());
-                    hub.note_recent_reject(Wtxid::from_byte_array(
-                        tx_r.compute_txid().to_byte_array(),
-                    ));
+                    hub.note_recent_reject_txid(tx_r.compute_txid());
                     let us = t0.elapsed().as_micros() as u64;
                     hub.meter_accept_stages(lock_us, stages);
                     hub.finish_accept_err(
@@ -5442,7 +5456,7 @@ impl MempoolHub {
         {
             return true;
         }
-        self.try_recent_reject(&Wtxid::from_byte_array(txid.to_byte_array()))
+        self.try_recent_reject_txid(txid)
     }
 
     pub fn orphan_getdata_parents(&self, tx: &Transaction) -> BTreeSet<Txid> {
