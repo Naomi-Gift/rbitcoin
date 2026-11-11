@@ -39,4 +39,6 @@ Fixed
   thread is bound, and a confirm batch does not wait while it holds the utxo
   view. The next confirm insert waits at 2,000,000 open edges. A 1 GiB log
   asks for one extra checkpoint, not another on every later batch. Neither is a
-  knob.
+  knob. Once the commit names a generation, a failed rename of that file still
+  keeps the publish, and the next checkpoint writes the next generation
+  instead of replacing the file the commit already names.

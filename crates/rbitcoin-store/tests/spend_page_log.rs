@@ -192,6 +192,36 @@ fn reload_prefers_a_generation_file_over_a_stale_pages_file() {
 }
 
 #[test]
+fn a_failed_pages_rename_does_not_publish_that_generation_again() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let first = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, first)]).unwrap();
+    // The generation file cannot replace a directory, so the pages rename fails
+    // after the commit already names that generation.
+    std::fs::create_dir(d.join(SPEND_PAGES_NAME)).unwrap();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    assert_eq!(log.slot(16), Some(first));
+    let commit = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    let generation = u32::from_le_bytes(commit[12..16].try_into().unwrap());
+    let gen_path = d.join(format!("{SPEND_PAGES_NAME}.{generation}"));
+    let image = std::fs::read(&gen_path).unwrap();
+    assert_eq!(&image[16..24], &first);
+    let second = [8u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(4096, second)]).unwrap();
+    log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+    assert_eq!(std::fs::read(&gen_path).unwrap(), image);
+    let commit = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    let next = u32::from_le_bytes(commit[12..16].try_into().unwrap());
+    assert_ne!(next, generation);
+    assert!(d.join(format!("{SPEND_PAGES_NAME}.{next}")).is_file());
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(first));
+    assert_eq!(loaded.slot(4096), Some(second));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn held_snapshot_is_not_folded() {
     let d = dir();
     let log = SpendPageLog::create(&d);

@@ -874,8 +874,12 @@ impl SpendPageLog {
     /// names that blob before the generation file is renamed over
     /// `spend.pages`. A crash before the commit rename leaves the old commit,
     /// which does not name the generation file. A crash after it reloads that
-    /// file. `commit_io` is held across the whole publish, so a fold hold
-    /// cannot rename the commit between the sample and the commit write.
+    /// file. Once that rename succeeds, this returns Ok even when the pages
+    /// rename or the directory sync fails. The next checkpoint writes the
+    /// next generation instead of replacing the file the commit already
+    /// names. A failed pages rename leaves that file in place. `commit_io`
+    /// is held across the whole publish, so a fold hold cannot rename the
+    /// commit between the sample and the commit write.
     fn publish_generation(
         &self,
         height: u32,
@@ -913,8 +917,7 @@ impl SpendPageLog {
         })?;
         let committed_len = blob.len() as u64;
         let held = {
-            let mut g = self.lock();
-            g.log_bytes = committed_len;
+            let g = self.lock();
             match hold {
                 PublishHold::Sample => g.fold_held,
                 PublishHold::Clear => false,
@@ -922,9 +925,11 @@ impl SpendPageLog {
         };
         let commit = encode_commit(height, generation, committed_len, &recs, held);
         write_synced_tmp_rename(&commit_path, &commit)?;
-        std::fs::rename(&gen_path, &pages_path).map_err(|e| StoreError::io(&pages_path, e))?;
-        fsync_parent_dir(&self.dir).map_err(|e| StoreError::io(&self.dir, e))?;
-        self.remove_page_sidecars();
+        {
+            let mut g = self.lock();
+            g.log_bytes = committed_len;
+        }
+        self.finish_pages_rename(&gen_path, &pages_path);
         Ok((generation, recs))
     }
 
@@ -939,6 +944,18 @@ impl SpendPageLog {
         let mut g = self.lock();
         g.log_bytes = 0;
         g.commit_height = None;
+    }
+
+    /// Move the generation file over `spend.pages` after the commit names it.
+    ///
+    /// A failed rename leaves `spend.pages.{generation}` for reload. Deleting
+    /// sidecars here would remove the file the commit still names. A directory
+    /// sync failure after a successful rename still keeps the publish.
+    fn finish_pages_rename(&self, gen_path: &Path, pages_path: &Path) {
+        if std::fs::rename(gen_path, pages_path).is_ok() {
+            let _ = fsync_parent_dir(&self.dir);
+            self.remove_page_sidecars();
+        }
     }
 
     /// Drop `spend.pages.{generation}` leftovers. The commit file stays.
