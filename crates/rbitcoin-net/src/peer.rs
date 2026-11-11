@@ -8162,7 +8162,7 @@ pub fn headers_reply_for_getheaders(
                     return Ok(vec![h]);
                 }
             } else if hub.stale_relay_allowed(&stop) {
-                let have_body = hub.cache.get_block(&stop).is_some()
+                let have_body = hub.cache.has_body(&stop)
                     || hub
                         .query
                         .is_block_archived(&stop.to_byte_array())
