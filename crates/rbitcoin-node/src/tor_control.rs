@@ -562,18 +562,22 @@ async fn read_reply_or_refusal(
                 "tor control: short reply `{line}`"
             )));
         }
-        let code = &line[..3];
-        let sep = line.as_bytes()[3];
-        let rest = &line[4..];
-        if code.as_bytes()[0] == b'5' {
+        let unexpected = || NodeError::Init(format!("tor control: unexpected reply `{line}`"));
+        let Some((code, tail)) = line.split_at_checked(3) else {
+            return Err(unexpected());
+        };
+        let mut tail = tail.chars();
+        let sep = tail.next();
+        let rest = tail.as_str();
+        if code.starts_with('5') {
             return Ok(Err(line.to_string()));
         }
         match sep {
-            b'-' => {
+            Some('-') => {
                 body.push_str(rest);
                 body.push('\n');
             }
-            b' ' => {
+            Some(' ') => {
                 if !rest.is_empty() {
                     if !body.is_empty() {
                         body.push('\n');
@@ -582,11 +586,7 @@ async fn read_reply_or_refusal(
                 }
                 return Ok(Ok(body));
             }
-            _ => {
-                return Err(NodeError::Init(format!(
-                    "tor control: unexpected reply `{line}`"
-                )));
-            }
+            _ => return Err(unexpected()),
         }
     }
 }
