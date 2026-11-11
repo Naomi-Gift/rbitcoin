@@ -30,14 +30,22 @@ fn set_nofile_soft(soft: u64, hard: u64) {
     assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
 }
 
+/// Open descriptors, or `None` when the table is too full to count them.
+#[cfg(unix)]
+fn open_fds() -> Option<u64> {
+    let dir = if cfg!(target_os = "linux") {
+        "/proc/self/fd"
+    } else {
+        "/dev/fd"
+    };
+    let n = std::fs::read_dir(dir).ok()?.count() as u64;
+    Some(n.saturating_sub(1))
+}
+
 #[cfg(unix)]
 fn fill_nulls(stop_free: u64, soft: u64) -> Vec<std::fs::File> {
     let mut files = Vec::new();
-    loop {
-        let open = std::fs::read_dir("/proc/self/fd")
-            .map(|rd| rd.count() as u64)
-            .unwrap_or(0)
-            .saturating_sub(1);
+    while let Some(open) = open_fds() {
         if soft.saturating_sub(open) <= stop_free {
             break;
         }
@@ -83,10 +91,7 @@ async fn listener_cap_electrum_retries_accept_error() {
     // Park `accept` before the table is full.
     tokio::task::yield_now().await;
 
-    let open = std::fs::read_dir("/proc/self/fd")
-        .map(|rd| rd.count() as u64)
-        .unwrap_or(0)
-        .saturating_sub(1);
+    let open = open_fds().expect("fd count");
     let tight = open.saturating_add(48).min(soft);
     assert!(tight > open + 20, "soft {soft} open {open}");
     // Spawn before the squeeze so the child keeps a soft limit that can connect.
@@ -109,6 +114,8 @@ async fn listener_cap_electrum_retries_accept_error() {
     std::thread::sleep(Duration::from_millis(500));
     let filler_more = fill_nulls(0, tight);
     let queued_out = queued.wait_with_output().expect("connector");
+    // Reaping the child closes its pipes. Take those descriptors too.
+    let filler_last = fill_nulls(0, tight);
     let queued_n: u32 = String::from_utf8_lossy(&queued_out.stdout)
         .trim()
         .parse()
@@ -124,6 +131,7 @@ async fn listener_cap_electrum_retries_accept_error() {
     let accept_ended = handle.tasks[0].is_finished();
     drop(filler);
     drop(filler_more);
+    drop(filler_last);
     assert!(
         !accept_ended,
         "electrum listener exited on the first accept error"

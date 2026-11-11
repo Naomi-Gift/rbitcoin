@@ -2,6 +2,10 @@
 //! This binary is alone so `setrlimit` does not trip the rest of the suite.
 
 use rbitcoin_consensus::{ChainParams, Milestone};
+#[cfg(unix)]
+use rbitcoin_net::listen::listener_fd_reserve;
+#[cfg(unix)]
+use rbitcoin_net::peers::MAX_INCOMPLETE_INBOUND_PER_ADDR;
 use rbitcoin_net::service::P2PNode;
 use rbitcoin_query::Query;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -100,10 +104,17 @@ async fn listener_cap_fd_reserve_leaves_room() {
     )
     .await
     .unwrap();
+    // Every client connects from 127.0.0.1, the one loopback address macOS
+    // configures. Leave room over the reserve for fewer connections than one
+    // address may hold, so the reserve and not the address cap refuses.
     let open = open_fds();
-    let tight = open.saturating_add(80).min(soft);
+    let mut tight = open + 48;
+    while tight - open < listener_fd_reserve(tight) + 16 {
+        tight += 1;
+    }
+    let reserve = listener_fd_reserve(tight);
     assert!(
-        tight > open + 40,
+        tight <= soft,
         "soft {soft} open {open} leaves no room to tighten"
     );
     set_nofile_soft(tight, hard);
@@ -111,18 +122,8 @@ async fn listener_cap_fd_reserve_leaves_room() {
 
     let mut held = Vec::new();
     let mut refused = 0u32;
-    let mut octet = 1u8;
-    for _ in 0..60 {
-        if tight.saturating_sub(open_fds()) < 8 {
-            break;
-        }
-        let src = std::net::SocketAddr::from(([127, 0, 0, octet], 0));
-        octet = octet.saturating_add(1).max(1);
-        let connect = async {
-            let sock = tokio::net::TcpSocket::new_v4()?;
-            sock.bind(src)?;
-            sock.connect(node.local_addr).await
-        };
+    for _ in 0..MAX_INCOMPLETE_INBOUND_PER_ADDR * 2 {
+        let connect = tokio::net::TcpStream::connect(node.local_addr);
         let mut sock = match tokio::time::timeout(Duration::from_millis(400), connect).await {
             Ok(Ok(sock)) => sock,
             _ => {
@@ -155,8 +156,8 @@ async fn listener_cap_fd_reserve_leaves_room() {
     }
     let left = tight.saturating_sub(open_fds());
     assert!(
-        held.len() > 8 && left >= 16,
-        "listener filled the table: {left} fds left, held {}, refused {refused}",
+        !held.is_empty() && held.len() < MAX_INCOMPLETE_INBOUND_PER_ADDR && left >= reserve,
+        "listener filled the table: {left} fds left of reserve {reserve}, held {}, refused {refused}",
         held.len()
     );
     drop(held);
