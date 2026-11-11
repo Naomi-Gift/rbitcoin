@@ -472,21 +472,6 @@ impl Orphanage {
         self.next_taken_gen
     }
 
-    /// Remember `wtxid` as out of the pool. A package lift uses this; promote
-    /// records the same way inside `take_children_of`.
-    pub fn note_taken(&mut self, wtxid: Wtxid, announcers: &[u64]) -> u64 {
-        let gen = self.alloc_taken_gen();
-        self.taken.insert(
-            wtxid,
-            TakenOrphan {
-                announcers: announcers.iter().copied().collect(),
-                drop: false,
-                gen,
-            },
-        );
-        gen
-    }
-
     /// Consume the in-flight record. `None` when this tx was not taken.
     pub(crate) fn claim_taken(&mut self, wtxid: &Wtxid) -> Option<TakenClaim> {
         let taken = self.taken.remove(wtxid)?;

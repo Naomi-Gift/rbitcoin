@@ -5208,17 +5208,26 @@ pub fn on_inv_wtxid(
         }
         return Some(Inventory::WTx(*wtxid));
     }
-    // Core `AddTxAnnouncement`: an orphan with no parent left to fetch,
-    // such as one whose txid is already pooled, takes no announcer.
     let s = session?;
     let tx = mp.try_orphan_tx_wtxid(wtxid)?;
-    let missing = mp.orphan_getdata_parents(&tx);
-    if missing.is_empty() {
-        return None;
-    }
-    let _ = mp.add_orphan_announcer(wtxid, s.id);
-    mp.schedule_orphan_parents(&missing, s.id, s.inbound, s.clock_now());
+    note_parked_announcer(mp, s, &tx);
     None
+}
+
+/// Core `AddTxAnnouncement` for a parked orphan: `s` becomes an announcer
+/// and is asked for the missing parents. An orphan with no parent left to
+/// fetch, such as one whose txid is already pooled, takes no announcer.
+fn note_parked_announcer(
+    mp: &crate::tx_relay::MempoolHub,
+    s: &crate::peers::LivePeer,
+    parked: &Transaction,
+) {
+    let missing = mp.orphan_getdata_parents(parked);
+    if missing.is_empty() {
+        return;
+    }
+    let _ = mp.add_orphan_announcer(&parked.compute_wtxid(), s.id);
+    mp.schedule_orphan_parents(&missing, s.id, s.inbound, s.clock_now());
 }
 
 struct HeadersApply {
@@ -6835,6 +6844,17 @@ pub async fn on_tx(
                 mp.resolve_tx_request(&txid, &wtxid, false);
                 maybe_force_relay_recent_reject(hub, session, mp, txid, wtxid);
                 return Ok(());
+            }
+            // Core `ReceivedTx`: a parked wtxid is already had, so it is not
+            // validated again.
+            if !trusted {
+                if let Some(parked) = mp.try_orphan_tx_wtxid(&wtxid) {
+                    mp.resolve_tx_request(&txid, &wtxid, false);
+                    if let Some(s) = session {
+                        note_parked_announcer(mp, s, &parked);
+                    }
+                    return Ok(());
+                }
             }
             if trusted {
                 mp.set_trusted_session(from);

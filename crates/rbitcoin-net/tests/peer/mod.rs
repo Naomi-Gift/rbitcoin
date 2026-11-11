@@ -2980,6 +2980,110 @@ fn always_relay_recent_reject_is_not_relayed() {
     recent_reject_skips_atmp_on_second_send(false);
 }
 
+/// Core `ReceivedTx`: a tx whose wtxid is parked is dropped before
+/// validation. A parked copy whose parent is now pooled is not admitted by
+/// a resend, and with no parent left to fetch the sender is no announcer.
+#[test]
+fn resent_parked_tx_is_not_validated_again() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use std::collections::BTreeSet;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("resent-parked");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_header().unwrap();
+    let (_tip, time, cbs) = rbitcoin_query::pad_empty_from(
+        &hub.query,
+        &ChainParams::regtest(),
+        hub.tip_hash().unwrap(),
+        tip.time,
+        1,
+        101,
+        1,
+    );
+    hub.clock.set_mock(i64::from(time) + 1);
+    let mp =
+        rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+    mp.set_relay_enabled(true);
+    assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
+    let spend = |prev: OutPoint, value: u64| Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: prev,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let parent = spend(OutPoint::new(cbs[0], 0), 50_0000_0000 - 10_000);
+    let child = spend(
+        OutPoint::new(parent.compute_txid(), 0),
+        50_0000_0000 - 20_000,
+    );
+    mp.accept_tx_from(&parent, rbitcoin_net::tx_relay::TxOrigin::Local)
+        .expect("the parent pays for itself");
+    assert!(mp.lock_write().orphanage.insert_from(
+        child.clone(),
+        BTreeSet::from([parent.compute_txid()]),
+        Some(4),
+    ));
+
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18451);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 11,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let peer = peers.register(
+        addr,
+        addr,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState::new();
+        handle_peer_frame(
+            frame_for(NetworkMessage::Tx(child.clone())),
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(peer.as_ref()),
+        )
+        .await
+        .unwrap();
+    });
+    assert!(
+        !mp.contains(&child.compute_txid()),
+        "a parked wtxid is not validated again"
+    );
+    assert_eq!(
+        mp.lock_read()
+            .orphanage
+            .announcers_of(&child.compute_wtxid()),
+        vec![4]
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Core `AlreadyHaveTx` asks the mempool, not the orphanage, by txid, and
 /// `AddTxAnnouncement` adds no orphan announcer for a tx with no missing
 /// parent. A child in the mempool that is also parked, beside a parked

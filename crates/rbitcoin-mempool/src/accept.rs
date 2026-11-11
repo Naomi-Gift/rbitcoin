@@ -641,17 +641,6 @@ pub struct ActiveMempool {
     pub trust_kept: HashSet<Txid>,
 }
 
-/// A parked child taken out to be admitted with its parent as 1p1c.
-///
-/// `announcers` are the peers who announced it, so a failed pair can park
-/// it again under them.
-pub struct LiftedOrphan {
-    pub tx: Transaction,
-    pub announcers: Vec<u64>,
-    /// In-flight generation from the lift. Zero when the orphan was not taken.
-    pub taken_gen: u64,
-}
-
 impl ActiveMempool {
     /// Share the hub's mock clock so stamped accept times follow `setmocktime`.
     pub fn set_node_clock(&mut self, clock: Arc<AtomicU64>) {
@@ -2137,18 +2126,19 @@ impl ActiveMempool {
         Ok(accepted)
     }
 
-    /// Lift one parked orphan that waits only on `parent` and spends its
-    /// dust output, so it can be admitted with `parent` as 1p1c (Core finds
-    /// the orphan child of a reconsiderable parent the same way). A child
+    /// One parked orphan that waits only on `parent` and spends its dust
+    /// output, to be admitted with `parent` as 1p1c (Core finds the orphan
+    /// child of a reconsiderable parent the same way). It stays parked: the
+    /// relay admit erases it, and a failed pair leaves it waiting. A child
     /// that `peer`, the parent's sender, announced goes first, as in Core's
     /// `Find1P1CPackage`. `tried` skips a child whose pair with `parent`
     /// already failed.
-    pub fn lift_dust_spender(
-        &mut self,
+    pub fn dust_spender(
+        &self,
         parent: &Transaction,
         peer: u64,
         tried: impl Fn(&Transaction) -> bool,
-    ) -> Option<LiftedOrphan> {
+    ) -> Option<Transaction> {
         let pid = parent.compute_txid();
         let mut untried = self
             .orphanage
@@ -2168,26 +2158,8 @@ impl ActiveMempool {
                 break e;
             }
             other.get_or_insert(e);
-        }
-        .tx
-        .clone();
-        self.lift_parked_member(&child)
-    }
-
-    /// Take `tx` out of the orphanage for a 1p1c admit, as Core erases an
-    /// orphan relay admits. The announcing peers come along so a failed pair
-    /// can park it again under them.
-    pub fn lift_parked_member(&mut self, tx: &Transaction) -> Option<LiftedOrphan> {
-        let id = tx.compute_wtxid();
-        self.orphanage.missing_of(&id)?;
-        let announcers = self.orphanage.announcers_of(&id);
-        let parked = self.orphanage.remove_wtxid(&id)?;
-        let taken_gen = self.orphanage.note_taken(id, &announcers);
-        Some(LiftedOrphan {
-            tx: parked,
-            announcers,
-            taken_gen,
-        })
+        };
+        Some(child.tx.clone())
     }
 
     /// Park `tx` under `missing` and restore every announcing peer.

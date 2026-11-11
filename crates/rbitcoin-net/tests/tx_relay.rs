@@ -2182,8 +2182,8 @@ fn unindex_drops_relay_seq_and_accept_at() {
     assert!(hub.contains(&stay.compute_txid()));
     assert!(hub.relay_seq_of(&gone_w).is_none());
     assert!(hub.relay_seq_of(&stay_w).is_some());
-    // A live tx stays indexed. A gone tx that is not parked drops its maps.
-    // An orphan that is only parked keeps them.
+    // A live tx stays indexed. A gone tx drops its maps, parked or not:
+    // parked is not a tx the node has.
     hub.unindex_if_absent(&stay);
     assert!(hub.relay_seq_of(&stay_w).is_some());
     let orphan = Transaction {
@@ -2218,8 +2218,8 @@ fn unindex_drops_relay_seq_and_accept_at() {
     assert!(hub.relay_seq_of(&orphan_w).is_some());
     hub.unindex_if_absent(&orphan);
     assert!(
-        hub.relay_seq_of(&orphan_w).is_some(),
-        "a parked orphan is still indexed"
+        hub.relay_seq_of(&orphan_w).is_none(),
+        "a parked orphan is not indexed"
     );
     let absent = spend_true(cbs[2], 3_000, ScriptBuf::from_bytes(vec![0x51]));
     let absent_w = absent.compute_wtxid();
@@ -3440,6 +3440,35 @@ fn local_submit_admits_a_parked_tx_whose_parent_is_pooled() {
     hub.accept_tx_from(&child, TxOrigin::Local)
         .expect("a local submit ignores the orphanage");
     assert!(hub.try_contains(&child.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core `MempoolAcceptedTx`: a relay admit erases the parked copy of the
+/// same wtxid, with the peer weight it held.
+#[test]
+fn relay_admit_erases_the_parked_copy() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let parent = spend_true(cbs[9], 10_000, ScriptBuf::from_bytes(vec![0x51]));
+    let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9980_0000);
+    hub.accept_tx_from(&parent, TxOrigin::Local)
+        .expect("the parent pays for itself");
+    assert!(hub.lock_write().orphanage.insert_from(
+        child.clone(),
+        BTreeSet::from([parent.compute_txid()]),
+        Some(4),
+    ));
+    hub.accept_tx_from(&child, TxOrigin::Relay(Some(5)))
+        .expect("its parent is pooled");
+    let g = hub.lock_read();
+    assert!(
+        !g.orphanage.contains_wtxid(&child.compute_wtxid()),
+        "the admitted wtxid leaves the orphanage"
+    );
+    assert_eq!(g.orphanage.peer_orphan_weight(4), 0);
+    drop(g);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
