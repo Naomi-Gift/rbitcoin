@@ -27,6 +27,17 @@ use tokio::net::TcpStream;
 
 use rbitcoin_query::testutil::FixtureChain;
 
+#[test]
+fn esplora_accept_cap_stays_inside_the_semaphore() {
+    let max = tokio::sync::Semaphore::MAX_PERMITS;
+    assert_eq!(esplora_accept_cap(4), 32);
+    assert!(
+        esplora_accept_cap(max) <= max,
+        "accept cap {} exceeds the semaphore",
+        esplora_accept_cap(max)
+    );
+}
+
 /// Esplora caps accepted TCP sockets, not only in-flight requests, and closes
 /// a connection that never sends headers.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -45,27 +56,7 @@ async fn listener_cap_esplora_idle_tcp_is_closed() {
     for _ in 0..(cap + 16) {
         opened.push(TcpStream::connect(addr).await.expect("connect"));
     }
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    let mut probes = tokio::task::JoinSet::new();
-    for mut sock in opened {
-        probes.spawn(async move {
-            let mut buf = [0u8; 1];
-            let open =
-                match tokio::time::timeout(Duration::from_millis(20), sock.read(&mut buf)).await {
-                    Err(_) => true,
-                    Ok(Ok(0)) | Ok(Err(_)) => false,
-                    Ok(Ok(_)) => true,
-                };
-            (sock, open)
-        });
-    }
-    let mut still = Vec::new();
-    while let Some(joined) = probes.join_next().await {
-        let (sock, open) = joined.expect("probe");
-        if open {
-            still.push(sock);
-        }
-    }
+    let mut still = accepted_within(opened, cap).await;
     assert!(
         !still.is_empty() && still.len() <= cap,
         "esplora held {} idle TCP connections; cap is {cap}",
@@ -108,27 +99,7 @@ async fn listener_cap_esplora_shutdown_closes_idle_tcp() {
     for _ in 0..(cap + 16) {
         opened.push(TcpStream::connect(addr).await.expect("connect"));
     }
-    tokio::time::sleep(Duration::from_millis(80)).await;
-    let mut probes = tokio::task::JoinSet::new();
-    for mut sock in opened {
-        probes.spawn(async move {
-            let mut buf = [0u8; 1];
-            let open =
-                match tokio::time::timeout(Duration::from_millis(20), sock.read(&mut buf)).await {
-                    Err(_) => true,
-                    Ok(Ok(0)) | Ok(Err(_)) => false,
-                    Ok(Ok(_)) => true,
-                };
-            (sock, open)
-        });
-    }
-    let mut still = Vec::new();
-    while let Some(joined) = probes.join_next().await {
-        let (sock, open) = joined.expect("probe");
-        if open {
-            still.push(sock);
-        }
-    }
+    let mut still = accepted_within(opened, cap).await;
     assert!(
         !still.is_empty() && still.len() <= cap,
         "esplora held {} idle TCP connections before shutdown; cap is {cap}",
@@ -169,6 +140,45 @@ async fn esplora_shutdown_wakes_without_the_fifty_ms_poll() {
     joined
         .expect("esplora stayed in the 50 ms shutdown poll")
         .expect("serve task");
+}
+
+/// Probe until the accept loop has refused down to `cap`, or the deadline.
+async fn accepted_within(mut opened: Vec<TcpStream>, cap: usize) -> Vec<TcpStream> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut probes = tokio::task::JoinSet::new();
+        for mut sock in opened {
+            probes.spawn(async move {
+                let mut buf = [0u8; 1];
+                let open = match tokio::time::timeout(
+                    Duration::from_millis(20),
+                    sock.read(&mut buf),
+                )
+                .await
+                {
+                    Err(_) => true,
+                    Ok(Ok(0)) | Ok(Err(_)) => false,
+                    Ok(Ok(_)) => true,
+                };
+                (sock, open)
+            });
+        }
+        let mut still = Vec::new();
+        while let Some(joined) = probes.join_next().await {
+            let (sock, open) = joined.expect("probe");
+            if open {
+                still.push(sock);
+            }
+        }
+        if !still.is_empty() && still.len() <= cap {
+            return still;
+        }
+        if std::time::Instant::now() >= deadline {
+            return still;
+        }
+        opened = still;
+        tokio::time::sleep(Duration::from_millis(40)).await;
+    }
 }
 
 fn temp_query(label: &str) -> (rbitcoin_query::testutil::TempDir, Query) {

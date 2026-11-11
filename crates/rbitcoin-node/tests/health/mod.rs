@@ -261,20 +261,31 @@ async fn listener_cap_idle_health_is_closed() {
     for _ in 0..80 {
         opened.push(TcpStream::connect(addr).await.expect("connect"));
     }
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    let mut probes = tokio::task::JoinSet::new();
-    for mut sock in opened {
-        probes.spawn(async move {
-            let open = tcp_still_open(&mut sock).await;
-            (sock, open)
-        });
-    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
     let mut still = Vec::new();
-    while let Some(joined) = probes.join_next().await {
-        let (sock, open) = joined.expect("probe");
-        if open {
-            still.push(sock);
+    loop {
+        let mut probes = tokio::task::JoinSet::new();
+        for mut sock in opened {
+            probes.spawn(async move {
+                let open = tcp_still_open(&mut sock).await;
+                (sock, open)
+            });
         }
+        still.clear();
+        while let Some(joined) = probes.join_next().await {
+            let (sock, open) = joined.expect("probe");
+            if open {
+                still.push(sock);
+            }
+        }
+        if !still.is_empty() && still.len() <= HEALTH_MAX_CONNECTIONS {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        opened = std::mem::take(&mut still);
+        tokio::time::sleep(Duration::from_millis(40)).await;
     }
     assert!(
         !still.is_empty() && still.len() <= HEALTH_MAX_CONNECTIONS,

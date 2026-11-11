@@ -1184,6 +1184,12 @@ pub async fn connect_and_handshake(
 /// Core VERSION/VERACK bound: 60s from TCP connect/accept. Timeout drops the stream.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Inbound handshake bound. `--peer-timeout` can shorten it. It cannot
+/// lengthen it past [`HANDSHAKE_TIMEOUT`].
+pub fn inbound_handshake_limit(peer_timeout_secs: u64) -> Duration {
+    Duration::from_secs(peer_timeout_secs).min(HANDSHAKE_TIMEOUT)
+}
+
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub async fn inbound_connect_and_handshake(
     stream: TcpStream,
@@ -1215,7 +1221,7 @@ pub async fn inbound_connect_and_handshake(
     sess.attach_tcp_shutdown(tcp_pre);
     // One deadline from accept through key exchange and VERSION/VERACK.
     // A per-read deadline would reset on each drip byte.
-    let limit = Duration::from_secs(peers.peer_timeout_secs());
+    let limit = inbound_handshake_limit(peers.peer_timeout_secs());
     let opened = tokio::time::timeout(limit, async {
         let perms = peers.permission_flags(their_addr, true, bind);
         let (mut reader, mut writer, wire, tcp_shutdown) =

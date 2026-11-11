@@ -737,6 +737,30 @@ fn accept_retries_a_full_fd_table_and_stops_on_a_dead_listener() {
     assert!(!accept_error_ends_listen(&emfile));
     assert!(!accept_error_ends_listen(&enfile));
     assert!(accept_error_ends_listen(&dead));
+    let reset = std::io::Error::new(std::io::ErrorKind::ConnectionReset, "rst");
+    let wsaemfile = std::io::Error::from_raw_os_error(10024);
+    let wsaenobufs = std::io::Error::from_raw_os_error(10055);
+    let wsaenetdown = std::io::Error::from_raw_os_error(10050);
+    let eperm = std::io::Error::from_raw_os_error(1);
+    let enobufs = std::io::Error::from_raw_os_error(105);
+    let enomem = std::io::Error::from_raw_os_error(12);
+    let ebadf = std::io::Error::from_raw_os_error(9);
+    assert!(!accept_error_ends_listen(&reset));
+    assert!(!accept_error_ends_listen(&wsaemfile));
+    assert!(!accept_error_ends_listen(&wsaenobufs));
+    assert!(!accept_error_ends_listen(&wsaenetdown));
+    assert!(!accept_error_ends_listen(&eperm));
+    assert!(!accept_error_ends_listen(&enobufs));
+    assert!(!accept_error_ends_listen(&enomem));
+    assert!(accept_error_ends_listen(&ebadf));
+}
+
+#[test]
+fn inbound_handshake_limit_cannot_exceed_sixty_seconds() {
+    use rbitcoin_net::peer::{inbound_handshake_limit, HANDSHAKE_TIMEOUT};
+    assert_eq!(inbound_handshake_limit(1), Duration::from_secs(1));
+    assert_eq!(inbound_handshake_limit(60), HANDSHAKE_TIMEOUT);
+    assert_eq!(inbound_handshake_limit(3600), HANDSHAKE_TIMEOUT);
 }
 
 #[tokio::test]

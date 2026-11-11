@@ -1028,7 +1028,10 @@ impl CappedAccept for tokio::net::UnixListener {
 /// Accepted sockets include requests waiting on the in-flight gate, so this
 /// is above `--esplora-max-inflight`. A connection past it is closed.
 pub fn esplora_accept_cap(max_inflight: usize) -> usize {
-    max_inflight.max(1).saturating_mul(8)
+    max_inflight
+        .max(1)
+        .saturating_mul(8)
+        .min(Semaphore::MAX_PERMITS)
 }
 
 /// Accept loop for TCP and unix. Caps sockets, closes one that never sends

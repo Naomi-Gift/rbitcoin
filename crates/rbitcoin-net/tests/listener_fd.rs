@@ -59,8 +59,8 @@ fn open_fds() -> u64 {
         "/dev/fd"
     };
     let n = std::fs::read_dir(dir)
-        .map(|rd| rd.count() as u64)
-        .unwrap_or(0);
+        .unwrap_or_else(|e| panic!("fd count failed: {e}"))
+        .count() as u64;
     n.saturating_sub(1)
 }
 
@@ -111,16 +111,19 @@ async fn listener_cap_fd_reserve_leaves_room() {
 
     let mut held = Vec::new();
     let mut refused = 0u32;
+    let mut octet = 1u8;
     for _ in 0..60 {
         if tight.saturating_sub(open_fds()) < 8 {
             break;
         }
-        let mut sock = match tokio::time::timeout(
-            Duration::from_millis(400),
-            tokio::net::TcpStream::connect(node.local_addr),
-        )
-        .await
-        {
+        let src = std::net::SocketAddr::from(([127, 0, 0, octet], 0));
+        octet = octet.saturating_add(1).max(1);
+        let connect = async {
+            let sock = tokio::net::TcpSocket::new_v4()?;
+            sock.bind(src)?;
+            sock.connect(node.local_addr).await
+        };
+        let mut sock = match tokio::time::timeout(Duration::from_millis(400), connect).await {
             Ok(Ok(sock)) => sock,
             _ => {
                 refused += 1;
@@ -152,7 +155,7 @@ async fn listener_cap_fd_reserve_leaves_room() {
     }
     let left = tight.saturating_sub(open_fds());
     assert!(
-        left >= 16,
+        held.len() > 8 && left >= 16,
         "listener filled the table: {left} fds left, held {}, refused {refused}",
         held.len()
     );

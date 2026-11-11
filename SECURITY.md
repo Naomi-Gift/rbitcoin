@@ -82,7 +82,8 @@ that affect consensus, P2P attack surface, or Electrum/query integrity.
   request that finds the in-flight cap full waits. That wait counts against
   the request timeout and the answer is then 408 (`admit_connection`,
   `TimeoutLayer`). Health, Esplora, Electrum, and inbound P2P leave a
-  descriptor reserve so the store and RPC can still open files. The numbers are
+  descriptor reserve so the store and RPC can still open files. That reserve
+  is Unix; Windows does not count descriptors and does not apply it. The numbers are
   [`docs/operator/interfaces.md`](docs/operator/interfaces.md). Esplora is
   opt-in (`--esplora-listen`). Internal electrs HTTP (`/internal/*`) is unix
   listen only, not the public TCP bind. Edge TLS, multi-tenant metering, and API keys

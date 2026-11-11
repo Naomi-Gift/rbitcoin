@@ -663,18 +663,24 @@ pub struct PreparedOutbound {
 
 /// A transient accept error should not stop the listen loop.
 ///
-/// `ConnectionAborted` is a peer that vanished during accept.
-/// `Interrupted` is a signal. `EMFILE` / `ENFILE` (24 / 23) clear once a
-/// socket is closed. Anything else, including a closed listener, ends accept.
+/// A reset peer, a signal, and a full socket table clear once a descriptor
+/// or buffer frees. A closed listener does not.
 #[doc(hidden)]
 pub fn accept_error_ends_listen(err: &std::io::Error) -> bool {
     if matches!(
         err.kind(),
-        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted
+        std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::Interrupted
     ) {
         return false;
     }
-    !matches!(err.raw_os_error(), Some(23 | 24))
+    // ENFILE/EMFILE, EPERM, ENOMEM, ENOBUFS, and the Windows socket-table
+    // and buffer errors. A bad listener fd is not in this set.
+    !matches!(
+        err.raw_os_error(),
+        Some(1 | 12 | 23 | 24 | 105 | 10024 | 10050 | 10055)
+    )
 }
 
 /// How often a down `--connect` / `addnode` target is tried again.
