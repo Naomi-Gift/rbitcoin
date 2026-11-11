@@ -9,12 +9,13 @@ token never buffers the body, and the node reads at most
 `UNREAD_BODY_MAX` (64 KiB) of it. Before any answer goes out (401, 404,
 405), the node reads a body no handler read frame by frame and drops each
 frame, up to that cap and the read timeout, so a small refused request
-gets its answer and not a reset. A larger body, declared or streamed, is
-answered at once with `Connection: close` and not read further. A client
-that sends it with its headers can still read a reset instead of the
-answer, as with an authorized 413. A body a client holds for `Expect:
-100-continue` is answered at once with `Connection: close` and not read.
-The
+gets its answer and not a reset. A broken body is then 400 and a stalled
+one 408, the status an authorized request gets. A larger body, declared or
+streamed, is answered at once with `Connection: close` and not read
+further. A client that sends it with its headers can still read a reset
+instead of the answer, as with an authorized 413. A body a client holds
+for `Expect: 100-continue` is answered at once with `Connection: close`
+and not read. The
 authenticated body cap is the named `RPC_MAX_HTTP_BODY` (32 MiB, Bitcoin
 Core `MAX_SIZE`): a larger body with a valid bearer is 413 and the method
 does not run. REST stays at `REST_MAX_HTTP_BODY` (2 MiB) and does not use

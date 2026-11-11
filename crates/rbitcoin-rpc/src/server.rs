@@ -708,6 +708,8 @@ async fn read_http_body(req: Request) -> Result<Bytes, Response> {
 /// It stops at [`UNREAD_BODY_MAX`] and at [`RPC_READ_TIMEOUT`], so a refused
 /// client can make the node read only a small body. A larger body, or one a
 /// handler stopped reading, is answered at once and the connection closes.
+/// A broken body is 400 and a stalled one 408, the status [`read_http_body`]
+/// gives, but with no error text.
 /// A client waiting on `Expect: 100-continue` is left to skip its upload, and
 /// the connection closes.
 async fn read_unread_body(req: Request, next: Next) -> Response {
@@ -736,19 +738,24 @@ async fn read_unread_body(req: Request, next: Next) -> Response {
     }
     let read_rest = async {
         let mut read = 0usize;
-        while let Some(Ok(frame)) =
+        while let Some(frame) =
             std::future::poll_fn(|cx| std::pin::Pin::new(&mut body).poll_frame(cx)).await
         {
+            let Ok(frame) = frame else {
+                return Err(StatusCode::BAD_REQUEST);
+            };
             read += frame.data_ref().map_or(0, Bytes::len);
             if read > UNREAD_BODY_MAX {
-                return false;
+                return Ok(false);
             }
         }
-        true
+        Ok(true)
     };
     match tokio::time::timeout_at(deadline, read_rest).await {
-        Ok(true) | Err(_) => response,
-        Ok(false) => closing(response),
+        Ok(Ok(true)) => response,
+        Ok(Ok(false)) => closing(response),
+        Ok(Err(status)) => closing(status.into_response()),
+        Err(_) => closing(StatusCode::REQUEST_TIMEOUT.into_response()),
     }
 }
 

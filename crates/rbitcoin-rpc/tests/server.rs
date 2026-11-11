@@ -635,6 +635,60 @@ async fn unread_body_is_read_before_the_answer_up_to_the_cap() {
             "{answer}"
         );
     }
+
+    // A broken body is 400 and a stalled one is 408, the status an authorized
+    // request gets, whatever the handler answered.
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut bad_chunk = tokio::net::TcpStream::connect(addr).await.unwrap();
+        bad_chunk
+            .write_all(b"POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n")
+            .await
+            .unwrap();
+        let answer = read_answer(&mut bad_chunk).await;
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+
+        let mut authorized = tokio::net::TcpStream::connect(addr).await.unwrap();
+        authorized
+            .write_all(format!("POST / HTTP/1.1\r\nHost: x\r\nAuthorization: {good}\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let answer = read_answer(&mut authorized).await;
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+        assert!(
+            answer.to_ascii_lowercase().contains("connection: close"),
+            "{answer}"
+        );
+
+        let mut short = tokio::net::TcpStream::connect(addr).await.unwrap();
+        short
+            .write_all(
+                b"POST /not-rpc HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{\"short\":1}",
+            )
+            .await
+            .unwrap();
+        short.shutdown().await.unwrap();
+        let answer = read_answer(&mut short).await;
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+
+        // The paused clock moves only once every task waits, so the server
+        // has set its deadline and parked on the body before time passes it.
+        tokio::time::pause();
+        let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stalled
+            .write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(60), stalled.read_to_end(&mut answer))
+            .await
+            .expect("408 at the deadline")
+            .expect("read answer");
+        tokio::time::resume();
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 408"), "{answer}");
+    }
     handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }
