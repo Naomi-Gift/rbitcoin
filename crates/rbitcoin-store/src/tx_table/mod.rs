@@ -2276,17 +2276,53 @@ impl TxTable {
             }
         }
         let backend = crate::spend_annotate_uring::spend_ann_backend();
+        let known = self.known_spend_slots(abs_edges)?;
+        let body_pub = self.spent.body_published_len();
         let mut cold = Vec::new();
-        for &(abs, cfk, vout, sfk, vin) in abs_edges {
-            let known = self.current_spend_slot(abs)?;
+        let mut live_edges = Vec::with_capacity(abs_edges.len());
+        let mut live_known = Vec::with_capacity(abs_edges.len());
+        for (edge, slot) in abs_edges.iter().copied().zip(known) {
+            let (abs, cfk, vout, sfk, vin) = edge;
+            if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > body_pub {
+                cold.push((cfk, vout, sfk, vin));
+                continue;
+            }
+            live_edges.push(edge);
+            live_known.push(slot);
+        }
+        if !live_edges.is_empty() {
             cold.extend(self.put_spend_batch_by_abs_meta_known(
                 spenders,
-                &[(abs, cfk, vout, sfk, vin)],
-                &[known],
+                &live_edges,
+                &live_known,
                 backend,
             )?);
         }
         Ok(cold)
+    }
+
+    /// One directory-or-body read for the whole batch.
+    ///
+    /// A slot past the published body is `(NULL, 0, 0)`, the same answer
+    /// [`Self::current_spend_slot`] returns without reading. A short or
+    /// undecodable in-range slot falls back to that read so the error stays.
+    fn known_spend_slots(
+        &self,
+        abs_edges: &[(u64, Fk, u32, Fk, u32)],
+    ) -> Result<Vec<(Fk, u8, u32)>, StoreError> {
+        let offs: Vec<u64> = abs_edges.iter().map(|edge| edge.0).collect();
+        let peeked = self.get_spender_meta_at_abs_batch(&offs)?;
+        let body_pub = self.spent.body_published_len();
+        let mut known = Vec::with_capacity(abs_edges.len());
+        for (edge, slot) in abs_edges.iter().zip(peeked) {
+            let past = edge.0.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > body_pub;
+            known.push(match slot {
+                Some((field, flags, vin)) => (field, flags, vin),
+                None if past => (Fk::NULL, 0, 0),
+                None => self.current_spend_slot(edge.0)?,
+            });
+        }
+        Ok(known)
     }
 
     fn current_spend_slot(&self, abs: u64) -> Result<(Fk, u8, u32), StoreError> {

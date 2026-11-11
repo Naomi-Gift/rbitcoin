@@ -41,4 +41,9 @@ Fixed
   asks for one extra checkpoint, not another on every later batch. Neither is a
   knob. Once the commit names a generation, a failed rename of that file still
   keeps the publish, and the next checkpoint writes the next generation
-  instead of replacing the file the commit already names.
+  instead of replacing the file the commit already names. A keep error
+  while filtering notes taken during compose leaves those notes in the
+  open directory, and the next checkpoint still publishes them. Startup
+  replay checkpoints a chunk once the open directory reaches 2,000,000
+  edges, and the next checkpoint folds that generation. It does not wait
+  for a sync thread.

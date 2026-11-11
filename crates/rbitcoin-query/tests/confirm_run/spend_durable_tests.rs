@@ -1152,3 +1152,43 @@ fn checkpoint_append_above_snapshot_still_publishes() {
     assert_eq!(q.tip_height(), Some(Height(3)));
     let _ = dir;
 }
+
+#[test]
+fn replay_folds_a_full_open_directory() {
+    let (dir, q) = chain_at_height("spend-replay-cap", 1);
+    let _ = std::fs::remove_file(q.store().path().join(rbitcoin_store::SPEND_DURABLE_NAME));
+    // Null spender field, vin 1. `keep` retains a null field, and the body
+    // byte is not zero, so a fold is visible.
+    let slot = [0u8, 0, 0, 0, 0, 0, 1, 0];
+    let cap = rbitcoin_store::spend_page_log::OPEN_EDGE_CAP;
+    let last_page = 1 + (cap - 1) / 512;
+    let end = (last_page + 1) * 4096;
+    let count = q.store().txs.spent.count();
+    q.store().txs.spent.truncate_body_to(count, end).unwrap();
+    let mut batch = Vec::with_capacity(512);
+    let mut n = 0u64;
+    while n < cap {
+        let page = 1 + n / 512;
+        let rel = n % 512;
+        batch.push((page * 4096 + rel * 8, slot));
+        n += 1;
+        if batch.len() == 512 {
+            q.store().note_open_spend_slots(&batch).unwrap();
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        q.store().note_open_spend_slots(&batch).unwrap();
+    }
+    assert!(q.store().spend_checkpoint_early());
+    rbitcoin_query::replay_spend_annotations(&q).unwrap();
+    let published = q.store().txs.spent.body_published_len();
+    let mut got = [0u8; 8];
+    q.store()
+        .txs
+        .spent
+        .read_prefix_at_published(published, 4096, 8, &mut got)
+        .unwrap();
+    assert_eq!(got, slot);
+    let _ = dir;
+}

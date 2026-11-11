@@ -54,12 +54,6 @@ pub fn note_spend_write_for_test() {
 #[doc(hidden)]
 pub type SpentAbsWrite = (u64, Fk, u32, Fk, u32, [u8; META_LEN]);
 
-#[doc(hidden)]
-pub enum Phase {
-    Reading,
-    Writing,
-}
-
 /// Annotate spends at absolute meta offsets via io_uring RMW.
 ///
 /// `edges`: `(abs_off, create_tx_fk, vout, spending_tx_fk)`.
@@ -248,7 +242,6 @@ pub fn annotate_unknown_pages_uring(
     let body_path = txs.spent.body_file_path().to_path_buf();
     struct PageSlot {
         group_i: usize,
-        phase: Phase,
         buf: Vec<u8>,
     }
     uring_session::with_thread_local(uring_session::DEFAULT_ENTRIES, |session| {
@@ -280,7 +273,6 @@ pub fn annotate_unknown_pages_uring(
                 };
                 slots[slot] = Some(PageSlot {
                     group_i: gi,
-                    phase: Phase::Reading,
                     buf: vec![0u8; groups[gi].len],
                 });
                 {
@@ -326,52 +318,36 @@ pub fn annotate_unknown_pages_uring(
                 let mut st = slots[slot]
                     .take()
                     .ok_or(StoreError::Corrupt("spend annotate empty slot"))?;
-                let expect = match st.phase {
-                    Phase::Reading => uring_session::KIND_SPEND_PAGE_READ,
-                    Phase::Writing => uring_session::KIND_SPEND_PAGE_WRITE,
-                };
-                if kind != expect {
+                if kind != uring_session::KIND_SPEND_PAGE_READ {
                     return Err(StoreError::Corrupt("spend annotate bad user_data"));
                 }
                 in_flight = in_flight.saturating_sub(1);
                 let gi = st.group_i;
-                match st.phase {
-                    Phase::Reading => {
-                        let want = st.buf.len();
-                        if let Err(e) = uring_session::require_full_cqe(res, want, &body_path) {
-                            free_slots.push(slot);
-                            return Err(e);
-                        }
-                        let wrote = poke_edge_page(
-                            &mut st.buf,
-                            groups[gi].off,
-                            &groups[gi].edges,
-                            spenders,
-                            &mut cold,
-                        )?;
-                        if wrote.is_empty() {
-                            free_slots.push(slot);
-                            continue;
-                        }
-                        note_spend_write_for_test();
-                        // Slot pwrites, not the page image. A torn page write
-                        // would zero neighbors this read just observed.
-                        if write_spent_slots(txs, &wrote).is_err() {
-                            for e in &groups[gi].edges {
-                                cold.push((e.1, e.2, e.3, e.4));
-                            }
-                        }
-                        free_slots.push(slot);
-                    }
-                    Phase::Writing => {
-                        let want = st.buf.len();
-                        if let Err(e) = uring_session::require_full_cqe(res, want, &body_path) {
-                            free_slots.push(slot);
-                            return Err(e);
-                        }
-                        free_slots.push(slot);
+                let want = st.buf.len();
+                if let Err(e) = uring_session::require_full_cqe(res, want, &body_path) {
+                    free_slots.push(slot);
+                    return Err(e);
+                }
+                let wrote = poke_edge_page(
+                    &mut st.buf,
+                    groups[gi].off,
+                    &groups[gi].edges,
+                    spenders,
+                    &mut cold,
+                )?;
+                if wrote.is_empty() {
+                    free_slots.push(slot);
+                    continue;
+                }
+                note_spend_write_for_test();
+                // Slot pwrites, not the page image. A torn page write
+                // would zero neighbors this read just observed.
+                if write_spent_slots(txs, &wrote).is_err() {
+                    for e in &groups[gi].edges {
+                        cold.push((e.1, e.2, e.3, e.4));
                     }
                 }
+                free_slots.push(slot);
             }
             arm(
                 &mut session,

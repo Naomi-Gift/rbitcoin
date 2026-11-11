@@ -419,7 +419,7 @@ fn pure_write_same_page_is_one_page_write() {
 }
 
 #[test]
-fn unknown_meta_annotate_is_one_rmw_per_page() {
+fn unknown_meta_annotate_stays_in_the_directory() {
     let (dir, t, spenders) = temp_table();
     let (fk, off, _len) = put_n_outs(&t, 520, 0x44);
     let a0 = rbitcoin_store::spent_abs(off, 0);
@@ -464,6 +464,41 @@ fn unknown_meta_annotate_is_one_rmw_per_page() {
     assert!(!m0 && f0 == Fk(10) && v0 == 1);
     assert!(!m1 && f1 == Fk(11) && v1 == 2);
     assert!(!m2 && f2 == Fk(12) && v2 == 3);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A logged slot stays the previous spender when the body byte is corrupt.
+/// An offset past the published body stays cold, in input order.
+#[test]
+fn batched_annotate_keeps_the_logged_slot_and_the_cold_tail() {
+    let (dir, t, spenders) = temp_table();
+    let (fk, off, len) = put_n_outs(&t, 2, 0x46);
+    let a0 = rbitcoin_store::spent_abs(off, 0);
+    let a1 = rbitcoin_store::spent_abs(off, 1);
+    let past = t.spent.body_published_len();
+    assert!(t
+        .put_spend_batch_by_abs_meta(&spenders, &[(a0, fk, 0, Fk(10), 1), (a1, fk, 1, Fk(12), 3)],)
+        .unwrap()
+        .is_empty());
+    t.spent
+        .write_body_abs(a0, &[0xff, 0, 0, 0, 0, 0, 0, 0])
+        .unwrap();
+    let cold = t
+        .put_spend_batch_by_abs_meta(
+            &spenders,
+            &[(a0, fk, 0, Fk(11), 2), (past, fk, 0, Fk(13), 4)],
+        )
+        .unwrap();
+    assert_eq!(cold, vec![(fk, 0, Fk(13), 4)]);
+    let (multi, field, _) = t.get_output_spender_meta_at(off, len, 0).unwrap();
+    assert!(multi);
+    let (second, second_vin, next) = spenders.get(field).unwrap();
+    assert_eq!((second, second_vin), (Fk(11), 2));
+    let (first, first_vin, end) = spenders.get(next).unwrap();
+    assert_eq!((first, first_vin), (Fk(10), 1));
+    assert!(end.is_null());
+    let (m1, f1, v1) = t.get_output_spender_meta_at(off, len, 1).unwrap();
+    assert!(!m1 && f1 == Fk(12) && v1 == 3);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

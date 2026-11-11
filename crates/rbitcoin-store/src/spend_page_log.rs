@@ -786,26 +786,25 @@ impl SpendPageLog {
     {
         // Slots noted during compose are not in the image. Drop ones `keep`
         // rejects before the directory swap, so a disconnected spend does not
-        // become the committed image.
+        // become the committed image. Replace the page only after every `keep`
+        // returns, so an error still leaves the note for the next checkpoint.
         let mut g = self.lock();
         let offs: Vec<u64> = g.open.keys().copied().collect();
         for off in offs {
-            let mut dropped = 0u64;
-            let remove = {
-                let Some(page) = g.open.get_mut(&off) else {
-                    continue;
-                };
-                let mut live = Vec::new();
-                for slot in page.slots.drain(..) {
-                    if keep(&slot.1)? {
-                        live.push(slot);
-                    } else {
-                        dropped = dropped.saturating_add(1);
-                    }
-                }
-                page.slots = live;
-                page.slots.is_empty() && page.base.is_none()
+            let Some(page) = g.open.get_mut(&off) else {
+                continue;
             };
+            let mut live = Vec::with_capacity(page.slots.len());
+            let mut dropped = 0u64;
+            for slot in &page.slots {
+                if keep(&slot.1)? {
+                    live.push(*slot);
+                } else {
+                    dropped = dropped.saturating_add(1);
+                }
+            }
+            page.slots = live;
+            let remove = page.slots.is_empty() && page.base.is_none();
             g.open_edges = g.open_edges.saturating_sub(dropped);
             if remove {
                 g.open.remove(&off);

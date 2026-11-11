@@ -1500,6 +1500,37 @@ fn fold_keeps_the_log_while_a_dirtied_page_is_still_open() {
 }
 
 #[test]
+fn keep_error_during_scrub_leaves_the_open_note() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let first = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    let later = [8u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, first)]).unwrap();
+    let err = log.commit_open(
+        3,
+        8192,
+        |_off, len| {
+            log.note_slots(&[(4096, later)]).unwrap();
+            Ok(vec![0u8; len])
+        },
+        |meta| {
+            if meta == &later {
+                Err(StoreError::Corrupt("keep failed"))
+            } else {
+                Ok(true)
+            }
+        },
+    );
+    assert!(err.is_err());
+    assert_eq!(log.slot(4096), Some(later));
+    log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+    assert_eq!(log.slot(4096), Some(later));
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(4096), Some(later));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn explode_keep_error_keeps_the_image() {
     let d = dir();
     let log = SpendPageLog::create(&d);

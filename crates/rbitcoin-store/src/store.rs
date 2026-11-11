@@ -1276,6 +1276,15 @@ impl Store {
             .put_spend_batch_by_abs_meta(&self.spenders, abs_edges)
     }
 
+    /// Record already-encoded spend slots in the open directory.
+    #[doc(hidden)]
+    pub fn note_open_spend_slots(
+        &self,
+        slots: &[(u64, [u8; crate::tx_table::OutputRecord::SPENT_SLOT_LEN])],
+    ) -> Result<(), StoreError> {
+        self.txs.note_historical_spend_slots(slots)
+    }
+
     /// Resolve txid → Class A fk without full body decode (head probe + body txid).
     ///
     /// **`TipThenAny`:** RPC / reconstruct (connected if present, else newest).
