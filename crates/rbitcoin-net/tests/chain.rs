@@ -60,8 +60,7 @@ fn generate_commit_pad() -> &'static rbitcoin_query::testutil::TempDir {
     PAD.get_or_init(|| {
         let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("generate-commit-pad");
         hub.ensure_genesis().unwrap();
-        hub.generate_to_script(101, ScriptBuf::from_bytes(vec![0x51]), vec![])
-            .unwrap();
+        hub.confirm_empty_regtest(101).unwrap();
         hub.query.flush().expect("flush generate-commit pad");
         dir
     })
@@ -580,8 +579,7 @@ fn conflicting_mempool_spend_leaves_with_the_block() {
     let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
     let mp = attach_mp(dir.path(), &hub);
-    hub.generate_to_script(101, ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
     let cb = hub
         .query
         .reconstruct_block_at_height(Height(1))
@@ -765,8 +763,7 @@ async fn confirmed_private_broadcast_is_not_sent_again_before_the_pool_is_mainta
             .unwrap();
     assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
     mp.set_isolated_broadcast(true);
-    hub.generate_to_script(101, ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
     let local = mature_spend_tx(&hub, 1);
     let txid = local.compute_txid();
     mp.accept_tx_from(&local, rbitcoin_net::TxOrigin::Local)
@@ -913,7 +910,7 @@ fn chain_hub_prefill_and_version() {
     );
 
     // `feature_dersig.py`: from 102 a version-2 block is `bad-version`.
-    hub.generate_to_script(97, op_true(), vec![]).unwrap();
+    hub.confirm_empty_regtest(97).unwrap();
     assert_eq!(hub.tip_height(), Some(101));
     let bad_version = |height: u32, version: i32| {
         let prev = hub.tip_hash().unwrap();
@@ -1284,8 +1281,7 @@ fn linux_thread_comms() -> Vec<String> {
 #[test]
 fn tip_accept_script_jobs_use_steal_pool() {
     let (dir, hub) = tmp_hub();
-    hub.generate_to_script(101, ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .expect("mature coinbases");
+    hub.confirm_empty_regtest(101).expect("mature coinbases");
     let cb1 = hub.block_at_height(1).unwrap().unwrap().txdata[0].compute_txid();
     let cb2 = hub.block_at_height(2).unwrap().unwrap().txdata[0].compute_txid();
     let spend = |txid, value| Transaction {
@@ -1424,8 +1420,7 @@ fn fresh_tip_accept_maintains_pool_without_peer_relay() {
     );
     // Coinbase at height 1 matures once the tip reaches 101. Those blocks
     // are still inside the pack, with relay off, and must strip.
-    hub.generate_to_script(100, ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(100).unwrap();
     assert!(!mp.relay_enabled());
     let spend = mature_spend_tx(&hub, 1);
     let txid = spend.compute_txid();
@@ -1467,8 +1462,7 @@ fn bulk_confirm_strips_once_the_pool_is_maintained() {
     hub.accept_block(mine(gen, now, 1)).unwrap();
     assert!(mp.pool_maintained());
     assert!(!mp.relay_enabled());
-    hub.generate_to_script(100, ScriptBuf::from_bytes(vec![0x51]), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(100).unwrap();
     let spend = mature_spend_tx(&hub, 1);
     let txid = spend.compute_txid();
     mp.accept_tx(&spend).expect("mature coinbase spend");
@@ -2125,6 +2119,8 @@ fn reorg_pad() -> ReorgPad {
     let gen = hub.tip_hash().unwrap();
     hub.accept_block(mine(gen, hub.clock.now_secs() as u32, 1))
         .unwrap();
+    // Per-block accept. The fault test truncates `txout.body` by half and
+    // relies on Class A appending one height at a time.
     hub.generate_to_script(100, ScriptBuf::from_bytes(vec![0x51]), vec![])
         .unwrap();
     let fork = hub.tip_height().unwrap();
@@ -3485,7 +3481,7 @@ fn invalidate_evicts_immature_coinbase_spend() {
     let (dir, hub) = tmp_hub();
     hub.ensure_genesis().unwrap();
     let hashes = hub
-        .generate_to_script(103, ScriptBuf::from_bytes(vec![0x51]), vec![])
+        .confirm_empty_regtest(103)
         .expect("pad to mature coinbase");
     assert_eq!(hashes.len(), 103);
     assert_eq!(hub.tip_height(), Some(103));
@@ -4940,8 +4936,7 @@ fn coinbase_spend_rejects_cached_height_after_disconnect() {
 fn check_block_proposal_prices_fees_and_rejects_on_one_chain() {
     let (dir, hub) = tmp_hub();
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(101, op_true.clone(), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
 
     let block = hub
         .assemble_block_to_script(op_true.clone(), vec![])
@@ -5224,8 +5219,7 @@ fn check_block_proposal_reads_medians_from_confirmed_headers() {
 fn check_block_proposal_rejects_witness_sigops_over_the_limit() {
     let (dir, hub) = tmp_hub();
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(101, op_true.clone(), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
     let ws = ScriptBuf::from_bytes(vec![0xac; 10_000]);
     let p2wsh = ScriptBuf::new_p2wsh(&ws.wscript_hash());
     let cb = hub
@@ -5334,8 +5328,7 @@ fn proposal_spend_of_an_unspendable_output_is_missing() {
 
     let (dir, hub) = tmp_hub();
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(101, op_true.clone(), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
     let mut op_return = one_sat(
         mature_spend_tx(&hub, 1).input[0].previous_output.txid,
         0,
@@ -6001,8 +5994,7 @@ fn review_trust_local_block_rechecks_marked_script() {
     let wpkh = WPubkeyHash::from_byte_array([0x41; 20]);
     hub.generate_to_script(1, ScriptBuf::new_p2wpkh(&wpkh), vec![])
         .unwrap();
-    hub.generate_to_script(101, op_true.clone(), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
     let cb = hub
         .query
         .reconstruct_block_at_height(Height(1))
@@ -6171,8 +6163,7 @@ fn review_trust_proposal_is_silent() {
     );
     assert_proposal_silent();
 
-    hub.generate_to_script(100, op_true.clone(), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(100).unwrap();
     let mut spend = mature_spend_tx(&hub, 1);
     spend.input[0].script_sig = ScriptBuf::from_bytes(vec![0x6a]);
     let script_block = hub.assemble_block_to_script(op_true, vec![spend]).unwrap();
@@ -6607,8 +6598,7 @@ fn bip94_off_tip_retarget_scales_the_period_first_bits() {
 fn check_block_proposal_decodes_only_the_spent_outputs_of_a_wide_parent() {
     let (dir, hub) = tmp_hub();
     let op_true = ScriptBuf::from_bytes(vec![0x51]);
-    hub.generate_to_script(101, op_true.clone(), vec![])
-        .unwrap();
+    hub.confirm_empty_regtest(101).unwrap();
     let mut wide = mature_spend_tx(&hub, 1);
     wide.output = (0..1_000u64)
         .map(|i| TxOut {

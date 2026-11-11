@@ -21,6 +21,8 @@ fn tip_announce_pad() -> &'static TipAnnouncePad {
     PAD.get_or_init(|| {
         let (built, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("tip-announce-build");
         hub.ensure_genesis().unwrap();
+        // `tip_announce_decision` walks cached body prev links. Batch confirm
+        // does not leave those bodies cached, so this pad stays on accept.
         hub.generate_to_script(102, op_true(), vec![]).unwrap();
         hub.query.flush().expect("flush tip-announce pad");
         let store = rbitcoin_query::testutil::TempDir::labeled("tip-announce-pad")
