@@ -2980,6 +2980,129 @@ fn always_relay_recent_reject_is_not_relayed() {
     recent_reject_skips_atmp_on_second_send(false);
 }
 
+/// Core `AlreadyHaveTx`: a tx in `m_lazy_recent_rejects` is not requested
+/// when another peer announces it, by txid or by wtxid
+/// (`p2p_orphan_handling.py` `test_orphan_inherit_rejection`).
+#[test]
+fn recent_reject_is_not_requested_from_other_peers() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use tokio::runtime::Builder;
+
+    let coinbase = Transaction {
+        version: TxVersion::ONE,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint::null(),
+            script_sig: ScriptBuf::from_bytes(vec![0x00, 0x01]),
+            sequence: Sequence::MAX,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let txid = coinbase.compute_txid();
+    let wtxid = coinbase.compute_wtxid();
+
+    let rt = Builder::new_current_thread().enable_all().build().unwrap();
+    rt.block_on(async {
+        let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("reject-inv-other-peer");
+        hub.ensure_genesis().unwrap();
+        let t = hub.tip_header().unwrap().time;
+        hub.clock.set_mock(i64::from(t) + 1);
+        let mp = rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query))
+            .unwrap();
+        mp.set_relay_enabled(true);
+        assert!(hub.attach_mempool(mp).is_ok());
+
+        let peers = rbitcoin_net::peers::PeerHub::new();
+        let register = |port: u16, nonce: u64| {
+            let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+            let ver = VersionMessage {
+                version: 70016,
+                services: ServiceFlags::NETWORK,
+                timestamp: 0,
+                receiver: Address::new(&addr, ServiceFlags::NONE),
+                sender: Address::new(&addr, ServiceFlags::NONE),
+                nonce,
+                user_agent: "/rbitcoin:test/".into(),
+                start_height: 0,
+                relay: true,
+            };
+            peers.register(
+                addr,
+                addr,
+                &ver,
+                true,
+                rbitcoin_net::peers::PeerConnType::Inbound,
+            )
+        };
+        let sender = register(18444, 1);
+        let by_txid = register(18445, 2);
+        let by_wtxid = register(18446, 3);
+        by_wtxid.set_wtxid_relay();
+
+        async fn getdata_for(
+            hub: &ChainHub,
+            peer: &rbitcoin_net::peers::LivePeer,
+            item: Inventory,
+        ) -> Vec<Inventory> {
+            let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+            let mut follow = PeerFollowState::new();
+            handle_peer_frame(
+                frame_for(NetworkMessage::Inv(vec![item])),
+                hub,
+                &out_tx,
+                &mut follow,
+                Some(peer),
+            )
+            .await
+            .unwrap();
+            let mut want = Vec::new();
+            while let Ok(out) = out_rx.try_recv() {
+                if let NetworkMessage::GetData(v) = out.expect_msg() {
+                    want.extend(v);
+                }
+            }
+            want
+        }
+
+        let unknown = bitcoin::Txid::from_byte_array([7; 32]);
+        assert_eq!(
+            getdata_for(&hub, &by_txid, Inventory::Transaction(unknown)).await,
+            vec![Inventory::WitnessTransaction(unknown)],
+            "an unknown tx is requested"
+        );
+
+        let (out_tx, _out_rx) = mpsc::unbounded_channel();
+        let mut follow = PeerFollowState::new();
+        handle_peer_frame(
+            frame_for(NetworkMessage::Tx(coinbase)),
+            &hub,
+            &out_tx,
+            &mut follow,
+            Some(sender.as_ref()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            getdata_for(&hub, &by_txid, Inventory::Transaction(txid)).await,
+            vec![],
+            "a rejected tx is not requested by txid"
+        );
+        assert_eq!(
+            getdata_for(&hub, &by_wtxid, Inventory::WTx(wtxid)).await,
+            vec![],
+            "a rejected tx is not requested by wtxid"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    });
+}
+
 /// Compact fill with a live mempool hub must not `list_live` every body.
 #[test]
 fn cmpct_helpers_with_mempool_skip_list_live() {
