@@ -415,3 +415,94 @@ fn orphan_of_weight(parent: Txid, target: u64) -> Transaction {
     }
     panic!("no witness length weighs {target}");
 }
+
+fn witnessed(tx: &Transaction, mark: u8) -> Transaction {
+    let mut w = tx.clone();
+    w.input[0].witness = Witness::from_slice(&[[mark]]);
+    w
+}
+
+/// Two witnesses of one txid are two orphans. The txid index follows the
+/// one that is left, and a block that confirms the txid drops both.
+#[test]
+fn two_witnesses_of_one_txid_are_two_orphans() {
+    let mut o = Orphanage::new();
+    let p = txid_n(20);
+    let plain = make_orphan(p, 1);
+    let marked = witnessed(&plain, 9);
+    let tid = plain.compute_txid();
+    assert_eq!(tid, marked.compute_txid());
+    for tx in [&plain, &marked] {
+        assert!(o.insert_from(tx.clone(), BTreeSet::from([p]), Some(1)));
+    }
+    assert_eq!(o.len(), 2);
+
+    assert!(o.remove_wtxid(&plain.compute_wtxid()).is_some());
+    assert!(o.contains(&tid), "the other witness is still parked");
+    assert!(o.contains_wtxid(&marked.compute_wtxid()));
+    assert_eq!(o.by_txid.get(&tid), Some(&vec![marked.compute_wtxid()]));
+    assert!(o.remove_wtxid(&marked.compute_wtxid()).is_some());
+    assert!(!o.contains(&tid));
+    assert!(o.by_txid.is_empty() && o.by_parent.is_empty());
+
+    for tx in [&plain, &marked] {
+        assert!(o.insert_from(tx.clone(), BTreeSet::from([p]), Some(1)));
+    }
+    o.erase_for_block(&[tid]);
+    assert!(o.is_empty(), "a confirmed txid drops every witness");
+    assert!(o.by_txid.is_empty() && o.by_parent.is_empty());
+    assert_eq!(o.peer_orphan_weight(1), 0);
+}
+
+/// A promote leaves a child whose txid is already pooled where it is,
+/// still under the parent, and takes the rest.
+#[test]
+fn take_children_leaves_a_pooled_txid_parked() {
+    let mut o = Orphanage::new();
+    let p = txid_n(21);
+    let pooled = make_orphan(p, 1);
+    let other = make_orphan(p, 2);
+    for tx in [&pooled, &other] {
+        assert!(o.insert_from(tx.clone(), BTreeSet::from([p]), Some(1)));
+    }
+    let pooled_id = pooled.compute_txid();
+    let taken = o.take_children_of(&p, |t| *t == pooled_id);
+    assert_eq!(taken.len(), 1);
+    assert_eq!(taken[0].tx.compute_txid(), other.compute_txid());
+    assert!(o.contains_wtxid(&pooled.compute_wtxid()));
+    assert!(o
+        .by_parent
+        .get(&p)
+        .is_some_and(|set| set.len() == 1 && set.contains(&pooled.compute_wtxid())));
+    assert!(o.take_children_of(&p, |_| false).len() == 1);
+    assert!(o.by_parent.is_empty());
+}
+
+/// `erase_pooled_children` drops only the sending peer's orphans, and only
+/// those whose txid is pooled.
+#[test]
+fn erase_pooled_children_keeps_other_peers_and_unpooled() {
+    let mut o = Orphanage::new();
+    let p = txid_n(22);
+    let mine = make_orphan(p, 1);
+    let mine_witness = witnessed(&mine, 9);
+    let theirs = make_orphan(p, 2);
+    let unpooled = make_orphan(p, 3);
+    assert!(o.insert_from(mine.clone(), BTreeSet::from([p]), Some(1)));
+    assert!(o.insert_from(mine_witness.clone(), BTreeSet::from([p]), Some(1)));
+    assert!(o.insert_from(theirs.clone(), BTreeSet::from([p]), Some(2)));
+    assert!(o.insert_from(unpooled.clone(), BTreeSet::from([p]), Some(1)));
+    let pooled = [mine.compute_txid(), theirs.compute_txid()];
+    o.erase_pooled_children(&p, 1, |t| pooled.contains(t));
+    assert!(!o.contains(&mine.compute_txid()), "both witnesses go");
+    assert!(
+        o.contains_wtxid(&theirs.compute_wtxid()),
+        "another peer's stays"
+    );
+    assert!(
+        o.contains_wtxid(&unpooled.compute_wtxid()),
+        "an unpooled one stays"
+    );
+    assert_eq!(o.len(), 2);
+    assert_eq!(o.snapshot().len(), 2, "the fifo holds no erased id");
+}

@@ -5139,8 +5139,9 @@ pub fn on_inv_txid(
     if mp.try_recent_reject_txid(txid) {
         return None;
     }
-    if mp.try_contains(txid) && !mp.try_orphan_txid(txid) && !asks_back_local_tx(mp, session, txid)
-    {
+    // Core `AlreadyHaveTx` does not ask the orphanage by txid: a parked
+    // witness may not be the one announced.
+    if mp.try_contains(txid) && !asks_back_local_tx(mp, session, txid) {
         return None;
     }
     if let Some(s) = session {
@@ -5207,12 +5208,16 @@ pub fn on_inv_wtxid(
         }
         return Some(Inventory::WTx(*wtxid));
     }
+    // Core `AddTxAnnouncement`: an orphan with no parent left to fetch,
+    // such as one whose txid is already pooled, takes no announcer.
     let s = session?;
-    let _ = mp.add_orphan_announcer(wtxid, s.id);
-    if let Some(tx) = mp.try_orphan_tx_wtxid(wtxid) {
-        let missing = mp.orphan_getdata_parents(&tx);
-        mp.schedule_orphan_parents(&missing, s.id, s.inbound, s.clock_now());
+    let tx = mp.try_orphan_tx_wtxid(wtxid)?;
+    let missing = mp.orphan_getdata_parents(&tx);
+    if missing.is_empty() {
+        return None;
     }
+    let _ = mp.add_orphan_announcer(wtxid, s.id);
+    mp.schedule_orphan_parents(&missing, s.id, s.inbound, s.clock_now());
     None
 }
 

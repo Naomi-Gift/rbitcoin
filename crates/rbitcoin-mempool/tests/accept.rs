@@ -3321,35 +3321,6 @@ fn assert_duplicate_inputs_not_applied(
     assert!(!mp.graph.contains(&dup_id));
 }
 
-/// `repark_lifted` is a local retry. The process flag does not waive it.
-#[test]
-fn review_trust_repark_does_not_use_process_bit() {
-    let dir = tmp_dir();
-    let (op, _, utxos) = chain_utxo(100_000);
-    let mut tx = spend_tx(op, 99_000);
-    tx.lock_time = LockTime::from_height(500).unwrap();
-    tx.input[0].sequence = Sequence::from_consensus(0xfffffffe);
-    let tip = ChainTipCtx {
-        height: 100,
-        mtp: u32::MAX,
-    };
-    let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
-    let lifted = LiftedOrphan {
-        tx: tx.clone(),
-        announcers: vec![1],
-        taken_gen: 0,
-    };
-    rbitcoin_log::capture_logs(false);
-    rbitcoin_log::capture_logs(true);
-    let ready = mp.repark_lifted(std::slice::from_ref(&lifted), &utxos, tip, &|_| 0, None);
-    assert!(ready.is_empty(), "a local non-final orphan is not ready");
-    assert!(!mp.graph.contains(&tx.compute_txid()));
-    let logs = trust_logs();
-    assert!(!logs.contains("trust-peer:"), "{logs}");
-    rbitcoin_log::capture_logs(false);
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
 /// A waived script is logged only after the tx is in the pool. A script
 /// fault that then loses the cluster limit logs nothing and stays out.
 #[test]
@@ -3689,16 +3660,18 @@ fn package_admit_drops_the_inflight_row() {
         vec![4],
         "the admitted child stays parked under its peer"
     );
-    mp.orphanage.erase_for_peer(4);
+    mp.orphanage.remove_wtxid(&child.compute_wtxid());
     assert!(
         !mp.orphanage.has_announcer(4),
-        "an admitted lift must not keep the peer in the in-flight map"
+        "the package must not leave the peer in the in-flight map"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A failed package leaves its parked member parked, under its peer, with
+/// no in-flight record: the package never takes it out.
 #[test]
-fn package_rollback_admit_drops_the_inflight_row() {
+fn package_rollback_leaves_the_parked_member() {
     let dir = tmp_dir();
     let (ops, utxos) = chain_coins(&[100_000, 50_000]);
     let mut mp = ActiveMempool::open_or_create(&dir).unwrap();
@@ -3717,21 +3690,23 @@ fn package_rollback_admit_drops_the_inflight_row() {
     mp.park_orphan_from(&child, missing, Some(4));
     let bad = spend_tx(ops[1], 60_000);
     let err = mp
-        .accept_package(&[child, bad], &utxos, TIP_OK)
+        .accept_package(&[child.clone(), bad], &utxos, TIP_OK)
         .expect_err("the overspend fails the package");
     assert!(
-        mp.graph.contains(&child_id),
-        "the lifted child is admitted on its own, got {err}"
+        !mp.graph.contains(&child_id),
+        "the rollback removes the child, got {err}"
     );
+    assert_eq!(mp.orphanage.announcers_of(&child.compute_wtxid()), vec![4]);
+    mp.orphanage.remove_wtxid(&child.compute_wtxid());
     assert!(
         !mp.orphanage.has_announcer(4),
-        "that admit must not keep the peer in the in-flight map"
+        "the package must not leave the peer in the in-flight map"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
 #[test]
-fn package_rollback_reject_drops_the_inflight_row() {
+fn package_reject_leaves_the_parked_member() {
     use bitcoin::WPubkeyHash;
 
     let dir = tmp_dir();
@@ -3772,13 +3747,15 @@ fn package_rollback_reject_drops_the_inflight_row() {
         "script failure, got {err}"
     );
     assert!(!mp.graph.contains(&child_id));
-    assert!(
-        !mp.orphanage.contains(&child_id),
-        "a script failure must not put the lifted child back"
+    assert_eq!(
+        mp.orphanage.announcers_of(&child.compute_wtxid()),
+        vec![4],
+        "a failed package leaves the orphanage alone"
     );
+    mp.orphanage.remove_wtxid(&child.compute_wtxid());
     assert!(
         !mp.orphanage.has_announcer(4),
-        "a rejected lift must not keep its peer"
+        "a rejected package must not keep its peer in flight"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -30,7 +30,9 @@ pub struct OrphanEntry {
     pub tx: Transaction,
     pub txid: Txid,
     pub weight: u64,
-    /// Missing parent txids (prevout.txid not in mempool/chain at insert).
+    /// Parent txids it waits on: absent from the mempool and chain when it
+    /// was parked. One may be pooled since, when this orphan's own txid is
+    /// pooled too and promote left it parked.
     pub missing: BTreeSet<Txid>,
     /// P2P peer ids that announced this orphan.
     pub announcers: BTreeSet<u64>,
@@ -389,8 +391,9 @@ impl Orphanage {
     /// misses another parent is parked again under those same peers.
     ///
     /// A child whose txid `pooled` already holds stays parked: it cannot
-    /// enter. Core leaves such an orphan when its txid entered other than by
-    /// relay; `Find1P1CPackage`, a block, or expiry erases it.
+    /// enter. Core leaves such an orphan when it entered the mempool other
+    /// than by relay (an RPC package), or when a version with a different
+    /// witness entered. `Find1P1CPackage`, a block, or expiry erases it.
     pub fn take_children_of(
         &mut self,
         parent: &Txid,

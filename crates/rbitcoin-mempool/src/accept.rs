@@ -641,10 +641,10 @@ pub struct ActiveMempool {
     pub trust_kept: HashSet<Txid>,
 }
 
-/// A parked package member, taken out before admit.
+/// A parked child taken out to be admitted with its parent as 1p1c.
 ///
-/// `announcers` are the peers who announced it. The missing-parent set is
-/// not kept: it is resolved again if the package puts the tx back.
+/// `announcers` are the peers who announced it, so a failed pair can park
+/// it again under them.
 pub struct LiftedOrphan {
     pub tx: Transaction,
     pub announcers: Vec<u64>,
@@ -1204,17 +1204,6 @@ impl ActiveMempool {
             // mempool_accept_wtxid.py).
             return Err(AcceptError::Policy("txn-same-nonwitness-data-in-mempool"));
         }
-        // Already parked: soft re-announce of the same orphan.
-        if report_orphans {
-            if let Some(missing) = self.orphanage.missing_of(&wtxid).cloned() {
-                return Err(AcceptError::Orphaned {
-                    txid,
-                    missing,
-                    fresh: false,
-                });
-            }
-        }
-
         let AdmitInputs {
             prevouts,
             chain_coins,
@@ -1748,13 +1737,6 @@ impl ActiveMempool {
             }
             return Err(AcceptError::Policy("txn-same-nonwitness-data-in-mempool"));
         }
-        if let Some(missing) = self.orphanage.missing_of(&prep.wtxid).cloned() {
-            return Err(AcceptError::Orphaned {
-                txid,
-                missing,
-                fresh: false,
-            });
-        }
 
         let scan = self.scan_conflicts_and_parents(txid, tx, &prep.chain_coins)?;
 
@@ -2133,56 +2115,20 @@ impl ActiveMempool {
             None
         };
         let mut accepted: Vec<AcceptResult> = Vec::with_capacity(txs.len());
-        // Members already parked are lifted so the short-circuit for a
-        // re-announced orphan does not reject them. Promote waits until
-        // every member is committed, so this walk cannot admit a later
-        // member and then roll it back as a duplicate.
-        let mut lifted: Vec<LiftedOrphan> = Vec::new();
+        // A parked member stays parked, as Core's package admit leaves the
+        // orphanage alone. Promote waits until every member is committed, so
+        // this walk cannot admit a later member and then roll it back as a
+        // duplicate.
         for tx in txs {
-            if let Some(parked) = self.lift_parked_member(tx) {
-                lifted.push(parked);
-            }
             // accept_tx_with (not top-level accept_tx) so stages are not reset per member.
             match self.accept_tx_with(tx, utxos, tip, 0, true, member_min, member_eviction) {
                 Ok(r) => accepted.push(r),
                 Err(e) => {
                     self.restore_undone(utxos, tip);
                     self.rollback_accepted_package(&accepted, utxos, tip);
-                    for item in self.repark_lifted(&lifted, utxos, tip, &|_| 0, None) {
-                        let id = item.tx.compute_wtxid();
-                        // A put-back after the failed package: it does not
-                        // evict the child the rollback just restored.
-                        match self.accept_tx_with(
-                            &item.tx,
-                            utxos,
-                            tip,
-                            0,
-                            true,
-                            None,
-                            SiblingEviction::Off,
-                        ) {
-                            Ok(r) => {
-                                // Admitted, so the lift row is not in flight.
-                                self.orphanage.forget_taken_gen(&id, item.taken_gen);
-                                self.promote_orphans_of(r.txid, utxos, tip);
-                            }
-                            Err(AcceptError::Orphaned { missing, .. }) => {
-                                self.park_announced(&item.tx, missing, &item.announcers);
-                            }
-                            Err(_) => {
-                                // Rejected without a repark. Drop the lift row.
-                                self.orphanage.forget_taken_gen(&id, item.taken_gen);
-                                self.restore_undone(utxos, tip);
-                            }
-                        }
-                    }
                     return Err(e);
                 }
             }
-        }
-        // Every lifted member was admitted, and stays parked as Core leaves it.
-        for item in &lifted {
-            self.keep_admitted_parked(item);
         }
         let ids: Vec<Txid> = accepted.iter().map(|r| r.txid).collect();
         for id in ids {
@@ -2228,11 +2174,9 @@ impl ActiveMempool {
         self.lift_parked_member(&child)
     }
 
-    /// Take `tx` out of the orphanage so a package can admit it.
-    ///
-    /// `prepare_admit` and `plan_after_script` both refuse a tx that is
-    /// still parked, even when its parents are already in the mempool.
-    /// The announcing peers come along so a failed package can put them back.
+    /// Take `tx` out of the orphanage for a 1p1c admit, as Core erases an
+    /// orphan relay admits. The announcing peers come along so a failed pair
+    /// can park it again under them.
     pub fn lift_parked_member(&mut self, tx: &Transaction) -> Option<LiftedOrphan> {
         let id = tx.compute_wtxid();
         self.orphanage.missing_of(&id)?;
@@ -2246,55 +2190,6 @@ impl ActiveMempool {
         })
     }
 
-    /// Put lifted members back, or hand back the ones that can be admitted.
-    ///
-    /// The missing set saved at the lift is not used. A parent can arrive
-    /// while the child is out of the orphanage, and parking under that parent
-    /// leaves the child with nobody left to wake it. Parents still absent are
-    /// resolved again here. `fee_delta` is the caller's `prioritisetransaction`
-    /// map: a child under the raw relay floor is still returned when that
-    /// delta clears it. Announcers are kept on either path.
-    pub fn repark_lifted(
-        &mut self,
-        lifted: &[LiftedOrphan],
-        utxos: &impl UtxoProvider,
-        tip: ChainTipCtx,
-        fee_delta: &impl Fn(&Txid) -> i64,
-        trusted: Option<u64>,
-    ) -> Vec<LiftedOrphan> {
-        let mut ready = Vec::new();
-        for item in lifted {
-            let txid = item.tx.compute_txid();
-            let wtxid = item.tx.compute_wtxid();
-            if self.graph.contains(&txid) {
-                self.orphanage.forget_taken_gen(&wtxid, item.taken_gen);
-                continue;
-            }
-            match self.prepare_admit(
-                &item.tx,
-                utxos,
-                tip,
-                PrepareOpts {
-                    fee_delta: fee_delta(&txid),
-                    report_orphans: true,
-                    min_relay: None,
-                    waive: trusted.is_some_and(|id| item.announcers.contains(&id)),
-                },
-            ) {
-                Err(AcceptError::Orphaned { missing, .. }) => {
-                    self.park_announced(&item.tx, missing, &item.announcers);
-                }
-                Ok(_) => ready.push(LiftedOrphan {
-                    tx: item.tx.clone(),
-                    announcers: item.announcers.clone(),
-                    taken_gen: item.taken_gen,
-                }),
-                Err(_) => self.orphanage.forget_taken_gen(&wtxid, item.taken_gen),
-            }
-        }
-        ready
-    }
-
     /// Park `tx` under `missing` and restore every announcing peer.
     ///
     /// The first peer is recorded by the insert. The rest are added before
@@ -2305,57 +2200,26 @@ impl ActiveMempool {
         missing: BTreeSet<Txid>,
         announcers: &[u64],
     ) -> AcceptError {
-        let Some(live) = self.live_announcers(tx, announcers) else {
-            return AcceptError::Orphaned {
-                txid: tx.compute_txid(),
-                missing,
-                fresh: false,
-            };
+        let wtxid = tx.compute_wtxid();
+        // A disconnect while this orphan was out of the orphanage edited the
+        // in-flight record. The slice from the take is already stale.
+        let live = match self.orphanage.claim_taken(&wtxid) {
+            Some(crate::orphanage::TakenClaim::Drop) => {
+                return AcceptError::Orphaned {
+                    txid: tx.compute_txid(),
+                    missing,
+                    fresh: false,
+                };
+            }
+            Some(crate::orphanage::TakenClaim::Keep(peers)) => peers,
+            None => announcers.to_vec(),
         };
         let first = live.first().copied();
         let err = self.park_orphan_from(tx, missing, first);
-        let wtxid = tx.compute_wtxid();
         for peer in live.iter().skip(1) {
             self.orphanage.add_announcer(&wtxid, *peer);
         }
         err
-    }
-
-    /// Park a lifted package member the package admitted, under its parents
-    /// in the mempool. Core's RPC package leaves the orphanage alone, so
-    /// the orphan stays until a resent parent, a block, or expiry erases it.
-    pub fn keep_admitted_parked(&mut self, item: &LiftedOrphan) {
-        let Some(live) = self.live_announcers(&item.tx, &item.announcers) else {
-            return;
-        };
-        let parents: BTreeSet<Txid> = item
-            .tx
-            .input
-            .iter()
-            .map(|i| i.previous_output.txid)
-            .filter(|t| self.graph.contains(t))
-            .collect();
-        let mut peers = live.into_iter();
-        if self
-            .orphanage
-            .insert_from(item.tx.clone(), parents, peers.next())
-        {
-            let wtxid = item.tx.compute_wtxid();
-            for peer in peers {
-                self.orphanage.add_announcer(&wtxid, peer);
-            }
-        }
-    }
-
-    /// Announcers of a taken orphan. A disconnect while it was out of the
-    /// orphanage edited the in-flight record, so the slice from the take is
-    /// stale. `None` when the last announcer left.
-    fn live_announcers(&mut self, tx: &Transaction, announcers: &[u64]) -> Option<Vec<u64>> {
-        match self.orphanage.claim_taken(&tx.compute_wtxid()) {
-            Some(crate::orphanage::TakenClaim::Drop) => None,
-            Some(crate::orphanage::TakenClaim::Keep(peers)) => Some(peers),
-            None => Some(announcers.to_vec()),
-        }
     }
 
     #[doc(hidden)]
@@ -2573,8 +2437,8 @@ impl ActiveMempool {
     /// Missing mempool entries are skipped (already not in pool). Returns how many removed.
     /// May trigger compaction when DEAD slots dominate.
     ///
-    /// Also drops orphanage entries that are confirmed or conflict with the block,
-    /// and best-effort re-accepts orphans whose parent just confirmed (caller must
+    /// Also drops orphanage entries whose txid the block confirms (not ones
+    /// that only conflict with it), and best-effort re-accepts orphans whose parent just confirmed (caller must
     /// pass a UTXO view that includes the new tip — use `remove_for_block_with_utxo`).
     pub fn remove_for_block(&mut self, block_txids: &[Txid]) -> Result<usize, AcceptError> {
         self.remove_for_block_with_utxo(
