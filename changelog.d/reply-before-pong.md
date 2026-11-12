@@ -8,7 +8,8 @@ Fixed
   transactions, and a `getdata` after `headers` from a high-bandwidth peer.
   A ping that arrives while that batch is being written does not rewrite
   the pong already in the batch. Its pong is queued behind replies already
-  waiting. A ping that arrives while a `getdata` or `getblocktxn` reply is
+  waiting. The nonce store and the claim share one atomic order, so that
+  ping is not dropped when the two updates overlap. A ping that arrives while a `getdata` or `getblocktxn` reply is
   only partly queued waits until the rest of that reply is queued. A ping
   with extra bytes after its nonce is answered from the first eight bytes.
   A pong with extra bytes, or a short pong, that waited behind another

@@ -1181,14 +1181,18 @@ impl LivePeer {
     }
 
     /// Remember the nonce a pong must carry. Does not queue the message.
+    ///
+    /// SeqCst with [`Self::claim_pong_send`] and [`Self::finish_pong_write`].
+    /// A release store on one atomic can stay invisible while the writer
+    /// loads the old nonce and the session still sees the claim held.
     pub fn store_pong_nonce(&self, n: u64) {
-        self.pong_nonce.store(n, Ordering::Release);
+        self.pong_nonce.store(n, Ordering::SeqCst);
     }
 
     /// `true` when this call should queue the one pending pong.
     pub fn claim_pong_send(&self) -> bool {
         self.pong_pending
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .is_ok()
     }
 
@@ -1198,9 +1202,12 @@ impl LivePeer {
 
     /// Drop the pending slot after the pong is written. A ping that landed
     /// during the write is claimed again so its nonce is not dropped.
+    ///
+    /// The clear happens before the load. Both are SeqCst, matching
+    /// [`Self::store_pong_nonce`] then [`Self::claim_pong_send`].
     pub fn finish_pong_write(&self, written: u64) -> Option<u64> {
-        self.pong_pending.store(false, Ordering::Release);
-        let now = self.pong_nonce.load(Ordering::Acquire);
+        self.pong_pending.store(false, Ordering::SeqCst);
+        let now = self.pong_nonce.load(Ordering::SeqCst);
         if now != written && self.claim_pong_send() {
             Some(now)
         } else {
