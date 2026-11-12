@@ -210,6 +210,24 @@ paths:
       responses:
         "200": { $ref: "#/components/responses/TxList" }
         "404": { $ref: "#/components/responses/NotFound" }
+  /block/{hash}/txs/summary:
+    get:
+      tags: [blocks]
+      summary: Txid, fee, weight, and value of every tx in the block (rbitcoin dialect)
+      description: |
+        Not in Blockstream Esplora API.md. One array row per tx in block order,
+        coinbase first (fee 0). Same 404s as `/txids`; this static segment wins
+        over `/txs/{start_index}`. No `--sh-index`. A pruned block whose
+        `txstat` rows predate schema 25 is 404 `pruned`.
+      parameters: [{ $ref: "#/components/parameters/BlockHash" }]
+      responses:
+        "200":
+          description: Rows
+          headers: { X-Bitcoin-Chain-Tip: { $ref: "#/components/headers/ChainTip" }, X-Bitcoin-Chain-Tip-Height: { $ref: "#/components/headers/ChainTipHeight" }, X-Powered-By: { $ref: "#/components/headers/PoweredBy" } }
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: "#/components/schemas/BlockTxSummaryRow" } }
+        "404": { $ref: "#/components/responses/NotFound" }
   /block/{hash}/txs/{start_index}:
     get:
       tags: [blocks]
@@ -1172,6 +1190,16 @@ components:
         height: { type: integer }
         time: { type: integer, description: confirming header timestamp, 0 if the header is missing }
         tx_position: { type: integer, description: index of the tx in its block }
+    BlockTxSummaryRow:
+      type: array
+      description: "`[txid, fee, weight, value]`: fee in sats (coinbase 0), BIP141 weight units (not sigop-adjusted), sum of the tx's output values in sats."
+      prefixItems:
+        - { $ref: "#/components/schemas/Hash" }
+        - { type: integer, minimum: 0 }
+        - { type: integer, minimum: 0 }
+        - { type: integer, minimum: 0 }
+      minItems: 4
+      maxItems: 4
     MempoolInfo:
       type: object
       required: [count, vsize, total_fee, fee_histogram]

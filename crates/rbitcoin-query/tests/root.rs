@@ -1273,6 +1273,108 @@ fn block_txstat_rows_have_fees_hash_and_cell_bytes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Block summary rows: stored txid order, stamped fee and weight, and the
+/// output value sum per tx, coinbase first with fee 0. Unstamped rows give
+/// the same rows from the reconstructed block, and the read writes nothing.
+#[test]
+fn block_tx_summary_rows_match_the_wire_block() {
+    let (dir, q) = temp_query("blk-summary");
+    let (h0, cb0) = coinbase_block(0, Fk::NULL, None);
+    let cb0_txid = cb0.tx.txid;
+    let hfk0 = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+
+    let (h1, cb1) = coinbase_block(1, hfk0, Some(h0.hash));
+    let mut parent = spend_apply(0x11, cb0_txid, 30_0000_0000);
+    parent.inputs[0].witness = vec![vec![0x30; 72], vec![0x02; 33]];
+    parent
+        .outputs
+        .extend([0, 19_9990_0000].map(|v| OutputRecord::unspent(v, vec![0x6a])));
+    parent.tx.output_count = 3;
+    let child = spend_apply(0x22, parent.tx.txid, 30_0000_0000 - 5_000);
+    let applies = [cb1, parent, child];
+    q.connect_block(Height(1), &h1, &applies).unwrap();
+
+    let want: Vec<([u8; 32], u64, u64, u64)> = applies
+        .iter()
+        .zip([0, 10_0000, 5_000])
+        .map(|(ta, fee)| {
+            let tx = rbitcoin_query::testutil::tx_apply_to_tx(ta);
+            let value = tx.output.iter().map(|o| o.value.to_sat()).sum();
+            (ta.tx.txid, fee, tx.weight().to_wu(), value)
+        })
+        .collect();
+    let witness_tx = rbitcoin_query::testutil::tx_apply_to_tx(&applies[1]);
+    assert!(
+        want[1].2 < 4 * witness_tx.total_size() as u64,
+        "witness discount"
+    );
+    let rows = |q: &Query| -> Vec<([u8; 32], u64, u64, u64)> {
+        q.block_tx_summary(&h1.hash)
+            .unwrap()
+            .expect("best chain")
+            .iter()
+            .map(|r| (r.txid, r.fee_sat, r.weight, r.value_sat))
+            .collect()
+    };
+    assert_eq!(rows(&q), want);
+    assert!(q.block_tx_summary(&[0xee; 32]).unwrap().is_none());
+
+    for fk in q.block_tx_fks(Height(1)).unwrap() {
+        unstamp_txstat(&q, fk);
+    }
+    assert!(q.stamped_txstat_block(Height(1)).unwrap().is_none());
+    assert_eq!(rows(&q), want, "unstamped rows come from the wire block");
+    assert!(
+        q.stamped_txstat_block(Height(1)).unwrap().is_none(),
+        "a summary read does not stamp"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The unstamped fallback reads the requested header's own transactions.
+/// After a same-height replace it still gives the first block's rows, never
+/// the replacement's.
+#[test]
+fn block_tx_summary_from_wire_reads_the_requested_header() {
+    let (dir, q) = temp_query("blk-summary-wire");
+    let (h0, cb0) = coinbase_block(0, Fk::NULL, None);
+    let hfk0 = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let (ha, cba) = coinbase_block(1, hfk0, Some(h0.hash));
+    q.connect_block(Height(1), &ha, std::slice::from_ref(&cba))
+        .unwrap();
+    let a_value: u64 = cba.outputs.iter().map(|o| o.value).sum();
+
+    q.disconnect_tip().unwrap();
+    let (mut hb, mut cbb) = coinbase_block(1, hfk0, Some(h0.hash));
+    hb.nonce = hb.nonce.wrapping_add(1);
+    rehash_header(&mut hb, &h0.hash);
+    cbb.tx.txid[30] = 0xbb;
+    cbb.outputs[0].value -= 1;
+    q.connect_block(Height(1), &hb, std::slice::from_ref(&cbb))
+        .unwrap();
+
+    let a = q
+        .block_tx_summary_from_wire(&ha.hash)
+        .unwrap()
+        .expect("the replaced block's header is still stored");
+    assert_eq!(
+        a.iter().map(|r| (r.txid, r.value_sat)).collect::<Vec<_>>(),
+        vec![(cba.tx.txid, a_value)],
+    );
+    assert!(
+        q.block_tx_summary(&ha.hash).unwrap().is_none(),
+        "a replaced block is off the best chain"
+    );
+    let b = q.block_tx_summary(&hb.hash).unwrap().expect("best chain");
+    assert_eq!(
+        b.iter().map(|r| (r.txid, r.value_sat)).collect::<Vec<_>>(),
+        vec![(cbb.tx.txid, a_value - 1)],
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn buried_rules_and_a_lying_header_path() {
     let (dir, q) = temp_query("ms-work");

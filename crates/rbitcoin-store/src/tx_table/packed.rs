@@ -1157,6 +1157,28 @@ pub fn visit_packed_scripts(
     Ok(())
 }
 
+/// Sum of every output amount of one packed create. Scripts are skipped by
+/// length, not decoded.
+pub fn packed_output_value_sum(raw: &[u8], n_out: u32) -> Result<u64, StoreError> {
+    let (_meta, mut off) = TxRecord::decode_body_meta(raw)?;
+    let mut sum = 0u64;
+    for _ in 0..n_out {
+        let Some(&flags) = raw.get(off) else {
+            return Err(StoreError::Corrupt("packed outputs short"));
+        };
+        let (kind, exp) = split_output_flags(flags)?;
+        let mut o = off + 1;
+        let (v, n) = decode_output_amount(exp, &raw[o..])?;
+        o += n;
+        sum = sum
+            .checked_add(v)
+            .ok_or(StoreError::Corrupt("packed output value sum overflow"))?;
+        off = o + crate::compact::script_kind_v17_disk_used(kind, &raw[o..])?;
+    }
+    check_trailing_zero_pad(raw, off)?;
+    Ok(sum)
+}
+
 /// Sparse pin decode: only materialize `need_vouts` scripts + denserel slots.
 ///
 /// Non-empty `need_vouts` (sorted unique) walks through the last needed vout
