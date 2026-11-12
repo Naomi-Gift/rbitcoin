@@ -132,3 +132,20 @@ fn encode_json_body_hops_only_at_4kib() {
     assert_eq!(got, serde_json::to_vec(&heavy).unwrap());
     assert!(got.len() >= JSON_CPU_MIN);
 }
+
+/// Summed leaves, commas, and object keys. Each body is under 4 KiB on its
+/// own; the walk total is what crosses.
+#[test]
+fn json_walk_counts_commas_keys_and_summed_leaves() {
+    let pair = json!(["a".repeat(2046), "a".repeat(2046)]);
+    assert!(json_is_cpu_heavy(&pair));
+
+    let one = json!(["a".repeat(4091)]);
+    assert!(!json_is_cpu_heavy(&one));
+
+    let key = json!({"k": "a".repeat(4087)});
+    assert!(!json_is_cpu_heavy(&key));
+
+    let heavy_value = json!({"k": "a".repeat(5000)});
+    assert!(json_is_cpu_heavy(&heavy_value));
+}

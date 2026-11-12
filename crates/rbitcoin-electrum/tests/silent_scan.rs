@@ -206,6 +206,13 @@ fn parse_sub_labels_start_and_networks() {
     assert_eq!(plain.labels, vec![0, 2]);
     let clamp = parse_sub(&json!([scan, spend, 100]), Network::Regtest, Some(3)).unwrap();
     assert_eq!(clamp.start, 3);
+    let at_cap = parse_sub(
+        &json!([scan, spend, 500_000_000]),
+        Network::Regtest,
+        Some(3),
+    )
+    .unwrap();
+    assert_eq!(at_cap.start, 3);
     let bool_start = parse_sub(&json!([scan, spend, true]), Network::Regtest, Some(0)).unwrap();
     assert_eq!(bool_start.start, 0);
 }

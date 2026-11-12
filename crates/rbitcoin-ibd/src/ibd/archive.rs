@@ -10,8 +10,6 @@ use bitcoin::BlockHash;
 use rbitcoin_net::chain::ChainHub;
 use rbitcoin_primitives::Fk;
 
-use std::time::Instant;
-
 /// Parent from the stored header, once. The orchestration loop does not do this.
 #[doc(hidden)]
 pub fn header_parent(hub: &ChainHub, header_fk: Fk) -> Option<BlockHash> {
@@ -56,8 +54,6 @@ pub fn rehydrate_block_queue_into_confirm(
     st: &mut super::state::IbdWorkState,
     confirm_feed: &super::confirm::ConfirmFeed,
 ) -> Result<usize, String> {
-    use rbitcoin_log::{info, warn};
-
     let tip_opt = hub.tip_height();
     let path_lo = match tip_opt {
         None => 0u32,
@@ -72,13 +68,7 @@ pub fn rehydrate_block_queue_into_confirm(
         return Ok(0);
     }
     let mut n = 0usize;
-    let mut bytes = 0u64;
     let mut h_min = u32::MAX;
-    let mut h_max = 0u32;
-    let mut dropped_done = 0usize;
-    let mut empty_skip = 0usize;
-    let mut unknown_h = 0usize;
-    let mut kept_above_tip_flag = 0usize;
     for qb in queued {
         let hash = BlockHash::from_byte_array(qb.hash);
         // Only drop residue at/below confirmed tip (write may have missed dequeue).
@@ -91,18 +81,12 @@ pub fn rehydrate_block_queue_into_confirm(
         );
         if at_or_below_tip {
             let _ = hub.query.block_queue_dequeue_height(qb.height);
-            dropped_done = dropped_done.saturating_add(1);
             continue;
         }
-        if hub.has_block(&hash) || st.body.is_known_archived(&hash) {
-            kept_above_tip_flag = kept_above_tip_flag.saturating_add(1);
-        }
         if qb.payload_len == 0 {
-            empty_skip = empty_skip.saturating_add(1);
             let _ = hub.query.block_queue_dequeue_height(qb.height);
             continue;
         }
-        let wire_bytes = qb.payload_len;
         st.body.mark_pending(hash);
         let header_fk = Fk(qb.header_fk);
         if !header_fk.is_null() {
@@ -112,14 +96,11 @@ pub fn rehydrate_block_queue_into_confirm(
             if leftover_chains(hub, st, qb.height, header_fk, hash) {
                 st.record_height(hash, qb.height);
                 confirm_feed.note(qb.height, hash);
-                bytes = bytes.saturating_add(wire_bytes);
                 h_min = h_min.min(qb.height);
-                h_max = h_max.max(qb.height);
                 n = n.saturating_add(1);
             }
         } else {
             st.body.mark_missing(hash);
-            unknown_h = unknown_h.saturating_add(1);
         }
     }
 
@@ -127,8 +108,8 @@ pub fn rehydrate_block_queue_into_confirm(
     // Skip only **claim-ready** heights (confirmed / pending / BQ). Class A alone
     // (resume seed `mark_archived`) is not claimable — still mark_missing so
     // tip-hole race / densify re-getdata into the body queue.
-    let mut gap_marked = 0u32;
-    if n > 0 && h_min > path_lo {
+    // Offered heights are above the tip, so `h_min == path_lo` is an empty range.
+    if n > 0 {
         for ht in path_lo..h_min {
             let Some(&hash) = st.height_to_hash.get(&ht) else {
                 continue;
@@ -140,34 +121,6 @@ pub fn rehydrate_block_queue_into_confirm(
                 continue;
             }
             st.body.mark_missing(hash);
-            gap_marked = gap_marked.saturating_add(1);
-        }
-        if gap_marked > 0 {
-            warn!(
-                "ibd: body queue gap tip+1={path_lo}..{} (bq starts {h_min}) — \
-                 marked {gap_marked} missing for densify re-getdata",
-                h_min.saturating_sub(1)
-            );
-        }
-    }
-
-    if n > 0 || dropped_done > 0 || empty_skip > 0 || unknown_h > 0 || gap_marked > 0 {
-        let mib = bytes / (1024 * 1024);
-        if n > 0 {
-            info!(
-                "ibd: rehydrate body queue → feed ready n={n} h={h_min}..{h_max} \
-                 {mib}MiB (dropped_le_tip={dropped_done} empty={empty_skip} unknown_h={unknown_h} \
-                 gap_marked={gap_marked} kept_above_tip_flag={kept_above_tip_flag})"
-            );
-        } else {
-            info!(
-                "ibd: rehydrate body queue: no ready entries \
-                 (dropped_le_tip={dropped_done} empty={empty_skip} unknown_h={unknown_h} \
-                 gap_marked={gap_marked})"
-            );
-        }
-        if empty_skip > 0 {
-            warn!("ibd: rehydrate dropped {empty_skip} empty body-queue rec(s)");
         }
     }
     Ok(n)
@@ -190,8 +143,6 @@ pub fn rehydrate_class_a_into_body_queue(
     confirm_feed: &super::confirm::ConfirmFeed,
     max: usize,
 ) -> Result<usize, String> {
-    use rbitcoin_log::info;
-
     if max == 0 {
         return Ok(0);
     }
@@ -199,45 +150,18 @@ pub fn rehydrate_class_a_into_body_queue(
         None => 0u32,
         Some(t) => t.saturating_add(1),
     };
-    let t0 = Instant::now();
     let mut n = 0usize;
-    let mut bytes = 0u64;
-    let mut h_min = u32::MAX;
-    let mut h_max = 0u32;
-    let mut failed = 0u32;
 
     for ht in path_lo.. {
         if n >= max {
             break;
         }
         match rehydrate_one_height(hub, st, confirm_feed, ht)? {
-            RehydrateOne::Offered { bytes: b } => {
-                bytes = bytes.saturating_add(b);
-                h_min = h_min.min(ht);
-                h_max = h_max.max(ht);
+            RehydrateOne::Offered { .. } | RehydrateOne::Queued => {
                 n = n.saturating_add(1);
             }
-            RehydrateOne::Queued => {
-                h_min = h_min.min(ht);
-                h_max = h_max.max(ht);
-                n = n.saturating_add(1);
-            }
-            RehydrateOne::Stop { failed: f } => {
-                if f {
-                    failed = failed.saturating_add(1);
-                }
-                break;
-            }
+            RehydrateOne::Stop { .. } => break,
         }
-    }
-
-    if n > 0 || failed > 0 {
-        let mib = bytes / (1024 * 1024);
-        info!(
-            "ibd: Class A rehydrate → body queue n={n} h={h_min}..{h_max} \
-             {mib}MiB fail={failed} (store reconstruct {:?})",
-            t0.elapsed()
-        );
     }
     Ok(n)
 }
@@ -256,23 +180,10 @@ pub fn rehydrate_one_height(
     confirm_feed: &super::confirm::ConfirmFeed,
     ht: u32,
 ) -> Result<RehydrateOne, String> {
-    use rbitcoin_log::warn;
     let Some(&hash) = st.height_to_hash.get(&ht) else {
         return Ok(RehydrateOne::Stop { failed: false });
     };
-    let path_lo = match hub.tip_height() {
-        None => 0u32,
-        Some(t) => t.saturating_add(1),
-    };
     if hub.has_block(&hash) {
-        if ht == path_lo && hub.tip_height().is_some() {
-            warn!(
-                "ibd: tip+1={ht} {hash} is in confirmed-set while tip={} — \
-                 confirmed[] likely maps an earlier height to tip+1; \
-                 restart after tip revalidate / open repair (or fresh datadir)",
-                hub.tip_height().unwrap_or(0)
-            );
-        }
         return Ok(RehydrateOne::Stop { failed: false });
     }
     if st.body.is_rejected(&hash) {

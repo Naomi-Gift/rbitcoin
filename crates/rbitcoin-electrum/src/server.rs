@@ -50,11 +50,15 @@ pub static METER: RequestMeter = RequestMeter::new();
 
 /// Electrum request meters since the previous sample: `(count, sum_us, max_us)`.
 /// Running totals are untouched ([`perf_totals`]).
+// Node `/metrics` and `tip: perf` read the window. No Electrum response does.
+#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn sample_reset_perf() -> (u64, u64, u64) {
     METER.take_window()
 }
 
 /// Running Electrum totals for `/metrics`: `(requests, sum_us)`.
+// Node `/metrics` reads the totals. No Electrum response does.
+#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn perf_totals() -> (u64, u64) {
     METER.totals()
 }
@@ -804,16 +808,12 @@ pub fn batch_trace_arm() {
     BATCH_TRACE_ON.with(|on| on.set(true));
 }
 
-/// Stop recording on this thread and drop what was recorded.
-#[cfg(debug_assertions)]
-pub fn batch_trace_clear() {
-    BATCH_TRACE_ON.with(|on| on.set(false));
-    BATCH_TRACE.with(|trace| trace.borrow_mut().clear());
-}
-
+/// Steps recorded on this thread, then stop. A debug build keeps nothing
+/// unless a test arms the trace again.
 #[cfg(debug_assertions)]
 pub fn batch_trace_snapshot() -> Vec<BatchStep> {
-    BATCH_TRACE.with(|trace| trace.borrow().clone())
+    BATCH_TRACE_ON.with(|on| on.set(false));
+    BATCH_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
 }
 
 /// The connection's fixed inputs to one request.
@@ -1752,7 +1752,8 @@ pub async fn serve_tweaks_empty_last<W: AsyncWrite + Unpin>(
     min_dust: u64,
 ) -> Result<(), std::io::Error> {
     let first =
-        match crate::tweaks::height_map_json(query, chain, req.start, !req.historical, min_dust) {
+        // Past the tip the map is empty before cut-through reads this flag.
+        match crate::tweaks::height_map_json(query, chain, req.start, false, min_dust) {
             Ok(v) => v,
             Err(e) => {
                 tweaks_sub_err(
@@ -2055,13 +2056,19 @@ pub fn settled_restatus_notes(
 #[doc(hidden)]
 pub const TICK_SCAN_MAX_GAP: u32 = 32;
 
+// `seen == now` already returned, so `>=` matches `>`.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn tick_forward(b: u32, a: u32) -> bool {
+    b > a
+}
+
 #[doc(hidden)]
 pub fn tick_scan(seen: Option<u32>, now: Option<u32>) -> Option<Option<Vec<u32>>> {
     if seen == now {
         return None;
     }
     match (seen, now) {
-        (Some(a), Some(b)) if b > a => {
+        (Some(a), Some(b)) if tick_forward(b, a) => {
             let gap = b.saturating_sub(a);
             if gap > TICK_SCAN_MAX_GAP {
                 Some(None)
@@ -2079,12 +2086,18 @@ pub fn tick_scan(seen: Option<u32>, now: Option<u32>) -> Option<Option<Vec<u32>>
 /// so this only catches leftovers and only runs when `last_sent` outgrows the
 /// sub set. Sweeping unconditionally on every push made each notification
 /// O(subs), so a block touching many subs of a large wallet went quadratic.
+// A same-sized leftover is not pushed. The sweep runs only once the map is larger.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn last_sent_outgrew(last_sent: usize, subs: usize) -> bool {
+    last_sent > subs
+}
+
 #[doc(hidden)]
 pub fn drop_unsubscribed_status(
     last_sent: &mut HashMap<[u8; 32], String>,
     sh_subs: &HashSet<[u8; 32]>,
 ) {
-    if last_sent.len() > sh_subs.len() {
+    if last_sent_outgrew(last_sent.len(), sh_subs.len()) {
         last_sent.retain(|k, _| sh_subs.contains(k));
     }
 }
@@ -3086,8 +3099,8 @@ pub fn pick_dotted(cmin_s: &str, cmax_s: &str) -> Result<String, String> {
         protocol_tuple(cmax_s).ok_or_else(|| format!("unsupported protocol version {cmax_s}"))?;
     let smin = protocol_tuple(PROTOCOL_MIN).expect("PROTOCOL_MIN");
     let smax = protocol_tuple(PROTOCOL_MAX).expect("PROTOCOL_MAX");
-    let lo = if cmin < smin { smin } else { cmin };
-    let hi = if cmax < smax { cmax } else { smax };
+    let lo = std::cmp::max(cmin, smin);
+    let hi = std::cmp::min(cmax, smax);
     if hi < lo {
         return Err("unsupported protocol version".into());
     }

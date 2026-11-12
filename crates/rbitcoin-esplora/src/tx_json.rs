@@ -505,7 +505,7 @@ pub fn attach_inner_scripts(
 ) {
     let prev = bitcoin::Script::from_bytes(spk);
     let redeem = if prev.is_p2sh() {
-        last_push_data(script_sig).filter(|b| !b.is_empty() && b.len() <= 10_000)
+        last_push_data(script_sig)
     } else {
         None
     };

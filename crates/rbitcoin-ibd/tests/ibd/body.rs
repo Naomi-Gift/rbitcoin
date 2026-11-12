@@ -1,5 +1,6 @@
 use bitcoin::hashes::Hash;
 use bitcoin::BlockHash;
+use rbitcoin_ibd::ibd::assign_plan::want_headers_beyond_soft_cap;
 use rbitcoin_ibd::ibd::body::BodyPresence;
 use std::time::Duration;
 
@@ -91,4 +92,22 @@ fn expire_stale_pending_if_surface() {
     assert_eq!(snap.known, 1);
     assert_eq!(snap.pending, 1);
     assert_eq!(snap.rejected, 1);
+}
+
+/// `known_len` is the soft-cap header fetch count. Eight archived headers
+/// clear the 3/4 bar; a stand-in of 1 does not.
+#[test]
+fn known_len_opens_soft_cap_header_fetch() {
+    let mut body = BodyPresence::new();
+    for n in 1u8..=8 {
+        body.mark_archived(h(n));
+    }
+    assert!(
+        want_headers_beyond_soft_cap(8, body.known_len(), 0, 1),
+        "eight known headers of eight live are mostly ready"
+    );
+    assert!(
+        !want_headers_beyond_soft_cap(8, 1, 0, 1),
+        "one known header of eight is not mostly ready"
+    );
 }

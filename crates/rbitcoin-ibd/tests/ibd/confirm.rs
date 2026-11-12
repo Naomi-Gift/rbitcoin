@@ -1245,6 +1245,31 @@ fn offer_confirm_ready_requires_a_recorded_parent() {
         &shared,
     );
     assert_eq!(n_child, 1, "the recorded child of the tip is offered");
+
+    // Height cap: below tip+1 offers nothing; tip+1 equal to the cap still offers.
+    let capped = ConfirmFeed::new();
+    capped.set_unproven_bounds(Some(0), 0, None);
+    let n_below = offer_confirm_ready(
+        &capped,
+        &h2h,
+        &prev_of,
+        &mut body,
+        &hub,
+        &mut max_arch,
+        &shared,
+    );
+    assert_eq!(n_below, 0, "a height cap below tip+1 offers nothing");
+    capped.set_unproven_bounds(Some(1), 0, None);
+    let n_at_cap = offer_confirm_ready(
+        &capped,
+        &h2h,
+        &prev_of,
+        &mut body,
+        &hub,
+        &mut max_arch,
+        &shared,
+    );
+    assert_eq!(n_at_cap, 1, "tip+1 equal to the height cap is offered");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -1507,6 +1532,26 @@ fn emit_confirm_reject_isolates_batched_consensus_and_requests_single() {
         feed_fault.isolate_until(),
         u32::MAX,
         "engine fault is not a cascade isolate"
+    );
+
+    let feed_cascade = ConfirmFeed::new();
+    let (tx, _rx) = std::sync::mpsc::channel();
+    emit_confirm_reject(
+        &tx,
+        &feed_cascade,
+        14,
+        hash,
+        ConfirmRejectClass::Cascade,
+        "connect height not tip+1".into(),
+        1,
+        None,
+        rbitcoin_ibd::ibd::confirm::RejectParent::default(),
+    )
+    .unwrap();
+    assert_eq!(
+        feed_cascade.isolate_until(),
+        u32::MAX,
+        "one cascade block is already alone"
     );
 }
 
@@ -2238,6 +2283,11 @@ fn load_fail_rewind_requeues_the_wave(
         );
         assert!(!solo.single_block(), "{class:?}");
         assert_eq!(hub.query.block_queue_has_height(t + 1), kept, "{class:?}");
+        assert_eq!(
+            solo.dropped_body(&head.block_hash()),
+            class == ConfirmRejectClass::ConsensusInvalid,
+            "{class:?}: only a lone consensus reject is held off getdata"
+        );
         if kept {
             hub.query.block_queue_dequeue_height(t + 1).unwrap();
         }
@@ -2302,6 +2352,10 @@ fn reject_rearms_lookup_and_requeues_a_retried_wave() {
         !hub.query.block_queue_has_height(1),
         "invalid block dropped"
     );
+    assert!(
+        feed.dropped_body(&b1.block_hash()),
+        "a one-block consensus reject is not fetched again"
+    );
     assert!(!feed.single_block());
 
     let feed = ConfirmFeed::new();
@@ -2312,6 +2366,10 @@ fn reject_rearms_lookup_and_requeues_a_retried_wave() {
         ConfirmRejectClass::Cascade,
         &wave[..1],
     ));
+    assert!(
+        !feed.dropped_body(&b1.block_hash()),
+        "a one-block cascade is retried, not dropped"
+    );
     assert!(
         !feed.single_block(),
         "a one-block retry is already one block"
@@ -2328,6 +2386,10 @@ fn reject_rearms_lookup_and_requeues_a_retried_wave() {
         hub.query.set_lookup_taken_hi(Some(2));
         let gen = hub.query.lookup_taken_gen();
         assert!(rearm_after_reject(&hub, &feed, class, &wave));
+        assert!(
+            !feed.dropped_body(&b1.block_hash()),
+            "{class:?}: a retried wave is not a dropped verdict"
+        );
         assert_ne!(hub.query.lookup_taken_gen(), gen, "{class:?}: load resets");
         assert_eq!(hub.query.lookup_taken_hi(), Some(0), "{class:?}");
         assert_eq!(feed.isolate_until(), 2, "{class:?}: isolated");
@@ -2574,37 +2636,79 @@ fn write_cancel_and_script_reject_requeue() {
         "an engine-fault script wave is back on the queue"
     );
     assert!(!feed.single_block());
+    for ht in [1, 2] {
+        hub.query.block_queue_dequeue_height(ht).unwrap();
+    }
+
+    let feed = ConfirmFeed::new();
+    rearm_script_reject(
+        &hub,
+        &feed,
+        false,
+        true,
+        ConfirmRejectClass::ConsensusInvalid,
+        &wave,
+    );
+    assert!(
+        hub.query.block_queue_has_height(1),
+        "a session fault keeps the consensus wave"
+    );
+    assert!(
+        !feed.dropped_body(&b1.block_hash()),
+        "a session fault does not hold the hash off getdata"
+    );
+    for ht in [1, 2] {
+        hub.query.block_queue_dequeue_height(ht).unwrap();
+    }
+
+    let feed = ConfirmFeed::new();
+    rearm_script_reject(
+        &hub,
+        &feed,
+        false,
+        false,
+        ConfirmRejectClass::Cascade,
+        &wave[..1],
+    );
+    assert!(
+        !feed.dropped_body(&b1.block_hash()),
+        "a one-block cascade is not a dropped consensus verdict"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 
 /// The 5s cut is the gap between two publishes on the confirm thread.
 /// A wall-clock journey would sleep to tell `<` from `<=`. The operator
 /// sees the progress line; this passes the timestamp the thread would.
+/// A fresh thread owns the clock, so a later publish cannot sit in the future.
 #[test]
 fn confirm_progress_publishes_on_a_five_second_boundary() {
-    use rbitcoin_ibd::ibd::confirm::{clear_confirm_progress_clock, publish_confirm_progress_at};
+    use rbitcoin_ibd::ibd::confirm::publish_confirm_progress_at;
     use std::time::{Duration, Instant};
 
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("confirm-progress");
     hub.ensure_genesis().unwrap();
-    clear_confirm_progress_clock();
-    rbitcoin_query::reset_progress_snapshot_counts();
-    let t0 = Instant::now() + Duration::from_secs(10_000);
-    publish_confirm_progress_at(&hub.query, t0);
-    assert_eq!(rbitcoin_query::progress_snapshot_counts().0, 1);
-    publish_confirm_progress_at(&hub.query, t0 + Duration::from_secs(4));
-    assert_eq!(
-        rbitcoin_query::progress_snapshot_counts().0,
-        1,
-        "four seconds does not publish again"
-    );
-    publish_confirm_progress_at(&hub.query, t0 + Duration::from_secs(5));
-    assert_eq!(
-        rbitcoin_query::progress_snapshot_counts().0,
-        2,
-        "five seconds publishes again"
-    );
-    clear_confirm_progress_clock();
+    let query = std::sync::Arc::clone(&hub.query);
+    let published = std::thread::spawn(move || {
+        rbitcoin_query::reset_progress_snapshot_counts();
+        let t0 = Instant::now();
+        publish_confirm_progress_at(&query, t0);
+        assert_eq!(rbitcoin_query::progress_snapshot_counts().0, 1);
+        publish_confirm_progress_at(&query, t0 + Duration::from_secs(4));
+        assert_eq!(
+            rbitcoin_query::progress_snapshot_counts().0,
+            1,
+            "four seconds does not publish again"
+        );
+        publish_confirm_progress_at(&query, t0 + Duration::from_secs(5));
+        assert_eq!(
+            rbitcoin_query::progress_snapshot_counts().0,
+            2,
+            "five seconds publishes again"
+        );
+    })
+    .join();
+    assert!(published.is_ok(), "progress clock panicked");
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -2961,14 +3065,18 @@ fn clear_refunds_only_heights_above_the_confirmed_tip() {
     let feed = ConfirmFeed::new();
     feed.set_unproven_bounds(Some(10), 0, Some(100));
     assert_eq!(
-        take_unproven_lead(&feed, Some(&[40, 40]), vec![2, 5]),
-        vec![2, 5]
+        take_unproven_lead(&feed, Some(&[30, 30, 30]), vec![2, 3, 5]),
+        vec![2, 3, 5]
     );
     feed.clear(3);
     let g = feed.inner.lock().unwrap();
     assert!(g.lead_reserved.contains_key(&2));
+    assert!(
+        g.lead_reserved.contains_key(&3),
+        "a reservation at the confirmed tip stays reserved"
+    );
     assert!(!g.lead_reserved.contains_key(&5));
-    assert_eq!(g.lead_bytes_left, Some(60));
+    assert_eq!(g.lead_bytes_left, Some(40));
 }
 
 #[test]
@@ -2981,6 +3089,19 @@ fn an_uncapped_lookup_keeps_the_wave() {
     assert_eq!(take_unproven_lead(&feed, None, vec![1, 2, 3]), vec![1]);
     feed.install_unproven_bounds(None, 0, None);
     assert_eq!(take_unproven_lead(&feed, None, vec![4, 5]), vec![4, 5]);
+
+    let bytes = ConfirmFeed::new();
+    bytes.set_unproven_bounds(None, 0, Some(1));
+    assert_eq!(
+        take_unproven_lead(&bytes, Some(&[5]), vec![4]),
+        Vec::<u32>::new()
+    );
+    bytes.install_unproven_bounds(None, 0, None);
+    assert_eq!(
+        take_unproven_lead(&bytes, Some(&[5]), vec![4]),
+        vec![4],
+        "lifting the byte cap keeps the wave"
+    );
 }
 
 #[test]
@@ -3243,4 +3364,89 @@ fn next_accepted(
             }
         }
     }
+}
+
+#[test]
+fn hold_ends_at_the_stamped_millisecond() {
+    // The stamped millisecond is over. Lookup's hold uses this cut.
+    use rbitcoin_ibd::ibd::confirm::hold_active;
+    assert!(hold_active(4, 5));
+    assert!(!hold_active(5, 5));
+    assert!(!hold_active(6, 5));
+}
+
+#[test]
+fn unproven_lead_is_either_cap() {
+    // Neither cap, height only, byte only. Lookup charges on either one.
+    let feed = ConfirmFeed::new();
+    assert!(!feed.unproven_lead_active());
+    assert!(!feed.lead_charged_or_now(false));
+    assert!(feed.lead_charged_or_now(true));
+    feed.set_unproven_bounds(Some(1), 0, None);
+    assert!(feed.unproven_lead_active());
+    assert!(feed.lead_charged_or_now(false));
+    feed.set_unproven_bounds(None, 0, Some(8));
+    assert!(feed.unproven_lead_active());
+    assert!(feed.lead_charged_or_now(false));
+    feed.set_unproven_bounds(None, 0, None);
+    assert!(!feed.unproven_lead_active());
+}
+
+#[test]
+fn confirm_stage_stops_on_either_flag() {
+    // Stopped or cancelled ends the stage. Scripts publish only while both are clear.
+    use rbitcoin_ibd::ibd::confirm::{confirm_stage_running, confirm_stage_stopping};
+    assert!(confirm_stage_stopping(true, false));
+    assert!(confirm_stage_stopping(false, true));
+    assert!(!confirm_stage_stopping(false, false));
+    assert!(confirm_stage_running(false, false));
+    assert!(!confirm_stage_running(true, false));
+    assert!(!confirm_stage_running(false, true));
+}
+
+#[test]
+fn a_stale_write_drops_unless_the_session_already_counted_it() {
+    // Skip-stale, a stale plan, the tip hash, and a spent batch already connected.
+    use rbitcoin_ibd::ibd::confirm::{drop_stale_write, write_already_committed};
+    assert!(drop_stale_write(false, true));
+    assert!(!drop_stale_write(true, true));
+    assert!(!drop_stale_write(false, false));
+    assert!(write_already_committed(false, true, false));
+    assert!(write_already_committed(false, false, true));
+    assert!(!write_already_committed(false, false, false));
+    assert!(!write_already_committed(true, true, true));
+}
+
+#[test]
+fn lookup_waits_only_when_the_wave_did_nothing() {
+    use rbitcoin_ibd::ibd::confirm::lookup_should_wait;
+    assert!(lookup_should_wait(false));
+    assert!(!lookup_should_wait(true));
+}
+
+#[test]
+fn write_batch_is_stale_on_height_or_epoch() {
+    // Behind tip+1, or claimed before clear. Either one drops the batch.
+    use rbitcoin_ibd::ibd::confirm::write_batch_is_stale_plan;
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("stale-plan");
+    hub.ensure_genesis().unwrap();
+    let feed = ConfirmFeed::new();
+    assert!(
+        write_batch_is_stale_plan(&hub, &feed, 0),
+        "height 0 is behind tip+1"
+    );
+    assert!(
+        !write_batch_is_stale_plan(&hub, &feed, 1),
+        "tip+1 with no claim is live"
+    );
+    {
+        let mut g = feed.inner.lock().unwrap();
+        g.claimed_epoch.insert(1, feed.epoch());
+    }
+    feed.clear(0);
+    assert!(
+        write_batch_is_stale_plan(&hub, &feed, 1),
+        "tip+1 claimed before clear is stale"
+    );
+    let _ = std::fs::remove_dir_all(dir);
 }

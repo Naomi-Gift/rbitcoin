@@ -475,7 +475,6 @@ fn push_quoted_u32(s: &mut String, n: u32) {
 
 fn push_hex(s: &mut String, data: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    s.reserve(data.len() * 2);
     for &b in data {
         s.push(HEX[(b >> 4) as usize] as char);
         s.push(HEX[(b & 0xf) as usize] as char);

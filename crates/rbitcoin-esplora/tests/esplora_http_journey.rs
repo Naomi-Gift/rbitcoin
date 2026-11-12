@@ -24,6 +24,13 @@ impl HttpPad {
     }
 }
 
+fn txids_of(body: &str) -> Vec<String> {
+    let rows: Vec<Value> = serde_json::from_str(body).unwrap();
+    rows.iter()
+        .filter_map(|v| v["txid"].as_str().map(str::to_owned))
+        .collect()
+}
+
 fn pay_txid(tag: u8) -> [u8; 32] {
     two_script_pay(tag, bitcoin::ScriptBuf::new()).tx.txid
 }
@@ -222,6 +229,15 @@ async fn wallet_posts_scripthashes(addr: SocketAddr, a: [&str; 2], sh: [&str; 2]
     assert_eq!(st, 422, "{resp}");
     assert!(resp.contains("after_txid not found"), "{resp}");
     cursor_outside_one_script_is_422(addr, a[0], sh[0], &t1, &t2, &t3).await;
+    let exactly: Vec<String> = (0..300).map(|_| "aa".repeat(32)).collect();
+    let (st, resp) = http_post(
+        addr,
+        "/scripthashes/txs",
+        &serde_json::to_vec(&exactly).unwrap(),
+    )
+    .await;
+    assert_eq!(st, 200, "{resp}");
+    assert!(!resp.contains("body too long"), "{resp}");
     let too: Vec<String> = (0..301).map(|_| "aa".repeat(32)).collect();
     let (st, resp) = http_post(
         addr,
@@ -393,6 +409,7 @@ async fn junk_paths_asof_and_post(addr: SocketAddr, genesis: &[u8; 32]) {
         ("/block-height/nope".into(), 400),
         ("/address/not-an-address".into(), 404),
         (format!("/tx/{h0hex}/outspend/nope"), 400),
+        (format!("/tx/{}/outspend/0", "ab".repeat(32)), 404),
         ("/blocks/nope".into(), 400),
         (format!("/tx/{h0hex}?asof={h0hex}"), 404),
         (format!("/mempool?asof={h0hex}"), 404),
@@ -642,6 +659,46 @@ async fn mempool_cursor_past_the_page_is_the_confirmed_page() {
     .await;
     assert_eq!(st, 200, "{posted}");
     assert!(!posted.contains(&past), "{posted}");
+
+    let (st, mem) = http_get(pad.addr, &format!("/scripthash/{sh}/txs/mempool")).await;
+    assert_eq!(st, 200, "{mem}");
+    let mem_rows: Vec<Value> = serde_json::from_str(&mem).unwrap();
+    let first = mem_rows[0]["txid"].as_str().unwrap().to_string();
+    let one = serde_json::to_vec(&json!([sh])).unwrap();
+    let (st, page) = http_post(pad.addr, "/scripthashes/txs", &one).await;
+    assert_eq!(st, 200, "{page}");
+    let page_ids = txids_of(&page);
+    assert!(page_ids.iter().any(|id| id == &first), "{page}");
+    let (st, tail) = http_post(
+        pad.addr,
+        &format!("/scripthashes/txs?after_txid={first}"),
+        &one,
+    )
+    .await;
+    assert_eq!(st, 200, "{tail}");
+    let tail_ids = txids_of(&tail);
+    assert!(!tail_ids.iter().any(|id| id == &first), "{tail}");
+    let mid = block_hash_hex(&pad.cbs[80]);
+    let (st, chain) = http_get(pad.addr, &format!("/scripthash/{sh}/txs/chain/{mid}")).await;
+    assert_eq!(st, 200, "{chain}");
+    let (st, posted) = http_post(
+        pad.addr,
+        &format!("/scripthashes/txs?after_txid={mid}"),
+        &one,
+    )
+    .await;
+    assert_eq!(st, 200, "{posted}");
+    assert_eq!(posted, chain, "a chain cursor drops the mempool page");
+    let foreign = block_hash_hex(&script_hash(&[0x00]));
+    let (st, missing) = http_post(
+        pad.addr,
+        &format!("/scripthashes/txs?after_txid={first}"),
+        &serde_json::to_vec(&json!([foreign])).unwrap(),
+    )
+    .await;
+    assert_eq!(st, 422, "{missing}");
+    assert!(missing.contains("after_txid not found"), "{missing}");
+
     handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
 }

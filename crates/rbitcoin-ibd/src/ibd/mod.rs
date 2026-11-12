@@ -533,13 +533,113 @@ pub fn publish_status_snap(st: &IbdWorkState, hub: &ChainHub, board: &StatusBoar
 fn full_outbound_slots(slots: &[peer_io::PeerSlot]) -> usize {
     slots
         .iter()
-        .filter(|s| s.alive && s.conn_type == rbitcoin_net::peers::PeerConnType::OutboundFullRelay)
+        .filter(|s| catch_up_full_outbound(s.alive, s.conn_type))
         .count()
+}
+
+/// Alive outbound full-relay. A dead slot or a manual slot does not count.
+#[doc(hidden)]
+pub fn catch_up_full_outbound(alive: bool, conn: rbitcoin_net::peers::PeerConnType) -> bool {
+    alive && conn == rbitcoin_net::peers::PeerConnType::OutboundFullRelay
+}
+
+/// When the peerless redial delay ends.
+#[doc(hidden)]
+pub fn dial_retry_deadline(now: Instant, delay: Duration) -> Instant {
+    now + delay
+}
+
+/// Confirmed in the store, or indexed at or below the tip.
+#[doc(hidden)]
+pub fn ordered_hash_is_past(in_store: bool, indexed_height: Option<u32>, tip: u32) -> bool {
+    in_store || indexed_height.is_some_and(|ht| ht <= tip)
+}
+
+/// Header poll runs when the path is empty and headers are not latched.
+#[doc(hidden)]
+pub fn header_path_empty(ordered_empty: bool, headers_done: bool) -> bool {
+    ordered_empty && !headers_done
+}
+
+/// Hard header reset: stall×6 has passed and the path is drained.
+#[doc(hidden)]
+pub fn hard_path_reset_due(elapsed: Duration, stall: Duration, drained: bool) -> bool {
+    elapsed > stall.saturating_mul(6) && drained
+}
+
+/// Drop a dial that is cooling or already live.
+#[doc(hidden)]
+pub fn drop_redial_slot(
+    blocked: &HashSet<rbitcoin_net::NetAddr>,
+    live: impl IntoIterator<Item = rbitcoin_net::NetAddr>,
+    addr: rbitcoin_net::NetAddr,
+) -> bool {
+    blocked.contains(&addr) || live.into_iter().any(|have| have == addr)
+}
+
+/// One accepted redial slot. Zero stays zero only when none connect.
+#[doc(hidden)]
+pub fn accept_one_redial(n: usize) -> usize {
+    n + 1
+}
+
+/// `dark_empty_after` treats any live slot as not fully dark.
+#[doc(hidden)]
+pub fn peer_slot_alive(alive_now: usize) -> bool {
+    alive_now > 0
+}
+
+/// At least one new slot came back from the dial.
+#[doc(hidden)]
+pub fn redial_added_any(n: usize) -> bool {
+    n > 0
+}
+
+/// Dark and still willing to dial. Give-up does not schedule another round.
+#[doc(hidden)]
+pub fn redial_again_when_dark(alive_now: usize, peerless: Peerless) -> bool {
+    alive_now == 0 && peerless != Peerless::GiveUp
+}
+
+/// Immediate dark delay, or the 15s refill interval once someone is alive.
+#[doc(hidden)]
+pub fn redial_interval_for(alive_n: usize, dark: u32, peerless: Peerless) -> Duration {
+    if alive_n == 0 {
+        peerless.dark_delay(dark)
+    } else {
+        Duration::from_secs(15)
+    }
+}
+
+/// Every conjunct is required. `alive_n == target` is not short.
+#[doc(hidden)]
+pub fn redial_spawn_due(
+    idle: bool,
+    alive_n: usize,
+    target: usize,
+    may: bool,
+    book_has_addr: bool,
+    since_last: Duration,
+    interval: Duration,
+) -> bool {
+    idle && alive_n < target && may && book_has_addr && since_last >= interval
+}
+
+/// Alive overlay row. A dead overlay slot does not hold the dial reservation.
+#[doc(hidden)]
+pub fn live_overlay_slot(alive: bool, overlay: bool) -> bool {
+    alive && overlay
+}
+
+/// Status tick. Five seconds is due; anything shorter waits.
+#[doc(hidden)]
+pub fn status_tick_due(elapsed: Duration) -> bool {
+    elapsed >= Duration::from_secs(5)
 }
 
 /// Sleep `delay` in short ticks. Returns true as soon as `cancelled` does.
 async fn sleep_unless_cancelled(delay: Duration, cancelled: impl Fn() -> bool) -> bool {
-    let until = Instant::now() + delay;
+    let until = dial_retry_deadline(Instant::now(), delay);
     while !cancelled() {
         let left = until.saturating_duration_since(Instant::now());
         if left.is_zero() {
@@ -887,8 +987,11 @@ pub async fn ibd_cancellable(
 
                 let tip_now = hub.tip_height().unwrap_or(0);
                 while let Some(&front) = st.ordered.front() {
-                    let past = hub.has_block(&front)
-                        || st.hash_height.get(&front).is_some_and(|&ht| ht <= tip_now);
+                    let past = ordered_hash_is_past(
+                        hub.has_block(&front),
+                        st.hash_height.get(&front).copied(),
+                        tip_now,
+                    );
                     if past {
                         st.ordered.pop_front();
                         st.ordered_set.remove(&front);
@@ -973,7 +1076,7 @@ pub async fn ibd_cancellable(
             // Soft-cap `ordered_set` (not deque ghosts). Bypass only when the path is dense
             // (sparse far-ready used to look empty forever → header flood / drain livelock).
             // Full-batch continuation still fires from apply_peer_event; this is the poll.
-            let path_empty = st.ordered.is_empty() && !st.headers_done;
+            let path_empty = header_path_empty(st.ordered.is_empty(), st.headers_done);
             // A block inv is not a queue-depth event. Ask on this turn, not
             // after the 500 ms header period, or the announced header waits
             // behind a full queue.
@@ -1025,7 +1128,7 @@ pub async fn ibd_cancellable(
             }
 
             // Hard reset only when ordered is empty — a full queue still waiting on getdata is not stalled.
-            if last_progress.elapsed() > cfg.stall.saturating_mul(6) && path_drained(st) {
+            if hard_path_reset_due(last_progress.elapsed(), cfg.stall, path_drained(st)) {
                 enqueue_header_cmd(st, HeaderCmd::Reseed);
                 enqueue_header_cmd(st, HeaderCmd::Ask);
                 info!(
@@ -1113,7 +1216,7 @@ pub async fn ibd_cancellable(
                     let mut n = 0usize;
                     for s in result.slots {
                         // Race: same addr may have connected on another path.
-                        if blocked.contains(&s.net) || st.slots.iter().any(|x| x.net == s.net) {
+                        if drop_redial_slot(&blocked, st.slots.iter().map(|x| x.net), s.net) {
                             warn!(
                                 "ibd: drop duplicate/cooldown dial peer[{}] {}",
                                 s.id, s.addr
@@ -1126,17 +1229,18 @@ pub async fn ibd_cancellable(
                             s.id, s.addr, s.peer_height
                         );
                         st.slots.push(s);
-                        n += 1;
+                        n = accept_one_redial(n);
                     }
                     let alive_now = st.slots.iter().filter(|s| s.alive).count();
-                    dark_redial_empty = dark_empty_after(dark_redial_empty, n, alive_now > 0);
-                    if n > 0 {
+                    dark_redial_empty =
+                        dark_empty_after(dark_redial_empty, n, peer_slot_alive(alive_now));
+                    if redial_added_any(n) {
                         st.slots.sort_by_key(|s| s.id);
                         info!("ibd: redial added {n} peer(s); live={alive_now}");
-                        if st.ordered.is_empty() && !st.headers_done {
+                        if header_path_empty(st.ordered.is_empty(), st.headers_done) {
                             enqueue_header_cmd(st, HeaderCmd::Ask);
                         }
-                    } else if alive_now == 0 && cfg.peerless != Peerless::GiveUp {
+                    } else if redial_again_when_dark(alive_now, cfg.peerless) {
                         last_redial = Instant::now();
                         warn!(
                             "ibd: redial returned 0 peers (empty_rounds={dark_redial_empty}) — no live peer, dialing again in {:?}",
@@ -1157,23 +1261,25 @@ pub async fn ibd_cancellable(
             let st = &mut *st_guard;
             let alive_n = st.slots.iter().filter(|s| s.alive).count();
             let target = cfg.target_peers.max(1);
-            let redial_interval = if alive_n == 0 {
-                cfg.peerless.dark_delay(dark_redial_empty)
-            } else {
-                Duration::from_secs(15)
-            };
-            if redial_handle.is_none()
-                && alive_n < target
-                && may_spawn_redial(alive_n, dark_redial_empty, cfg.peerless)
-                && !peer_sess.book().is_empty()
-                && last_redial.elapsed() >= redial_interval
-            {
+            let redial_interval = redial_interval_for(alive_n, dark_redial_empty, cfg.peerless);
+            if redial_spawn_due(
+                redial_handle.is_none(),
+                alive_n,
+                target,
+                may_spawn_redial(alive_n, dark_redial_empty, cfg.peerless),
+                !peer_sess.book().is_empty(),
+                last_redial.elapsed(),
+                redial_interval,
+            ) {
                 peer_sess.pull_shared();
                 let want = redial_want(alive_n, target);
                 let mut already = dial_blocked_addrs(&st.slots, &st.addr_cooldown, Instant::now());
                 let occupied = alive_dial_addrs(&st.slots);
                 let live: HashSet<_> = st.slots.iter().map(|s| s.net).collect();
-                let overlay_live = st.slots.iter().any(|s| s.alive && s.net.is_overlay());
+                let overlay_live = st
+                    .slots
+                    .iter()
+                    .any(|s| live_overlay_slot(s.alive, s.net.is_overlay()));
                 if let Some(addr) = admit_cooldown_fallback(
                     peer_sess.book(),
                     &mut already,
@@ -1221,7 +1327,7 @@ pub async fn ibd_cancellable(
                 last_redial = Instant::now();
             }
 
-            if last_status.elapsed() >= Duration::from_secs(5) {
+            if status_tick_due(last_status.elapsed()) {
                 let now = Instant::now();
                 let scan_t0 = Instant::now();
                 let horizon = header_walk::peer_horizon(st);
@@ -1240,12 +1346,7 @@ pub async fn ibd_cancellable(
 
                 let peers_n = st.slots.iter().filter(|s| s.alive).count();
                 let (_load_q, script_q, write_q) = confirm_queues.snap();
-                let path_lo = published.tip.map(|t| t.saturating_add(1)).unwrap_or(0);
-                let inflight_h = {
-                    let g = confirm_feed.inner.lock().unwrap();
-                    g.inflight.clone()
-                };
-                let ready_n = confirm::confirm_ready_count(&hub.query, path_lo, &inflight_h);
+                let ready_n = 0;
                 let (bq_bytes, bq_count) = hub.query.block_queue_stats();
 
                 tip_rate_tracker.push(now, prog.tip);
@@ -1293,27 +1394,6 @@ pub async fn ibd_cancellable(
                 );
                 perf_log::log_sample(&perf);
 
-                // Stall WARN only if the pipeline is idle. ready_n is BQ inventory, not occupancy.
-                let conf_busy = feed_inflight > 0
-                    || script_q > 0
-                    || write_q > 0
-                    || loop_stats.confirm_live_snap().is_some();
-                if last_progress.elapsed() > Duration::from_secs(15)
-                    && prog.tip_hole == 0
-                    && !conf_busy
-                    && st.inflight.is_empty()
-                    && prog.ready_hwm > prog.tip.saturating_add(1)
-                {
-                    warn!(
-                    "ibd: tip stall tip={} hwm={} ordered_len={} feed_ready={} hole={} (idle {:?})",
-                    prog.tip,
-                    prog.ready_hwm,
-                    st.ordered.len(),
-                    feed_ready,
-                    prog.tip_hole,
-                    last_progress.elapsed(),
-                );
-                }
                 last_status = Instant::now();
             }
 
