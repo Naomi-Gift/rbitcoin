@@ -240,7 +240,8 @@ sequential on a 4k-tx 9p block; witness stays in `seqsigwit`). Indexed serve doe
 
 Serve-time **`--sp-tweaks-dust SATS`** (conf `sp_tweaks_dust=`) omits P2TR outs
 with `value <= SATS` and drops txs that then have none. Default **1000**.
-`0` serves every value. **`546` matches Cake electrs** `sp_min_dust`. This is
+`0` serves every value. **`545` matches Cake electrs** at `sp_min_dust` 546, which keeps
+`value >= 546`. This is
 not Core dust: P2TR at 1 sat/vB is about **330** sats; 546 is the P2PKH
 figure Cake’s server used. The index is unchanged — only the Electrum JSON.
 
