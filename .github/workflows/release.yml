@@ -459,13 +459,6 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$NIGHTLY" == true ]]; then
-            # A re-run keeps its run's SHA, which master may have passed,
-            # and would move `nightly` back onto it. Fresh nightlies run in
-            # trigger order (the workflow group), so only a re-run can.
-            if [[ "$GITHUB_RUN_ATTEMPT" != 1 ]]; then
-              echo "nightly re-run of ${GITHUB_SHA:0:12} refused: dispatch a new nightly instead" >&2
-              exit 1
-            fi
             tags="$(./scripts/docker-tags.sh --nightly "$(date -u +%Y%m%d)")"
           else
             tags="$(./scripts/docker-tags.sh "$GITHUB_REF_NAME")"
@@ -475,6 +468,20 @@ jobs:
           images=("ghcr.io/${GITHUB_REPOSITORY,,}")
           if [[ -n "$DOCKERHUB_REPOSITORY" ]]; then
             images+=("docker.io/$DOCKERHUB_REPOSITORY")
+          fi
+          # A late nightly (a re-run, or one GitHub queued behind a newer
+          # one) must not move `nightly` back. This job's group holds the
+          # read and the push together. No tag yet is the first publish.
+          if [[ "$NIGHTLY" == true ]]; then
+            head="$(git rev-parse HEAD)"
+            cur="$(docker buildx imagetools inspect "${images[0]}:nightly" \
+              --format '{{json (index .Image "linux/amd64").Config.Labels}}' 2>/dev/null |
+              jq -r '."org.opencontainers.image.revision" // empty')" || cur=""
+            if [[ -n "$cur" && "$cur" != "$head" ]] &&
+              git merge-base --is-ancestor "$head" "$cur" 2>/dev/null; then
+              echo "published nightly ${cur:0:12} is newer than ${head:0:12}; not moving it back"
+              exit 0
+            fi
           fi
           refs=()
           for t in $tags; do
