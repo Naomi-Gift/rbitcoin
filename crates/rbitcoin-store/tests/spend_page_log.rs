@@ -2980,3 +2980,74 @@ fn review_1501_fold_spindle() {
     drop(s);
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A spender sync that fails after the freeze must still wake confirm.
+///
+/// The freeze has already moved the open notes and dropped the edge count.
+/// Confirm is asleep on that cap. The error return never reaches install.
+#[test]
+fn review_1501_failed_freeze_wakes_the_edge_wait() {
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    let d = dir();
+    let log = Arc::new(SpendPageLog::create(&d));
+    let slot = [8u8, 1, 2, 3, 4, 5, 6, 7];
+    let mut batch = Vec::with_capacity(4096);
+    let mut n = 0u64;
+    while n < OPEN_EDGE_CAP {
+        let page = n / 512;
+        let rel = n % 512;
+        batch.push((page * 4096 + rel * 8, slot));
+        n += 1;
+        if batch.len() == 4096 {
+            log.note_slots(&batch).unwrap();
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        log.note_slots(&batch).unwrap();
+    }
+    let wake = Arc::new((Mutex::new(false), Condvar::new()));
+    log.bind_sync_wake(Arc::clone(&wake));
+    let log_wait = Arc::clone(&log);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let (lock, cv) = &*wake;
+    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let worker = std::thread::spawn(move || {
+        log_wait.wait_open_edge_room();
+        let _ = done_tx.send(());
+    });
+    let (_guard, waited) = cv
+        .wait_timeout(guard, Duration::from_secs(5))
+        .unwrap_or_else(|e| e.into_inner());
+    assert!(
+        !waited.timed_out(),
+        "confirm must reach the edge wait before the freeze fails"
+    );
+    let err = log.prepare_commit_in(
+        1,
+        8192,
+        zeros,
+        |_| Ok(true),
+        |page| {
+            page.freeze_open();
+            Err(StoreError::io(
+                std::path::Path::new("spent.ovf"),
+                std::io::Error::other("sync failed"),
+            ))
+        },
+        |_| Ok(1),
+    );
+    assert!(err.is_err(), "the sync after the freeze must fail");
+    assert_eq!(
+        log.slot(16),
+        Some(slot),
+        "a failed freeze must keep the spend it already took"
+    );
+    done_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("a failed freeze must wake confirm waiting at the edge cap");
+    worker.join().unwrap();
+    let _ = std::fs::remove_dir_all(&d);
+}

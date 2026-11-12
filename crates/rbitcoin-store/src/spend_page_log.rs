@@ -112,7 +112,6 @@ struct PendingInstall {
 
 struct CommitSnapshot {
     pages: Vec<(u64, OpenPage)>,
-    froze: bool,
 }
 
 /// `Clear` writes the commit with the held bit off. RAM still has the old
@@ -664,9 +663,6 @@ impl SpendPageLog {
                 seal_tip,
             );
         };
-        if snap.froze {
-            self.pace.notify_room();
-        }
         let (mut kept, mut rejected, more) = filter_kept_pages(&mut keep, snap.pages)?;
         clears.extend(more);
         let pages = compose_kept_pages(&mut read_page, published, &kept, &clears, &stored)?;
@@ -1034,10 +1030,14 @@ impl SpendPageLog {
             .collect();
         fold_open_into_snapshot(&mut pages, &g.open, &g.committed);
         merge_later(&mut g, reset_edges);
-        Some(CommitSnapshot {
-            pages,
-            froze: !reuse,
-        })
+        let froze = !reuse;
+        drop(g);
+        // Confirm may already be asleep on the edge cap. The caller can
+        // fail after this freeze and never reach the install wake.
+        if froze {
+            self.pace.notify_room();
+        }
+        Some(CommitSnapshot { pages })
     }
 
     fn scrub_open_notes<K>(&self, keep: &mut K) -> Result<(), StoreError>
