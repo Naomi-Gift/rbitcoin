@@ -586,7 +586,7 @@ in
     spTweaksDust = mkOption {
       type = types.nullOr types.ints.unsigned;
       default = null;
-      example = 546;
+      example = 545;
       description = ''
         Pass `--sp-tweaks-dust SATS`. Null keeps the node default (1000).
         0 serves every P2TR output. 545 matches Cake electrs at its 546 floor.
