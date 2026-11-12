@@ -201,13 +201,24 @@ class WalletHub:
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError) as e:
             raise RpcError(ERR_MISC, f"esplora unreachable: {e}") from e
 
-    def _esplora(self, path: str, timeout: float = 5.0) -> Any:
+    def _esplora(
+        self,
+        path: str,
+        timeout: float = 5.0,
+        *,
+        tries: int = 40,
+        deadline: float | None = None,
+    ) -> Any:
         last: Exception | None = None
-        for _ in range(40):
+        for i in range(tries):
+            if i and deadline is not None and time.monotonic() >= deadline:
+                break
             try:
                 return self._esplora_once(path, timeout=timeout)
             except RpcError as e:
                 last = e
+                if deadline is not None and time.monotonic() >= deadline:
+                    break
                 time.sleep(0.1)
         raise RpcError(ERR_MISC, f"esplora unreachable: {last}")
 
@@ -372,9 +383,13 @@ class WalletHub:
         wait_esplora_tip(self._esplora_once, tip)
         found: list[dict[str, Any]] = []
         seen: set[tuple[str, int]] = set()
+        # One urlopen timeout is not a dead listener. The whole address walk
+        # still has to finish inside the harness client (30s, or 120s with
+        # --timeout-factor=4). Past that the client reports -344 and this
+        # loop would keep sending.
+        deadline = time.monotonic() + 12.0
         for addr in list(w.addr_index.keys()):
-            # One urlopen timeout is not a dead listener. `_esplora` retries.
-            arr = self._esplora(f"/address/{addr}/utxo")
+            arr = self._esplora(f"/address/{addr}/utxo", deadline=deadline)
             if not isinstance(arr, list):
                 raise RpcError(ERR_MISC, "esplora utxo was not a list")
             for u in arr:

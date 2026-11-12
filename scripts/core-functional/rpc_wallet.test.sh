@@ -442,6 +442,36 @@ node.shutdown()
 slow.shutdown()
 print("ok - one slow esplora utxo read is retried")
 
+# Accepts the UTXO connection and never answers. The RPC has to come
+# back as esplora unreachable before the harness client gives up.
+class StallUtxo(Esplora):
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path.startswith("/address/") and path.endswith("/utxo"):
+            time.sleep(20)
+            return
+        try:
+            super().do_GET()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+
+stall_port = free_port()
+stall = HTTPServer(("127.0.0.1", stall_port), StallUtxo)
+threading.Thread(target=stall.serve_forever, daemon=True).start()
+proxy, node, listen = proxy_on(stall_port)
+import_wallet(listen)
+started = time.monotonic()
+body = call(listen, "getbalance", timeout=25)
+elapsed = time.monotonic() - started
+assert body["error"] is not None, body
+assert "esplora unreachable" in body["error"]["message"], body
+assert elapsed < 25, elapsed
+proxy.shutdown()
+node.shutdown()
+stall.shutdown()
+print("ok - a stalled esplora utxo read fails inside the client timeout")
+
 # A listener that never binds is an error, not a zero balance.
 import rpc_proxy
 
