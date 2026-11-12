@@ -1544,9 +1544,10 @@ impl ChainHub {
         true
     }
 
-    /// Prev hash from a held/archive body, header-only tip, or the header store.
+    /// Prev hash from a held body, header-only tip, or the header row.
+    /// An archived block is not rebuilt: its header row already names the parent.
     pub fn prev_of(&self, hash: &BlockHash) -> Option<BlockHash> {
-        if let Some(b) = self.load_side_body(hash) {
+        if let Some(b) = self.held_body(hash) {
             return Some(b.header.prev_blockhash);
         }
         if let Some((prev, _)) = self.header_tips.read().unwrap().get(hash) {
