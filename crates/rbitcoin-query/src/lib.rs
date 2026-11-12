@@ -613,6 +613,9 @@ pub struct MilestonePath {
     pub work_through: [u8; 32],
     pub work_height: u32,
     pub work_valid: bool,
+    /// Hash last recorded at `work_height`. A load pack may drop that slot.
+    /// The next header still has to link to this hash before work grows.
+    work_hash: Option<[u8; 32]>,
 }
 
 impl MilestonePath {
@@ -626,6 +629,21 @@ impl MilestonePath {
         }
         let idx = (height - self.base) as usize;
         self.slots.get(idx).copied().flatten()
+    }
+
+    /// `prev` is the header work was summed through. A dropped slot still
+    /// counts when it is that tip. A hole that is still in range does not.
+    fn links_work_tip(&self, height: u32, prev: [u8; 32]) -> bool {
+        if self.work_height != height {
+            return false;
+        }
+        if !self.slots.is_empty() && height >= self.base {
+            let idx = (height - self.base) as usize;
+            if let Some(slot) = self.slots.get(idx) {
+                return *slot == Some(prev);
+            }
+        }
+        self.work_hash == Some(prev)
     }
 
     fn note(&mut self, height: u32, hash: [u8; 32]) {
@@ -1078,6 +1096,7 @@ impl Query {
                 g.work_through = acc.to_be_bytes();
                 g.work_height = height;
                 g.work_valid = true;
+                g.work_hash = Some(hash);
             }
             return;
         }
@@ -1085,10 +1104,11 @@ impl Query {
             Some(h) => h,
             None => return,
         };
-        if g.work_valid && g.work_height == prev_h && g.hash_at(prev_h) == Some(prev) {
+        if g.work_valid && g.links_work_tip(prev_h, prev) {
             let acc = bitcoin::Work::from_be_bytes(g.work_through) + header_work;
             g.work_through = acc.to_be_bytes();
             g.work_height = height;
+            g.work_hash = Some(hash);
         }
     }
 
@@ -1098,6 +1118,9 @@ impl Query {
     pub fn note_milestone_checkpoint_work(&self, height: u32, work_be: [u8; 32]) {
         let mut g = self.milestone_path_lock();
         if !g.work_valid || height >= g.work_height {
+            if height != g.work_height {
+                g.work_hash = None;
+            }
             g.work_through = work_be;
             g.work_height = height;
             g.work_valid = true;
@@ -1111,6 +1134,7 @@ impl Query {
         if g.work_valid && g.work_height > height {
             g.work_valid = false;
             g.work_through = [0; 32];
+            g.work_hash = None;
         }
     }
 

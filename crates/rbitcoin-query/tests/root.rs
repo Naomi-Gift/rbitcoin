@@ -1530,6 +1530,43 @@ fn a_confirmed_tip_drops_milestone_hashes_it_passed() {
 }
 
 #[test]
+fn a_header_after_a_dropped_tip_still_adds_its_work() {
+    let (dir, q) = temp_query("ms-drop-extend");
+    let mut base_be = [0u8; 32];
+    base_be[31] = 4;
+    let base = bitcoin::Work::from_be_bytes(base_be);
+    let mut one_be = [0u8; 32];
+    one_be[31] = 1;
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    let h10 = [0x10u8; 32];
+    let h11 = [0x11u8; 32];
+    q.note_milestone_header(10, h10, [0x09; 32], one, Some(base));
+    let through_ten = (base + one).to_be_bytes();
+    q.drop_milestone_path_through(10);
+    assert_eq!(q.milestone_header_at(10), None);
+    assert!(!q.has_milestone_path());
+    assert_eq!(q.milestone_best_work_be(), Some(through_ten));
+
+    q.note_milestone_header(11, h11, h10, one, None);
+    let through_eleven = (base + one + one).to_be_bytes();
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(through_eleven),
+        "a header that links to the dropped tip still adds its work"
+    );
+    assert_eq!(q.milestone_header_at(10), None);
+    assert_eq!(q.milestone_header_at(11), Some(h11));
+
+    q.note_milestone_header(12, [0x12; 32], [0x99; 32], one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(through_eleven),
+        "a header that does not link to that tip adds nothing"
+    );
+    let _ = dir;
+}
+
+#[test]
 fn a_load_pack_drops_milestone_hashes_the_store_tip_passed() {
     let (dir, q) = temp_query("ms-load-pack");
     let (mut h0, _) = coinbase_block(0, Fk::NULL, None);
