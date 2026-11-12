@@ -61,6 +61,9 @@ class FakeNode(BaseHTTPRequestHandler):
         error = None
         if method == "getblockcount":
             result = STORE["tip"]
+        elif method in ("getblockchaininfo", "getnetworkinfo"):
+            # Bare result: the proxy warmup lets a fake with no relay bit through.
+            result = "ready"
         elif method == "gettxout":
             txid = g(0, "txid")
             vout = int(g(1, "n") if g(1, "n") is not None else g(1, "vout") or 0)
@@ -292,7 +295,13 @@ class Node(BaseHTTPRequestHandler):
     def do_POST(self):
         n = int(self.headers.get("Content-Length", "0"))
         item = json.loads(self.rfile.read(n).decode())
-        result = TIP if item.get("method") == "getblockcount" else None
+        method = item.get("method")
+        if method == "getblockcount":
+            result = TIP
+        elif method in ("getblockchaininfo", "getnetworkinfo"):
+            result = "ready"
+        else:
+            result = None
         error = None if result is not None else {"code": -32601, "message": "no"}
         body = json.dumps({"result": result, "error": error, "id": item.get("id")}).encode()
         self.send_response(200)
@@ -399,6 +408,39 @@ assert len(body["result"]["unspents"]) == 1, body
 proxy.shutdown()
 node.shutdown()
 print("ok - balance and scantxoutset wait for a late esplora")
+
+# The first address UTXO read stalls past one urlopen timeout. Balance
+# still has to come back; a single timed-out GET is not a dead listener.
+class SlowFirstUtxo(Esplora):
+    first = True
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if (
+            SlowFirstUtxo.first
+            and path.startswith("/address/")
+            and path.endswith("/utxo")
+        ):
+            SlowFirstUtxo.first = False
+            time.sleep(6)
+        try:
+            super().do_GET()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+
+slow_port = free_port()
+slow = HTTPServer(("127.0.0.1", slow_port), SlowFirstUtxo)
+threading.Thread(target=slow.serve_forever, daemon=True).start()
+proxy, node, listen = proxy_on(slow_port)
+import_wallet(listen)
+body = call(listen, "getbalance", timeout=30)
+assert body["error"] is None, body
+assert body["result"] == 50, body
+proxy.shutdown()
+node.shutdown()
+slow.shutdown()
+print("ok - one slow esplora utxo read is retried")
 
 # A listener that never binds is an error, not a zero balance.
 import rpc_proxy

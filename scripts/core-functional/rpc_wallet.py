@@ -373,7 +373,8 @@ class WalletHub:
         found: list[dict[str, Any]] = []
         seen: set[tuple[str, int]] = set()
         for addr in list(w.addr_index.keys()):
-            arr = self._esplora_once(f"/address/{addr}/utxo")
+            # One urlopen timeout is not a dead listener. `_esplora` retries.
+            arr = self._esplora(f"/address/{addr}/utxo")
             if not isinstance(arr, list):
                 raise RpcError(ERR_MISC, "esplora utxo was not a list")
             for u in arr:
