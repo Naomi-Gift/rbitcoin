@@ -718,6 +718,10 @@ pub struct MempoolAnnounce {
     pub replaced_scripthashes: Vec<[u8; 32]>,
     /// Output + spent-input scripthashes of the **new** body (Electrum notify filter).
     pub scripthashes: Vec<[u8; 32]>,
+    /// Outpoints whose spend status this accept may have changed: the inputs
+    /// of the new body and of every replaced body, sorted and deduplicated.
+    /// Shared, so each receiver's clone does not copy the list.
+    pub outpoints: Arc<[OutPoint]>,
 }
 
 /// Reverse index: scripthash → live mempool txids (Electrum status / listunspent).
@@ -2357,12 +2361,26 @@ impl MempoolHub {
     }
 
     #[doc(hidden)]
-    pub fn publish_announce(&self, r: &AcceptResult, scripthashes: Vec<[u8; 32]>) {
+    pub fn publish_announce(
+        &self,
+        tx: &Transaction,
+        r: &AcceptResult,
+        scripthashes: Vec<[u8; 32]>,
+    ) {
+        let mut outpoints: Vec<OutPoint> = tx
+            .input
+            .iter()
+            .chain(r.replaced_txs.iter().flat_map(|old| old.input.iter()))
+            .map(|i| i.previous_output)
+            .collect();
+        outpoints.sort_unstable();
+        outpoints.dedup();
         let _ = self.announce.send(MempoolAnnounce {
             txid: r.txid,
             replaced: r.replaced.clone(),
             replaced_scripthashes: r.replaced_scripthashes.clone(),
             scripthashes,
+            outpoints: outpoints.into(),
         });
         self.meter_announce.fetch_add(1, Ordering::Relaxed);
     }
@@ -3775,7 +3793,7 @@ impl MempoolHub {
             .get(&r.txid)
             .cloned()
             .unwrap_or_default();
-        self.publish_announce(r, shs);
+        self.publish_announce(tx, r, shs);
         self.note_template_update();
     }
 
@@ -5153,7 +5171,7 @@ impl MempoolHub {
                 .get(&r.txid)
                 .cloned()
                 .unwrap_or_default();
-            self.publish_announce(r, shs);
+            self.publish_announce(tx, r, shs);
             ids.push(r.txid);
         }
         self.note_template_update();
@@ -6828,6 +6846,7 @@ impl MempoolHub {
                 replaced: Vec::new(),
                 replaced_scripthashes: Vec::new(),
                 scripthashes: Vec::new(),
+                outpoints: Arc::default(),
             });
             self.meter_announce.fetch_add(1, Ordering::Relaxed);
         }

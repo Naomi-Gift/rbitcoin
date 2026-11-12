@@ -990,6 +990,53 @@ fn scripthash_reopen_drops_parent_then_child() {
     let _ = std::fs::remove_dir_all(&mp);
 }
 
+/// The announce names the outpoints an accept spends, and for a replacement
+/// also the ones its victims spent, which it frees.
+#[test]
+fn announce_lists_spent_and_freed_outpoints() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let mp = tmp();
+    let hub = MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let mut rx = hub.subscribe_announces();
+    let kept = OutPoint {
+        txid: cbs[4],
+        vout: 0,
+    };
+    let freed = OutPoint {
+        txid: cbs[5],
+        vout: 0,
+    };
+    let input = |previous_output| TxIn {
+        previous_output,
+        script_sig: ScriptBuf::new(),
+        sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+        witness: Witness::new(),
+    };
+    let victim = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![input(kept), input(freed)],
+        output: vec![TxOut {
+            value: Amount::from_sat(100_0000_0000 - 1_000),
+            script_pubkey: spk.clone(),
+        }],
+    };
+    hub.accept_tx(&victim).expect("accept victim");
+    let ann = rx.try_recv().expect("victim announce");
+    let listed: BTreeSet<OutPoint> = ann.outpoints.iter().copied().collect();
+    assert_eq!(listed, BTreeSet::from([kept, freed]));
+
+    let replacement = spend_true(cbs[4], 20_000, spk);
+    let r = hub.accept_tx(&replacement).expect("accept replacement");
+    assert_eq!(r.replaced, vec![victim.compute_txid()]);
+    let ann = rx.try_recv().expect("replacement announce");
+    let listed: BTreeSet<OutPoint> = ann.outpoints.iter().copied().collect();
+    assert_eq!(listed, BTreeSet::from([kept, freed]));
+    let _ = std::fs::remove_dir_all(&mp);
+}
+
 #[allow(clippy::cognitive_complexity)] // one mempool session: later beats see earlier accepts
 #[test]
 fn live_pool_recent_accepts_and_1p1c_rollback() {
