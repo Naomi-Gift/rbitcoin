@@ -44,7 +44,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [028](./028-prevout-count.md) | high | Empty prevouts skipped script checks | fixed | `prevout_count_must_match_inputs` |
 | [042](./042-milestone-anchor.md) | medium | Height milestone skipped a low-work fork | fixed | `low_work_fork_does_not_skip_even_at_the_milestone_height` |
 | [041](./041-hygiene.md) | medium | P2PKH policy flags, RPC token, inv cap, log newlines | fixed | `peer_command_logs_have_no_raw_newline` |
-| [037](./037-rpc-esplora-limits.md) | high | RPC body, work queue, waits, and Esplora client id | fixed | `unauthorized_large_content_length_is_401_before_body` |
+| [037](./037-rpc-esplora-limits.md) | high | RPC body, work queue, waits, and Esplora client id | fixed | `unread_body_is_read_before_the_answer_up_to_the_cap` |
 | [039](./039-io-lifetimes.md) | high | Store I/O buffer must outlive the submit | fixed | `enter_failure_with_pending_matches_the_hard_cap` |
 | [047](./047-orphan-reserve.md) | medium | Orphan reserve can refuse every later orphan | fixed | `mempool_under_pressure` |
 | [048](./048-standard-sigops.md) | medium | No standard sigop cap before the interpreter | fixed (block limit, not 16k) | `mempool_accept_life` (`sigop_block_budget`), `mempool_under_pressure` |

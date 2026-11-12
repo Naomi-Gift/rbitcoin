@@ -509,31 +509,215 @@ async fn jsonrpc_v2_batch_and_http_codes() {
 }
 
 #[tokio::test]
-async fn unauthorized_large_content_length_is_401_before_body() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::time::{timeout, Duration};
-    let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-auth-body").expect("temp dir");
+async fn unread_body_is_read_before_the_answer_up_to_the_cap() {
+    use std::time::Duration;
+    let dir = rbitcoin_store::testutil::TempDir::labeled("rpc-unread-body").expect("temp dir");
     let q = Arc::new(Query::open_or_create_tiny(dir.join("store")).unwrap());
     let cfg = regtest_rpc(dir.path());
     let handle = run_rpc(cfg, q, None, None, None, None, None).await.unwrap();
-    let mut stream = tokio::net::TcpStream::connect(tcp_addr(&handle))
-        .await
-        .unwrap();
-    let headers =
-        b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 8000000\r\nConnection: close\r\n\r\n";
-    stream.write_all(headers).await.unwrap();
-    let mut buf = vec![0u8; 512];
-    let n = timeout(Duration::from_millis(400), stream.read(&mut buf))
-        .await
-        .expect("401 before any body bytes")
-        .unwrap();
-    let text = String::from_utf8_lossy(&buf[..n]);
+    let addr = tcp_addr(&handle);
+    let good = auth_header(&handle.auth);
+
+    // Unread request bytes at close make the kernel send RST, and the client
+    // reads ECONNRESET instead of the answer. A body the handler never read is
+    // read up to UNREAD_BODY_MAX, whatever the path.
+    for (verb, path, auth, status) in [
+        ("POST", "/", "Bearer wrong", "401 Unauthorized"),
+        ("POST", "/not-rpc", good.as_str(), "404 Not Found"),
+        ("GET", "/", good.as_str(), "405 Method Not Allowed"),
+        (
+            "POST",
+            "/rest/chaininfo.json",
+            good.as_str(),
+            "404 Not Found",
+        ),
+    ] {
+        let mut late =
+            br#"{"jsonrpc":"1.0","id":"1","method":"getblockcount","params":[]}"#.to_vec();
+        late.resize(UNREAD_BODY_MAX, b' ');
+        let answer =
+            request_body_after(addr, verb, path, auth, &late, Duration::from_millis(100)).await;
+        assert!(answer.contains(status), "{verb} {path}: {answer}");
+    }
+
+    // A refused chunk of exactly UNREAD_BODY_MAX is read to its end before the
+    // answer. One byte more is answered at once and the connection closes. The
+    // client stalls after its last byte, so nothing is left unread either way.
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let refused = |len: usize, close: &str| {
+            let mut req = format!(
+                "POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\nTransfer-Encoding: chunked\r\n{close}\r\n{len:x}\r\n"
+            )
+            .into_bytes();
+            req.resize(req.len() + len, b' ');
+            req
+        };
+        let mut at_cap = tokio::net::TcpStream::connect(addr).await.unwrap();
+        at_cap
+            .write_all(&refused(UNREAD_BODY_MAX, "Connection: close\r\n"))
+            .await
+            .unwrap();
+        let mut early = [0u8; 1];
+        let before_end =
+            tokio::time::timeout(Duration::from_millis(300), at_cap.read(&mut early)).await;
+        assert!(before_end.is_err(), "answered before the body ended");
+        at_cap.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+        let answer = read_answer(&mut at_cap).await;
+        assert!(
+            answer.starts_with("HTTP/1.1 401"),
+            "chunked at the cap: {answer}"
+        );
+
+        let mut over = tokio::net::TcpStream::connect(addr).await.unwrap();
+        over.write_all(&refused(UNREAD_BODY_MAX + 1, ""))
+            .await
+            .unwrap();
+        let answer = read_answer(&mut over).await;
+        assert!(
+            answer.starts_with("HTTP/1.1 401"),
+            "chunked past the cap: {answer}"
+        );
+        assert!(
+            answer.to_ascii_lowercase().contains("connection: close"),
+            "{answer}"
+        );
+    }
+
+    // A declared body past UNREAD_BODY_MAX is answered at once and not read.
+    let declared = answer_before_body(
+        addr,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n",
+            UNREAD_BODY_MAX + 1
+        ),
+    )
+    .await;
+    assert!(declared.starts_with("HTTP/1.1 401"), "{declared}");
     assert!(
-        text.contains("401") || text.contains("Unauthorized"),
-        "{text}"
+        declared.to_ascii_lowercase().contains("connection: close"),
+        "{declared}"
     );
+
+    // A client waiting on 100 Continue gets the answer and never uploads. The
+    // body stays unread, so the answer says the connection closes.
+    let expect = answer_before_body(
+        addr,
+        &format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nExpect: 100-continue\r\nContent-Length: {UNREAD_BODY_MAX}\r\n\r\n"
+        ),
+    )
+    .await;
+    assert!(expect.starts_with("HTTP/1.1 401"), "{expect}");
+    assert!(
+        expect.to_ascii_lowercase().contains("connection: close"),
+        "{expect}"
+    );
+
+    // A handler that stopped reading answers at once and closes, even if the
+    // client stalls after the byte that crossed the handler's cap.
+    {
+        use tokio::io::AsyncWriteExt;
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut over = format!(
+            "POST / HTTP/1.1\r\nHost: x\r\nAuthorization: {good}\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+            RPC_MAX_HTTP_BODY + 1
+        )
+        .into_bytes();
+        over.resize(over.len() + RPC_MAX_HTTP_BODY + 1, b' ');
+        stream.write_all(&over).await.unwrap();
+        let answer = read_answer(&mut stream).await;
+        assert!(answer.starts_with("HTTP/1.1 413"), "{answer}");
+        assert!(
+            answer.to_ascii_lowercase().contains("connection: close"),
+            "{answer}"
+        );
+    }
+
+    // A broken body is 400 and a stalled one is 408, the status an authorized
+    // request gets, whatever the handler answered.
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut bad_chunk = tokio::net::TcpStream::connect(addr).await.unwrap();
+        bad_chunk
+            .write_all(b"POST / HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer wrong\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n")
+            .await
+            .unwrap();
+        let answer = read_answer(&mut bad_chunk).await;
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+
+        let mut authorized = tokio::net::TcpStream::connect(addr).await.unwrap();
+        authorized
+            .write_all(format!("POST / HTTP/1.1\r\nHost: x\r\nAuthorization: {good}\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nhello\r\n0\r\n\r\n").as_bytes())
+            .await
+            .unwrap();
+        let answer = read_answer(&mut authorized).await;
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+        assert!(
+            answer.to_ascii_lowercase().contains("connection: close"),
+            "{answer}"
+        );
+
+        let mut short = tokio::net::TcpStream::connect(addr).await.unwrap();
+        short
+            .write_all(
+                b"POST /not-rpc HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{\"short\":1}",
+            )
+            .await
+            .unwrap();
+        short.shutdown().await.unwrap();
+        let answer = read_answer(&mut short).await;
+        assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+
+        // The paused clock moves only once every task waits, so the server
+        // has set its deadline and parked on the body before time passes it.
+        tokio::time::pause();
+        let mut stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stalled
+            .write_all(b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 100\r\n\r\n{")
+            .await
+            .unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(60), stalled.read_to_end(&mut answer))
+            .await
+            .expect("408 at the deadline")
+            .expect("read answer");
+        tokio::time::resume();
+        let answer = String::from_utf8_lossy(&answer);
+        assert!(answer.starts_with("HTTP/1.1 408"), "{answer}");
+    }
     handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The whole answer, read until the server closes.
+async fn read_answer(stream: &mut tokio::net::TcpStream) -> String {
+    use tokio::io::AsyncReadExt;
+    let mut answer = Vec::new();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.read_to_end(&mut answer),
+    )
+    .await
+    .expect("answer")
+    .expect("read answer");
+    String::from_utf8_lossy(&answer).into_owned()
+}
+
+/// The first response bytes, read before any body is sent.
+async fn answer_before_body(addr: SocketAddr, head: &str) -> String {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    stream.write_all(head.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 512];
+    let n = tokio::time::timeout(std::time::Duration::from_millis(400), stream.read(&mut buf))
+        .await
+        .expect("answer before any body bytes")
+        .unwrap();
+    String::from_utf8_lossy(&buf[..n]).into_owned()
 }
 
 #[tokio::test]
@@ -901,27 +1085,6 @@ async fn large_block_submit_and_proposal_clear_http_413() {
         "a body over the cap must not run: {over_tcp}"
     );
 
-    let wrong = status_before_body(
-        tcp_addr(&handle),
-        "POST / HTTP/1.1\r\nHost: rpc\r\nAuthorization: Bearer not-the-token\r\nContent-Length: 8000000\r\nConnection: close\r\n\r\n",
-    )
-    .await;
-    println!("BAD_CREDENTIAL {wrong}");
-    assert!(
-        wrong.contains("401") || wrong.contains("Unauthorized"),
-        "wrong credential must be 401 before the body: {wrong}"
-    );
-    let missing = status_before_body(
-        tcp_addr(&handle),
-        "POST / HTTP/1.1\r\nHost: rpc\r\nContent-Length: 8000000\r\nConnection: close\r\n\r\n",
-    )
-    .await;
-    println!("MISSING_CREDENTIAL {missing}");
-    assert!(
-        missing.contains("401") || missing.contains("Unauthorized"),
-        "missing credential must be 401 before the body: {missing}"
-    );
-
     let rest_body = vec![b'{'; two_mib + 1];
     let mut rest = tokio::net::TcpStream::connect(tcp_addr(&handle))
         .await
@@ -944,18 +1107,6 @@ async fn large_block_submit_and_proposal_clear_http_413() {
 
     handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-async fn status_before_body(addr: SocketAddr, head: &str) -> String {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    stream.write_all(head.as_bytes()).await.unwrap();
-    let mut buf = vec![0u8; 512];
-    let n = tokio::time::timeout(std::time::Duration::from_millis(800), stream.read(&mut buf))
-        .await
-        .expect("401 before any body bytes")
-        .unwrap();
-    String::from_utf8_lossy(&buf[..n]).into_owned()
 }
 
 #[tokio::test]
@@ -2519,15 +2670,37 @@ async fn http_verb(
 }
 
 async fn post_with_authorization(addr: SocketAddr, authorization: &str) -> String {
+    let body = br#"{"jsonrpc":"1.0","id":"1","method":"getblockcount","params":[]}"#;
+    request_body_after(
+        addr,
+        "POST",
+        "/",
+        authorization,
+        body,
+        std::time::Duration::ZERO,
+    )
+    .await
+}
+
+/// `pause` sits between the headers and the body, so the body lands after the
+/// server has read the headers.
+async fn request_body_after(
+    addr: SocketAddr,
+    verb: &str,
+    path: &str,
+    authorization: &str,
+    body: &[u8],
+    pause: std::time::Duration,
+) -> String {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    let body = br#"{"jsonrpc":"1.0","id":"1","method":"getblockcount","params":[]}"#;
     let request = format!(
-        "POST / HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {authorization}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{verb} {path} HTTP/1.1\r\nHost: {addr}\r\nAuthorization: {authorization}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     stream.write_all(request.as_bytes()).await.unwrap();
+    tokio::time::sleep(pause).await;
     stream.write_all(body).await.unwrap();
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await.unwrap();
