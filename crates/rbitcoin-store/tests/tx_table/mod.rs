@@ -5137,3 +5137,90 @@ fn backfill_head_from_empty_and_unindexed() {
 }
 
 mod packed;
+
+fn put_values(t: &TxTable, tag: u8, values: &[u64]) -> Fk {
+    let mut txid = [0u8; 32];
+    txid[0] = tag;
+    txid[1] = 0x5e;
+    let tx = TxRecord {
+        txid,
+        version: 2,
+        locktime: 0,
+        input_count: 1,
+        output_count: values.len() as u32,
+    };
+    let inputs = vec![InputRecord::coinbase(u32::MAX, vec![0x51], vec![])];
+    let outs: Vec<OutputRecord> = values
+        .iter()
+        .map(|&v| OutputRecord::unspent(v, vec![0x6a]))
+        .collect();
+    t.put_full_batch_indexed(&[(tx, inputs, outs)], false)
+        .unwrap()[0]
+}
+
+/// Per-create output value sums over a span, at a span cap that coalesces
+/// everything, one that splits mid-range, and one below every create.
+#[test]
+fn output_value_sums_follow_fk_order_across_span_reads() {
+    let dir = tempfile_dir("value-sums");
+    let t = create_tiny(&dir);
+    let many: Vec<u64> = (0..300u64)
+        .map(|i| if i % 7 == 0 { 0 } else { i * 1_000 + 3 })
+        .collect();
+    let rows: Vec<Vec<u64>> = vec![
+        many,
+        vec![50_0000_0000],
+        vec![0, 0, 0],
+        vec![21_000_000 * 100_000_000, 1],
+        vec![546],
+    ];
+    let fks: Vec<Fk> = rows
+        .iter()
+        .enumerate()
+        .map(|(i, v)| put_values(&t, i as u8 + 1, v))
+        .collect();
+    let want: Vec<u64> = rows.iter().map(|v| v.iter().sum()).collect();
+    let (first, last) = (fks[0].0, fks[fks.len() - 1].0);
+
+    let locs = t.create_loc_range_batch(&fks).unwrap();
+    let lens: Vec<u64> = locs.iter().map(|p| p.unwrap().txout.1).collect();
+    let split = lens[0] + lens[1];
+    assert!(split < lens.iter().sum::<u64>(), "cap must split the range");
+    for cap in [u64::MAX, split, 1] {
+        assert_eq!(
+            t.output_value_sums_in_fk_span(first, last, cap).unwrap(),
+            want,
+            "cap={cap}"
+        );
+    }
+    assert_eq!(
+        t.output_value_sums_in_fk_span(fks[1].0, fks[2].0, split)
+            .unwrap(),
+        want[1..3].to_vec()
+    );
+    assert!(t
+        .output_value_sums_in_fk_span(last, first, split)
+        .unwrap()
+        .is_empty());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A create in the span without a location is an error, never a short list.
+#[test]
+fn output_value_sums_missing_location_is_an_error() {
+    let dir = tempfile_dir("value-sums-missing");
+    let t = create_tiny(&dir);
+    let a = put_values(&t, 1, &[5, 6]);
+    let b = put_values(&t, 2, &[7]);
+    assert_eq!(
+        t.output_value_sums_in_fk_span(a.0, b.0, u64::MAX).unwrap(),
+        vec![11, 7]
+    );
+    for (lo, hi) in [(a.0, b.0 + 1), (b.0 + 1, b.0 + 2)] {
+        match t.output_value_sums_in_fk_span(lo, hi, u64::MAX) {
+            Err(StoreError::Corrupt(m)) => assert!(m.contains("create.loc"), "{m}"),
+            other => panic!("expected Corrupt for {lo}..={hi}, got {other:?}"),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

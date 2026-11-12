@@ -2770,6 +2770,57 @@ impl TxTable {
         Ok(())
     }
 
+    /// Sum of output values for each create in `first..=last`, in fk order.
+    /// Adjacent `txout.body` ranges coalesce into reads of at most
+    /// `span_max` bytes (one create's range is never split). A create in the
+    /// span without a `create.loc` row is `Corrupt`: a short list would
+    /// misalign with the block's txids.
+    pub fn output_value_sums_in_fk_span(
+        &self,
+        first: u64,
+        last: u64,
+        span_max: u64,
+    ) -> Result<Vec<u64>, StoreError> {
+        if last < first {
+            return Ok(Vec::new());
+        }
+        let fks: Vec<Fk> = (first..=last).map(Fk).collect();
+        let mut locs = Vec::with_capacity(fks.len());
+        for p in self.create_loc.range_batch(&fks)? {
+            locs.push(p.ok_or(StoreError::Corrupt(
+                "invariant: create.loc missing in value-sum span",
+            ))?);
+        }
+        let mut sums = Vec::with_capacity(locs.len());
+        let mut i = 0usize;
+        while i < locs.len() {
+            let span_lo = locs[i].txout.0;
+            let mut span_hi = span_lo.saturating_add(locs[i].txout.1);
+            let mut j = i + 1;
+            while let Some(&(off, len)) = locs.get(j).map(|p| &p.txout) {
+                if off != span_hi || span_hi.saturating_sub(span_lo).saturating_add(len) > span_max
+                {
+                    break;
+                }
+                span_hi = span_hi.saturating_add(len);
+                j += 1;
+            }
+            self.body
+                .with_bytes_at_pread(span_lo, span_hi.saturating_sub(span_lo), |buf| {
+                    for p in &locs[i..j] {
+                        let rel = p.txout.0.saturating_sub(span_lo) as usize;
+                        let raw = buf
+                            .get(rel..rel.saturating_add(p.txout.1 as usize))
+                            .ok_or(StoreError::Corrupt("txout span short for fk range"))?;
+                        sums.push(packed_output_value_sum(raw, p.n_out)?);
+                    }
+                    Ok(())
+                })?;
+            i = j;
+        }
+        Ok(sums)
+    }
+
     /// Append Class A rows: `txout` + `seqsigwit` + zero `spent` + `txid.body` + `txstat.body`.
     pub fn put_full_batch_indexed(
         &self,
