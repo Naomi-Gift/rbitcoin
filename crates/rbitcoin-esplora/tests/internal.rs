@@ -228,6 +228,19 @@ async fn internal_mempool_pages(sock: &std::path::Path) {
     assert!(a3.is_empty(), "{p3}");
 }
 
+/// The public dialect `/block/:hash/txs/summary` is on the unix listener too.
+async fn unix_block_txs_summary(sock: &std::path::Path, pad: &Pad) {
+    let genesis = bitcoin::blockdata::constants::genesis_block(bitcoin::Network::Regtest);
+    let cb = genesis.txdata[0].compute_txid().to_string();
+    let (st, sum) = http_get_unix(sock, &format!("/block/{}/txs/summary", pad.genesis)).await;
+    assert_eq!(st, 200, "{sum}");
+    let sum: Vec<Value> = serde_json::from_str(&sum).unwrap();
+    assert_eq!(sum.len(), 1, "genesis coinbase row");
+    assert_eq!(sum[0][0].as_str(), Some(cb.as_str()));
+    assert_eq!(sum[0][1], 0, "coinbase fee");
+    assert_eq!(sum[0][3], 50_0000_0000u64, "coinbase value");
+}
+
 async fn internal_txs_and_block_txs(sock: &std::path::Path, pad: &Pad, mem: &str) {
     let conf = pad.cbs[3].to_string();
     let unknown = "00".repeat(32);
@@ -334,6 +347,7 @@ async fn esplora_unix_internal() {
     mempool_totals_and_txid_pages(&sock, &pad).await;
     internal_mempool_pages(&sock).await;
     internal_txs_and_block_txs(&sock, &pad, &txs[0].compute_txid().to_string()).await;
+    unix_block_txs_summary(&sock, &pad).await;
     outspends_by_txid_outpoint_and_query(&sock, &pad).await;
 
     handle.shutdown().await;

@@ -648,6 +648,31 @@ async fn pin_esplora_block_txs_pages(esplora_addr: SocketAddr, tip_hash: &str, n
     );
 }
 
+/// Dialect `/block/:hash/txs/summary` rows equal `getblock` verbosity 2:
+/// txid order, fee (BTC there, coinbase has none), weight, and output sum.
+async fn pin_esplora_block_txs_summary_matches_getblock(
+    esplora_addr: SocketAddr,
+    tip_hash: &str,
+    txs: &[Value],
+) {
+    let sat = |v: &Value| (v.as_f64().expect("BTC amount") * 1e8).round() as u64;
+    let (st, body, rows) =
+        esplora_json_array(esplora_addr, &format!("/block/{tip_hash}/txs/summary")).await;
+    assert_eq!(st, 200, "GET /txs/summary: {body}");
+    assert_eq!(rows.len(), txs.len(), "{body}");
+    for (i, (row, tx)) in rows.iter().zip(txs).enumerate() {
+        let fee = if i == 0 { 0 } else { sat(&tx["fee"]) };
+        let value: u64 = tx["vout"]
+            .as_array()
+            .expect("vout")
+            .iter()
+            .map(|o| sat(&o["value"]))
+            .sum();
+        let want = json!([tx["txid"], fee, tx["weight"], value]);
+        assert_eq!(row, &want, "row {i}");
+    }
+}
+
 /// Extra Esplora HTTP leftover: txids, merkle-proof, coinbase outspend.
 async fn pin_esplora_block_txids_merkle_and_outspend(
     esplora_addr: SocketAddr,
@@ -2283,6 +2308,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     assert_template_spends_nothing_the_block_spent(&woken, txs);
     pin_esplora_blocks_summaries(esplora_addr, 108, new_hash).await;
     pin_esplora_block_txs_pages(esplora_addr, new_hash, txs.len()).await;
+    pin_esplora_block_txs_summary_matches_getblock(esplora_addr, new_hash, txs).await;
     pin_internal_block_txs_and_outspends(esplora_addr, new_hash).await;
     // Core-shaped coinbase input: a `coinbase` hex script and no txid/vout,
     // which is what mempool's indexer requires.

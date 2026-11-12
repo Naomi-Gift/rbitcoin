@@ -307,6 +307,28 @@ pub async fn block_txids(State(st): State<AppState>, Path(hash_hex): Path<String
     .await
 }
 
+/// `GET /block/:hash/txs/summary` — `[txid, fee, weight, value]` per tx, coinbase first.
+pub async fn block_txs_summary(
+    State(st): State<AppState>,
+    Path(hash_hex): Path<String>,
+) -> Response {
+    spawn_join(move || {
+        let Ok(hash) = parse_hash32(&hash_hex) else {
+            return not_found();
+        };
+        match st.query.block_tx_summary(&hash) {
+            Ok(Some(rows)) => json_reply_here(
+                rows.iter()
+                    .map(|r| json!([block_hash_hex(&r.txid), r.fee_sat, r.weight, r.value_sat]))
+                    .collect::<Vec<_>>(),
+            ),
+            Ok(None) => not_found(),
+            Err(e) => store_err(e),
+        }
+    })
+    .await
+}
+
 /// Optional start index via path: `/block/:hash/txs` or `/block/:hash/txs/:start`.
 pub async fn block_txs_start(
     State(st): State<AppState>,

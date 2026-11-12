@@ -1130,6 +1130,127 @@ async fn block_txs_past_end_is_not_found() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Spend of `prev:vout` with the given outputs; `wit` adds a witness stack.
+fn summary_spend(tag: u8, prev: [u8; 32], vout: u32, outs: &[u64], wit: bool) -> TxApply {
+    let mut txid = [tag; 32];
+    txid[31] = 0x5a;
+    TxApply {
+        tx: TxRecord {
+            txid,
+            version: 2,
+            locktime: 0,
+            input_count: 1,
+            output_count: outs.len() as u32,
+        },
+        inputs: vec![InputRecord {
+            prev_txid: prev,
+            parent: rbitcoin_store::InputParent::Unlinked { vout },
+            sequence: u32::MAX,
+            script_sig: vec![],
+            witness: if wit {
+                vec![vec![0x30; 71], vec![0x02; 33]]
+            } else {
+                vec![]
+            },
+        }],
+        outputs: outs
+            .iter()
+            .map(|&v| OutputRecord::unspent(v, vec![0x51]))
+            .collect(),
+    }
+}
+
+/// `/block/:hash/txs/summary`: one `[txid, fee, weight, value]` row per tx in
+/// `/txids` order, coinbase first with fee 0, the same chain-tip stamp, and
+/// the same 404s as `/txids` for a malformed, unknown, or reorged-out hash.
+#[tokio::test]
+async fn block_txs_summary_rows_and_misses() {
+    let (dir, q) = temp_query("blk-txs-summary");
+    let mut prev = Fk::NULL;
+    let mut parent_hash = None;
+    let mut cbs = Vec::new();
+    for h in 0..3u32 {
+        let (header, ta) = coinbase(h, prev, parent_hash);
+        parent_hash = Some(header.hash);
+        cbs.push(ta.tx.txid);
+        prev = q.connect_block(Height(h), &header, &[ta]).unwrap();
+    }
+    let cb_value = 50_0000_0000u64;
+    let a_outs = [20_0000_0000, 0, 29_9999_0000];
+    let a = summary_spend(0xa1, cbs[0], 0, &a_outs, true);
+    let b = summary_spend(0xb2, cbs[1], 0, &[cb_value - 2_500], false);
+    let c = summary_spend(0xc3, a.tx.txid, 2, &[29_9998_0000, 0], true);
+    let prevout_value = [cb_value, cb_value, a_outs[2]];
+    let (h3, cb3) = coinbase(3, prev, parent_hash);
+    let applies = vec![cb3, a, b, c];
+    q.connect_block(Height(3), &h3, &applies).unwrap();
+    let q = Arc::new(q);
+    let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    let handle = run_esplora(cfg, Arc::clone(&q), None)
+        .await
+        .expect("listen");
+    let addr = handle.local_addr;
+    let hash = block_hash_hex(&h3.hash);
+
+    let (st, raw, body) = http_get_raw(addr, &format!("/block/{hash}/txs/summary")).await;
+    assert_eq!(st, 200, "{body}");
+    assert_eq!(
+        header_value(&raw, HDR_CHAIN_TIP).as_deref(),
+        Some(hash.as_str())
+    );
+    let rows: Vec<Value> = serde_json::from_str(&body).unwrap();
+    let (st, ids) = http_get(addr, &format!("/block/{hash}/txids")).await;
+    assert_eq!(st, 200, "{ids}");
+    let ids: Vec<String> = serde_json::from_str(&ids).unwrap();
+    assert_eq!(rows.len(), applies.len(), "{body}");
+    for (i, (row, ta)) in rows.iter().zip(&applies).enumerate() {
+        let tx = rbitcoin_query::testutil::tx_apply_to_tx(ta);
+        let out_sum: u64 = tx.output.iter().map(|o| o.value.to_sat()).sum();
+        let fee = if i == 0 {
+            0
+        } else {
+            prevout_value[i - 1] - out_sum
+        };
+        let want = json!([ids[i], fee, tx.weight().to_wu(), out_sum]);
+        assert_eq!(row, &want, "row {i}");
+    }
+    assert_eq!(rows[3][1], 1_0000, "{body}");
+
+    let unknown = "ff".repeat(32);
+    for (path, want) in [
+        (format!("/block/{unknown}/txs/summary"), 404),
+        ("/block/zz/txs/summary".to_string(), 404),
+        (format!("/block/{hash}/txs/0"), 200),
+    ] {
+        let (st, body) = http_get(addr, &path).await;
+        assert_eq!(st, want, "{path}: {body}");
+    }
+
+    q.disconnect_tip().unwrap();
+    let (mut alt, alt_cb) = coinbase(3, prev, parent_hash);
+    alt.nonce += 1;
+    alt.hash = rbitcoin_store::block_header_hash(
+        alt.version,
+        &parent_hash.unwrap(),
+        &alt.merkle_root,
+        alt.timestamp,
+        alt.bits,
+        alt.nonce,
+    );
+    q.connect_block(Height(3), &alt, &[alt_cb]).unwrap();
+    let (st_ids, _) = http_get(addr, &format!("/block/{hash}/txids")).await;
+    let (st, body) = http_get(addr, &format!("/block/{hash}/txs/summary")).await;
+    assert_eq!((st, st_ids), (404, 404), "reorged out: {body}");
+    let alt_hex = block_hash_hex(&alt.hash);
+    let (st, body) = http_get(addr, &format!("/block/{alt_hex}/txs/summary")).await;
+    assert_eq!(st, 200, "{body}");
+    let alt_rows: Vec<Value> = serde_json::from_str(&body).unwrap();
+    assert_eq!(alt_rows.len(), 1, "{body}");
+
+    handle.shutdown().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 struct ScriptHold {
     gate: Arc<(Mutex<bool>, std::sync::Condvar)>,
 }

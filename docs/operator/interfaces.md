@@ -191,7 +191,8 @@ it those routes are 503 `scripthash index disabled`; the listener still binds.
 mempool.space `/api/v1/` catalogue. Opt-in `GET /block-template` is GBT
 (`--esplora-block-template`), not a stratum/pool stack. Compact
 `/address|scripthash/…/txs/summary` is a mempool.space-shaped dialect (not
-Blockstream Esplora `API.md`); surface: [`COMPAT.md`](../../COMPAT.md).
+Blockstream Esplora `API.md`), and so is per-block `/block/:hash/txs/summary`;
+surface: [`COMPAT.md`](../../COMPAT.md).
 
 ```bash
 ./target/release/rbitcoin-node \
@@ -214,7 +215,7 @@ the first page; dirty/singleflight; not FIFO/LRU). RAM: [`docs/ibd-memory.md`](.
 | Feature | Behavior |
 |---------|----------|
 | Transport | plain HTTP (axum + tower body/concurrency/timeout from `ServeLimits`) |
-| Tip / blocks | tip height/hash; `/blocks[/:start_height]` (10 summaries); `/block/:hash` JSON + **raw** + status |
+| Tip / blocks | tip height/hash; `/blocks[/:start_height]` (10 summaries); `/block/:hash` JSON + **raw** + status; compact `/block/:hash/txs/summary` (dialect; [`COMPAT.md`](../../COMPAT.md)) |
 | Tx | full JSON, hex, **raw**, status, Electrum merkle-proof, **BIP37 merkleblock-proof**, outspends |
 | Address / scripthash | chain_stats, utxo, `/txs` + `/txs/chain` + `/txs/mempool`, compact `/txs/summary` (dialect; [`COMPAT.md`](../../COMPAT.md)); complete after SH tip finalize |
 | Mempool | `/mempool`, `/mempool/txids`, `/mempool/recent`, `/fee-estimates`; `POST /tx` and **`POST /txs/package`** when hub open |

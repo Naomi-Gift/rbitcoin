@@ -536,6 +536,27 @@ async fn pruned_tail_is_partial_json(pad: &mut HttpPad) {
             .any(|t| t["txid"] == tx0 && t["pruned"] == true),
         "{body}"
     );
+
+    let summary = format!("/block/{h0}/txs/summary");
+    let (st, body) = http_get(pad.addr, &summary).await;
+    assert_eq!(st, 200, "stamped pruned block: {body}");
+    let rows: Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(rows[0][0], tx0, "{body}");
+    assert_eq!(rows[0][3], 50_0000_0000u64, "{body}");
+    let cb0 = pad.q.block_tx_fks(Height(0)).unwrap()[0];
+    pad.q
+        .store()
+        .write_txstat_row(
+            cb0,
+            &rbitcoin_store::TxStatRow {
+                fee_sat: 0,
+                base: 0,
+                wit_extra: 0,
+            },
+        )
+        .unwrap();
+    let (st, body) = http_get(pad.addr, &summary).await;
+    assert_eq!((st, body.as_str()), (404, "pruned"), "unstamped pruned block");
 }
 
 /// A mempool-only cursor past the first 50 index rows is not a chain cursor.

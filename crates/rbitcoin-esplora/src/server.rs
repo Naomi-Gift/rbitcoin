@@ -1172,6 +1172,10 @@ pub async fn run_esplora(
         .route("/block/{hash}/txids", get(handlers::block_txids))
         .route("/block/{hash}/txid/{index}", get(handlers::block_txid_at))
         .route("/block/{hash}/txs", get(handlers::block_txs_0))
+        .route(
+            "/block/{hash}/txs/summary",
+            get(handlers::block_txs_summary),
+        )
         .route("/block/{hash}/txs/{start}", get(handlers::block_txs_start))
         .route("/tx/{txid}", get(tx_full))
         .route("/tx/{txid}/hex", get(tx_hex))
