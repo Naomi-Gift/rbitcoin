@@ -143,3 +143,17 @@ fn a_block_without_witness_still_serves() {
     assert!(!block_has_witness(&served));
     let _ = std::fs::remove_dir_all(dir.path());
 }
+
+#[test]
+fn a_commitment_without_a_reserved_value_still_serves() {
+    let (dir, q) = tiny_query_labeled("reconstruct-commitment-no-reserved");
+    let (header, txs) = coinbase_only_block(false, true);
+    q.commit_class_a_only(&header, &txs).expect("archive");
+
+    let served = q
+        .reconstruct_archived_block(&header.hash)
+        .expect("reconstruct")
+        .expect("archived body");
+    assert!(!block_has_witness(&served));
+    let _ = std::fs::remove_dir_all(dir.path());
+}

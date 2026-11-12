@@ -2,9 +2,8 @@
 
 use super::*;
 use crate::U64Map;
-use rbitcoin_consensus::{
-    block::{check_witness_commitment_with_wtxids, coinbase_has_witness_commitment},
-    ConsensusError,
+use rbitcoin_consensus::block::{
+    check_witness_commitment_with_wtxids, coinbase_has_witness_commitment,
 };
 use std::time::Instant;
 
@@ -532,7 +531,7 @@ impl Query {
             ));
         }
         let block = Block { header, txdata };
-        if coinbase_has_witness_commitment(&block) {
+        if coinbase_has_witness_commitment(&block) && has_witness_reserved_value(&block) {
             check_rebuilt_witness_commitment(&block)?;
         }
         Ok(block)
@@ -807,6 +806,14 @@ pub fn encode_class_a_tx(
     let _ = rec.locktime.consensus_encode(&mut *out);
 }
 
+fn has_witness_reserved_value(block: &Block) -> bool {
+    let Some(input) = block.txdata[0].input.first() else {
+        return false;
+    };
+    let mut items = input.witness.iter();
+    matches!((items.next(), items.next()), (Some(reserved), None) if reserved.len() == 32)
+}
+
 fn check_rebuilt_witness_commitment(block: &Block) -> Result<(), StoreError> {
     let wtxids: Vec<[u8; 32]> = block
         .txdata
@@ -814,12 +821,6 @@ fn check_rebuilt_witness_commitment(block: &Block) -> Result<(), StoreError> {
         .skip(1)
         .map(|tx| tx.compute_wtxid().to_byte_array())
         .collect();
-    check_witness_commitment_with_wtxids(block, &wtxids).map_err(|e| {
-        StoreError::Corrupt(match e {
-            ConsensusError::BadBlock("bad-witness-nonce-size") => {
-                "reconstruct: bad witness nonce size"
-            }
-            _ => "reconstruct: witness commitment mismatch",
-        })
-    })
+    check_witness_commitment_with_wtxids(block, &wtxids)
+        .map_err(|_| StoreError::Corrupt("reconstruct: witness commitment mismatch"))
 }

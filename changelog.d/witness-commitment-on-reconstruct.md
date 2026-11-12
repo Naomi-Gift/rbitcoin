@@ -7,5 +7,6 @@ Fixed
   to the stored hash, and the header row supplies its own `merkle_root`, so no
   transaction byte reached that comparison. Reconstruction now recomputes the
   wtxids and refuses a block whose coinbase carries a witness commitment that
-  no longer matches. A block whose coinbase carries no commitment is unchanged,
-  which covers every pre-segwit block.
+  no longer matches. A block whose coinbase carries no commitment, or no
+  reserved witness value to compare against, is unchanged. That covers every
+  pre-segwit block.

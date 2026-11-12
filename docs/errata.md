@@ -36,14 +36,16 @@ be this case.
 
 Reconstruction checks a rebuilt block against the witness commitment in its
 coinbase ([`reconstruct.rs`](../crates/rbitcoin-query/src/reconstruct.rs)). The
-check runs only when the coinbase carries a commitment. Without one there is
-nothing to compare, and every pre-segwit block is in that state legitimately.
+check runs only when the coinbase carries a commitment **and** a reserved value
+of exactly one 32-byte witness item. Without both there is nothing to compare:
+every pre-segwit block is in that state, and a block stored before segwit
+activation can carry a commitment with no coinbase witness at all.
 
-Corruption in the six magic bytes (`6a24aa21a9ed`) of the commitment script
-therefore leaves a block looking commitment-free, and it is served without
-verification. A flipped byte anywhere else in the witness table, or in the
-commitment digest, is refused. A refused block still needs a reindex: the check
-stops bad data being served, it does not repair it
+Corruption in the six magic bytes (`6a24aa21a9ed`) of the commitment script,
+or one that leaves the coinbase with no reserved value or the wrong size,
+therefore leaves a block unverified. A flipped byte anywhere else in the
+witness table, or in the commitment digest, is refused. A refused block still
+needs a reindex: the check stops bad data being served, it does not repair it
 ([106](./external_findings/106-historical-bitrot.md)).
 
 Closing this needs the height, so a commitment can be required at or above
