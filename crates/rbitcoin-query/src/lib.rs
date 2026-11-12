@@ -590,25 +590,112 @@ pub struct Query {
     pub seqsigwit_ram_window: Mutex<SeqSigWitRamWindow>,
     /// Inputs from the most recent Class A append wave (fk-keyed).
     pub seqsigwit_append_cache: Mutex<U64Map<Vec<InputRecord>>>,
-    /// Header work-path height → hash plus work through the contiguous tip.
+    /// Header hashes on the best header path, plus work through that tip.
     ///
-    /// Second map beside IBD `height_to_hash` so confirm threads can do two
-    /// O(1) milestone lookups without the IBD state lock. While the map has
-    /// any height it is the only source: a missing height is not an ancestor
-    /// of the milestone. When it is empty, the confirmed chain is the source.
-    /// RAM is one hash per header on that path for the process lifetime of the sync.
+    /// Confirm threads look up two heights without the IBD state lock. While
+    /// any height is occupied, this vec is the only source: a missing height
+    /// in that range is not an ancestor of the milestone. When it is empty,
+    /// the confirmed chain is the source. Each load pack drops heights at or
+    /// below the confirmed tip.
     pub milestone_path: Mutex<MilestonePath>,
 }
 
 /// Best header path published by IBD header intake.
+///
+/// `slots[i]` is the hash at `base + i`. A `None` slot is a hole in that
+/// range. Heights outside `[base, base + slots.len())` are not on the path.
 #[derive(Default)]
 #[doc(hidden)]
 pub struct MilestonePath {
-    pub by_height: HashMap<u32, [u8; 32]>,
+    base: u32,
+    slots: Vec<Option<[u8; 32]>>,
     /// Work through `work_height` when `work_valid` (big-endian).
     pub work_through: [u8; 32],
     pub work_height: u32,
     pub work_valid: bool,
+}
+
+impl MilestonePath {
+    fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    fn hash_at(&self, height: u32) -> Option<[u8; 32]> {
+        if self.slots.is_empty() || height < self.base {
+            return None;
+        }
+        let idx = (height - self.base) as usize;
+        self.slots.get(idx).copied().flatten()
+    }
+
+    fn note(&mut self, height: u32, hash: [u8; 32]) {
+        if self.slots.is_empty() {
+            self.base = height;
+            self.slots.push(Some(hash));
+            return;
+        }
+        if height < self.base {
+            let gap = (self.base - height) as usize;
+            let mut prefix = Vec::with_capacity(gap + self.slots.len());
+            prefix.resize(gap, None);
+            prefix[0] = Some(hash);
+            prefix.append(&mut self.slots);
+            self.slots = prefix;
+            self.base = height;
+            return;
+        }
+        let idx = (height - self.base) as usize;
+        if idx >= self.slots.len() {
+            self.slots.resize(idx + 1, None);
+        }
+        self.slots[idx] = Some(hash);
+    }
+
+    fn clear_above(&mut self, height: u32) {
+        if self.slots.is_empty() {
+            return;
+        }
+        if height < self.base {
+            self.slots.clear();
+            return;
+        }
+        let keep = (height - self.base) as usize + 1;
+        if keep < self.slots.len() {
+            self.slots.truncate(keep);
+        }
+        self.clear_if_blank();
+    }
+
+    /// Drop every hash at or below `height`. Work is left alone: it is the
+    /// header tip, which stays ahead of the confirmed tip.
+    fn drop_through(&mut self, height: u32) {
+        if self.slots.is_empty() || height < self.base {
+            return;
+        }
+        let drop_n = ((height - self.base) as usize).saturating_add(1);
+        if drop_n >= self.slots.len() {
+            self.slots.clear();
+            return;
+        }
+        self.slots.drain(..drop_n);
+        self.base = height.saturating_add(1);
+        if self.clear_if_blank() {
+            return;
+        }
+        let live = self.slots.len();
+        if self.slots.capacity() > live.saturating_mul(2).max(64) {
+            self.slots.shrink_to_fit();
+        }
+    }
+
+    fn clear_if_blank(&mut self) -> bool {
+        if self.slots.iter().all(Option::is_none) {
+            self.slots.clear();
+            true
+        } else {
+            false
+        }
+    }
 }
 
 /// In-process hash→height map for the confirmed tip chain (~33 MiB raw at 1e6 tips).
@@ -943,14 +1030,14 @@ impl Query {
 
     /// Header hash at `height` on one chain.
     ///
-    /// While the published header path has any hash, that map is the only
-    /// source. A missing height is not an ancestor of the milestone: the
-    /// confirmed chain and the body queue are different chains. When the
-    /// path is empty, the confirmed chain is the source.
+    /// While the published header path has any hash, that vec is the only
+    /// source. A missing height in its range is not an ancestor of the
+    /// milestone: the confirmed chain and the body queue are different
+    /// chains. When the path is empty, the confirmed chain is the source.
     pub fn milestone_header_at(&self, height: u32) -> Option<[u8; 32]> {
         let g = self.milestone_path_lock();
-        if !g.by_height.is_empty() {
-            return g.by_height.get(&height).copied();
+        if !g.is_empty() {
+            return g.hash_at(height);
         }
         drop(g);
         match self.header_at_height(rbitcoin_primitives::Height(height)) {
@@ -961,7 +1048,7 @@ impl Query {
 
     /// True when header intake has published any height on the milestone path.
     pub fn has_milestone_path(&self) -> bool {
-        !self.milestone_path_lock().by_height.is_empty()
+        !self.milestone_path_lock().is_empty()
     }
 
     /// Work through the contiguous published header tip, if intake seeded it.
@@ -984,7 +1071,7 @@ impl Query {
         base_through_prev: Option<bitcoin::Work>,
     ) {
         let mut g = self.milestone_path_lock();
-        g.by_height.insert(height, hash);
+        g.note(height, hash);
         if let Some(base) = base_through_prev {
             if !g.work_valid || height >= g.work_height {
                 let acc = base + header_work;
@@ -998,10 +1085,7 @@ impl Query {
             Some(h) => h,
             None => return,
         };
-        if g.work_valid
-            && g.work_height == prev_h
-            && g.by_height.get(&prev_h).copied() == Some(prev)
-        {
+        if g.work_valid && g.work_height == prev_h && g.hash_at(prev_h) == Some(prev) {
             let acc = bitcoin::Work::from_be_bytes(g.work_through) + header_work;
             g.work_through = acc.to_be_bytes();
             g.work_height = height;
@@ -1023,11 +1107,16 @@ impl Query {
     /// Drop path slots above `height`. Work above the rewind is forgotten.
     pub fn clear_milestone_path_above(&self, height: u32) {
         let mut g = self.milestone_path_lock();
-        g.by_height.retain(|h, _| *h <= height);
+        g.clear_above(height);
         if g.work_valid && g.work_height > height {
             g.work_valid = false;
             g.work_through = [0; 32];
         }
+    }
+
+    /// Drop path slots at or below a confirmed tip. Header-tip work stays.
+    pub fn drop_milestone_path_through(&self, height: u32) {
+        self.milestone_path_lock().drop_through(height);
     }
 
     #[doc(hidden)]
@@ -1797,10 +1886,11 @@ impl Query {
         Some(self.disconnect_height.load(AtomicOrdering::Acquire))
     }
 
-    /// Every load pack: GC header plans to store tip.
+    /// Every load pack: GC header plans and milestone hashes to the store tip.
     pub fn on_load_pack(&self) -> Result<(), QueryError> {
         if let Some(tip) = self.tip_height() {
             self.advance_parent_cache_tip(tip.0);
+            self.drop_milestone_path_through(tip.0);
         }
         Ok(())
     }

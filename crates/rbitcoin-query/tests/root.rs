@@ -1473,6 +1473,93 @@ fn a_queued_body_off_the_header_path_is_not_the_milestone_chain() {
     let _ = dir;
 }
 
+#[test]
+fn a_confirmed_tip_drops_milestone_hashes_it_passed() {
+    let (dir, q) = temp_query("ms-drop-tip");
+    let mut one_be = [0u8; 32];
+    one_be[31] = 1;
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    let at_five = [0x11u8; 32];
+    let at_nine = [0x22u8; 32];
+    let at_ten = [0x33u8; 32];
+    q.note_milestone_header(
+        5,
+        at_five,
+        [0; 32],
+        one,
+        Some(bitcoin::Work::from_be_bytes([0; 32])),
+    );
+    q.note_milestone_header(9, at_nine, [0; 32], one, None);
+    q.note_milestone_header(10, at_ten, at_nine, one, None);
+    let work = q.milestone_best_work_be();
+    assert!(work.is_some());
+
+    q.drop_milestone_path_through(9);
+    assert_eq!(
+        q.milestone_header_at(5),
+        None,
+        "a height the tip passed is not kept on the path"
+    );
+    assert_eq!(q.milestone_header_at(9), None);
+    assert_eq!(
+        q.milestone_header_at(8),
+        None,
+        "a hole in the range still held is not an ancestor"
+    );
+    assert_eq!(q.milestone_header_at(10), Some(at_ten));
+    assert!(q.has_milestone_path());
+    assert_eq!(
+        q.milestone_best_work_be(),
+        work,
+        "dropping confirmed heights keeps the header-tip work"
+    );
+
+    q.note_milestone_header(4, [0x44; 32], [0; 32], one, None);
+    assert_eq!(q.milestone_header_at(4), Some([0x44; 32]));
+    assert_eq!(
+        q.milestone_header_at(5),
+        None,
+        "a height between the new low and the retained tip stays a hole"
+    );
+    assert_eq!(q.milestone_header_at(10), Some(at_ten));
+
+    q.drop_milestone_path_through(10);
+    assert!(!q.has_milestone_path());
+    assert_eq!(q.milestone_header_at(10), None);
+    let _ = dir;
+}
+
+#[test]
+fn a_load_pack_drops_milestone_hashes_the_store_tip_passed() {
+    let (dir, q) = temp_query("ms-load-pack");
+    let (mut h0, _) = coinbase_block(0, Fk::NULL, None);
+    h0.hash = rbitcoin_store::block_header_hash(
+        h0.version,
+        &[0u8; 32],
+        &h0.merkle_root,
+        h0.timestamp,
+        h0.bits,
+        h0.nonce,
+    );
+    let hfk = q.put_header(&h0).unwrap();
+    q.store()
+        .confirmed
+        .set(&rbitcoin_store::ClassCWrite::for_test(), Height(0), hfk)
+        .unwrap();
+    q.store().rebuild_height_fence().unwrap();
+    assert_eq!(q.tip_height(), Some(Height(0)));
+    let mut one_be = [0u8; 32];
+    one_be[31] = 1;
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    q.note_milestone_header(0, [0x11; 32], [0; 32], one, None);
+    q.note_milestone_header(1, [0x22; 32], [0x11; 32], one, None);
+    q.on_load_pack().unwrap();
+    assert_eq!(q.milestone_header_at(0), None);
+    assert_eq!(q.milestone_header_at(1), Some([0x22; 32]));
+    assert!(q.has_milestone_path());
+    let _ = dir;
+}
+
 #[allow(clippy::cognitive_complexity)] // one fixture, many helper arms
 #[test]
 fn index_mode_helpers_and_batch_helpers() {
