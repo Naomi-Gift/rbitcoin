@@ -1332,6 +1332,49 @@ fn block_tx_summary_rows_match_the_wire_block() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The unstamped fallback reads the requested header's own transactions.
+/// After a same-height replace it still gives the first block's rows, never
+/// the replacement's.
+#[test]
+fn block_tx_summary_from_wire_reads_the_requested_header() {
+    let (dir, q) = temp_query("blk-summary-wire");
+    let (h0, cb0) = coinbase_block(0, Fk::NULL, None);
+    let hfk0 = q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let (ha, cba) = coinbase_block(1, hfk0, Some(h0.hash));
+    q.connect_block(Height(1), &ha, std::slice::from_ref(&cba))
+        .unwrap();
+    let a_value: u64 = cba.outputs.iter().map(|o| o.value).sum();
+
+    q.disconnect_tip().unwrap();
+    let (mut hb, mut cbb) = coinbase_block(1, hfk0, Some(h0.hash));
+    hb.nonce = hb.nonce.wrapping_add(1);
+    rehash_header(&mut hb, &h0.hash);
+    cbb.tx.txid[30] = 0xbb;
+    cbb.outputs[0].value -= 1;
+    q.connect_block(Height(1), &hb, std::slice::from_ref(&cbb))
+        .unwrap();
+
+    let a = q
+        .block_tx_summary_from_wire(&ha.hash)
+        .unwrap()
+        .expect("the replaced block's header is still stored");
+    assert_eq!(
+        a.iter().map(|r| (r.txid, r.value_sat)).collect::<Vec<_>>(),
+        vec![(cba.tx.txid, a_value)],
+    );
+    assert!(
+        q.block_tx_summary(&ha.hash).unwrap().is_none(),
+        "a replaced block is off the best chain"
+    );
+    let b = q.block_tx_summary(&hb.hash).unwrap().expect("best chain");
+    assert_eq!(
+        b.iter().map(|r| (r.txid, r.value_sat)).collect::<Vec<_>>(),
+        vec![(cbb.tx.txid, a_value - 1)],
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[test]
 fn buried_rules_and_a_lying_header_path() {
     let (dir, q) = temp_query("ms-work");

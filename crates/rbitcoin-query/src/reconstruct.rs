@@ -607,7 +607,7 @@ impl Query {
             return Ok(None);
         };
         let Some(stamped) = self.stamped_txstat_block(height)? else {
-            return self.block_tx_summary_from_wire(height, hash);
+            return self.block_tx_summary_from_wire(hash);
         };
         if stamped.rec.hash != *hash {
             return Ok(None);
@@ -638,17 +638,18 @@ impl Query {
     }
 
     /// [`Self::block_tx_summary`] for a block whose `txstat` rows are
-    /// unstamped: every row comes from the one reconstructed block.
-    fn block_tx_summary_from_wire(
+    /// unstamped: every row comes from the one reconstructed block. The
+    /// block and its txids are read through the header `hash` names, never
+    /// through a height, so a replace at that height cannot mix two blocks.
+    #[doc(hidden)]
+    pub fn block_tx_summary_from_wire(
         &self,
-        height: Height,
         hash: &[u8; 32],
     ) -> Result<Option<Vec<BlockTxSummary>>, QueryError> {
-        let block = self.reconstruct_block_at_height(height)?;
-        if block.block_hash().to_byte_array() != *hash {
-            return Ok(None);
-        }
         let Some((header_fk, _)) = self.get_header_by_hash(hash)? else {
+            return Ok(None);
+        };
+        let Some(block) = self.reconstruct_archived_block(hash)? else {
             return Ok(None);
         };
         let txids = self.header_txids(header_fk)?;
