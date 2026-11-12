@@ -566,6 +566,9 @@ async fn read_reply_or_refusal(
         let Some((code, tail)) = line.split_at_checked(3) else {
             return Err(unexpected());
         };
+        if !code.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(unexpected());
+        }
         let mut tail = tail.chars();
         let sep = tail.next();
         let rest = tail.as_str();
