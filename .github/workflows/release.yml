@@ -471,15 +471,16 @@ jobs:
           fi
           # A late nightly (a re-run, or one GitHub queued behind a newer
           # one) must not move `nightly` back. This job's group holds the
-          # read and the push together. Only "not found" is a first
-          # nightly; any other read error stops here rather than guess.
+          # read and the push together. Only the tag itself missing is a
+          # first nightly. Any other error, including a missing manifest
+          # under an existing tag, stops here rather than guess.
           if [[ "$NIGHTLY" == true ]]; then
             head="$(git rev-parse HEAD)"
             if out="$(docker buildx imagetools inspect "${images[0]}:nightly" \
               --format '{{json (index .Image "linux/amd64").Config.Labels}}' 2>&1)"; then
               cur="$(jq -r '."org.opencontainers.image.revision" // empty' <<<"$out")"
               [[ -n "$cur" ]] || { echo "published nightly has no revision label" >&2; exit 1; }
-            elif [[ "$out" == *": not found"* ]]; then
+            elif [[ "$out" == "ERROR: ${images[0]}:nightly: not found" ]]; then
               cur=""
             else
               echo "cannot read the published nightly: $out" >&2
