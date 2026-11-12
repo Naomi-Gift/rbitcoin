@@ -121,6 +121,7 @@ All hermetic pins: `./scripts/release.test.sh` (includes
 | `./scripts/release.sh --tag-only` | push the tag, not the branch |
 | `./scripts/release-post.sh` | tag + for `X.Y.0` create `vX.Y.x` |
 | `./scripts/docker-tags.sh vX.Y.Z` | image tags: `X.Y.Z`; `X.Y` when newest on its line; `latest` when newest overall |
+| `./scripts/docker-tags.sh --nightly YYYYMMDD` | nightly image tags: `nightly-YYYYMMDD`, then `nightly` |
 | `./scripts/docker-smoke.sh IMAGE SUMS` | image run contract (hashes, version, regtest boot, cli, SIGTERM) |
 
 `--minor` / `--major` require a `.99` tree. `--patch` is refused on `.99`.
@@ -154,11 +155,30 @@ aarch64 binary before it ships. `docker-publish` rebuilds the image in one
 call from the same staged binaries (the Dockerfile has no `RUN`, so no
 emulation) and `sha256sum -c`s them first.
 
-`workflow_dispatch` runs both builds and both smoke legs and never
-publishes. If `docker-publish` fails after a good Release, rerun that job:
+`workflow_dispatch` without **nightly** runs both builds and both smoke
+legs and never publishes. If `docker-publish` fails after a good Release, rerun that job:
 the same tag gives the same platform manifests.
 
-`docker-publish` runs one tag at a time across the repo (its own
+### Nightly image
+
+The same workflow runs nightly at `13 8 * * *` (08:13 UTC) on master. It
+runs the two `musl` legs and the two `docker` smoke legs, then
+`docker-publish` pushes the master tip as `nightly` and
+`nightly-YYYYMMDD` (UTC run date) to the same registries. `windows`,
+`macos`, `nixos-module-runtime`, and `github-release` are skipped. The
+image version label is `nightly-YYYYMMDD`, and the revision label is the
+commit.
+
+To publish one now: Actions → **release** → Run workflow on `master`,
+tick **nightly**, and leave **ref** empty. The `musl` legs fail at once on
+any other branch or with a ref, so `nightly` only ever names master. A
+second nightly on the same day moves both tags.
+
+Before it pushes, `docker-publish` reads the commit the published
+`nightly` names. When that commit is newer than this build, the job skips
+the push. A re-run or a late nightly never moves `nightly` back.
+
+`docker-publish` runs one tag (or nightly) at a time across the repo (its own
 concurrency group), and each run reads the tag list at its start. Two tags
 cut together, such as `X.Y.0` and a patch on `vX.(Y-1).x`, cannot move
 `latest` or `X.Y` backwards. The group sets `queue: max`, so a third tag

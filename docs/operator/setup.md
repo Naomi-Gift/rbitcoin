@@ -210,6 +210,14 @@ the Release musl binaries on `FROM scratch`: no shell, no libc, no base
 image. Tags are `X.Y.Z`, `X.Y` (newest patch on that line), and `latest`
 (newest release). A patch on an older line does not move `latest`.
 
+Each night the master tip is also published to the same registries as
+`nightly` and `nightly-YYYYMMDD` (UTC date). A nightly is not a release:
+it skips the release gates, and it can migrate the datadir to a schema an
+older binary refuses ([schema upgrade](./storage.md#schema-upgrade)). The
+dated tag is the last nightly published that day; a second one that day
+replaces it. To hold one build, pin its digest
+(`ghcr.io/rbitcoin-org/rbitcoin@sha256:…`).
+
 ```bash
 docker volume create rbitcoin
 docker run -d --name rbitcoin --stop-timeout 300 \
