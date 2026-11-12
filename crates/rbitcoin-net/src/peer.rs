@@ -6811,6 +6811,24 @@ fn note_blocksonly_sender(
     }
 }
 
+/// The other announcers of a parked `tx` become its announcers. With a
+/// `session`, its missing parents are asked for from it and from the
+/// announcers still live.
+fn fetch_parked_parents(
+    mp: &crate::tx_relay::MempoolHub,
+    tx: &Transaction,
+    wtxid: &bitcoin::Wtxid,
+    session: Option<&crate::peers::LivePeer>,
+    extra_from: &[u64],
+) {
+    for p in extra_from {
+        let _ = mp.add_orphan_announcer(wtxid, *p);
+    }
+    if mp.try_orphan_missing(wtxid).is_some() {
+        schedule_orphan_parent_getdata(mp, tx, session, extra_from);
+    }
+}
+
 /// Core `AlreadyHaveTx` for a received tx, which is dropped unvalidated: a
 /// recent reject, or a parked wtxid whose sender is no new announcer. Unlike
 /// Core, a mempool hit is not had here; it goes on to the duplicate handling
@@ -6923,20 +6941,10 @@ pub async fn on_tx(
                         }
                         TxAcceptLog::Park(_missing) => {
                             rbitcoin_log::debug!("txrelay: park {txid} missingorspent");
-                            for p in &extra_from {
-                                let _ = mp.add_orphan_announcer(&wtxid, *p);
-                            }
-                            if mp.try_orphan_missing(&wtxid).is_some() {
-                                schedule_orphan_parent_getdata(mp, tx, session, &extra_from);
-                            }
+                            fetch_parked_parents(mp, tx, &wtxid, session, &extra_from);
                         }
                         TxAcceptLog::ParentFetch(_missing) => {
-                            for p in &extra_from {
-                                let _ = mp.add_orphan_announcer(&wtxid, *p);
-                            }
-                            if mp.try_orphan_missing(&wtxid).is_some() {
-                                schedule_orphan_parent_getdata(mp, tx, session, &extra_from);
-                            }
+                            fetch_parked_parents(mp, tx, &wtxid, session, &extra_from);
                         }
                         TxAcceptLog::Reject => {
                             follow.ban_score =
