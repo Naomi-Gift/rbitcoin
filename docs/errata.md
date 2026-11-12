@@ -44,8 +44,13 @@ activation can carry a commitment with no coinbase witness at all.
 Corruption in the six magic bytes (`6a24aa21a9ed`) of the commitment script,
 or one that leaves the coinbase with no reserved value or the wrong size,
 therefore leaves a block unverified. A flipped byte anywhere else in the
-witness table, or in the commitment digest, is refused. A refused block still
-needs a reindex: the check stops bad data being served, it does not repair it
+witness table, or in the commitment digest, is refused on every path that
+serves a block: the rebuilt block, the encoded block bytes full-block `getdata`
+returns, and the coinbase `getblock` verbosity 1 attaches. Serving a single
+transaction (`getrawtransaction`, Electrum) is not checked, which is the scope
+[#1366](https://github.com/rbitcoin-org/rbitcoin/issues/1366) asked for. A
+refused block still needs a reindex: the check stops bad data being served, it
+does not repair it
 ([106](./external_findings/106-historical-bitrot.md)).
 
 Closing this needs the height, so a commitment can be required at or above

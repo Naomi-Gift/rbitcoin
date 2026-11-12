@@ -145,6 +145,126 @@ fn a_block_without_witness_still_serves() {
 }
 
 #[test]
+fn a_flipped_witness_byte_is_not_served_as_block_bytes() {
+    let (dir, q) = tiny_query_labeled("reconstruct-witness-bytes");
+    let (header, txs) = coinbase_only_block(true, true);
+    let header_fk = q.commit_class_a_only(&header, &txs).expect("archive");
+    assert!(q
+        .witness_block_bytes_by_hash(&header.hash)
+        .expect("encode intact")
+        .is_some());
+
+    let fks = q
+        .header_tx_fks(header_fk, None)
+        .expect("tx fks")
+        .expect("body list");
+    flip_last_seqsigwit_byte(&q, fks[0]);
+
+    assert!(
+        q.witness_block_bytes_by_hash(&header.hash)
+            .expect("encode flipped")
+            .is_none(),
+        "encoded block bytes are not served when the witness no longer matches"
+    );
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+#[test]
+fn witness_commitment_intact_reports_a_flipped_byte() {
+    let (dir, q) = tiny_query_labeled("reconstruct-witness-intact-check");
+    let (header, txs) = coinbase_only_block(true, true);
+    let header_fk = q.commit_class_a_only(&header, &txs).expect("archive");
+    let fks = q
+        .header_tx_fks(header_fk, None)
+        .expect("tx fks")
+        .expect("body list");
+    assert!(q.witness_commitment_intact(&fks).expect("intact"));
+
+    flip_last_seqsigwit_byte(&q, fks[0]);
+
+    assert!(!q.witness_commitment_intact(&fks).expect("flipped"));
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+/// Two transactions: a coinbase carrying the commitment, and a second one with
+/// a witness whose null prevout keeps its wtxid independent of the commitment.
+fn block_with_a_witness_tx() -> (HeaderRecord, Vec<TxApply>) {
+    let mut second = TxApply {
+        tx: TxRecord {
+            txid: [0u8; 32],
+            version: 2,
+            locktime: 0,
+            input_count: 1,
+            output_count: 1,
+        },
+        inputs: vec![InputRecord::coinbase(
+            u32::MAX,
+            vec![0x02],
+            vec![vec![0x11, 0x22]],
+        )],
+        outputs: vec![OutputRecord::unspent(49_0000_0000, vec![0x51])],
+    };
+    let second_tx = tx_apply_to_tx(&second);
+    second.tx.txid = second_tx.compute_txid().to_byte_array();
+    let second_wtxid = second_tx.compute_wtxid().to_byte_array();
+
+    let mut coinbase = TxApply {
+        tx: TxRecord {
+            txid: [0u8; 32],
+            version: 2,
+            locktime: 0,
+            input_count: 1,
+            output_count: 2,
+        },
+        inputs: vec![InputRecord::coinbase(
+            u32::MAX,
+            vec![0x01, 0x02],
+            vec![RESERVED.to_vec()],
+        )],
+        outputs: vec![
+            OutputRecord::unspent(50_0000_0000, vec![0x51]),
+            OutputRecord::unspent(0, witness_commitment_script([second_wtxid], &RESERVED)),
+        ],
+    };
+    coinbase.tx.txid = tx_apply_to_tx(&coinbase).compute_txid().to_byte_array();
+    let header = header_with_merkle_marker(0, Fk::NULL, None, 0x98);
+    (header, vec![coinbase, second])
+}
+
+#[test]
+fn a_flipped_non_coinbase_witness_byte_is_not_served() {
+    let (dir, q) = tiny_query_labeled("reconstruct-witness-tx");
+    let (header, txs) = block_with_a_witness_tx();
+    let header_fk = q.commit_class_a_only(&header, &txs).expect("archive");
+
+    let fks = q
+        .header_tx_fks(header_fk, None)
+        .expect("tx fks")
+        .expect("body list");
+    assert_eq!(fks.len(), 2);
+    assert!(q.witness_commitment_intact(&fks).expect("intact"));
+    assert!(q
+        .witness_block_bytes_by_hash(&header.hash)
+        .expect("encode intact")
+        .is_some());
+
+    flip_last_seqsigwit_byte(&q, fks[1]);
+
+    assert!(!q.witness_commitment_intact(&fks).expect("flipped"));
+    assert!(
+        q.witness_block_bytes_by_hash(&header.hash)
+            .expect("encode flipped")
+            .is_none(),
+        "a flipped witness byte in a served transaction is not written out"
+    );
+    let err = q
+        .reconstruct_archived_block(&header.hash)
+        .expect_err("the rebuilt block is refused");
+    assert!(format!("{err:?}").contains("commitment"), "{err:?}");
+    let _ = std::fs::remove_dir_all(dir.path());
+}
+
+#[test]
 fn a_commitment_without_a_reserved_value_still_serves() {
     let (dir, q) = tiny_query_labeled("reconstruct-commitment-no-reserved");
     let (header, txs) = coinbase_only_block(false, true);

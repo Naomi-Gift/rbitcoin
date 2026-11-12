@@ -4,6 +4,7 @@ use super::*;
 use crate::U64Map;
 use rbitcoin_consensus::block::{
     check_witness_commitment_with_wtxids, coinbase_has_witness_commitment,
+    witness_commitment_script, witness_commitment_vout_index,
 };
 use std::time::Instant;
 
@@ -440,7 +441,29 @@ impl Query {
         }
         let header = self.wire_header_from_record_prev(&rec, None)?;
         let rows = self.load_class_a_rows(&tx_fks)?;
+        if let Some((first, rest)) = rows.split_first() {
+            let coinbase =
+                Self::transaction_from_class_a(first.0.clone(), first.2.clone(), first.1.clone());
+            if !rows_match_commitment(&coinbase, rest) {
+                return Ok(None);
+            }
+        }
         Ok(Some(encode_witness_block(&header, &rows)))
+    }
+
+    /// True when the coinbase commitment covers the stored bodies, or when the
+    /// coinbase carries none. `Pruned` when the witness rows are gone.
+    pub fn witness_commitment_intact(&self, tx_fks: &[Fk]) -> Result<bool, QueryError> {
+        let Some((first, rest)) = tx_fks.split_first() else {
+            return Ok(true);
+        };
+        let (rec, outs, ins) = self.load_body_from_store(*first)?;
+        let coinbase = Self::transaction_from_class_a(rec, outs, ins);
+        if coinbase_commitment(&coinbase).is_none() {
+            return Ok(true);
+        }
+        let rows = self.load_class_a_rows(rest)?;
+        Ok(rows_match_commitment(&coinbase, &rows))
     }
 
     /// Consensus-encoded wire bytes for a stored tx (Electrum / RPC).
@@ -823,4 +846,34 @@ fn check_rebuilt_witness_commitment(block: &Block) -> Result<(), StoreError> {
         .collect();
     check_witness_commitment_with_wtxids(block, &wtxids)
         .map_err(|_| StoreError::Corrupt("reconstruct: witness commitment mismatch"))
+}
+
+fn coinbase_commitment(coinbase: &Transaction) -> Option<([u8; 32], [u8; 38])> {
+    let idx = witness_commitment_vout_index(coinbase)?;
+    let mut items = coinbase.input.first()?.witness.iter();
+    let reserved = items.next()?;
+    if reserved.len() != 32 || items.next().is_some() {
+        return None;
+    }
+    let mut value = [0u8; 32];
+    value.copy_from_slice(reserved);
+    let mut committed = [0u8; 38];
+    committed.copy_from_slice(&coinbase.output[idx].script_pubkey.as_bytes()[..38]);
+    Some((value, committed))
+}
+
+type ClassARow = (TxRecord, Vec<InputRecord>, Vec<OutputRecord>);
+
+fn rows_match_commitment(coinbase: &Transaction, rows: &[ClassARow]) -> bool {
+    let Some((reserved, committed)) = coinbase_commitment(coinbase) else {
+        return true;
+    };
+    let mut wtxids = Vec::with_capacity(rows.len());
+    let mut buf = Vec::new();
+    for (rec, ins, outs) in rows {
+        buf.clear();
+        encode_class_a_tx(&mut buf, rec, ins, outs);
+        wtxids.push(bitcoin::hashes::sha256d::Hash::hash(&buf).to_byte_array());
+    }
+    witness_commitment_script(wtxids, &reserved) == committed
 }
