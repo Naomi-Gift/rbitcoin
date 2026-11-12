@@ -1279,9 +1279,9 @@ impl Store {
     /// Annotate spends using absolute 8-byte spender-meta offsets (pin layout).
     ///
     /// Tuple: `(abs_off, create_tx_fk, vout, spending_tx_fk, spending_vin)`.
-    /// Prefer io_uring RMW (read → sole/multi/promote → write); multi-list nodes
-    /// go to `spent.ovf` inline on read completion. Returns edges that still
-    /// need a full cold path (OOB abs).
+    /// One read of the current slot, then a page-log insert. A slot past the
+    /// published body is cold and is not written. Multi-list nodes go to
+    /// `spent.ovf` while the slot is decided. Returns those cold edges.
     pub fn put_spend_batch_by_abs_meta(
         &self,
         abs_edges: &[(u64, Fk, u32, Fk, u32)],

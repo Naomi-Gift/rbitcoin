@@ -2659,6 +2659,42 @@ impl TxTable {
         self.spend_pages.finish_cooled()
     }
 
+    /// Record one decided spend slot.
+    ///
+    /// A slot inside the published body, or one the page log already serves,
+    /// is a directory note. A later fold must not copy an older image over
+    /// that spend. A slot past the published body is the create-time overlay
+    /// and stays a `spent.body` write.
+    pub(crate) fn store_spend_slot_at(
+        &self,
+        body_off: u64,
+        body_len: u64,
+        vout: u32,
+        multi: bool,
+        field: Fk,
+        vin: u32,
+    ) -> Result<(), StoreError> {
+        let abs = spent_abs(body_off, vout);
+        let end = body_off.saturating_add(body_len);
+        if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
+            return Err(StoreError::Corrupt("spent slot OOB"));
+        }
+        let flags = if multi {
+            output_flags::MULTI_SPENDER
+        } else {
+            0
+        };
+        let slot_vin = if multi { 0 } else { vin };
+        let meta = encode_spent_slot(flags, field, slot_vin)?;
+        let published = self.spent.body_published_len();
+        if self.spend_pages.slot(abs).is_some()
+            || crate::spend_page_log::is_historical(published, abs)
+        {
+            return self.note_historical_spend_slots(&[(abs, meta)]);
+        }
+        self.spent.write_body_pwrite(abs, &meta)
+    }
+
     /// Patch multi + spender_field on create tx output (packed Class A body).
     pub fn set_output_spender_meta(
         &self,
@@ -3400,9 +3436,7 @@ impl TxTable {
                 let e = spenders.append(spend_fk, spend_vin, field)?;
                 (true, e, 0)
             };
-            self.set_output_spender_meta_at(
-                spent_off, spent_len, vout, new_multi, new_field, new_vin,
-            )?;
+            self.store_spend_slot_at(spent_off, spent_len, vout, new_multi, new_field, new_vin)?;
         }
         Ok(())
     }

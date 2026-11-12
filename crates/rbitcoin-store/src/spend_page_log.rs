@@ -242,6 +242,9 @@ impl SpendPageLog {
     /// Open repairs `spent.body` before this log. A commit composed against
     /// the longer file names pages the repair removed. Those records are
     /// gone, not corrupt. A page that straddles `body_end` keeps the prefix.
+    /// A drop or a shorter image is written back to `spend.pages.commit`
+    /// before this returns. The image file stays. A crash before that rename
+    /// leaves the old commit, and the next open clips it again.
     #[doc(hidden)]
     pub fn load_clipped(dir: &Path, body_end: u64) -> Result<Self, StoreError> {
         let log = Self::empty(dir);
@@ -1418,23 +1421,34 @@ impl SpendPageLog {
         g.log_bytes = parsed.committed_len;
         g.open_edges = 0;
         g.committed.clear();
+        let mut kept_recs: Vec<(u64, u64, u32)> = Vec::new();
+        let mut clipped = false;
         for rec in parsed.recs {
             if body_end.is_some_and(|end| rec.page_off >= end) {
+                clipped = true;
                 continue;
             }
             let mut image_len = u64::from(rec.image_len);
             if let Some(end) = body_end {
                 let room = end.saturating_sub(rec.page_off);
                 if room == 0 {
+                    clipped = true;
                     continue;
                 }
                 if image_len > room {
                     image_len = room;
+                    clipped = true;
                 }
             }
             if image_len == 0 {
+                if body_end.is_some() {
+                    clipped = true;
+                }
                 continue;
             }
+            // `image_len` starts as the record's `u32` and only shrinks.
+            let image_len = image_len as u32;
+            kept_recs.push((rec.page_off, rec.log_off, image_len));
             let start = rec.log_off as usize;
             let take = image_len as usize;
             let image: Arc<[u8]> = Arc::from(file[start..start + take].to_vec().into_boxed_slice());
@@ -1446,6 +1460,27 @@ impl SpendPageLog {
                     generation: parsed.generation,
                 },
             );
+        }
+        let rewrite = clipped.then(|| {
+            encode_commit(
+                parsed.height,
+                parsed.generation,
+                parsed.committed_len,
+                &kept_recs,
+                parsed.fold_held,
+                parsed.sealed_tip,
+            )
+        });
+        drop(g);
+        if let Some(bytes) = rewrite {
+            // `hold_fold_above` takes `commit_io` before the directory lock.
+            let _io = self.commit_io.lock().unwrap_or_else(|e| e.into_inner());
+            if !write_commit_file(&commit_path, &bytes)? {
+                return Err(StoreError::io(
+                    &commit_path,
+                    std::io::Error::other("spend.pages.commit directory sync failed"),
+                ));
+            }
         }
         Ok(())
     }
@@ -1851,13 +1886,15 @@ fn body_fold_span(page_off: u64, image: &[u8]) -> (u64, &[u8]) {
 /// Decide what a held image does at this checkpoint.
 ///
 /// A pure-zero image is folded: the file stays, and nothing is rebuilt from
-/// the body. An image that still has a spend, and no rejected slot, moves
-/// those slots into `open` but stays in `committed`. Compose copies that
+/// the body. An image that still has a spend, and no rejected slot, keeps
+/// those slots and stays in `committed`. A frozen note on that page stays.
+/// A slot the frozen page does not name yet is added beside it. With no
+/// frozen page, the slots move into `open`. Compose copies the stored
 /// image, so a zero on the page is kept, and this checkpoint does not fold
 /// it. The hold stays until the publish after the second `keep`. Clearing
 /// it here lets a disconnect during the first `keep` fold the old image.
 /// A rejected slot leaves the old image in place and clears `base` so
-/// compose reads the body. A frozen note on the same page keeps the live slots.
+/// compose reads the body.
 fn apply_held_explode(
     g: &mut Inner,
     held: &[(u64, Arc<[u8]>)],
@@ -1882,7 +1919,7 @@ fn apply_held_explode(
         }
         for (page_off, slots) in restored {
             if spend_offs.contains(&page_off) {
-                park_open_slots(g, page_off, slots);
+                restore_kept_slots(g, page_off, slots);
             }
         }
         return Vec::new();
@@ -1900,14 +1937,22 @@ fn apply_held_explode(
         if !cleared_offs.contains(&page_off) {
             continue;
         }
-        if let Some(page) = g.frozen.get_mut(&page_off) {
-            overlay_missing_slots(page, slots);
-            page.base = None;
-        } else {
-            park_open_slots(g, page_off, slots);
-        }
+        restore_kept_slots(g, page_off, slots);
     }
     cleared
+}
+
+/// Keep restored slots without covering a newer frozen note.
+///
+/// `open` replaces a frozen slot on the next snapshot. Parking the older
+/// committed value there publishes that value and drops the note.
+fn restore_kept_slots(g: &mut Inner, page_off: u64, slots: PageSlots) {
+    if let Some(page) = g.frozen.get_mut(&page_off) {
+        overlay_missing_slots(page, slots);
+        page.base = None;
+    } else {
+        park_open_slots(g, page_off, slots);
+    }
 }
 
 /// Copy slots that this page does not already name. A newer note stays.

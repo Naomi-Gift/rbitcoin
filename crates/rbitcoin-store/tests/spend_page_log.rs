@@ -677,6 +677,39 @@ fn explode_keeps_a_strong_slot_and_a_newer_open_note() {
 }
 
 #[test]
+fn review_1501_fix_live_explode_keeps_frozen_note() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let older = [5u8, 1, 2, 3, 4, 5, 6, 7];
+    let sibling = [7u8, 1, 2, 3, 4, 5, 6, 7];
+    let newer = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    let waiting = [8u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, older), (24, sibling)]).unwrap();
+    log.commit_open(9, 16384, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(16, newer)]).unwrap();
+    // The page already has a base, so compose does not read the body.
+    // `keep` runs after the freeze and is what leaves that snapshot behind.
+    log.commit_open(9, 16384, zeros, |_| Err(StoreError::Corrupt("boom")))
+        .unwrap_err();
+    log.note_slots(&[(8192, waiting)]).unwrap();
+    log.hold_fold_above(1).unwrap();
+    log.commit_open(4, 16384, zeros, |_| Ok(true)).unwrap();
+    assert_eq!(
+        log.slot(16),
+        Some(newer),
+        "a frozen note must not lose to the older committed slot"
+    );
+    assert_eq!(log.slot(24), Some(sibling));
+    assert_eq!(log.slot(8192), Some(waiting));
+    drop(log);
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(newer));
+    assert_eq!(loaded.slot(24), Some(sibling));
+    assert_eq!(loaded.slot(8192), Some(waiting));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn loaded_commit_above_the_checkpoint_is_not_folded() {
     let d = dir();
     let log = SpendPageLog::create(&d);
@@ -1992,6 +2025,92 @@ fn reload_drops_a_page_past_the_repaired_body_and_cuts_a_straddle() {
 }
 
 #[test]
+fn review_1501_fix_clipped_commit_is_durable() {
+    let slot = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    let later = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(16, slot), (4096, later)]).unwrap();
+    log.cover_confirmed_tip(9);
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(1).unwrap();
+    let pages = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
+    drop(log);
+    let loaded = SpendPageLog::load_clipped(&d, 4096).unwrap();
+    assert_eq!(loaded.slot(16), Some(slot));
+    assert_eq!(loaded.slot(4096), None);
+    drop(loaded);
+    assert_eq!(
+        std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap(),
+        pages,
+        "clipping rewrites the commit, not the image file"
+    );
+    let buf = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    assert_eq!(u16::from_le_bytes(buf[6..8].try_into().unwrap()), 1);
+    assert_eq!(u32::from_le_bytes(buf[8..12].try_into().unwrap()), 1);
+    assert_eq!(u32::from_le_bytes(buf[12..16].try_into().unwrap()), 1);
+    assert_eq!(u32::from_le_bytes(buf[24..28].try_into().unwrap()), 1);
+    let sealed_at = 28 + 24;
+    assert_eq!(
+        u32::from_le_bytes(buf[sealed_at..sealed_at + 4].try_into().unwrap()),
+        9
+    );
+    let again = SpendPageLog::load(&d).unwrap();
+    assert_eq!(again.slot(16), Some(slot));
+    assert_eq!(
+        again.slot(4096),
+        None,
+        "a later open must not bring back the clipped page"
+    );
+    let mut writes = 0u32;
+    again
+        .fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(writes, 0, "the held bit survives the clipped commit");
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(16, slot), (96, later)]).unwrap();
+    log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+    let pages = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
+    drop(log);
+    let loaded = SpendPageLog::load_clipped(&d, 100).unwrap();
+    assert_eq!(loaded.slot(96), None);
+    drop(loaded);
+    assert_eq!(std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap(), pages);
+    let buf = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    let image_len = u32::from_le_bytes(buf[44..48].try_into().unwrap());
+    assert_eq!(image_len, 100, "the commit names the shortened image");
+    let again = SpendPageLog::load(&d).unwrap();
+    assert_eq!(again.slot(16), Some(slot));
+    assert_eq!(again.slot(96), None);
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(4, 8192, zeros, |_| Ok(true)).unwrap();
+    let before = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    drop(log);
+    let loaded = SpendPageLog::load_clipped(&d, 8192).unwrap();
+    assert_eq!(loaded.slot(16), Some(slot));
+    drop(loaded);
+    assert_eq!(
+        std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap(),
+        before,
+        "a clip that drops nothing leaves the commit file alone"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn freeze_tip_above_the_snapshot_holds_the_fold() {
     let d = dir();
     let log = SpendPageLog::create(&d);
@@ -2138,6 +2257,127 @@ fn skip_rewrites_a_logged_spend_the_body_does_not_hold() {
     assert!(
         !d.join(SPEND_PAGES_COMMIT_NAME).exists(),
         "a body that already has the spend is not noted again"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn review_1501_fix_put_spend_logged_slot() {
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::point_table::put_spend_on_create_at;
+    use rbitcoin_store::tx_table::encode_spent_slot;
+    use rbitcoin_store::Store;
+    let d = dir();
+    let store = Store::create_tiny(&d).unwrap();
+    let nbytes = 4096usize;
+    let prep = store
+        .txs
+        .spent
+        .prepare_batch_encode(1, nbytes, |_i, buf| {
+            buf.resize(buf.len() + nbytes, 0);
+        })
+        .unwrap()
+        .expect("one spent append");
+    let abs = prep.start;
+    let len = prep.body_blob.len() as u64;
+    store
+        .txs
+        .spent
+        .write_body_blob_bulk(prep.start, &prep.body_blob)
+        .unwrap();
+    store.txs.spent.finish_prepared(prep).unwrap();
+    store.note_open_spend_slots(&[(abs, [0u8; 8])]).unwrap();
+    store.checkpoint_observed_spend().unwrap();
+    put_spend_on_create_at(
+        &store.txs,
+        &store.spenders,
+        Fk(1),
+        0,
+        Fk(9),
+        4,
+        Some((abs, len)),
+    )
+    .unwrap();
+    let got = store.get_spender_meta_at_abs_batch(&[abs]).unwrap();
+    assert_eq!(
+        got[0].map(|(field, _flags, vin)| (field, vin)),
+        Some((Fk(9), 4)),
+        "a logged zero must not hide the new spend"
+    );
+    // The next checkpoint keeps a best-chain sole spend and must not fold
+    // the older zero image back over it.
+    store
+        .confirmed
+        .set(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            rbitcoin_primitives::Height(0),
+            Fk(1),
+        )
+        .unwrap();
+    store
+        .header_txs
+        .put_range(&rbitcoin_store::ClassCWrite::for_test(), Fk(1), Fk(1), 9)
+        .unwrap();
+    store
+        .strong_tx
+        .set_strong(&rbitcoin_store::ClassCWrite::for_test(), Fk(9), Fk(1))
+        .unwrap();
+    store.rebuild_height_fence().unwrap();
+    store.checkpoint_observed_spend().unwrap();
+    store.checkpoint_observed_spend().unwrap();
+    let got = store.get_spender_meta_at_abs_batch(&[abs]).unwrap();
+    assert_eq!(
+        got[0].map(|(field, _flags, vin)| (field, vin)),
+        Some((Fk(9), 4))
+    );
+    let expect = encode_spent_slot(0, Fk(9), 4).unwrap();
+    assert_eq!(store.txs.spent.pread_span(abs, 8).unwrap(), expect);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn review_1501_fix_put_spend_tail_stays_on_the_body() {
+    use rbitcoin_primitives::Fk;
+    use rbitcoin_store::point_table::put_spend_on_create_at;
+    use rbitcoin_store::tx_table::encode_spent_slot;
+    use rbitcoin_store::Store;
+    let d = dir();
+    let store = Store::create_tiny(&d).unwrap();
+    let nbytes = 64usize;
+    let prep = store
+        .txs
+        .spent
+        .prepare_batch_encode(1, nbytes, |_i, buf| {
+            buf.resize(buf.len() + nbytes, 0);
+        })
+        .unwrap()
+        .expect("one spent append");
+    let abs = prep.start;
+    let len = prep.body_blob.len() as u64;
+    store
+        .txs
+        .spent
+        .write_body_blob_bulk(prep.start, &prep.body_blob)
+        .unwrap();
+    assert!(
+        abs.saturating_add(8) > store.txs.spent.body_published_len(),
+        "the overlay tail is not published yet"
+    );
+    put_spend_on_create_at(
+        &store.txs,
+        &store.spenders,
+        Fk(1),
+        0,
+        Fk(9),
+        4,
+        Some((abs, len)),
+    )
+    .unwrap();
+    let expect = encode_spent_slot(0, Fk(9), 4).unwrap();
+    assert_eq!(
+        store.txs.spent.pread_span(abs, 8).unwrap(),
+        expect,
+        "a same-batch tail spend stays on spent.body"
     );
     let _ = std::fs::remove_dir_all(&d);
 }
