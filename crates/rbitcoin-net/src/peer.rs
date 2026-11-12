@@ -6811,6 +6811,19 @@ fn note_blocksonly_sender(
     }
 }
 
+/// Core `AlreadyHaveTx` for a received tx, which is dropped unvalidated: a
+/// recent reject, or a parked wtxid whose sender is no new announcer. Unlike
+/// Core, a mempool hit is not had here; it goes on to the duplicate handling
+/// in [`on_tx`].
+fn already_had_unvalidated(
+    mp: &crate::tx_relay::MempoolHub,
+    txid: &bitcoin::Txid,
+    wtxid: &bitcoin::Wtxid,
+) -> bool {
+    mp.try_recent_reject(wtxid)
+        || (mp.try_orphan_missing(wtxid).is_some() && !mp.try_contains(txid))
+}
+
 pub async fn on_tx(
     hub: &ChainHub,
     _out_tx: &mpsc::UnboundedSender<PeerOut>,
@@ -6838,17 +6851,8 @@ pub async fn on_tx(
             let from = session.map(|s| s.id);
             let trusted = session
                 .is_some_and(|s| s.peer_hub().is_some_and(|ph| ph.session_is_trusted_peer(s)));
-            // A recent reject is final for every peer except the trusted one.
-            // That session already accepted the tx, so judge it again.
-            if mp.try_recent_reject(&wtxid) && !trusted {
-                mp.resolve_tx_request(&txid, &wtxid, false);
-                maybe_force_relay_recent_reject(hub, session, mp, txid, wtxid);
-                return Ok(());
-            }
-            // Core `ReceivedTx`: a parked wtxid is already had, so it is
-            // dropped unvalidated and its sender is no new announcer. One the
-            // mempool holds too goes on to the duplicate handling below.
-            if !trusted && mp.try_orphan_missing(&wtxid).is_some() && !mp.try_contains(&txid) {
+            // The trusted peer already accepted the tx, so judge it again.
+            if !trusted && already_had_unvalidated(mp, &txid, &wtxid) {
                 mp.resolve_tx_request(&txid, &wtxid, false);
                 maybe_force_relay_recent_reject(hub, session, mp, txid, wtxid);
                 return Ok(());
