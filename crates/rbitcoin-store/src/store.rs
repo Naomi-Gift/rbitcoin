@@ -450,6 +450,15 @@ pub fn keep_unspent_vout_subsequence<T>(
     });
 }
 
+#[cfg(debug_assertions)]
+type SpendFreezeProbe = fn(&SpenderTable, &crate::spend_page_log::SpendPageLog);
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SPEND_FREEZE_PROBE: std::cell::Cell<Option<SpendFreezeProbe>> =
+        const { std::cell::Cell::new(None) };
+}
+
 impl Store {
     pub fn create(path: impl Into<PathBuf>) -> Result<Self, StoreError> {
         Self::create_layout(StoreLayout::single(path.into()))
@@ -1982,26 +1991,62 @@ impl Store {
         self.txs.relax_spend_pace();
     }
 
+    /// Run once inside the spend freeze, after the early `spent.ovf` sync.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn arm_spend_freeze_probe(probe: SpendFreezeProbe) {
+        SPEND_FREEZE_PROBE.with(|slot| slot.set(Some(probe)));
+    }
+
+    /// Drop a probe [`arm_spend_freeze_probe`] has not consumed.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn disarm_spend_freeze_probe() {
+        SPEND_FREEZE_PROBE.with(|slot| slot.set(None));
+    }
+
+    #[cfg(debug_assertions)]
+    fn take_spend_freeze_probe() -> Option<SpendFreezeProbe> {
+        SPEND_FREEZE_PROBE.with(|slot| slot.take())
+    }
+
     fn publish_open_spend_pages(
         &self,
         height: u32,
         keep: impl FnMut(&[u8; 8]) -> Result<bool, StoreError>,
     ) -> Result<(), StoreError> {
         // A loaded commit above this checkpoint is held before the quiet
-        // pages are copied. The freeze tip is read under the utxo view, after
-        // that copy and after the keep walk, so a note already in `open` is
-        // inside the tip a later disconnect holds.
+        // pages are copied. The freeze tip is read under the utxo view after
+        // that copy. The sealed tip is raised again after the second keep.
         self.txs.widen_for_checkpoint(height);
         self.fold_sealed_spend_pages()?;
         let publish = &self.utxo_publish;
         let view = &self.utxo_view;
         let confirmed = &self.confirmed;
-        self.txs.prepare_open_spend_pages(height, keep, |log| {
-            let _g = hold_view(publish, view);
-            let tip = confirmed.tip_height().map(|h| h.0).unwrap_or(height);
-            log.cover_confirmed_tip(tip);
-            log.freeze_open();
-        })?;
+        let spenders = &self.spenders;
+        self.txs.prepare_open_spend_pages(
+            height,
+            keep,
+            |log, len| {
+                {
+                    let _g = hold_view(publish, view);
+                    #[cfg(debug_assertions)]
+                    if let Some(probe) = Self::take_spend_freeze_probe() {
+                        probe(spenders, log);
+                    }
+                    let tip = confirmed.tip_height().map(|h| h.0).unwrap_or(height);
+                    log.cover_confirmed_tip(tip);
+                    log.freeze_open();
+                    log.cover_published_len(len());
+                }
+                spenders.sync_data_only()?;
+                Ok(())
+            },
+            |_log| {
+                let _g = hold_view(publish, view);
+                Ok(confirmed.tip_height().map(|h| h.0).unwrap_or(height))
+            },
+        )?;
         self.install_prepared_spend_pages()
     }
 

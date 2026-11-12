@@ -2514,9 +2514,11 @@ impl TxTable {
             })
     }
 
-    /// One packed body walk: spender meta for many vouts (ascending).
+    /// Spender meta for many vouts.
     ///
-    /// Returns `(vout, multi, field)` for each found vout. Missing vouts omitted.
+    /// The page log is read first. One `spent.body` walk fills the misses.
+    /// Returns `(vout, multi, field, vin)` for each found vout. Missing vouts
+    /// are omitted.
     pub fn get_output_spender_metas_at(
         &self,
         body_off: u64,
@@ -2527,28 +2529,52 @@ impl TxTable {
             return Ok(Vec::new());
         }
         let slot = OutputRecord::SPENT_SLOT_LEN;
-        self.spent.with_bytes_at(body_off, body_len, |raw| {
-            let mut out = Vec::with_capacity(vouts.len());
-            for &v in vouts {
-                let abs = spent_abs(body_off, v);
-                let decoded = if let Some(logged) = self.spend_pages.slot(abs) {
-                    decode_spent_slot(&logged).ok()
-                } else {
-                    let start = (v as usize).saturating_mul(slot);
-                    let end = start.saturating_add(slot);
-                    if end > raw.len() {
-                        None
-                    } else {
-                        decode_spent_slot(&raw[start..end]).ok()
-                    }
-                };
-                let Some((flags, field, vin)) = decoded else {
-                    continue;
-                };
-                out.push((v, flags & output_flags::MULTI_SPENDER != 0, field, vin));
+        let end = body_off.saturating_add(body_len);
+        let mut hits: Vec<Option<(bool, Fk, u32)>> = Vec::with_capacity(vouts.len());
+        let mut misses = Vec::new();
+        for (i, &v) in vouts.iter().enumerate() {
+            let abs = spent_abs(body_off, v);
+            if abs.saturating_add(slot as u64) > end {
+                hits.push(None);
+                continue;
             }
-            Ok(out)
+            if let Some(logged) = self.spend_pages.slot(abs) {
+                hits.push(decode_spent_slot(&logged).ok().map(|(flags, field, vin)| {
+                    (flags & output_flags::MULTI_SPENDER != 0, field, vin)
+                }));
+            } else {
+                hits.push(None);
+                misses.push(i);
+            }
+        }
+        if misses.is_empty() {
+            return Ok(Self::pack_spender_metas(vouts, hits));
+        }
+        self.spent.with_bytes_at(body_off, body_len, |raw| {
+            for i in misses {
+                let v = vouts[i];
+                let start = (v as usize).saturating_mul(slot);
+                let stop = start.saturating_add(slot);
+                if stop > raw.len() {
+                    continue;
+                }
+                if let Ok((flags, field, vin)) = decode_spent_slot(&raw[start..stop]) {
+                    hits[i] = Some((flags & output_flags::MULTI_SPENDER != 0, field, vin));
+                }
+            }
+            Ok(Self::pack_spender_metas(vouts, hits))
         })
+    }
+
+    fn pack_spender_metas(
+        vouts: &[u32],
+        hits: Vec<Option<(bool, Fk, u32)>>,
+    ) -> Vec<(u32, bool, Fk, u32)> {
+        vouts
+            .iter()
+            .zip(hits)
+            .filter_map(|(&v, hit)| hit.map(|(multi, field, vin)| (v, multi, field, vin)))
+            .collect()
     }
 
     pub(crate) fn note_historical_spend_slots(
@@ -2558,28 +2584,33 @@ impl TxTable {
         self.spend_pages.note_slots(slots)
     }
 
-    pub(crate) fn prepare_open_spend_pages<K, B>(
+    pub(crate) fn prepare_open_spend_pages<K, B, S>(
         &self,
         height: u32,
         keep: K,
         before_freeze: B,
+        seal_tip: S,
     ) -> Result<(), StoreError>
     where
         K: FnMut(&[u8; OutputRecord::SPENT_SLOT_LEN]) -> Result<bool, StoreError>,
-        B: FnOnce(&crate::spend_page_log::SpendPageLog),
+        B: FnOnce(&crate::spend_page_log::SpendPageLog, &dyn Fn() -> u64) -> Result<(), StoreError>,
+        S: FnOnce(&crate::spend_page_log::SpendPageLog) -> Result<u32, StoreError>,
     {
         let published = self.spent.body_published_len();
+        let len_now = || self.spent.body_published_len();
         self.spend_pages.prepare_commit_in(
             height,
             published,
             |off, len| {
                 let mut buf = vec![0u8; len];
+                let end = self.spent.body_published_len();
                 self.spent
-                    .read_prefix_at_published(published, off, len as u64, &mut buf)?;
+                    .read_prefix_at_published(end, off, len as u64, &mut buf)?;
                 Ok(buf)
             },
             keep,
-            before_freeze,
+            |log| before_freeze(log, &len_now),
+            seal_tip,
         )
     }
 

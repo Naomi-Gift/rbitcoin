@@ -247,6 +247,8 @@ impl VarTable {
         unsafe {
             buf.set_len(n);
         }
+        #[cfg(debug_assertions)]
+        crate::io_handle::note_test_pread();
         f(buf)
     }
 

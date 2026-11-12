@@ -66,4 +66,10 @@ Fixed
   edge cap is still armed, and the full ten minutes otherwise. Startup
   replay checkpoints a chunk once the open directory reaches 2,000,000
   edges, and the next checkpoint folds that generation. It does not wait
-  for a sync thread.
+  for a sync thread. Spender overflow is synced again after the freeze and
+  before the commit rename, so a multi-list node noted after the first sync
+  is durable before that commit names it. A note that lands after the body
+  length is sampled is composed at the length taken with the freeze. A reader
+  of many outputs checks the page log before `spent.body`. A spend accepted
+  after the freeze raises the sealed tip, so a later disconnect below that
+  tip holds and does not fold it.

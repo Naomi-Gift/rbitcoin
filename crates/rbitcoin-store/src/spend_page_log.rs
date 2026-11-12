@@ -158,6 +158,9 @@ struct Inner {
     /// Confirmed tip sampled when a checkpoint froze. The snapshot height can
     /// sit below spends already in that image. Written after the page list.
     sealed_tip: Option<u32>,
+    /// `spent.body` length sampled at the freeze. Unset means the caller’s
+    /// argument. A note between that argument and the freeze can sit past it.
+    published_at_freeze: Option<u64>,
     /// Snapshot taken while the caller held the utxo view. `prepare_commit`
     /// publishes this instead of freezing again.
     staged_freeze: Option<Option<CommitSnapshot>>,
@@ -264,6 +267,7 @@ impl SpendPageLog {
                 compose_height: None,
                 fold_held: false,
                 sealed_tip: None,
+                published_at_freeze: None,
                 staged_freeze: None,
                 hold_ticks: 0,
                 open_edges: 0,
@@ -337,6 +341,10 @@ impl SpendPageLog {
     /// Current 8-byte image for `abs`, from the open directory, the frozen
     /// generation, or a committed page. `None` means the body still holds the slot.
     pub fn slot(&self, abs: u64) -> Option<[u8; SLOT]> {
+        #[cfg(debug_assertions)]
+        if crate::io_handle::hidden_after_pread() {
+            return None;
+        }
         let page_off = abs & !(BODY_PAGE_SIZE - 1);
         let rel = ((abs - page_off) / SLOT as u64) as u16;
         let g = self.lock();
@@ -403,6 +411,22 @@ impl SpendPageLog {
         } else {
             g.sealed_tip = Some(tip);
         }
+    }
+
+    /// Body length the freeze saw. Compose uses this instead of an earlier sample.
+    #[doc(hidden)]
+    pub fn cover_published_len(&self, published: u64) {
+        self.lock().published_at_freeze = Some(published);
+    }
+
+    fn sealed_tip_or(&self, height: u32) -> u32 {
+        self.lock().sealed_tip.unwrap_or(height)
+    }
+
+    /// Raise the sealed tip. A drop during the keep must not lower it.
+    fn raise_sealed_tip(&self, tip: u32) {
+        let mut g = self.lock();
+        g.sealed_tip = Some(g.sealed_tip.map(|prev| prev.max(tip)).unwrap_or(tip));
     }
 
     /// A loaded commit above `height` must not be folded. The held bit may
@@ -544,34 +568,50 @@ impl SpendPageLog {
         F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
         K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
     {
-        self.prepare_commit_in(height, published, read_page, keep, |log| log.freeze_open())
+        self.prepare_commit_in(
+            height,
+            published,
+            read_page,
+            keep,
+            |log| {
+                log.freeze_open();
+                Ok(())
+            },
+            |log| Ok(log.sealed_tip_or(height)),
+        )
     }
 
     /// Freeze `open` while the caller holds the utxo view.
     ///
     /// [`Self::prepare_commit_in`] publishes this snapshot. A note that arrives
     /// after the view is released waits for the next checkpoint.
-    pub(crate) fn freeze_open(&self) {
+    #[doc(hidden)]
+    pub fn freeze_open(&self) {
         let snap = self.snapshot_commit();
         self.lock().staged_freeze = Some(snap);
     }
 
-    pub(crate) fn prepare_commit_in<F, K, B>(
+    #[doc(hidden)]
+    pub fn prepare_commit_in<F, K, B, S>(
         &self,
         height: u32,
         published: u64,
         mut read_page: F,
         mut keep: K,
         before_freeze: B,
+        seal_tip: S,
     ) -> Result<(), StoreError>
     where
         F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
         K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
-        B: FnOnce(&Self),
+        B: FnOnce(&Self) -> Result<(), StoreError>,
+        S: FnOnce(&Self) -> Result<u32, StoreError>,
     {
         if self.lock().pending.is_some() {
             return Ok(());
         }
+        self.lock().published_at_freeze = None;
+        let explode_published = published;
         let sampled_ticks = {
             let mut g = self.lock();
             if g.commit_height.is_some_and(|committed| committed > height) {
@@ -588,7 +628,7 @@ impl SpendPageLog {
         };
         let _clear_compose = ClearCompose(self);
         let _release_later = ReleaseLater(self);
-        let mut clears = self.explode_held(published, sampled_ticks, &mut keep)?;
+        let mut clears = self.explode_held(explode_published, sampled_ticks, &mut keep)?;
         // Every slot was rejected. The commit file is still the retry record
         // until compose publishes a replacement or decides the body has none.
         let deferred = {
@@ -599,7 +639,11 @@ impl SpendPageLog {
         // The caller covers the freeze tip and freezes `open` while it holds
         // the utxo view. Notes taken during the quiet fold are already in
         // `open`. A note after this waits for the next checkpoint.
-        before_freeze(self);
+        before_freeze(self)?;
+        let published = {
+            let mut g = self.lock();
+            g.published_at_freeze.take().unwrap_or(published)
+        };
         let snap = match self.lock().staged_freeze.take() {
             Some(snap) => snap,
             None => self.snapshot_commit(),
@@ -614,6 +658,7 @@ impl SpendPageLog {
                 deferred,
                 &clears,
                 sampled_ticks,
+                seal_tip,
             );
         };
         if snap.froze {
@@ -635,6 +680,7 @@ impl SpendPageLog {
             return Ok(());
         }
         self.scrub_open_notes(&mut keep)?;
+        self.raise_sealed_tip(seal_tip(self)?);
         let mut replaced: Vec<u64> = clears.iter().map(|clear| clear.page_off).collect();
         replaced.extend(kept.iter().map(|(off, _)| *off));
         let carried = {
@@ -671,7 +717,8 @@ impl SpendPageLog {
     /// keeping only a zero page, would serve that best-chain spend as unspent.
     /// The commit file stays in place until this returns. A `read_page` error
     /// never reaches here, so a restart still loads the old image.
-    fn settle_deferred_clear(
+    #[allow(clippy::too_many_arguments)] // the seal runs only when this publishes
+    fn settle_deferred_clear<S>(
         &self,
         height: u32,
         published: u64,
@@ -679,7 +726,11 @@ impl SpendPageLog {
         deferred: bool,
         clears: &[BodyClear],
         sampled_ticks: u64,
-    ) -> Result<(), StoreError> {
+        seal_tip: S,
+    ) -> Result<(), StoreError>
+    where
+        S: FnOnce(&Self) -> Result<u32, StoreError>,
+    {
         let fresh: HashSet<u64> = pages.iter().map(|(off, _)| *off).collect();
         let cleared: HashSet<u64> = clears.iter().map(|clear| clear.page_off).collect();
         let mut carried = if deferred {
@@ -694,6 +745,7 @@ impl SpendPageLog {
             }
             return Ok(());
         }
+        self.raise_sealed_tip(seal_tip(self)?);
         let (clear_hold, hold) = self.publish_hold(deferred, sampled_ticks);
         self.store_pending(
             height,

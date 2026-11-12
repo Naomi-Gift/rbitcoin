@@ -2420,3 +2420,234 @@ fn directory_sync_failure_during_hold_still_holds() {
     assert_eq!(log.slot(16), Some(slot));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static REVIEW_ABS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(debug_assertions)]
+fn review_1501_freeze_probe(
+    spenders: &rbitcoin_store::spender_table::SpenderTable,
+    log: &SpendPageLog,
+) {
+    let e1 = match spenders.append(rbitcoin_primitives::Fk(2), 0, rbitcoin_primitives::Fk::NULL) {
+        Ok(fk) => fk,
+        Err(_) => panic!("overflow append failed"),
+    };
+    let e2 = match spenders.append(rbitcoin_primitives::Fk(3), 1, e1) {
+        Ok(fk) => fk,
+        Err(_) => panic!("overflow append failed"),
+    };
+    let meta = match rbitcoin_store::tx_table::encode_spent_slot(
+        rbitcoin_store::output_flags::MULTI_SPENDER,
+        e2,
+        0,
+    ) {
+        Ok(meta) => meta,
+        Err(_) => panic!("multi slot encode failed"),
+    };
+    let abs = REVIEW_ABS.with(|slot| slot.get());
+    match log.note_slots(&[(abs, meta)]) {
+        Ok(()) => {}
+        Err(_) => panic!("note during freeze failed"),
+    }
+    rbitcoin_store::io_handle::arm_fail_sync(spenders.body.read_fd(), 1);
+}
+
+#[cfg(debug_assertions)]
+struct ClearFreezeProbe(rbitcoin_store::io_handle::IoHandle);
+
+#[cfg(debug_assertions)]
+impl Drop for ClearFreezeProbe {
+    fn drop(&mut self) {
+        rbitcoin_store::Store::disarm_spend_freeze_probe();
+        rbitcoin_store::io_handle::disarm_sync(self.0);
+    }
+}
+
+/// A multi-list node noted after the early overflow sync must not be named by
+/// the commit unless a second sync made that node durable.
+#[cfg(debug_assertions)]
+#[test]
+fn review_1501_ovf_sync() {
+    let d = dir();
+    let s = rbitcoin_store::Store::create_tiny(&d).unwrap();
+    s.confirmed
+        .set(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            rbitcoin_primitives::Height(0),
+            rbitcoin_primitives::Fk(1),
+        )
+        .unwrap();
+    let tx = rbitcoin_store::TxRecord {
+        txid: [0x11; 32],
+        version: 1,
+        locktime: 0,
+        input_count: 1,
+        output_count: 1,
+    };
+    let inputs = vec![rbitcoin_store::InputRecord {
+        prev_txid: [0u8; 32],
+        parent: rbitcoin_store::InputParent::Coinbase,
+        sequence: u32::MAX,
+        script_sig: vec![0x01],
+        witness: vec![],
+    }];
+    let outputs = vec![rbitcoin_store::OutputRecord::unspent(1, vec![0x51])];
+    let fks = s
+        .txs
+        .put_full_batch_indexed(&[(tx, inputs, outputs)], false)
+        .unwrap();
+    let (off, len) = s.txs.spent_range(fks[0]).unwrap();
+    let abs = rbitcoin_store::spent_abs(off, 0);
+    assert!(
+        rbitcoin_store::spend_page_log::is_historical(s.txs.spent.body_published_len(), abs),
+        "the body must already cover the slot"
+    );
+    REVIEW_ABS.with(|slot| slot.set(abs));
+    let _clear = ClearFreezeProbe(s.spenders.body.read_fd());
+    rbitcoin_store::Store::arm_spend_freeze_probe(review_1501_freeze_probe);
+    let err = match s.checkpoint_spend_through(0) {
+        Err(err) => err,
+        Ok(()) => {
+            panic!("a multi-list note after the early sync was committed without a second ovf sync")
+        }
+    };
+    let msg = err.to_string();
+    assert!(
+        msg.contains("spent.ovf"),
+        "the second overflow sync must fail before the commit rename"
+    );
+    drop(s);
+    let loaded = rbitcoin_store::Store::open(&d).unwrap();
+    let (multi, field, vin) = loaded.txs.get_output_spender_meta_at(off, len, 0).unwrap();
+    assert!(
+        !multi && field.is_null() && vin == 0,
+        "a failed overflow sync must not leave the multi slot in the commit"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A note taken after the published length is sampled is composed at the
+/// length the freeze records.
+#[test]
+fn review_1501_published_sample() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [7u8, 1, 2, 3, 4, 5, 6, 7];
+    log.prepare_commit_in(
+        1,
+        100,
+        zeros,
+        |_| Ok(true),
+        |page| {
+            page.note_slots(&[(200, slot)])?;
+            page.freeze_open();
+            page.cover_published_len(4096);
+            Ok(())
+        },
+        |_| Ok(1),
+    )
+    .unwrap();
+    log.install_commit().unwrap();
+    assert_eq!(
+        log.slot(200),
+        Some(slot),
+        "a note past the earlier published length must stay in the commit"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(debug_assertions)]
+struct ClearHide;
+
+#[cfg(debug_assertions)]
+impl Drop for ClearHide {
+    fn drop(&mut self) {
+        rbitcoin_store::io_handle::disarm_hide_after_pread();
+    }
+}
+
+/// The batch reader must see the page log even when a pread of `spent.body`
+/// happens before the log would have been checked.
+#[cfg(debug_assertions)]
+#[test]
+fn review_1501_meta_order() {
+    let d = dir();
+    let s = rbitcoin_store::Store::create_tiny(&d).unwrap();
+    let tx = rbitcoin_store::TxRecord {
+        txid: [0x22; 32],
+        version: 1,
+        locktime: 0,
+        input_count: 1,
+        output_count: 1,
+    };
+    let inputs = vec![rbitcoin_store::InputRecord {
+        prev_txid: [0u8; 32],
+        parent: rbitcoin_store::InputParent::Coinbase,
+        sequence: u32::MAX,
+        script_sig: vec![0x01],
+        witness: vec![],
+    }];
+    let outputs = vec![rbitcoin_store::OutputRecord::unspent(1, vec![0x51])];
+    let fks = s
+        .txs
+        .put_full_batch_indexed(&[(tx, inputs, outputs)], false)
+        .unwrap();
+    let (off, len) = s.txs.spent_range(fks[0]).unwrap();
+    let abs = rbitcoin_store::spent_abs(off, 0);
+    let slot =
+        rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk(9), 1).unwrap();
+    s.note_open_spend_slots(&[(abs, slot)]).unwrap();
+    let _clear = ClearHide;
+    rbitcoin_store::io_handle::arm_hide_after_pread();
+    let metas = s.txs.get_output_spender_metas_at(off, len, &[0]).unwrap();
+    assert_eq!(
+        metas,
+        vec![(0, false, rbitcoin_primitives::Fk(9), 1)],
+        "a body pread between the log read and the answer must not hide the spend"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A spend the second keep accepts above the freeze tip raises that tip, so
+/// a later disconnect holds and does not fold it.
+#[test]
+fn review_1501_sealed_tip() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [6u8, 1, 2, 3, 4, 5, 6, 7];
+    log.cover_confirmed_tip(1);
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.prepare_commit_in(
+        1,
+        8192,
+        zeros,
+        |_| Ok(true),
+        |page| {
+            page.freeze_open();
+            Ok(())
+        },
+        |_| Ok(5),
+    )
+    .unwrap();
+    log.install_commit().unwrap();
+    log.hold_fold_above(1).unwrap();
+    log.widen_for_checkpoint(1);
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, _image| {
+            writes += 1;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        writes, 0,
+        "a spend reconnected above the freeze must not be folded"
+    );
+    assert_eq!(log.slot(16), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+}
