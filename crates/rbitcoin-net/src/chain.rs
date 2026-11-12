@@ -1351,10 +1351,7 @@ impl ChainHub {
     /// background on connect). Must **not** fall back to `height_of_hash` here —
     /// header-only archive rows would force multi-thousand-height scans per call.
     pub fn has_block(&self, hash: &BlockHash) -> bool {
-        if self.cache.get_block(hash).is_some() {
-            return true;
-        }
-        self.confirmed.read().unwrap().contains(hash)
+        self.cache.has_body(hash) || self.confirmed.read().unwrap().contains(hash)
     }
 
     /// True if `hash` is connected on the best chain (has a height).

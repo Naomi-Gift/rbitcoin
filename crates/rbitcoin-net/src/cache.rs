@@ -72,6 +72,12 @@ impl BlockCache {
         self.inner.read().unwrap().by_hash.get(hash).cloned()
     }
 
+    /// Whether the cache retains the block body, without copying it.
+    #[doc(hidden)]
+    pub fn has_body(&self, hash: &BlockHash) -> bool {
+        self.inner.read().unwrap().by_hash.contains_key(hash)
+    }
+
     pub fn get_header(&self, hash: &BlockHash) -> Option<Header> {
         self.inner
             .read()

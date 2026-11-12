@@ -3028,6 +3028,7 @@ fn block_cache_and_mempool_hub_surface() {
     assert_eq!(cache.tip_hash(), Some(tip));
     assert_eq!(cache.tip_height(), Some(maturity + 1));
     assert!(cache.get_block(&tip).is_some());
+    assert!(cache.has_body(&tip));
     assert!(cache.get_header(&tip).is_some());
     assert!(cache.hash_at_height(0).is_some());
     assert!(cache.header_at_height(maturity + 1).is_some());
@@ -3036,6 +3037,7 @@ fn block_cache_and_mempool_hub_surface() {
         cache.get_block(&blocks[0].block_hash()).is_none(),
         "body depth eviction"
     );
+    assert!(!cache.has_body(&blocks[0].block_hash()));
     assert!(cache.hash_at_height(0).is_some(), "hash chain retained");
     let genesis_hash = cache.hash_at_height(0).unwrap();
     let stop = BlockHash::from_byte_array([0u8; 32]);
