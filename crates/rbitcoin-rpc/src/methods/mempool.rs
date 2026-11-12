@@ -2504,10 +2504,25 @@ pub fn gettxspendingprevout(ctx: &RpcContext, params: &RpcParams) -> Result<Valu
             .get("txid")
             .and_then(|x| x.as_str())
             .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "txid required"))?;
-        let vout =
-            obj.get("vout")
-                .and_then(|x| x.as_u64())
-                .ok_or_else(|| rpc_error(ERR_INVALID_PARAMS, "vout required"))? as u32;
+        let vout = match obj.get("vout") {
+            None | Some(Value::Null) => return Err(rpc_error(ERR_TYPE_ERROR, "Missing vout")),
+            Some(v @ Value::Number(_)) => v,
+            Some(v) => {
+                return Err(rpc_error(
+                    ERR_TYPE_ERROR,
+                    format!(
+                        "JSON value of type {} for field vout is not of expected type number",
+                        json_type_name(v)
+                    ),
+                ));
+            }
+        };
+        let vout = u32::try_from(core_json_int::<i32>(vout)?).map_err(|_| {
+            rpc_error(
+                ERR_INVALID_PARAMETER,
+                "Invalid parameter, vout cannot be negative",
+            )
+        })?;
         let want = parse_hash32_display(txid)?;
         let op = OutPoint {
             txid: Txid::from_byte_array(want),
