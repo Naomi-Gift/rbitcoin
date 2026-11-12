@@ -915,6 +915,19 @@ impl Store {
         self.txs.for_each_script_hashes_in_fk_span(first, last, f)
     }
 
+    /// Output value sum per create for create_fks `first..=last` (coalesced span).
+    pub fn output_value_sums_in_fk_span(
+        &self,
+        first: u64,
+        last: u64,
+    ) -> Result<Vec<u64>, StoreError> {
+        self.txs.output_value_sums_in_fk_span(
+            first,
+            last,
+            crate::tx_table::SCRIPT_HASH_COLLECT_SPAN,
+        )
+    }
+
     /// Load: meta + input prevouts only (no script/output allocation).
     pub fn get_tx_meta_and_prevouts(
         &self,

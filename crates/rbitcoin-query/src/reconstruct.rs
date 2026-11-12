@@ -25,6 +25,15 @@ pub struct StampedTxstatBlock {
     pub n_outs: Vec<u32>,
 }
 
+/// One transaction of [`Query::block_tx_summary`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlockTxSummary {
+    pub txid: [u8; 32],
+    pub fee_sat: u64,
+    pub weight: u64,
+    pub value_sat: u64,
+}
+
 #[doc(hidden)]
 pub fn block_size_weight_from_txstat(
     rows: &[rbitcoin_store::TxStatRow],
@@ -581,6 +590,58 @@ impl Query {
             rows: packed.into_iter().map(|r| r.unwrap()).collect(),
             n_outs,
         }))
+    }
+
+    /// Txid, fee, weight, and output value of every tx in best-chain block
+    /// `hash`, coinbase first. `None` when `hash` is not on the best chain.
+    ///
+    /// Reads `txstat`, `create.loc`, `txout.body`, and `txid.body` over the
+    /// block's create span. Unstamped `txstat` rows are first stamped from the
+    /// reconstructed block, which needs `seqsigwit` (`Pruned` when cut).
+    pub fn block_tx_summary(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<Option<Vec<BlockTxSummary>>, QueryError> {
+        let Some(height) = self.height_of_hash(hash)? else {
+            return Ok(None);
+        };
+        let stamped = match self.stamped_txstat_block(height)? {
+            Some(s) => s,
+            None => {
+                let block = self.reconstruct_block_at_height(height)?;
+                self.stamp_txstat_from_block(height, &block)?;
+                self.stamped_txstat_block(height)?
+                    .ok_or(StoreError::Corrupt(
+                        "invariant: txstat unstamped after stamp",
+                    ))?
+            }
+        };
+        if stamped.rec.hash != *hash {
+            return Ok(None);
+        }
+        let (Some(first), Some(last)) = (stamped.fks.first(), stamped.fks.last()) else {
+            return Err(StoreError::Corrupt(
+                "invariant: stamped block without creates",
+            ));
+        };
+        let txids = self.store.txs.body_txid_range(first.0, last.0)?;
+        let values = self.store.output_value_sums_in_fk_span(first.0, last.0)?;
+        if txids.len() != stamped.rows.len() || values.len() != stamped.rows.len() {
+            return Err(StoreError::Corrupt("invariant: block summary row count"));
+        }
+        let rows = stamped
+            .rows
+            .iter()
+            .zip(txids)
+            .zip(values)
+            .map(|((row, txid), value_sat)| BlockTxSummary {
+                txid,
+                fee_sat: row.fee_sat,
+                weight: row.weight(),
+                value_sat,
+            })
+            .collect();
+        Ok(Some(rows))
     }
 
     /// Fill unstamped `txstat` rows from a reconstructed wire block.
