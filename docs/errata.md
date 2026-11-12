@@ -32,6 +32,25 @@ connected; n−1 is held in in-flight until after the child pin.
 Do not grow these maps to `Vec<Fk>` unless a mainnet miss is shown to
 be this case.
 
+## A block that looks commitment-free is served unverified
+
+Reconstruction checks a rebuilt block against the witness commitment in its
+coinbase ([`reconstruct.rs`](../crates/rbitcoin-query/src/reconstruct.rs)). The
+check runs only when the coinbase carries a commitment. Without one there is
+nothing to compare, and every pre-segwit block is in that state legitimately.
+
+Corruption in the six magic bytes (`6a24aa21a9ed`) of the commitment script
+therefore leaves a block looking commitment-free, and it is served without
+verification. A flipped byte anywhere else in the witness table, or in the
+commitment digest, is refused. A refused block still needs a reindex: the check
+stops bad data being served, it does not repair it
+([106](./external_findings/106-historical-bitrot.md)).
+
+Closing this needs the height, so a commitment can be required at or above
+segwit activation. Do not key the check on witness presence instead: storage
+tests store witness-carrying blocks that were never valid, and those must keep
+reconstructing.
+
 ## Retired confirm dual paths
 
 A missed fact the pipeline promised is

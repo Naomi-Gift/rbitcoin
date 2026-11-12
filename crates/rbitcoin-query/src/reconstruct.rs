@@ -2,6 +2,10 @@
 
 use super::*;
 use crate::U64Map;
+use rbitcoin_consensus::{
+    block::{check_witness_commitment_with_wtxids, coinbase_has_witness_commitment},
+    ConsensusError,
+};
 use std::time::Instant;
 
 #[doc(hidden)]
@@ -527,7 +531,11 @@ impl Query {
                 stored_inputs,
             ));
         }
-        Ok(Block { header, txdata })
+        let block = Block { header, txdata };
+        if coinbase_has_witness_commitment(&block) {
+            check_rebuilt_witness_commitment(&block)?;
+        }
+        Ok(block)
     }
 
     /// Reconstruct a full wire block at a confirmed height from the relational archive.
@@ -797,4 +805,21 @@ pub fn encode_class_a_tx(
         }
     }
     let _ = rec.locktime.consensus_encode(&mut *out);
+}
+
+fn check_rebuilt_witness_commitment(block: &Block) -> Result<(), StoreError> {
+    let wtxids: Vec<[u8; 32]> = block
+        .txdata
+        .iter()
+        .skip(1)
+        .map(|tx| tx.compute_wtxid().to_byte_array())
+        .collect();
+    check_witness_commitment_with_wtxids(block, &wtxids).map_err(|e| {
+        StoreError::Corrupt(match e {
+            ConsensusError::BadBlock("bad-witness-nonce-size") => {
+                "reconstruct: bad witness nonce size"
+            }
+            _ => "reconstruct: witness commitment mismatch",
+        })
+    })
 }
