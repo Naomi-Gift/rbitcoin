@@ -11,3 +11,5 @@ Fixed
   waiting. A ping that arrives while a `getdata` or `getblocktxn` reply is
   only partly queued waits until the rest of that reply is queued. A ping
   with extra bytes after its nonce is answered from the first eight bytes.
+  A pong with extra bytes, or a short pong, that waited behind another
+  frame still updates the outstanding ping.

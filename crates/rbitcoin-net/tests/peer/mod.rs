@@ -8530,7 +8530,7 @@ fn one_charged_pong_keeps_the_queued_nonce() {
 /// requeues a later pong onto, through the same channel it is draining.
 async fn messages_from_writer(
     peer: &Arc<rbitcoin_net::peers::LivePeer>,
-    queued: Vec<PeerOut>,
+    prepare: impl FnOnce(&mpsc::UnboundedSender<PeerOut>),
     want: usize,
 ) -> Vec<NetworkMessage> {
     let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
@@ -8548,9 +8548,7 @@ async fn messages_from_writer(
     ));
     let (tx, rx) = mpsc::unbounded_channel();
     peer.attach_out(tx.clone());
-    for msg in queued {
-        tx.send(msg).unwrap();
-    }
+    prepare(&tx);
     let task = tokio::spawn(run_writer_task(writer, rx, Some(Arc::clone(peer))));
     let mut reader = rbitcoin_net::v1::V1Reader::new(client);
     let mut out = Vec::new();
@@ -8584,7 +8582,12 @@ fn wire_pongs(wire: &[NetworkMessage]) -> Vec<u64> {
 async fn writer_sends_the_queued_pong_then_a_later_nonce_behind_the_replies() {
     let peer = addrfetch_peer();
     peer.store_pong_nonce(0);
-    let only = messages_from_writer(&peer, vec![PeerOut::Msg(NetworkMessage::Pong(4))], 2).await;
+    let only = messages_from_writer(
+        &peer,
+        |tx| tx.send(PeerOut::Msg(NetworkMessage::Pong(4))).unwrap(),
+        2,
+    )
+    .await;
     assert_eq!(
         wire_pongs(&only),
         vec![4, 0],
@@ -8592,10 +8595,19 @@ async fn writer_sends_the_queued_pong_then_a_later_nonce_behind_the_replies() {
     );
 
     let peer = addrfetch_peer();
-    let mut queued = vec![PeerOut::Msg(NetworkMessage::Pong(1))];
-    queued.extend((0..100).map(|_| PeerOut::Msg(NetworkMessage::GetData(Vec::new()))));
     peer.store_pong_nonce(2);
-    let wire = messages_from_writer(&peer, queued, 102).await;
+    let wire = messages_from_writer(
+        &peer,
+        |tx| {
+            tx.send(PeerOut::Msg(NetworkMessage::Pong(1))).unwrap();
+            for _ in 0..100 {
+                tx.send(PeerOut::Msg(NetworkMessage::GetData(Vec::new())))
+                    .unwrap();
+            }
+        },
+        102,
+    )
+    .await;
     let getdata = wire
         .iter()
         .filter(|msg| matches!(msg, NetworkMessage::GetData(_)))
@@ -8620,6 +8632,30 @@ async fn writer_sends_the_queued_pong_then_a_later_nonce_behind_the_replies() {
     assert!(
         pong_2.is_some() && last_reply.is_some() && pong_2 > last_reply,
         "pong 2 must follow every reply, pong_2={pong_2:?} last_reply={last_reply:?}"
+    );
+
+    // A raw send from a zero budget hides a missing charge: the subtract
+    // saturates at 0. Queue through `queue_pong` on top of a baseline.
+    let peer = addrfetch_peer();
+    peer.note_send_queued(1000);
+    let charged = messages_from_writer(
+        &peer,
+        |tx| {
+            queue_pong(Some(peer.as_ref()), tx, 1).unwrap();
+            peer.store_pong_nonce(2);
+        },
+        2,
+    )
+    .await;
+    assert_eq!(
+        wire_pongs(&charged),
+        vec![1, 2],
+        "the charged pong keeps nonce 1; nonce 2 is written after it"
+    );
+    assert_eq!(
+        peer.send_queued(),
+        1000,
+        "both pongs are charged and then subtracted, so the baseline remains"
     );
 }
 
@@ -8684,6 +8720,44 @@ async fn ping_pong_waits_until_both_serve_tails_are_empty() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A ping parked behind only a getdata tail. The flush at the end of
+/// `serve_getdata_tail` is what queues the pong, after that tail's reply.
+#[tokio::test(flavor = "current_thread")]
+async fn ping_pong_follows_a_getdata_tail_alone() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-getdata");
+    hub.ensure_genesis().unwrap();
+    let peer = addrfetch_peer();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    follow
+        .getdata_tail
+        .push_back(Inventory::WitnessBlock(BlockHash::from_byte_array(
+            [9u8; 32],
+        )));
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 21).unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "the pong stays parked while the getdata tail is the only tail pending"
+    );
+    serve_getdata_tail(&hub, &tx, &mut follow, Some(peer.as_ref()))
+        .await
+        .unwrap();
+    assert!(
+        follow.getdata_tail.is_empty(),
+        "the getdata item was served"
+    );
+    match rx.try_recv() {
+        Ok(PeerOut::Msg(NetworkMessage::NotFound(_))) => {}
+        other => panic!("the missing block is a notfound before the pong, got {other:?}"),
+    }
+    match rx.try_recv() {
+        Ok(PeerOut::Msg(NetworkMessage::Pong(21))) => {}
+        other => panic!("the parked ping is queued after that notfound, got {other:?}"),
+    }
+    assert!(rx.try_recv().is_err(), "one pong for the parked ping");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Bytes after the 8-byte nonce used to decode as `Unknown` and get no pong.
 #[test]
 fn ping_with_bytes_after_the_nonce_still_gets_a_pong() {
@@ -8718,6 +8792,51 @@ fn ping_with_bytes_after_the_nonce_still_gets_a_pong() {
         "a ping shorter than eight bytes is not answered"
     );
     assert!(rx.try_recv().is_err(), "a short ping queues no pong");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A pong that waited in `decode_q` decodes as `Unknown` when the payload
+/// is not exactly eight bytes. The read arm still passes those bytes to
+/// `on_pong`. This arm must too, or a matching nonce leaves the ping up
+/// until the timeout.
+#[test]
+fn pong_with_extra_or_short_bytes_still_updates_the_ping() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-unknown");
+    hub.ensure_genesis().unwrap();
+    let peer = addrfetch_peer();
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let nonce = 0x99u64;
+    peer.ping_nonce_sent.store(nonce, Ordering::Relaxed);
+    let mut payload = nonce.to_le_bytes().to_vec();
+    payload.push(0xff);
+    let long = NetworkMessage::Unknown {
+        command: bitcoin::p2p::message::CommandString::try_from("pong").unwrap(),
+        payload,
+    };
+    assert!(
+        handle_peer_control_msg(&long, &hub, &tx, &mut follow, Some(peer.as_ref())).unwrap(),
+        "a pong with extra bytes is still a pong"
+    );
+    assert_eq!(
+        peer.ping_nonce_sent.load(Ordering::Relaxed),
+        0,
+        "a long pong whose first eight bytes match must clear the outstanding ping"
+    );
+    peer.ping_nonce_sent.store(nonce, Ordering::Relaxed);
+    let short = NetworkMessage::Unknown {
+        command: bitcoin::p2p::message::CommandString::try_from("pong").unwrap(),
+        payload: vec![1, 2, 3],
+    };
+    assert!(
+        handle_peer_control_msg(&short, &hub, &tx, &mut follow, Some(peer.as_ref())).unwrap(),
+        "a short pong is still a pong"
+    );
+    assert_eq!(
+        peer.ping_nonce_sent.load(Ordering::Relaxed),
+        0,
+        "a short pong must clear the outstanding ping"
+    );
     let _ = std::fs::remove_dir_all(dir);
 }
 

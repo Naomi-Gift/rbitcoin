@@ -3949,11 +3949,20 @@ pub fn handle_peer_control_msg(
             on_ping(hub, out_tx, follow, session, u64::from_le_bytes(nonce))?;
         }
         // A pong that waited behind `decode_q` is applied here. The read arm
-        // only handles a pong when that queue is empty.
+        // only handles a pong when that queue is empty. Extra bytes, or fewer
+        // than eight, decode as Unknown. The ping state still uses the raw
+        // payload, the same as that read arm.
         NetworkMessage::Pong(n) => {
             if let Some(s) = session {
                 let payload = n.to_le_bytes();
                 if let Some(line) = s.on_pong(&payload, s.clock_now()) {
+                    rbitcoin_log::info!("{line}");
+                }
+            }
+        }
+        NetworkMessage::Unknown { command, payload } if command.as_ref() == "pong" => {
+            if let Some(s) = session {
+                if let Some(line) = s.on_pong(payload, s.clock_now()) {
                     rbitcoin_log::info!("{line}");
                 }
             }
