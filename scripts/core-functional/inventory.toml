@@ -793,7 +793,7 @@ analog = "peer 1p1c is for anchor parents only (#1407); no reconsiderable-reject
 name = "p2p_orphan_handling.py"
 status = "skip"
 reason = "node-behavior"
-analog = "follow-up #1487: child of a rejected parent is requested from other peers"
+analog = "#1487 test_orphan_in_mempool: the orphanage keeps one tx per txid, so a second witness of a parked child replaces the first; Core keeps both"
 
 [[test]]
 name = "p2p_outbound_eviction.py"

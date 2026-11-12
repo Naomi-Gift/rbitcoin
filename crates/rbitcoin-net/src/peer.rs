@@ -5124,6 +5124,12 @@ pub fn on_inv_txid(
         return None;
     }
     let mp = hub.mempool()?;
+    // Core `AlreadyHaveTx` (without the reconsiderable set): a recent reject
+    // is not asked for again, from this peer or another. The child of a
+    // rejected parent is in the set by txid.
+    if mp.try_recent_reject_txid(txid) {
+        return None;
+    }
     let in_orphan = mp.try_orphan_missing(txid).is_some();
     if mp.try_contains(txid) && !in_orphan {
         if let Some(s) = session {
@@ -5170,6 +5176,9 @@ pub fn on_inv_wtxid(
         return None;
     }
     let mp = hub.mempool()?;
+    if mp.try_recent_reject(wtxid) {
+        return None;
+    }
     let ask_back = mp
         .try_txid_for_wtxid(wtxid)
         .is_some_and(|txid| asks_back_local_tx(mp, session, &txid));
