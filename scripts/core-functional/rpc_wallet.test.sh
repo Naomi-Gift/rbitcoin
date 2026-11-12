@@ -354,8 +354,10 @@ def listen_later(port: int, delay_s: float) -> HTTPServer:
     return httpd
 
 
-def proxy_on(esplora_port: int) -> tuple[RpcProxy, HTTPServer, int]:
-    node = HTTPServer(("127.0.0.1", 0), Node)
+def proxy_on(
+    esplora_port: int, node_cls: type[BaseHTTPRequestHandler] = Node
+) -> tuple[RpcProxy, HTTPServer, int]:
+    node = HTTPServer(("127.0.0.1", 0), node_cls)
     threading.Thread(target=node.serve_forever, daemon=True).start()
     proxy = RpcProxy(
         ("127.0.0.1", 0),
@@ -471,6 +473,98 @@ proxy.shutdown()
 node.shutdown()
 stall.shutdown()
 print("ok - a stalled esplora utxo read fails inside the client timeout")
+
+# Node says the tx is not in the mempool and has no confirmations, so
+# gettransaction asks Esplora for /tx/:txid/status. A listener that
+# accepts and never answers has to return inside the client timeout.
+class StallStatus(Esplora):
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path.startswith("/tx/") and path.endswith("/status"):
+            time.sleep(20)
+            return
+        try:
+            super().do_GET()
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+
+class StatusNode(Node):
+    sent: dict[str, str] = {}
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", "0"))
+        item = json.loads(self.rfile.read(n).decode())
+        method = item.get("method")
+        params = item.get("params") or []
+        result = None
+        error = None
+        if method == "getblockcount":
+            result = TIP
+        elif method in ("getblockchaininfo", "getnetworkinfo"):
+            result = "ready"
+        elif method == "gettxout":
+            txid = params[0] if params else None
+            vout = int(params[1]) if len(params) > 1 else 0
+            if txid == TXID and vout == 0:
+                result = {
+                    "value": 50,
+                    "confirmations": 200,
+                    "coinbase": True,
+                    "scriptPubKey": {"hex": spk.hex()},
+                }
+        elif method == "sendrawtransaction":
+            from test_framework.messages import tx_from_hex
+
+            hx = params[0] if params else ""
+            tx = tx_from_hex(hx)
+            StatusNode.sent[tx.txid_hex] = hx
+            result = tx.txid_hex
+        elif method == "getrawtransaction":
+            txid = params[0] if params else ""
+            verbose = bool(params[1]) if len(params) > 1 else False
+            hx = StatusNode.sent.get(str(txid))
+            if hx is None:
+                error = {"code": -5, "message": "No such mempool or blockchain transaction"}
+            elif not verbose:
+                result = hx
+            else:
+                result = {
+                    "txid": txid,
+                    "hex": hx,
+                    "confirmations": 0,
+                    "vin": [],
+                    "vout": [],
+                }
+        else:
+            error = {"code": -32601, "message": "no"}
+        body = json.dumps({"result": result, "error": error, "id": item.get("id")}).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+status_port = free_port()
+status = HTTPServer(("127.0.0.1", status_port), StallStatus)
+threading.Thread(target=status.serve_forever, daemon=True).start()
+proxy, node, listen = proxy_on(status_port, StatusNode)
+import_wallet(listen)
+body = call(listen, "sendtoaddress", ["mnonCMyH9TmAsSj3M59DsbH8H63U3RKoFP", 1], timeout=30)
+assert body["error"] is None, body
+txid = body["result"]
+started = time.monotonic()
+body = call(listen, "gettransaction", [txid], timeout=25)
+elapsed = time.monotonic() - started
+assert body["error"] is None, body
+assert body["result"]["confirmations"] == 0, body
+# The status GET has to have been attempted. Skipping it returns at once.
+assert 4 < elapsed < 25, elapsed
+proxy.shutdown()
+node.shutdown()
+status.shutdown()
+print("ok - a stalled esplora status read returns inside the client timeout")
 
 # A listener that never binds is an error, not a zero balance.
 import rpc_proxy

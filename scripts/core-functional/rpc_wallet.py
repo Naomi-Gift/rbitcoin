@@ -54,6 +54,22 @@ ERR_WALLET_NOT_FOUND = -18
 ERR_INSUFFICIENT = -6
 COINBASE_MATURITY = 100
 DEFAULT_FEE_SAT_VB = 10
+# The harness client stops at 30s, or 120s with --timeout-factor=4.
+# A 5s urlopen can still be in flight when the budget runs out.
+_ESPLORA_BUDGET_S = 12.0
+
+
+def _is_esplora_timeout(err: BaseException) -> bool:
+    seen: BaseException | None = err
+    while seen is not None:
+        if isinstance(seen, TimeoutError):
+            return True
+        reason = getattr(seen, "reason", None)
+        if isinstance(reason, BaseException) and reason is not seen:
+            seen = reason
+            continue
+        seen = seen.__cause__
+    return False
 
 # Core TestNode.PRIV_KEYS[0] — used by unit tests and the 199-block cache.
 CACHE_WIF_0 = "cVpF924EspNh8KjYsfhgY96mmxvT6DgdWiTYMtMjuM74hJaU5psW"
@@ -206,20 +222,27 @@ class WalletHub:
         path: str,
         timeout: float = 5.0,
         *,
-        tries: int = 40,
         deadline: float | None = None,
     ) -> Any:
+        """Retry one timed-out GET until ``deadline``.
+
+        A refused connection fails on the first try. Callers that walk
+        several paths pass one shared deadline so a stall cannot add
+        another budget per path.
+        """
+        if deadline is None:
+            deadline = time.monotonic() + _ESPLORA_BUDGET_S
         last: Exception | None = None
-        for i in range(tries):
-            if i and deadline is not None and time.monotonic() >= deadline:
-                break
+        while time.monotonic() < deadline:
             try:
                 return self._esplora_once(path, timeout=timeout)
             except RpcError as e:
                 last = e
-                if deadline is not None and time.monotonic() >= deadline:
+                if not _is_esplora_timeout(e) or time.monotonic() >= deadline:
                     break
                 time.sleep(0.1)
+        if last is None:
+            raise RpcError(ERR_MISC, "esplora unreachable: timed out")
         raise RpcError(ERR_MISC, f"esplora unreachable: {last}")
 
     def _tip(self) -> int:
@@ -383,11 +406,7 @@ class WalletHub:
         wait_esplora_tip(self._esplora_once, tip)
         found: list[dict[str, Any]] = []
         seen: set[tuple[str, int]] = set()
-        # One urlopen timeout is not a dead listener. The whole address walk
-        # still has to finish inside the harness client (30s, or 120s with
-        # --timeout-factor=4). Past that the client reports -344 and this
-        # loop would keep sending.
-        deadline = time.monotonic() + 12.0
+        deadline = time.monotonic() + _ESPLORA_BUDGET_S
         for addr in list(w.addr_index.keys()):
             arr = self._esplora(f"/address/{addr}/utxo", deadline=deadline)
             if not isinstance(arr, list):
@@ -428,6 +447,7 @@ class WalletHub:
         spent: set[tuple[str, int]] = set()
         extra: list[dict[str, Any]] = []
         seen_tx: set[str] = set()
+        deadline = time.monotonic() + _ESPLORA_BUDGET_S
 
         def mark_spent(txid: str, vout: int) -> None:
             t = str(txid).lower()
@@ -467,7 +487,7 @@ class WalletHub:
             if not raw.get("in_mempool"):
                 # Reorged off the tip (Class A still has the hex). Do not
                 # treat those outputs as wallet UTXOs.
-                if self._conflict_conf(w, rec) < 0:
+                if self._conflict_conf(w, rec, deadline=deadline) < 0:
                     continue
             try:
                 tx = tx_from_hex(rec.hex)
@@ -901,6 +921,7 @@ class WalletHub:
         raw = self._node_or_none("getrawtransaction", [txid, True])
         conf = 0
         hx = rec.hex
+        deadline = time.monotonic() + _ESPLORA_BUDGET_S
         if isinstance(raw, dict):
             hx = raw.get("hex") or hx
             if raw.get("in_mempool"):
@@ -908,14 +929,14 @@ class WalletHub:
             elif "confirmations" in raw and int(raw["confirmations"] or 0) > 0:
                 conf = int(raw["confirmations"])
             else:
-                conf = self._conf_via_esplora(txid)
+                conf = self._conf_via_esplora(txid, deadline=deadline)
             if conf == 0 and not raw.get("in_mempool"):
                 # Archive still has the tx after a reorg; report the conflict.
-                c = self._conflict_conf(w, rec)
+                c = self._conflict_conf(w, rec, deadline=deadline)
                 if c < 0:
                     conf = c
         else:
-            conf = self._conflict_conf(w, rec)
+            conf = self._conflict_conf(w, rec, deadline=deadline)
         out: dict[str, Any] = {
             "amount": sat_btc(rec.amount_sat),
             "fee": sat_btc(-rec.fee_sat) if rec.sent else 0,
@@ -1033,9 +1054,9 @@ class WalletHub:
             "errors": [],
         }
 
-    def _conf_via_esplora(self, txid: str) -> int:
+    def _conf_via_esplora(self, txid: str, *, deadline: float | None = None) -> int:
         try:
-            st = self._esplora(f"/tx/{txid}/status")
+            st = self._esplora(f"/tx/{txid}/status", deadline=deadline)
         except RpcError:
             return 0
         if not isinstance(st, dict) or not st.get("confirmed"):
@@ -1045,7 +1066,9 @@ class WalletHub:
             return 1
         return max(1, self._tip() - height + 1)
 
-    def _conflict_conf(self, w: Wallet, rec: WalletTx) -> int:
+    def _conflict_conf(
+        self, w: Wallet, rec: WalletTx, *, deadline: float | None = None
+    ) -> int:
         ours = set(rec.vin)
         best = 0
         for other in w.txs.values():
@@ -1055,11 +1078,14 @@ class WalletHub:
                 continue
             raw = self._node_or_none("getrawtransaction", [other.txid, True])
             if not isinstance(raw, dict):
-                c = self._conf_via_esplora(other.txid)
+                c = self._conf_via_esplora(other.txid, deadline=deadline)
             elif raw.get("in_mempool"):
                 c = 0
             else:
-                c = int(raw.get("confirmations") or self._conf_via_esplora(other.txid))
+                c = int(
+                    raw.get("confirmations")
+                    or self._conf_via_esplora(other.txid, deadline=deadline)
+                )
             if c > best:
                 best = c
         return -best if best else 0
