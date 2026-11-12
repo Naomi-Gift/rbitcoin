@@ -484,48 +484,41 @@ impl SpendPageLog {
     /// be installed, or a freeze tip names a height above `tip`. Keep serving
     /// those slots, and do not fold them. Only an installed commit height is
     /// lowered to `tip`. A freeze tip above `tip` sets the hold without
-    /// rewriting that height.
+    /// rewriting that height. The RAM hold is stored before the commit file
+    /// is patched, so a failed read or rename still blocks the fold.
     pub fn hold_fold_above(&self, tip: u32) -> Result<(), StoreError> {
         let _io = self.commit_io.lock().unwrap_or_else(|e| e.into_inner());
         let path = self.dir.join(SPEND_PAGES_COMMIT_NAME);
-        let (installed_above, in_flight_above, sealed_above) = {
-            let g = self.lock();
+        let lower_height = {
+            let mut g = self.lock();
+            let installed = g.commit_height.is_some_and(|h| h > tip);
             let in_flight = g.compose_height.is_some_and(|h| h > tip)
                 || g.pending.as_ref().is_some_and(|p| p.height > tip);
-            (
-                g.commit_height.is_some_and(|h| h > tip),
-                in_flight,
-                g.sealed_tip.is_some_and(|h| h > tip),
-            )
-        };
-        if !installed_above && !in_flight_above && !sealed_above {
-            return Ok(());
-        }
-        if path.exists() {
-            let mut buf = std::fs::read(&path).map_err(|e| StoreError::io(&path, e))?;
-            if buf.len() >= COMMIT_HEAD {
-                buf[6..8].copy_from_slice(&1u16.to_le_bytes());
-                if installed_above {
-                    buf[8..12].copy_from_slice(&tip.to_le_bytes());
-                }
-                // The rename is already visible. A directory sync error must
-                // not skip the RAM hold, or this process still folds.
-                write_commit_file(&path, &buf)?;
+            let sealed = g.sealed_tip.is_some_and(|h| h > tip);
+            if !installed && !in_flight && !sealed {
+                return Ok(());
             }
-        }
-        let mut g = self.lock();
-        let installed = g.commit_height.is_some_and(|h| h > tip);
-        let sealed = g.sealed_tip.is_some_and(|h| h > tip);
-        let in_flight = g.compose_height.is_some_and(|h| h > tip)
-            || g.pending.as_ref().is_some_and(|p| p.height > tip);
-        if !installed && !sealed && !in_flight {
+            if installed {
+                g.commit_height = Some(tip);
+            }
+            g.fold_held = true;
+            g.hold_ticks = g.hold_ticks.saturating_add(1);
+            installed
+        };
+        if !path.exists() {
             return Ok(());
         }
-        if installed {
-            g.commit_height = Some(tip);
+        let mut buf = std::fs::read(&path).map_err(|e| StoreError::io(&path, e))?;
+        if buf.len() < COMMIT_HEAD {
+            return Ok(());
         }
-        g.fold_held = true;
-        g.hold_ticks = g.hold_ticks.saturating_add(1);
+        buf[6..8].copy_from_slice(&1u16.to_le_bytes());
+        if lower_height {
+            buf[8..12].copy_from_slice(&tip.to_le_bytes());
+        }
+        // The hold is already stored. A directory sync failure after the
+        // rename stays success. A read or rename error still returns.
+        write_commit_file(&path, &buf)?;
         Ok(())
     }
 
@@ -1228,17 +1221,24 @@ impl SpendPageLog {
         // back if it runs between the two unlinks. Keep the file names and the
         // RAM height behind the same lock the hold uses.
         let _io = self.commit_io.lock().unwrap_or_else(|e| e.into_inner());
-        let _ = std::fs::remove_file(self.dir.join(SPEND_PAGES_COMMIT_NAME));
-        // The commit unlink has to be durable before the page files go. A
-        // crash that keeps the commit and loses the page file reloads the
-        // new records against an older image, or refuses to open.
-        if fsync_parent_dir(&self.dir).is_ok() {
+        let commit_path = self.dir.join(SPEND_PAGES_COMMIT_NAME);
+        let commit_gone = match std::fs::remove_file(&commit_path) {
+            Ok(()) => true,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => true,
+            Err(_) => false,
+        };
+        // The commit name has to be gone, and that directory entry durable,
+        // before the page files go. A directory sync does not prove the
+        // unlink happened. A crash that keeps the commit and loses the page
+        // file reloads the new records against an older image, or refuses
+        // to open.
+        if commit_gone && fsync_parent_dir(&self.dir).is_ok() {
             let _ = std::fs::remove_file(self.dir.join(SPEND_PAGES_NAME));
             self.remove_page_sidecars();
+            let mut g = self.lock();
+            g.log_bytes = 0;
+            g.commit_height = None;
         }
-        let mut g = self.lock();
-        g.log_bytes = 0;
-        g.commit_height = None;
     }
 
     /// Move the generation file over `spend.pages` after the commit names it.

@@ -3089,3 +3089,60 @@ fn review_1501_unstaged_freeze_is_corrupt() {
     .expect("an empty freeze is a real stage");
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A commit read that fails after the tip is already down must still hold.
+///
+/// The next checkpoint would fold that generation onto `spent.body`.
+#[test]
+fn review_1501_hold_patch_failure_still_blocks_the_fold() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+    let commit = d.join(SPEND_PAGES_COMMIT_NAME);
+    std::fs::remove_file(&commit).unwrap();
+    std::fs::create_dir(&commit).unwrap();
+    let err = log.hold_fold_above(1).unwrap_err();
+    assert!(
+        matches!(err, StoreError::Io { .. }),
+        "a failed hold patch must surface the io error, got {err:?}"
+    );
+    log.widen_cool_through();
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, _image| {
+            writes += 1;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(writes, 0, "a failed hold patch must still block the fold");
+    assert_eq!(log.slot(16), Some(slot));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Page files stay when the commit unlink fails.
+///
+/// A directory sync after that does not mean the commit file is gone.
+#[test]
+fn review_1501_commit_unlink_failure_keeps_the_pages() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    log.widen_cool_through();
+    let commit = d.join(SPEND_PAGES_COMMIT_NAME);
+    let pages = d.join(SPEND_PAGES_NAME);
+    assert!(pages.is_file());
+    std::fs::remove_file(&commit).unwrap();
+    std::fs::create_dir(&commit).unwrap();
+    log.fold_into(|_off, _image| Ok(()), || Ok(())).unwrap();
+    assert!(
+        pages.is_file(),
+        "a failed commit unlink must leave the page file"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
