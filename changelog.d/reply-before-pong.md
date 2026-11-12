@@ -8,4 +8,6 @@ Fixed
   transactions, and a `getdata` after `headers` from a high-bandwidth peer.
   A ping that arrives while that batch is being written does not rewrite
   the pong already in the batch. Its pong is queued behind replies already
-  waiting.
+  waiting. A ping that arrives while a `getdata` or `getblocktxn` reply is
+  only partly queued waits until the rest of that reply is queued. A ping
+  with extra bytes after its nonce is answered from the first eight bytes.

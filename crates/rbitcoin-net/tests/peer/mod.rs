@@ -8432,10 +8432,12 @@ fn addrfetch_peer() -> Arc<rbitcoin_net::peers::LivePeer> {
     )
 }
 
-/// Tip-follow keeps one charged pong. Nonce 0 is a real nonce. Draining
-/// that one charge returns the send budget to its previous value.
+/// Tip-follow queues one pong. That message keeps the nonce from the claim.
+/// Later pings replace the stored nonce. The writer sends the queued nonce,
+/// then one pong for the stored nonce. Draining the one queued charge
+/// returns the send budget to its previous value. Nonce 0 is a real nonce.
 #[test]
-fn one_charged_pong_carries_the_latest_nonce() {
+fn one_charged_pong_keeps_the_queued_nonce() {
     let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-one");
     hub.ensure_genesis().unwrap();
     let peer = addrfetch_peer();
@@ -8455,12 +8457,21 @@ fn one_charged_pong_carries_the_latest_nonce() {
         }
     }
     assert_eq!(pongs.len(), 1, "pings coalesce to one pong");
+    assert_eq!(
+        pongs[0], 1,
+        "the queued pong keeps the nonce from its claim"
+    );
+    assert_eq!(
+        peer.pong_nonce(),
+        99_999,
+        "later pings replace the stored nonce"
+    );
     let charge = rbitcoin_net::peers::outbound_msg_bytes(&NetworkMessage::Pong(0));
     assert_eq!(peer.send_queued().saturating_sub(before), charge);
     assert_eq!(
-        pong_nonce_for_write(Some(peer.as_ref()), pongs[0]),
-        99_999,
-        "the writer sends the latest nonce"
+        peer.finish_pong_write(pongs[0]),
+        Some(99_999),
+        "the writer sends 1, then queues this nonce"
     );
     peer.note_out_written(false, charge);
     assert_eq!(
@@ -8490,7 +8501,11 @@ fn one_charged_pong_carries_the_latest_nonce() {
     let fast_before = fast.send_queued();
     queue_pong(Some(fast.as_ref()), &tx, 4).unwrap();
     queue_pong(Some(fast.as_ref()), &tx, 0).unwrap();
-    assert_eq!(pong_nonce_for_write(Some(fast.as_ref()), 4), 0);
+    match rx.try_recv() {
+        Ok(PeerOut::Msg(NetworkMessage::Pong(4))) => {}
+        other => panic!("the queued pong keeps nonce 4, got {other:?}"),
+    }
+    assert_eq!(fast.pong_nonce(), 0, "the later ping stored nonce 0");
     assert_eq!(
         fast.send_queued().saturating_sub(fast_before),
         charge,
@@ -8511,6 +8526,201 @@ fn one_charged_pong_carries_the_latest_nonce() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// Drive `run_writer_task` on a v1 socket. `peer` is the session the writer
+/// requeues a later pong onto, through the same channel it is draining.
+async fn messages_from_writer(
+    peer: &Arc<rbitcoin_net::peers::LivePeer>,
+    queued: Vec<PeerOut>,
+    want: usize,
+) -> Vec<NetworkMessage> {
+    let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = TcpStream::connect(addr).await.unwrap();
+    let (server, _) = listener.accept().await.unwrap();
+    let (_read, write) = server.into_split();
+    let magic = Magic::from(Network::Regtest);
+    let wire = rbitcoin_net::WireBytes::new();
+    let writer = rbitcoin_net::v1::PeerWriter::V1(rbitcoin_net::v1::V1Writer::new(
+        wire.count_write(write),
+        magic,
+    ));
+    let (tx, rx) = mpsc::unbounded_channel();
+    peer.attach_out(tx.clone());
+    for msg in queued {
+        tx.send(msg).unwrap();
+    }
+    let task = tokio::spawn(run_writer_task(writer, rx, Some(Arc::clone(peer))));
+    let mut reader = rbitcoin_net::v1::V1Reader::new(client);
+    let mut out = Vec::new();
+    while out.len() < want {
+        match tokio::time::timeout(Duration::from_secs(2), reader.read_frame(magic, |_| Ok(())))
+            .await
+        {
+            Ok(Ok(frame)) => out.push(frame.decode().into_payload()),
+            Ok(Err(e)) => panic!("writer socket closed early: {e}"),
+            Err(_) => break,
+        }
+    }
+    drop(tx);
+    let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
+    out
+}
+
+fn wire_pongs(wire: &[NetworkMessage]) -> Vec<u64> {
+    wire.iter()
+        .filter_map(|msg| match msg {
+            NetworkMessage::Pong(n) => Some(*n),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The writer puts the nonce from the queued pong on the wire. A newer
+/// nonce stored on the session is a second pong, after replies that were
+/// already queued past the 64-message batch.
+#[tokio::test(flavor = "current_thread")]
+async fn writer_sends_the_queued_pong_then_a_later_nonce_behind_the_replies() {
+    let peer = addrfetch_peer();
+    peer.store_pong_nonce(0);
+    let only = messages_from_writer(&peer, vec![PeerOut::Msg(NetworkMessage::Pong(4))], 2).await;
+    assert_eq!(
+        wire_pongs(&only),
+        vec![4, 0],
+        "nonce 0 on the session must not replace the queued pong; it is answered after it"
+    );
+
+    let peer = addrfetch_peer();
+    let mut queued = vec![PeerOut::Msg(NetworkMessage::Pong(1))];
+    queued.extend((0..100).map(|_| PeerOut::Msg(NetworkMessage::GetData(Vec::new()))));
+    peer.store_pong_nonce(2);
+    let wire = messages_from_writer(&peer, queued, 102).await;
+    let getdata = wire
+        .iter()
+        .filter(|msg| matches!(msg, NetworkMessage::GetData(_)))
+        .count();
+    let pong_2 = wire
+        .iter()
+        .position(|msg| matches!(msg, NetworkMessage::Pong(2)));
+    let last_reply = wire
+        .iter()
+        .rposition(|msg| matches!(msg, NetworkMessage::GetData(_)));
+    assert_eq!(
+        getdata,
+        100,
+        "all 100 replies are written, pongs={:?}",
+        wire_pongs(&wire)
+    );
+    assert_eq!(
+        wire_pongs(&wire),
+        vec![1, 2],
+        "the queued nonce stays 1; nonce 2 is a later pong"
+    );
+    assert!(
+        pong_2.is_some() && last_reply.is_some() && pong_2 > last_reply,
+        "pong 2 must follow every reply, pong_2={pong_2:?} last_reply={last_reply:?}"
+    );
+}
+
+/// A ping while either serve tail still has work does not queue its pong.
+/// The pong follows the replies, and only once both tails are empty. A
+/// second ping replaces the parked nonce.
+#[tokio::test(flavor = "current_thread")]
+async fn ping_pong_waits_until_both_serve_tails_are_empty() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-tail");
+    hub.ensure_genesis().unwrap();
+    let peer = addrfetch_peer();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    follow.getdata_tail.push_back(Inventory::Error);
+    follow.getblocktxn_tail.push_back(BlockTransactionsRequest {
+        block_hash: BlockHash::from_byte_array([0u8; 32]),
+        indexes: vec![0],
+    });
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 11).unwrap();
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 12).unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "a ping must not queue its pong while a getdata or getblocktxn tail is pending"
+    );
+    serve_getdata_tail(&hub, &tx, &mut follow, Some(peer.as_ref()))
+        .await
+        .unwrap();
+    assert!(
+        follow.getdata_tail.is_empty(),
+        "the getdata item was served"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "the pong still waits while the getblocktxn tail is pending"
+    );
+    serve_getblocktxn_tail(&hub, &tx, &mut follow, Some(peer.as_ref()))
+        .await
+        .unwrap();
+    match rx.try_recv() {
+        Ok(PeerOut::Msg(NetworkMessage::Pong(12))) => {}
+        other => panic!("the later parked ping is the one pong, got {other:?}"),
+    }
+    assert!(rx.try_recv().is_err(), "one pong for the parked pings");
+
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 13).unwrap();
+    assert_eq!(peer.pong_nonce(), 13);
+    assert!(
+        rx.try_recv().is_err(),
+        "a later ping replaces the nonce of the pong that is not written yet"
+    );
+    assert_eq!(
+        peer.finish_pong_write(12),
+        Some(13),
+        "the writer sends the parked nonce, then this later one"
+    );
+    assert_eq!(peer.finish_pong_write(13), None);
+    on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 14).unwrap();
+    match rx.try_recv() {
+        Ok(PeerOut::Msg(NetworkMessage::Pong(14))) => {}
+        other => panic!("a ping with both tails empty queues its pong, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Bytes after the 8-byte nonce used to decode as `Unknown` and get no pong.
+#[test]
+fn ping_with_bytes_after_the_nonce_still_gets_a_pong() {
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("pong-extra");
+    hub.ensure_genesis().unwrap();
+    let peer = addrfetch_peer();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let nonce = 0x1122_3344_5566_7788u64;
+    let mut payload = nonce.to_le_bytes().to_vec();
+    payload.push(0xff);
+    let msg = NetworkMessage::Unknown {
+        command: bitcoin::p2p::message::CommandString::try_from("ping").unwrap(),
+        payload,
+    };
+    assert!(
+        handle_peer_control_msg(&msg, &hub, &tx, &mut follow, Some(peer.as_ref())).unwrap(),
+        "a ping with extra bytes is still a ping"
+    );
+    match rx.try_recv() {
+        Ok(PeerOut::Msg(NetworkMessage::Pong(n))) => {
+            assert_eq!(n, nonce, "the pong uses the first eight bytes");
+        }
+        other => panic!("extra bytes after a ping nonce must still be answered, got {other:?}"),
+    }
+    let short = NetworkMessage::Unknown {
+        command: bitcoin::p2p::message::CommandString::try_from("ping").unwrap(),
+        payload: vec![1, 2, 3],
+    };
+    assert!(
+        !handle_peer_control_msg(&short, &hub, &tx, &mut follow, Some(peer.as_ref())).unwrap(),
+        "a ping shorter than eight bytes is not answered"
+    );
+    assert!(rx.try_recv().is_err(), "a short ping queues no pong");
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// A ping that lands after a write batch was taken does not rewrite the
 /// pong in that batch. Its pong is queued behind a reply already waiting.
 #[test]
@@ -8522,21 +8732,15 @@ fn later_ping_pong_waits_behind_a_reply_already_queued() {
     peer.attach_out(tx.clone());
     let mut follow = PeerFollowState::new();
     on_ping(&hub, &tx, &mut follow, Some(peer.as_ref()), 1).unwrap();
-    let snapshot = peer.pong_nonce();
     let queued = match rx.try_recv() {
         Ok(PeerOut::Msg(NetworkMessage::Pong(n))) => n,
         other => panic!("the first ping queues one pong, got {other:?}"),
     };
-    assert_eq!(pong_nonce_for_batch(Some(snapshot), queued), 1);
+    assert_eq!(queued, 1);
     tx.send(PeerOut::Msg(NetworkMessage::GetData(vec![])))
         .unwrap();
     peer.store_pong_nonce(2);
-    assert_eq!(
-        pong_nonce_for_batch(Some(snapshot), queued),
-        1,
-        "the batch keeps the nonce from when it was taken"
-    );
-    requeue_later_pong(peer.as_ref(), snapshot);
+    requeue_later_pong(peer.as_ref(), queued);
     match rx.try_recv() {
         Ok(PeerOut::Msg(NetworkMessage::GetData(_))) => {}
         other => {

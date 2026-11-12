@@ -1732,19 +1732,10 @@ pub fn take_outbound_write_batch(
     batch
 }
 
-/// Nonce to put on a pong already taken into a write batch.
+/// Queue one pong when a nonce newer than `written` is stored.
 ///
-/// A ping that arrives after the batch was taken must not change it. That
-/// ping's pong is queued later, behind replies already waiting on the channel.
-#[doc(hidden)]
-pub fn pong_nonce_for_batch(snapshot: Option<u64>, queued: u64) -> u64 {
-    snapshot.unwrap_or(queued)
-}
-
-/// Queue one pong for a ping that arrived while `written` was on the wire.
-///
-/// The message goes on the session channel, behind a reply queued before
-/// this call. It is not written inside the batch that just finished.
+/// The message goes on the session channel, behind a reply already waiting.
+/// It is not written inside the batch that just finished.
 #[doc(hidden)]
 pub fn requeue_later_pong(session: &crate::peers::LivePeer, written: u64) {
     let Some(extra) = session.finish_pong_write(written) else {
@@ -1763,18 +1754,14 @@ pub async fn run_writer_task(
     writer_session: Option<Arc<crate::peers::LivePeer>>,
 ) {
     while let Some(first) = out_rx.recv().await {
-        // Freeze the nonce for this batch. A ping that lands while a body
-        // in the batch is still on the wire keeps its own later pong.
-        let nonce_at_take = writer_session.as_ref().map(|s| s.pong_nonce());
+        // Write the nonce that was queued. A newer ping is queued again
+        // after this write, so it stays behind replies still on the channel.
         for out in take_outbound_write_batch(first, &mut out_rx) {
             let n = crate::peers::outbound_queued_bytes(&out);
             let serve_slot = out.holds_serve_slot();
-            let (out, pong_written) = match out {
-                PeerOut::Msg(NetworkMessage::Pong(queued)) => {
-                    let nonce = pong_nonce_for_batch(nonce_at_take, queued);
-                    (PeerOut::Msg(NetworkMessage::Pong(nonce)), Some(nonce))
-                }
-                other => (other, None),
+            let pong_written = match &out {
+                PeerOut::Msg(NetworkMessage::Pong(queued)) => Some(*queued),
+                _ => None,
             };
             let err = match out {
                 PeerOut::Msg(msg) | PeerOut::Served(msg) => {
@@ -2605,8 +2592,8 @@ pub async fn peer_session_with(
                     }
                     // A ping or pong already in `decode_q` is applied with those
                     // frames. A later pong must not move the clock ahead of an
-                    // earlier block. A ping on an empty queue is an ordinary
-                    // message: `on_ping` queues its pong after earlier replies.
+                    // earlier block. `on_ping` holds its pong while a getdata
+                    // or getblocktxn tail is still unsent.
                     if (frame.is_ping() || frame.is_pong()) && !decode_q.is_empty() {
                         let n = frame.payload_len();
                         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3584,6 +3571,10 @@ pub struct PeerFollowState {
     /// One parked `getblocktxn`. The session reads no frame while this is
     /// non-empty, so a peer that never reads cannot stack reconstructs.
     pub getblocktxn_tail: VecDeque<BlockTransactionsRequest>,
+    /// Ping nonce held until both serve tails are empty. Queuing the pong
+    /// earlier lets it leave before the rest of that reply. A later ping
+    /// replaces this nonce.
+    pub parked_pong: Option<u64>,
 }
 
 /// A live session's follow state. Dropping it, including when
@@ -3630,6 +3621,7 @@ impl PeerFollowState {
             ban_score: 0,
             getdata_tail: VecDeque::new(),
             getblocktxn_tail: VecDeque::new(),
+            parked_pong: None,
         }
     }
 }
@@ -3947,6 +3939,15 @@ pub fn handle_peer_control_msg(
         NetworkMessage::Version(_) => on_redundant_version(session),
         NetworkMessage::Verack => on_redundant_verack(session),
         NetworkMessage::Ping(n) => on_ping(hub, out_tx, follow, session, *n)?,
+        // Extra bytes after the nonce decode as Unknown. The pong still
+        // uses the first eight, the same as a ping with an exact payload.
+        NetworkMessage::Unknown { command, payload }
+            if command.as_ref() == "ping" && payload.len() >= 8 =>
+        {
+            let mut nonce = [0u8; 8];
+            nonce.copy_from_slice(&payload[..8]);
+            on_ping(hub, out_tx, follow, session, u64::from_le_bytes(nonce))?;
+        }
         // A pong that waited behind `decode_q` is applied here. The read arm
         // only handles a pong when that queue is empty.
         NetworkMessage::Pong(n) => {
@@ -4223,8 +4224,32 @@ pub fn on_ping(
         // sees it before sync_with_ping returns.
         let _ = maybe_queue_initial_getheaders(out_tx, hub, s);
     }
+    if serve_tail_pending(follow) {
+        follow.parked_pong = Some(n);
+        return Ok(());
+    }
+    follow.parked_pong = None;
     queue_pong(session, out_tx, n)?;
     Ok(())
+}
+
+fn serve_tail_pending(follow: &PeerFollowState) -> bool {
+    !follow.getdata_tail.is_empty() || !follow.getblocktxn_tail.is_empty()
+}
+
+/// Queue a pong parked by [`on_ping`] once both serve tails are empty.
+fn flush_parked_pong(
+    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    follow: &mut PeerFollowState,
+    session: Option<&crate::peers::LivePeer>,
+) -> Result<(), NetError> {
+    if serve_tail_pending(follow) {
+        return Ok(());
+    }
+    let Some(n) = follow.parked_pong.take() else {
+        return Ok(());
+    };
+    queue_pong(session, out_tx, n)
 }
 
 #[doc(hidden)]
@@ -4572,7 +4597,7 @@ pub async fn serve_getdata_tail(
                     "filtered block request received when NODE_BLOOM service disabled"
                 );
                 punish_disconnect(&mut follow.ban_score, session);
-                return Ok(());
+                return flush_parked_pong(out_tx, follow, session);
             }
             // Unknown hash: Core ProcessGetData answers notfound. Silence
             // holds the requester's getdata until the stall floor.
@@ -4601,7 +4626,7 @@ pub async fn serve_getdata_tail(
     if !notfound.is_empty() {
         queue_accounted(session, out_tx, NetworkMessage::NotFound(notfound))?;
     }
-    Ok(())
+    flush_parked_pong(out_tx, follow, session)
 }
 
 pub async fn serve_getdata_full_block(
@@ -4857,7 +4882,7 @@ pub async fn serve_getblocktxn_tail(
         };
         serve_one_getblocktxn(hub, out_tx, follow, session, req).await?;
     }
-    Ok(())
+    flush_parked_pong(out_tx, follow, session)
 }
 
 pub async fn serve_one_getblocktxn(
@@ -7865,13 +7890,6 @@ pub fn queue_pong(
         return Ok(());
     }
     queue_accounted(Some(session), out, NetworkMessage::Pong(nonce))
-}
-
-/// Nonce the writer puts on a queued pong. The queued value is only used
-/// when no session is tracking a later ping.
-#[doc(hidden)]
-pub fn pong_nonce_for_write(session: Option<&crate::peers::LivePeer>, queued: u64) -> u64 {
-    session.map(|s| s.pong_nonce()).unwrap_or(queued)
 }
 
 /// Send filtered tx announcements in [`TX_INV_BATCH`] chunks.
