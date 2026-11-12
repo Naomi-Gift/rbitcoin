@@ -653,6 +653,19 @@ impl MilestonePath {
         self.work_hash = Some(hash);
     }
 
+    /// The slot at `height` wins. A dropped tip keeps its link only when work
+    /// is already valid at this same height.
+    fn bind_work_hash(&mut self, height: u32) {
+        if let Some(hash) = self.hash_at(height) {
+            self.work_hash = Some(hash);
+            return;
+        }
+        if self.work_valid && self.work_height == height {
+            return;
+        }
+        self.work_hash = None;
+    }
+
     fn note(&mut self, height: u32, hash: [u8; 32]) {
         if self.slots.is_empty() {
             self.base = height;
@@ -1101,7 +1114,7 @@ impl Query {
         let mut g = self.milestone_path_lock();
         g.note(height, hash);
         if g.work_valid && height == g.work_height {
-            g.work_hash = Some(hash);
+            g.bind_work_hash(height);
         }
         if let Some(base) = base_through_prev {
             if !g.work_valid || height >= g.work_height {
@@ -1122,12 +1135,12 @@ impl Query {
     /// Work through a checkpoint the header file has not stored.
     ///
     /// Later checkpoints replace earlier ones. A lower height does not rewind.
+    /// The checkpoint takes the hash at that height when the slot is present,
+    /// including when work at that height was not valid.
     pub fn note_milestone_checkpoint_work(&self, height: u32, work_be: [u8; 32]) {
         let mut g = self.milestone_path_lock();
         if !g.work_valid || height >= g.work_height {
-            if height != g.work_height {
-                g.work_hash = g.hash_at(height);
-            }
+            g.bind_work_hash(height);
             g.work_through = work_be;
             g.work_height = height;
             g.work_valid = true;

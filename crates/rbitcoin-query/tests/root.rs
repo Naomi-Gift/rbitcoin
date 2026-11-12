@@ -1604,6 +1604,64 @@ fn a_note_at_the_checkpoint_height_still_links_after_the_drop() {
 }
 
 #[test]
+fn a_checkpoint_on_an_invalid_work_tip_still_links_after_the_drop() {
+    let (dir, q) = temp_query("ms-checkpoint-invalid");
+    let mut work_be = [0u8; 32];
+    work_be[31] = 4;
+    let one_be = {
+        let mut b = [0u8; 32];
+        b[31] = 1;
+        b
+    };
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    let through = (bitcoin::Work::from_be_bytes(work_be) + one).to_be_bytes();
+    let h0 = [0x0au8; 32];
+    let h1 = [0x0bu8; 32];
+    q.note_milestone_header(0, h0, [0; 32], one, None);
+    q.note_milestone_checkpoint_work(0, work_be);
+    q.drop_milestone_path_through(0);
+    q.note_milestone_header(1, h1, h0, one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(through),
+        "a checkpoint at height 0 takes the hash already noted there"
+    );
+
+    let h10 = [0x10u8; 32];
+    let h10_b = [0x1bu8; 32];
+    let h11 = [0x11u8; 32];
+    let base_be = {
+        let mut b = [0u8; 32];
+        b[31] = 2;
+        b
+    };
+    q.note_milestone_header(
+        10,
+        h10,
+        [0; 32],
+        one,
+        Some(bitcoin::Work::from_be_bytes(base_be)),
+    );
+    q.clear_milestone_path_above(5);
+    q.note_milestone_header(10, h10_b, [0; 32], one, None);
+    q.note_milestone_checkpoint_work(10, work_be);
+    q.drop_milestone_path_through(10);
+    q.note_milestone_header(11, h11, h10, one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(work_be),
+        "a child of the hash from before the rewind adds nothing"
+    );
+    q.note_milestone_header(11, h11, h10_b, one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(through),
+        "a checkpoint after a rewind takes the hash noted at that height"
+    );
+    let _ = dir;
+}
+
+#[test]
 fn a_load_pack_drops_milestone_hashes_the_store_tip_passed() {
     let (dir, q) = temp_query("ms-load-pack");
     let (mut h0, _) = coinbase_block(0, Fk::NULL, None);
