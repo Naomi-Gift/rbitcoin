@@ -8,8 +8,9 @@ so the harness cookie lands at `DIR/regtest/.cookie` (mirrored from the
 node's `{datadir}/rpc.token` as `__cookie__:<token>`).
 
 Tests speak to a JSON-RPC proxy on `-rpcport`. The node listens on
-`rpcport+10000` and Esplora on `rpcport+20000` (not node-RPC+1: Core
-gives consecutive rpcports, so that collided across nodes).
+`rpcport+10000`. Esplora listens above the ephemeral range (61000-65535),
+not on `rpcport+20000` (that band is inside the ephemeral range) and not
+on node-RPC+1 (Core gives consecutive rpcports, so those collided).
 """
 
 from __future__ import annotations
