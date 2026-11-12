@@ -155,8 +155,8 @@ aarch64 binary before it ships. `docker-publish` rebuilds the image in one
 call from the same staged binaries (the Dockerfile has no `RUN`, so no
 emulation) and `sha256sum -c`s them first.
 
-`workflow_dispatch` runs both builds and both smoke legs and never
-publishes. If `docker-publish` fails after a good Release, rerun that job:
+`workflow_dispatch` without **nightly** runs both builds and both smoke
+legs and never publishes. If `docker-publish` fails after a good Release, rerun that job:
 the same tag gives the same platform manifests.
 
 ### Nightly image
