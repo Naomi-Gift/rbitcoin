@@ -1567,6 +1567,43 @@ fn a_header_after_a_dropped_tip_still_adds_its_work() {
 }
 
 #[test]
+fn a_note_at_the_checkpoint_height_still_links_after_the_drop() {
+    let (dir, q) = temp_query("ms-checkpoint-link");
+    let mut work_be = [0u8; 32];
+    work_be[31] = 4;
+    let one_be = {
+        let mut b = [0u8; 32];
+        b[31] = 1;
+        b
+    };
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    let through_ten = (bitcoin::Work::from_be_bytes(work_be) + one).to_be_bytes();
+    let h10 = [0x10u8; 32];
+    let h10_b = [0x1au8; 32];
+    let h11 = [0x11u8; 32];
+    q.note_milestone_checkpoint_work(10, work_be);
+    q.note_milestone_header(10, h10, [0x09; 32], one, None);
+    q.note_milestone_header(10, h10_b, [0x09; 32], one, None);
+    q.drop_milestone_path_through(10);
+    assert_eq!(q.milestone_header_at(10), None);
+    assert_eq!(q.milestone_best_work_be(), Some(work_be));
+
+    q.note_milestone_header(11, h11, h10, one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(work_be),
+        "a child of the replaced hash adds nothing"
+    );
+    q.note_milestone_header(11, h11, h10_b, one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(through_ten),
+        "a child of the hash now at the checkpoint height adds its work"
+    );
+    let _ = dir;
+}
+
+#[test]
 fn a_load_pack_drops_milestone_hashes_the_store_tip_passed() {
     let (dir, q) = temp_query("ms-load-pack");
     let (mut h0, _) = coinbase_block(0, Fk::NULL, None);

@@ -613,8 +613,8 @@ pub struct MilestonePath {
     pub work_through: [u8; 32],
     pub work_height: u32,
     pub work_valid: bool,
-    /// Hash last recorded at `work_height`. A load pack may drop that slot.
-    /// The next header still has to link to this hash before work grows.
+    /// Hash at `work_height`. A load pack may drop that slot. The next header
+    /// still has to link to this hash before work grows.
     work_hash: Option<[u8; 32]>,
 }
 
@@ -623,27 +623,34 @@ impl MilestonePath {
         self.slots.is_empty()
     }
 
-    fn hash_at(&self, height: u32) -> Option<[u8; 32]> {
+    fn slot(&self, height: u32) -> Option<&Option<[u8; 32]>> {
         if self.slots.is_empty() || height < self.base {
             return None;
         }
-        let idx = (height - self.base) as usize;
-        self.slots.get(idx).copied().flatten()
+        self.slots.get((height - self.base) as usize)
     }
 
-    /// `prev` is the header work was summed through. A dropped slot still
-    /// counts when it is that tip. A hole that is still in range does not.
+    fn hash_at(&self, height: u32) -> Option<[u8; 32]> {
+        self.slot(height).copied().flatten()
+    }
+
+    /// A slot still in range wins. A hole there does not link. A dropped tip
+    /// links through `work_hash`.
     fn links_work_tip(&self, height: u32, prev: [u8; 32]) -> bool {
         if self.work_height != height {
             return false;
         }
-        if !self.slots.is_empty() && height >= self.base {
-            let idx = (height - self.base) as usize;
-            if let Some(slot) = self.slots.get(idx) {
-                return *slot == Some(prev);
-            }
+        match self.slot(height) {
+            Some(slot) => *slot == Some(prev),
+            None => self.work_hash == Some(prev),
         }
-        self.work_hash == Some(prev)
+    }
+
+    fn adopt_work(&mut self, height: u32, through: [u8; 32], hash: [u8; 32]) {
+        self.work_through = through;
+        self.work_height = height;
+        self.work_valid = true;
+        self.work_hash = Some(hash);
     }
 
     fn note(&mut self, height: u32, hash: [u8; 32]) {
@@ -655,8 +662,8 @@ impl MilestonePath {
         if height < self.base {
             let gap = (self.base - height) as usize;
             let mut prefix = Vec::with_capacity(gap + self.slots.len());
+            prefix.push(Some(hash));
             prefix.resize(gap, None);
-            prefix[0] = Some(hash);
             prefix.append(&mut self.slots);
             self.slots = prefix;
             self.base = height;
@@ -674,7 +681,7 @@ impl MilestonePath {
             return;
         }
         if height < self.base {
-            self.slots.clear();
+            self.slots = Vec::new();
             return;
         }
         let keep = (height - self.base) as usize + 1;
@@ -684,15 +691,17 @@ impl MilestonePath {
         self.clear_if_blank();
     }
 
-    /// Drop every hash at or below `height`. Work is left alone: it is the
-    /// header tip, which stays ahead of the confirmed tip.
+    /// Drop every hash at or below `height`.
+    ///
+    /// Work stays. Its tip can be this height, so the slot can go while
+    /// `work_hash` still links the next header.
     fn drop_through(&mut self, height: u32) {
         if self.slots.is_empty() || height < self.base {
             return;
         }
         let drop_n = ((height - self.base) as usize).saturating_add(1);
         if drop_n >= self.slots.len() {
-            self.slots.clear();
+            self.slots = Vec::new();
             return;
         }
         self.slots.drain(..drop_n);
@@ -708,7 +717,7 @@ impl MilestonePath {
 
     fn clear_if_blank(&mut self) -> bool {
         if self.slots.iter().all(Option::is_none) {
-            self.slots.clear();
+            self.slots = Vec::new();
             true
         } else {
             false
@@ -1079,7 +1088,8 @@ impl Query {
     ///
     /// `base_through_prev` is confirmed work through the parent, and only the
     /// caller that checked `prev` is the tip should pass it. Later headers
-    /// extend that total when `prev` is the hash already stored at `height-1`.
+    /// extend that total when `prev` is the hash at `height - 1`, including
+    /// after that slot has been dropped.
     pub fn note_milestone_header(
         &self,
         height: u32,
@@ -1090,13 +1100,12 @@ impl Query {
     ) {
         let mut g = self.milestone_path_lock();
         g.note(height, hash);
+        if g.work_valid && height == g.work_height {
+            g.work_hash = Some(hash);
+        }
         if let Some(base) = base_through_prev {
             if !g.work_valid || height >= g.work_height {
-                let acc = base + header_work;
-                g.work_through = acc.to_be_bytes();
-                g.work_height = height;
-                g.work_valid = true;
-                g.work_hash = Some(hash);
+                g.adopt_work(height, (base + header_work).to_be_bytes(), hash);
             }
             return;
         }
@@ -1106,9 +1115,7 @@ impl Query {
         };
         if g.work_valid && g.links_work_tip(prev_h, prev) {
             let acc = bitcoin::Work::from_be_bytes(g.work_through) + header_work;
-            g.work_through = acc.to_be_bytes();
-            g.work_height = height;
-            g.work_hash = Some(hash);
+            g.adopt_work(height, acc.to_be_bytes(), hash);
         }
     }
 
@@ -1119,7 +1126,7 @@ impl Query {
         let mut g = self.milestone_path_lock();
         if !g.work_valid || height >= g.work_height {
             if height != g.work_height {
-                g.work_hash = None;
+                g.work_hash = g.hash_at(height);
             }
             g.work_through = work_be;
             g.work_height = height;
