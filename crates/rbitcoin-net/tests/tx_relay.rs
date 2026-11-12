@@ -747,6 +747,60 @@ async fn returned_tx_waits_for_in_flight_isolated_sends() {
     );
 }
 
+/// The inbound INV floor is the oldest live accept. Confirming a newer tx
+/// keeps it, and confirming the oldest moves it to the next oldest, not the
+/// newest. Ending a private broadcast restamps the oldest accept, and the
+/// floor moves to the other live tx rather than to the new stamp.
+#[tokio::test]
+async fn inv_floor_follows_the_oldest_live_accept() {
+    let (_store, q, cbs) = pad_cbs(6);
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let hub = MempoolHub::open(tmp(), Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let admit = |cb: Txid, at: u64| {
+        hub.note_mock_now(at);
+        let tx = spend_true(cb, 1_000, spk.clone());
+        hub.accept_tx(&tx).expect("accept");
+        tx.compute_txid()
+    };
+    let oldest = admit(cbs[1], 1_000);
+    admit(cbs[2], 5_000);
+    let newest = admit(cbs[3], 5_005);
+    hub.note_mock_now(5_010);
+    assert_eq!(hub.remove_for_block(&[newest]), 1);
+    assert!(
+        hub.any_tx_inv_due(),
+        "the 1000 accept is still live and due"
+    );
+    assert_eq!(hub.remove_for_block(&[oldest]), 1);
+    assert!(
+        !hub.any_tx_inv_due(),
+        "the 5000 accept is the floor, 10s old"
+    );
+    hub.note_mock_now(5_030);
+    assert!(hub.any_tx_inv_due(), "the 5000 accept is 30s old");
+
+    let hub = MempoolHub::open(tmp(), Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    hub.set_isolated_broadcast(true);
+    hub.note_mock_now(1_000);
+    let local = spend_true(cbs[4], 1_000, spk.clone());
+    let local_id = local.compute_txid();
+    hub.accept_tx_from(&local, TxOrigin::Local).expect("accept");
+    assert_eq!(hub.next_isolated().await.0, local_id);
+    hub.note_mock_now(5_000);
+    hub.accept_tx(&spend_true(cbs[5], 1_000, spk))
+        .expect("accept");
+    hub.isolated_sent(&local_id);
+    hub.note_mock_now(5_040);
+    hub.note_returned(&local_id);
+    assert_eq!(hub.accept_time_txid(&local_id), Some(5_040));
+    assert!(
+        hub.any_tx_inv_due(),
+        "the floor is the 5000 accept, not the 5040 restamp"
+    );
+}
+
 /// The row is still local origin at the moment the age stamp takes the
 /// wtxid map. Dropping it first lets an inbound inv tick read the submit time.
 fn row_stays_until_age_stamp(
