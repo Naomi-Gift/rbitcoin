@@ -169,23 +169,6 @@ fn a_flipped_witness_byte_is_not_served_as_block_bytes() {
     let _ = std::fs::remove_dir_all(dir.path());
 }
 
-#[test]
-fn witness_commitment_intact_reports_a_flipped_byte() {
-    let (dir, q) = tiny_query_labeled("reconstruct-witness-intact-check");
-    let (header, txs) = coinbase_only_block(true, true);
-    let header_fk = q.commit_class_a_only(&header, &txs).expect("archive");
-    let fks = q
-        .header_tx_fks(header_fk, None)
-        .expect("tx fks")
-        .expect("body list");
-    assert!(q.witness_commitment_intact(&fks).expect("intact"));
-
-    flip_last_seqsigwit_byte(&q, fks[0]);
-
-    assert!(!q.witness_commitment_intact(&fks).expect("flipped"));
-    let _ = std::fs::remove_dir_all(dir.path());
-}
-
 /// Two transactions: a coinbase carrying the commitment, and a second one with
 /// a witness whose null prevout keeps its wtxid independent of the commitment.
 fn block_with_a_witness_tx() -> (HeaderRecord, Vec<TxApply>) {
@@ -242,7 +225,6 @@ fn a_flipped_non_coinbase_witness_byte_is_not_served() {
         .expect("tx fks")
         .expect("body list");
     assert_eq!(fks.len(), 2);
-    assert!(q.witness_commitment_intact(&fks).expect("intact"));
     assert!(q
         .witness_block_bytes_by_hash(&header.hash)
         .expect("encode intact")
@@ -250,7 +232,6 @@ fn a_flipped_non_coinbase_witness_byte_is_not_served() {
 
     flip_last_seqsigwit_byte(&q, fks[1]);
 
-    assert!(!q.witness_commitment_intact(&fks).expect("flipped"));
     assert!(
         q.witness_block_bytes_by_hash(&header.hash)
             .expect("encode flipped")

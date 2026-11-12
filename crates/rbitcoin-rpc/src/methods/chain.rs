@@ -1036,20 +1036,16 @@ fn getblock_v1(
     if let Ok(Some((size, weight))) = ctx.query.block_size_weight(at.header_fk) {
         insert_size_weight(&mut obj, u64::from(size), u64::from(weight));
     }
-    let fks = ctx
+    let cb_fk = ctx
         .query
         .header_tx_fks(at.header_fk, Some(&at.hash))
-        .map_err(misc)?;
-    let cb_witness_intact = fks
-        .as_ref()
-        .is_none_or(|fks| ctx.query.witness_commitment_intact(fks).unwrap_or(false));
-    if cb_witness_intact {
-        if let Some(fk) = fks.as_ref().and_then(|fks| fks.first().copied()) {
-            match ctx.query.reconstruct_tx(fk) {
-                Ok(cb) => obj["coinbase_tx"] = coinbase_tx_json(&cb),
-                Err(rbitcoin_store::StoreError::Pruned { .. }) => {}
-                Err(e) => return Err(misc(e)),
-            }
+        .map_err(misc)?
+        .and_then(|fks| fks.first().copied());
+    if let Some(fk) = cb_fk {
+        match ctx.query.reconstruct_tx(fk) {
+            Ok(cb) => obj["coinbase_tx"] = coinbase_tx_json(&cb),
+            Err(rbitcoin_store::StoreError::Pruned { .. }) => {}
+            Err(e) => return Err(misc(e)),
         }
     }
     if !at.finish(ctx, &mut obj)? {

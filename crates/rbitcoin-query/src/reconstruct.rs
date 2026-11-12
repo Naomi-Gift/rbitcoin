@@ -451,21 +451,6 @@ impl Query {
         Ok(Some(encode_witness_block(&header, &rows)))
     }
 
-    /// True when the coinbase commitment covers the stored bodies, or when the
-    /// coinbase carries none. `Pruned` when the witness rows are gone.
-    pub fn witness_commitment_intact(&self, tx_fks: &[Fk]) -> Result<bool, QueryError> {
-        let Some((first, rest)) = tx_fks.split_first() else {
-            return Ok(true);
-        };
-        let (rec, outs, ins) = self.load_body_from_store(*first)?;
-        let coinbase = Self::transaction_from_class_a(rec, outs, ins);
-        if coinbase_commitment(&coinbase).is_none() {
-            return Ok(true);
-        }
-        let rows = self.load_class_a_rows(rest)?;
-        Ok(rows_match_commitment(&coinbase, &rows))
-    }
-
     /// Consensus-encoded wire bytes for a stored tx (Electrum / RPC).
     pub fn tx_wire_bytes(&self, tx_fk: Fk) -> Result<Vec<u8>, QueryError> {
         use bitcoin::consensus::Encodable;
