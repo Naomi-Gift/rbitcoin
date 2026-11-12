@@ -8,3 +8,6 @@ Fixed
   announcer. A peer's parent resent after its txid is in the mempool erases
   that peer's orphans whose txid is pooled too (Core `Find1P1CPackage`).
   `p2p_orphan_handling.py` now runs.
+- **A reparked orphan is no longer evicted first.** Removing an orphan left its
+  wtxid in the eviction order. Parked again, the stale entry made it the
+  oldest, so the next eviction dropped it instead of the oldest orphan.

@@ -56,6 +56,7 @@ pub struct Orphanage {
     pub by_txid: HashMap<Txid, Vec<Wtxid>>,
     /// parent txid → orphan children waiting on it.
     pub by_parent: HashMap<Txid, HashSet<Wtxid>>,
+    /// Eviction order, oldest first: each key of `by_wtxid` once.
     pub fifo: VecDeque<Wtxid>,
     pub total_weight: u64,
     /// Announced weight per peer. Eviction reads this instead of scanning the set.
@@ -319,7 +320,6 @@ impl Orphanage {
         if last {
             self.remove_wtxid(&wtxid);
         }
-        self.fifo.retain(|w| self.by_wtxid.contains_key(w));
         true
     }
 
@@ -337,9 +337,6 @@ impl Orphanage {
     pub fn evict_oldest_filtered(&mut self, honor_reserve: bool) -> bool {
         let mut skipped = VecDeque::new();
         while let Some(wtxid) = self.fifo.pop_front() {
-            if !self.by_wtxid.contains_key(&wtxid) {
-                continue;
-            }
             if honor_reserve && self.announcers_within_reserve(&wtxid) {
                 skipped.push_back(wtxid);
                 continue;
@@ -362,10 +359,11 @@ impl Orphanage {
         Some(e.tx)
     }
 
-    /// Drop `wtxid` from every index but `by_parent`. A stale fifo id is
-    /// skipped on pop.
+    /// Drop `wtxid` from every index but `by_parent`, the eviction order
+    /// included, so a later park of the same wtxid is the newest.
     fn unlink(&mut self, wtxid: &Wtxid) -> Option<OrphanEntry> {
         let e = self.by_wtxid.remove(wtxid)?;
+        self.fifo.retain(|w| w != wtxid);
         if let Some(versions) = self.by_txid.get_mut(&e.txid) {
             versions.retain(|w| w != wtxid);
             if versions.is_empty() {
@@ -461,7 +459,6 @@ impl Orphanage {
         for w in &gone {
             self.remove_wtxid(w);
         }
-        self.fifo.retain(|w| self.by_wtxid.contains_key(w));
     }
 
     fn alloc_taken_gen(&mut self) -> u64 {
@@ -548,7 +545,6 @@ impl Orphanage {
         for w in drop {
             self.remove_wtxid(&w);
         }
-        self.fifo.retain(|w| self.by_wtxid.contains_key(w));
         for taken in self.taken.values_mut() {
             if taken.announcers.remove(&peer) && taken.announcers.is_empty() {
                 taken.drop = true;
@@ -558,11 +554,7 @@ impl Orphanage {
 
     pub fn snapshot(&self) -> Vec<OrphanSnapshot> {
         let mut out = Vec::with_capacity(self.fifo.len());
-        let mut seen = HashSet::new();
         for wtxid in &self.fifo {
-            if !seen.insert(*wtxid) {
-                continue;
-            }
             if let Some(e) = self.by_wtxid.get(wtxid) {
                 out.push(OrphanSnapshot {
                     tx: e.tx.clone(),
@@ -590,6 +582,5 @@ impl Orphanage {
         for w in drop {
             self.remove_wtxid(&w);
         }
-        self.fifo.retain(|w| self.by_wtxid.contains_key(w));
     }
 }

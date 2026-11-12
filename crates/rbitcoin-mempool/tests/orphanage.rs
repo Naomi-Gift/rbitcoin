@@ -154,6 +154,30 @@ fn fifo_evicts_under_count_cap() {
     assert!(o.total_weight() <= DEFAULT_ORPHAN_MAX_WEIGHT);
 }
 
+/// A removed orphan leaves no place in the eviction order. Parked again, it
+/// is the newest, so the next eviction takes the older one.
+#[test]
+fn reparked_orphan_counts_as_newest() {
+    let mut o = Orphanage::with_limits(DEFAULT_ORPHAN_MAX_WEIGHT, 2);
+    let p = txid_n(9);
+    let miss = || BTreeSet::from([p]);
+    let a = make_orphan(p, 1);
+    let b = make_orphan(p, 2);
+    let c = make_orphan(p, 3);
+    assert!(o.insert_from(a.clone(), miss(), None));
+    assert!(o.remove_wtxid(&a.compute_wtxid()).is_some());
+    assert!(o.insert_from(b.clone(), miss(), None));
+    assert!(o.insert_from(a.clone(), miss(), None));
+    assert!(o.insert_from(c.clone(), miss(), None));
+    assert!(!o.contains_wtxid(&b.compute_wtxid()), "the oldest goes");
+    assert!(
+        o.contains_wtxid(&a.compute_wtxid()),
+        "the reparked one stays"
+    );
+    assert!(o.contains_wtxid(&c.compute_wtxid()));
+    assert_eq!(o.fifo.len(), o.len(), "one fifo id per orphan");
+}
+
 #[test]
 fn core_like_budget_constants() {
     assert_eq!(ORPHAN_RESERVED_WEIGHT_PER_PEER, 404_000);
