@@ -9562,3 +9562,85 @@ fn submitblock_reads_each_spent_parent_once_and_only_its_spent_outputs() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn flip_last_seqsigwit_byte(query: &Query, fk: rbitcoin_primitives::Fk) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+
+    let (off, len) = query.store().tx_seqsigwit_range(fk).expect("locator");
+    let (_, inputs, _) = query.store().get_tx_full(fk).expect("decode");
+    assert!(
+        inputs.last().is_some_and(|i| !i.witness.is_empty()),
+        "fixture must end with a witness item"
+    );
+    let mut record = Vec::new();
+    for inp in &inputs {
+        inp.encode_into(&mut record);
+    }
+    let rec_len = record.len() as u64;
+    assert!(
+        rec_len <= len && len - rec_len < 8,
+        "locator span {len} must be the record {rec_len} plus 8-byte padding"
+    );
+    let store = query.store();
+    let path = store
+        .cold_path()
+        .unwrap_or(store.path())
+        .join("seqsigwit.body");
+    let at = off + rec_len - 1;
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&path)
+        .expect("open seqsigwit.body");
+    f.seek(SeekFrom::Start(at)).expect("seek");
+    let mut byte = [0u8; 1];
+    f.read_exact(&mut byte).expect("read byte");
+    f.seek(SeekFrom::Start(at)).expect("seek back");
+    f.write_all(&[byte[0] ^ 0x01]).expect("write byte");
+    f.flush().expect("flush");
+    query.clear_seqsigwit_ram_window();
+}
+
+#[test]
+fn getblock_verbosity_1_omits_a_coinbase_whose_witness_no_longer_matches() {
+    let mut params = rbitcoin_consensus::ChainParams::regtest();
+    params.apply_test_activation_height("segwit", 1).unwrap();
+    let (ctx, dir, hub) = ctx_regtest_hub_on(params, 300_000_000);
+    let prev = hub.tip_hash().unwrap();
+    let prev_time = hub.tip_header().unwrap().time;
+    let reserved = [0u8; 32];
+    let mut b = rbitcoin_consensus::mine_regtest_paying(
+        prev,
+        prev_time + 1,
+        1,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![],
+    );
+    b.txdata[0].input[0].witness = bitcoin::Witness::from_slice(&[reserved]);
+    b.txdata[0].output.push(bitcoin::TxOut {
+        value: Amount::ZERO,
+        script_pubkey: ScriptBuf::from_bytes(rbitcoin_consensus::witness_commitment_script(
+            [],
+            &reserved,
+        )),
+    });
+    b.header.merkle_root = b.compute_merkle_root().unwrap();
+    regrind(&mut b);
+    let submitted = dispatch(&ctx, "submitblock", vec![json!(block_hex(&b))]).unwrap();
+    assert!(submitted.is_null(), "{submitted}");
+    let hash = b.block_hash().to_string();
+
+    let before = dispatch(&ctx, "getblock", vec![json!(hash), json!(1)]).unwrap();
+    assert!(before.get("coinbase_tx").is_some(), "{before}");
+
+    let fks = hub.query.block_tx_fks(Height(1)).unwrap();
+    flip_last_seqsigwit_byte(&hub.query, fks[0]);
+
+    let after = dispatch(&ctx, "getblock", vec![json!(hash), json!(1)]).unwrap();
+    assert!(
+        after.get("coinbase_tx").is_none(),
+        "a coinbase whose witness no longer matches the commitment is not attached: {after}"
+    );
+    assert_eq!(after["tx"].as_array().unwrap().len(), 1);
+    let _ = std::fs::remove_dir_all(&dir);
+}
