@@ -33,9 +33,6 @@ pub fn verify(
     amount: Amount,
 ) -> Result<(), ConsensusError> {
     let (sig_raw, pubkey_raw) = witness_pair(&tx.input[input_index.get()])?;
-    if sig_raw.is_empty() || pubkey_raw.is_empty() {
-        return Err(ConsensusError::Script("p2wpkh empty witness item".into()));
-    }
     verify_loaded(
         job,
         input_index,

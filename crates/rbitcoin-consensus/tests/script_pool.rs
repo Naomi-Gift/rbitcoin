@@ -1004,3 +1004,126 @@ fn run_cpu_guest_cannot_touch_store_io() {
     .expect("script worker");
     assert!(hit, "store read on a script worker must panic");
 }
+
+/// Lost-wakeup close: work pending or a newer epoch returns before park.
+/// A parked mutant is unparked so this process still exits.
+fn expect_idle_miss(pool: Arc<ScriptWorkers>, epoch: usize) -> bool {
+    let idle = Arc::new(rbitcoin_consensus::sync::Mutex::new(Vec::new()));
+    let (tx, rx) = mpsc::channel();
+    let pool_t = Arc::clone(&pool);
+    let idle_t = Arc::clone(&idle);
+    let handle = thread::spawn(move || {
+        let v = park_if_still_idle(&pool_t, epoch, &idle_t);
+        let _ = tx.send(v);
+    });
+    match rx.recv_timeout(Duration::from_millis(400)) {
+        Ok(v) => {
+            handle.join().expect("idle turn");
+            v
+        }
+        Err(_) => {
+            handle.thread().unpark();
+            let v = rx.recv_timeout(Duration::from_secs(2)).unwrap_or(true);
+            handle.join().expect("idle turn");
+            v
+        }
+    }
+}
+
+fn local_pool(epoch: usize) -> Arc<ScriptWorkers> {
+    Arc::new(ScriptWorkers {
+        jobs: rbitcoin_consensus::sync::Mutex::new(Default::default()),
+        epoch: AtomicUsize::new(epoch),
+    })
+}
+
+#[test]
+fn park_returns_before_sleep_when_work_or_epoch_moved() {
+    let _gate = STEAL_TEST.lock().unwrap_or_else(|p| p.into_inner());
+    let pool = local_pool(7);
+    {
+        let mut jobs = rbitcoin_consensus::sync::lock(&pool.jobs);
+        jobs.push_back(Box::new(|| {}));
+    }
+    // The recheck repeats this predicate. Queued work must return before that gate.
+    let arm = DelayParkArm::arm();
+    let entered_before = DELAY_PARK_ENTERED.load(Ordering::SeqCst);
+    let idle = Arc::new(rbitcoin_consensus::sync::Mutex::new(Vec::new()));
+    let (tx, rx) = mpsc::channel();
+    let pool_t = Arc::clone(&pool);
+    let idle_t = Arc::clone(&idle);
+    let handle = thread::spawn(move || {
+        let v = park_if_still_idle(&pool_t, 7, &idle_t);
+        let _ = tx.send(v);
+    });
+    let reached_gate = match rx.recv_timeout(Duration::from_millis(400)) {
+        Ok(false) => false,
+        Ok(true) => true,
+        Err(_) => {
+            arm.go();
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+            true
+        }
+    };
+    handle.join().expect("queued work");
+    assert!(
+        !reached_gate && DELAY_PARK_ENTERED.load(Ordering::SeqCst) == entered_before,
+        "queued work must return before the park gate"
+    );
+    drop(arm);
+    let fresh = local_pool(7);
+    assert!(
+        !expect_idle_miss(Arc::clone(&fresh), 3),
+        "a newer epoch must not park"
+    );
+
+    let second = local_pool(4);
+    let arm = DelayParkArm::arm();
+    let idle = Arc::new(rbitcoin_consensus::sync::Mutex::new(Vec::new()));
+    let (tx, rx) = mpsc::channel();
+    let pool_t = Arc::clone(&second);
+    let idle_t = Arc::clone(&idle);
+    let handle = thread::spawn(move || {
+        let v = park_if_still_idle(&pool_t, 4, &idle_t);
+        let _ = tx.send(v);
+    });
+    wait_until("park recheck", || {
+        DELAY_PARK_ENTERED.load(Ordering::SeqCst) != 0
+    });
+    second.epoch.fetch_add(1, Ordering::Release);
+    arm.go();
+    let parked = match rx.recv_timeout(Duration::from_millis(400)) {
+        Ok(v) => v,
+        Err(_) => {
+            handle.thread().unpark();
+            rx.recv_timeout(Duration::from_secs(2)).unwrap_or(true)
+        }
+    };
+    handle.join().expect("second check");
+    assert!(!parked, "an epoch bump during the recheck must not park");
+
+    let third = local_pool(4);
+    let arm = DelayParkArm::arm();
+    let idle = Arc::new(rbitcoin_consensus::sync::Mutex::new(Vec::new()));
+    let (tx, rx) = mpsc::channel();
+    let pool_t = Arc::clone(&third);
+    let idle_t = Arc::clone(&idle);
+    let handle = thread::spawn(move || {
+        let v = park_if_still_idle(&pool_t, 4, &idle_t);
+        let _ = tx.send(v);
+    });
+    wait_until("park recheck work", || {
+        DELAY_PARK_ENTERED.load(Ordering::SeqCst) != 0
+    });
+    rbitcoin_consensus::sync::lock(&third.jobs).push_back(Box::new(|| {}));
+    arm.go();
+    let parked = match rx.recv_timeout(Duration::from_millis(400)) {
+        Ok(v) => v,
+        Err(_) => {
+            handle.thread().unpark();
+            rx.recv_timeout(Duration::from_secs(2)).unwrap_or(true)
+        }
+    };
+    handle.join().expect("second check work");
+    assert!(!parked, "work queued during the recheck must not park");
+}

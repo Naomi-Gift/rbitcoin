@@ -116,3 +116,15 @@ fn witness_shape_errors() {
     }
     .is_err());
 }
+
+#[test]
+fn witness_element_at_the_520_byte_cap_is_not_push_size() {
+    let cap = vec![0x02u8; 520];
+    let over = vec![0x02u8; 521];
+    assert!(check_element_sizes(&cap, &[0x02; 33]).is_ok());
+    let sig_over = check_element_sizes(&over, &[0x02; 33]).unwrap_err();
+    assert!(format!("{sig_over}").contains("PUSH_SIZE"), "{sig_over}");
+    assert!(check_element_sizes(&[0x30, 0x01], &cap).is_ok());
+    let pk_over = check_element_sizes(&[0x30, 0x01], &over).unwrap_err();
+    assert!(format!("{pk_over}").contains("PUSH_SIZE"), "{pk_over}");
+}
