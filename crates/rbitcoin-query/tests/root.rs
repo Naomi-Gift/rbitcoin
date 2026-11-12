@@ -1274,8 +1274,8 @@ fn block_txstat_rows_have_fees_hash_and_cell_bytes() {
 }
 
 /// Block summary rows: stored txid order, stamped fee and weight, and the
-/// output value sum per tx, coinbase first with fee 0. Unstamped rows are
-/// stamped from the reconstructed block and give the same rows.
+/// output value sum per tx, coinbase first with fee 0. Unstamped rows give
+/// the same rows from the reconstructed block, and the read writes nothing.
 #[test]
 fn block_tx_summary_rows_match_the_wire_block() {
     let (dir, q) = temp_query("blk-summary");
@@ -1323,8 +1323,11 @@ fn block_tx_summary_rows_match_the_wire_block() {
         unstamp_txstat(&q, fk);
     }
     assert!(q.stamped_txstat_block(Height(1)).unwrap().is_none());
-    assert_eq!(rows(&q), want, "unstamped rows restamp from the block");
-    assert!(q.stamped_txstat_block(Height(1)).unwrap().is_some());
+    assert_eq!(rows(&q), want, "unstamped rows come from the wire block");
+    assert!(
+        q.stamped_txstat_block(Height(1)).unwrap().is_none(),
+        "a summary read does not stamp"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
