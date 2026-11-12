@@ -311,6 +311,7 @@ fn chain_ops_client_param_edges(ctx: &mut RpcContext) {
     chain_ops_regtest_type_errors(ctx);
     chain_ops_generate_count_is_core_int(ctx);
     chain_ops_index_args_are_core_ints(ctx);
+    chain_ops_spendingprevout_vout_is_core_int(ctx);
     chain_ops_junk_tx_hex(ctx);
     chain_ops_network_identity(ctx);
     ctx.stop.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -516,7 +517,6 @@ fn chain_ops_unknown_named_param(ctx: &RpcContext) {
 fn chain_ops_wrong_json_types(ctx: &RpcContext) {
     for (method, params, needle) in [
         ("help", vec![json!(1)], "command must be a string"),
-        ("getblockhash", vec![json!("0")], "must be an integer"),
         ("getblockheader", vec![json!(1)], "must be a string"),
         ("getblock", vec![json!(true)], "must be a string"),
         ("getrawtransaction", vec![json!([])], "must be a string"),
@@ -636,10 +636,48 @@ fn chain_ops_generate_count_is_core_int(ctx: &RpcContext) {
     assert_eq!(tip_count(ctx), 0);
 }
 
-/// Core reads `gettxout` `n` with `getInt<uint32_t>` and `waitforblockheight`
-/// `height` with `getInt<int>`. A value outside that type is `-1` `JSON
-/// integer out of range`, not a vout or height cut to 32 bits, and a
-/// negative height is already reached.
+/// Core type-checks each `gettxspendingprevout` output, then reads `vout`
+/// with `getInt<int>`: a missing or null `vout` and a string are `-3`, a value
+/// outside `int` is `-1`, and a negative one is `-8`.
+fn chain_ops_spendingprevout_vout_is_core_int(ctx: &RpcContext) {
+    let txid = json!("00".repeat(32));
+    let spender_of = |output: Value| dispatch(ctx, "gettxspendingprevout", vec![json!([output])]);
+    let at = |vout: Value| spender_of(json!({ "txid": txid.clone(), "vout": vout }));
+    for vout in [
+        json!(4_294_967_296_u64),
+        json!(u32::MAX),
+        json!(2_147_483_648_u64),
+        json_num("1.5"),
+    ] {
+        let err = at(vout.clone()).unwrap_err();
+        assert_eq!(err["code"], ERR_MISC, "vout={vout}: {err}");
+        assert_eq!(err["message"], "JSON integer out of range", "vout={vout}: {err}");
+    }
+    let err = at(json!(-1)).unwrap_err();
+    assert_eq!(err["code"], ERR_INVALID_PARAMETER, "{err}");
+    assert_eq!(err["message"], "Invalid parameter, vout cannot be negative", "{err}");
+    for output in [json!({ "txid": txid.clone() }), json!({ "txid": txid.clone(), "vout": null })] {
+        let err = spender_of(output).unwrap_err();
+        assert_eq!(err["code"], ERR_TYPE_ERROR, "{err}");
+        assert_eq!(err["message"], "Missing vout", "{err}");
+    }
+    let err = at(json!("0")).unwrap_err();
+    assert_eq!(err["code"], ERR_TYPE_ERROR, "{err}");
+    assert_eq!(
+        err["message"], "JSON value of type string for field vout is not of expected type number",
+        "{err}"
+    );
+    for (vout, want) in [(json_num("-0"), 0), (json!(i32::MAX), i32::MAX)] {
+        let row = at(vout).unwrap();
+        assert_eq!(row, json!([{ "txid": txid.clone(), "vout": want }]));
+    }
+}
+
+/// Core reads `gettxout` `n` with `getInt<uint32_t>`, and `waitforblockheight`
+/// and `getblockhash` `height` with `getInt<int>`. A value outside that type
+/// is `-1` `JSON integer out of range`, not a height cut to 32 bits. A
+/// negative `waitforblockheight` height is already reached; a negative
+/// `getblockhash` height is `-8`.
 fn chain_ops_index_args_are_core_ints(ctx: &RpcContext) {
     let txid = json!("00".repeat(32));
     for n in [
@@ -652,25 +690,6 @@ fn chain_ops_index_args_are_core_ints(ctx: &RpcContext) {
         assert_eq!(err["code"], ERR_MISC, "gettxout n={n}: {err}");
         assert_eq!(err["message"], "JSON integer out of range", "gettxout n={n}: {err}");
     }
-    let spender_of = |vout: Value| {
-        let outputs = json!([{ "txid": txid.clone(), "vout": vout }]);
-        dispatch(ctx, "gettxspendingprevout", vec![outputs])
-    };
-    for vout in [json!(4_294_967_296_u64), json!(4_294_967_297_u64), json!(u64::MAX)] {
-        let err = spender_of(vout.clone()).unwrap_err();
-        assert_eq!(err["code"], ERR_INVALID_PARAMETER, "vout={vout}: {err}");
-        assert_eq!(err["message"], "vout out of range", "vout={vout}: {err}");
-    }
-    for vout in [json!(-1), json_num("1.5"), json!("0"), Value::Null] {
-        let err = spender_of(vout).unwrap_err();
-        assert_eq!(err["code"], ERR_INVALID_PARAMS, "{err}");
-        assert_eq!(err["message"], "vout required", "{err}");
-    }
-    for vout in [0, i32::MAX as u32 + 1, u32::MAX] {
-        let row = spender_of(json!(vout)).unwrap();
-        assert_eq!(row, json!([{ "txid": txid.clone(), "vout": vout }]));
-    }
-
     let last_vout = dispatch(ctx, "gettxout", vec![txid, json!(u32::MAX)]).unwrap();
     assert!(last_vout.is_null(), "{last_vout}");
 
@@ -678,13 +697,20 @@ fn chain_ops_index_args_are_core_ints(ctx: &RpcContext) {
         let err = dispatch(ctx, "waitforblockheight", vec![height.clone(), json!(100)]).unwrap_err();
         assert_eq!(err["code"], ERR_MISC, "height={height}: {err}");
         assert_eq!(err["message"], "JSON integer out of range", "height={height}: {err}");
+        let err = dispatch(ctx, "getblockhash", vec![height.clone()]).unwrap_err();
+        assert_eq!(err["code"], ERR_MISC, "getblockhash {height}: {err}");
+        assert_eq!(err["message"], "JSON integer out of range", "getblockhash {height}: {err}");
     }
     let below_genesis = dispatch(ctx, "waitforblockheight", vec![json!(-1), json!(100)]).unwrap();
     assert_eq!(below_genesis["height"], 0, "{below_genesis}");
+    let err = dispatch(ctx, "getblockhash", vec![json!(-1)]).unwrap_err();
+    assert_eq!(err["code"], ERR_INVALID_PARAMETER, "{err}");
+    assert_eq!(err["message"], "Block height out of range", "{err}");
 
     for (method, params) in [
         ("gettxout", vec![json!("00".repeat(32)), json!("0")]),
         ("waitforblockheight", vec![json!("1")]),
+        ("getblockhash", vec![json!("0")]),
     ] {
         let err = dispatch(ctx, method, params).unwrap_err();
         assert_eq!(err["code"], ERR_TYPE_ERROR, "{method}: {err}");

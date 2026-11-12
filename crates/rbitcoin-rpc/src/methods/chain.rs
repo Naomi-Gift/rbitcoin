@@ -35,12 +35,14 @@ pub fn getbestblockhash(ctx: &RpcContext) -> Result<Value, Value> {
 
 pub fn getblockhash(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
     params.reject_unknown(&["height"])?;
-    let height = params.req_u64(0, "height")? as u32;
+    let out_of_range = || rpc_error(ERR_INVALID_PARAMETER, "Block height out of range");
+    let height =
+        u32::try_from(params.req_core_int::<i32>(0, "height")?).map_err(|_| out_of_range())?;
     let (_, rec) = ctx
         .query
         .header_at_height(Height(height))
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?
-        .ok_or_else(|| rpc_error(ERR_INVALID_PARAMETER, "Block height out of range"))?;
+        .ok_or_else(out_of_range)?;
     Ok(json!(hash_hex_display(&rec.hash)))
 }
 
