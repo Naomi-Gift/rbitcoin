@@ -8561,6 +8561,9 @@ async fn messages_from_writer(
             Err(_) => break,
         }
     }
+    // `attach_out` keeps a sender, and the writer task holds this peer, so
+    // dropping only the local sender leaves `recv` waiting out the timeout.
+    peer.clear_out_tx();
     drop(tx);
     let _ = tokio::time::timeout(Duration::from_secs(2), task).await;
     out
