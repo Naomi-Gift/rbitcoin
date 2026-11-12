@@ -8758,6 +8758,50 @@ async fn ping_pong_follows_a_getdata_tail_alone() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A ping parked behind a getblocktxn for a block we hold. The flush at
+/// the end of `serve_getblocktxn_tail` queues the pong after that reply.
+#[tokio::test(flavor = "current_thread")]
+async fn ping_pong_follows_a_getblocktxn_reply() {
+    let s = serve_session("pong-gbtxn", 1);
+    let hash = *s.hashes.last().expect("mined block");
+    let peer = addrfetch_peer();
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    follow.getblocktxn_tail.push_back(BlockTransactionsRequest {
+        block_hash: hash,
+        indexes: vec![0],
+    });
+    on_ping(&s.hub, &tx, &mut follow, Some(peer.as_ref()), 31).unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "the pong stays parked while the getblocktxn tail is pending"
+    );
+    serve_getblocktxn_tail(&s.hub, &tx, &mut follow, Some(peer.as_ref()))
+        .await
+        .unwrap();
+    assert!(
+        follow.getblocktxn_tail.is_empty(),
+        "the getblocktxn was served"
+    );
+    let reply = rx
+        .try_recv()
+        .expect("the getblocktxn reply is queued before the pong");
+    match &reply {
+        PeerOut::Served(NetworkMessage::BlockTxn(bt)) => {
+            assert_eq!(bt.transactions.block_hash, hash);
+        }
+        PeerOut::Served(NetworkMessage::Block(block)) => {
+            assert_eq!(block.block_hash(), hash);
+        }
+        other => panic!("expected the served getblocktxn reply before the pong, got {other:?}"),
+    }
+    match rx.try_recv() {
+        Ok(PeerOut::Msg(NetworkMessage::Pong(31))) => {}
+        other => panic!("the parked pong follows that reply, got {other:?}"),
+    }
+    assert!(rx.try_recv().is_err(), "one pong for the parked ping");
+}
+
 /// Bytes after the 8-byte nonce used to decode as `Unknown` and get no pong.
 #[test]
 fn ping_with_bytes_after_the_nonce_still_gets_a_pong() {
