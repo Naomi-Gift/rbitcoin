@@ -1771,7 +1771,7 @@ impl ChainHub {
         if let Some(header) = self.cache.get_header(hash) {
             return Some(header);
         }
-        if let Some(b) = self.load_side_body(hash) {
+        if let Some(b) = self.held_body(hash) {
             return Some(b.header);
         }
         let (_, rec) = self

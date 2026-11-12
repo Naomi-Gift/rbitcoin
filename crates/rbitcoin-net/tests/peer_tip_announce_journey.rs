@@ -486,12 +486,7 @@ fn tip_announce_checks_rebuild_no_archived_block() {
         Ann::Inv,
         "an inv peer behind the tip gets the inv",
     );
-    assert_eq!(
-        hub.query.sample_reset_reconstruct_archived(),
-        0,
-        "announce checks must not rebuild archived blocks"
-    );
-
+    // A peer three back needs the two headers below the tip as well.
     let TipAnnounce::Headers(hs) =
         tip_announce_decision(hub, &ev, true, None, Some(older), false)
     else {
@@ -500,6 +495,11 @@ fn tip_announce_checks_rebuild_no_archived_block() {
     assert_eq!(hs.len(), 3);
     assert_eq!(hs[0].prev_blockhash, older);
     assert_eq!(hs[2].block_hash(), ev.hash);
+    assert_eq!(
+        hub.query.sample_reset_reconstruct_archived(),
+        0,
+        "announce checks must not rebuild archived blocks"
+    );
 }
 
 /// Depth 5 is still compact. One deeper is a full block. A full block then
