@@ -1749,8 +1749,10 @@ impl MempoolHub {
             if let Some(at) = at {
                 order.remove(&(at, w));
             }
-            let min = ats.values().copied().min().unwrap_or(u64::MAX);
-            self.min_live_accept_at.store(min, Ordering::Relaxed);
+            self.min_live_accept_at.store(
+                order.first_key_value().map_or(u64::MAX, |(&(at, _), _)| at),
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -6786,8 +6788,10 @@ impl MempoolHub {
         order.remove(&(old, wtxid));
         order.insert((now, wtxid), *txid);
         if old == self.min_live_accept_at.load(Ordering::Relaxed) {
-            let min = ats.values().copied().min().unwrap_or(u64::MAX);
-            self.min_live_accept_at.store(min, Ordering::Relaxed);
+            self.min_live_accept_at.store(
+                order.first_key_value().map_or(u64::MAX, |(&(at, _), _)| at),
+                Ordering::Relaxed,
+            );
         }
     }
 
