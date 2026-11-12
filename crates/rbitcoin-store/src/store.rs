@@ -454,8 +454,13 @@ pub fn keep_unspent_vout_subsequence<T>(
 type SpendFreezeProbe = fn(&SpenderTable, &crate::spend_page_log::SpendPageLog);
 
 #[cfg(debug_assertions)]
+type SpendFoldProbe = fn();
+
+#[cfg(debug_assertions)]
 thread_local! {
     static SPEND_FREEZE_PROBE: std::cell::Cell<Option<SpendFreezeProbe>> =
+        const { std::cell::Cell::new(None) };
+    static SPEND_FOLD_PROBE: std::cell::Cell<Option<SpendFoldProbe>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -1610,12 +1615,6 @@ impl Store {
         self.spenders.count()
     }
 
-    /// True if `tx_fk` is strong **and** sits on the confirmed tip chain.
-    ///
-    /// Class C writes set `strong_tx` before advancing `confirmed[]` (tip is the
-    /// commit point). The height fence is rebuilt/extended only from confirmed
-    /// header_txs, so leftover strong bits above tip have no fence height and
-    /// do not count as best-chain spent.
     /// A sole-spender slot stays in the page log only while that spender is
     /// still best-chain. Multi-list slots stay; `is_confirmed_strong` filters
     /// each list member at read time.
@@ -1627,6 +1626,12 @@ impl Store {
         self.is_confirmed_strong(field)
     }
 
+    /// True if `tx_fk` is strong **and** sits on the confirmed tip chain.
+    ///
+    /// Class C writes set `strong_tx` before advancing `confirmed[]` (tip is the
+    /// commit point). The height fence is rebuilt/extended only from confirmed
+    /// header_txs, so leftover strong bits above tip have no fence height and
+    /// do not count as best-chain spent.
     pub fn is_confirmed_strong(&self, tx_fk: Fk) -> Result<bool, StoreError> {
         let tip = self.confirmed.tip_height().map(|t| t.0);
         self.is_confirmed_strong_at(tx_fk, tip)
@@ -2010,6 +2015,25 @@ impl Store {
         SPEND_FREEZE_PROBE.with(|slot| slot.take())
     }
 
+    /// Run once inside the cooled-page body copy, while the spindle is held.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn arm_spend_fold_probe(probe: SpendFoldProbe) {
+        SPEND_FOLD_PROBE.with(|slot| slot.set(Some(probe)));
+    }
+
+    /// Drop a probe [`arm_spend_fold_probe`] has not consumed.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    pub fn disarm_spend_fold_probe() {
+        SPEND_FOLD_PROBE.with(|slot| slot.set(None));
+    }
+
+    #[cfg(debug_assertions)]
+    fn take_spend_fold_probe() -> Option<SpendFoldProbe> {
+        SPEND_FOLD_PROBE.with(|slot| slot.take())
+    }
+
     fn publish_open_spend_pages(
         &self,
         height: u32,
@@ -2056,10 +2080,17 @@ impl Store {
     }
 
     fn fold_sealed_spend_pages(&self) -> Result<(), StoreError> {
-        // The body copy can take the spindle for a full page. Readers still
-        // see the committed image, so they do not need the utxo view here.
-        self.spindle_wait();
-        self.txs.copy_cooled_spend_pages()?;
+        // Readers still see the committed image, so the copy does not take
+        // the utxo view. Drop the spindle before that view: disconnect takes
+        // the view and must not wait on this lock.
+        {
+            let _spindle = self.spindle_hold();
+            #[cfg(debug_assertions)]
+            if let Some(probe) = Self::take_spend_fold_probe() {
+                probe();
+            }
+            self.txs.copy_cooled_spend_pages()?;
+        }
         // Disconnect holds this view and then sets the fold hold. Take it only
         // to drop directory entries after the copy is durable.
         let _g = hold_view(&self.utxo_publish, &self.utxo_view);

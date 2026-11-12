@@ -13,7 +13,7 @@ Fixed
   the open directory. A page whose new notes are no longer best-chain still
   names that sealed image. Folding the first page does not rewrite the file header, and it does
   not publish a shorter `spent.body` end while confirm is still appending. The
-  body copy does not hold the utxo view. A checkpoint below a loaded commit height
+  body copy holds the `--datadir-hdd` spindle until it returns, and does not hold the utxo view. A checkpoint below a loaded commit height
   filters that image before fold, even when the held bit was never written.
   Unlinking a finished generation takes the same lock as a fold hold. A spend
   noted while that filter walks the image stays out of the checkpoint height

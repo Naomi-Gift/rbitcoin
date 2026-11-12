@@ -97,7 +97,7 @@ spend annotations.
 There is **no** global “pause queries during confirm write.” Tip-as-commit +
 `is_confirmed_strong` define query visibility ([`crash-recovery.md`](./crash-recovery.md)).
 
-`--datadir-hdd` is the spindle exception. The write thread holds it across the Class A body pwrites, then starts the `tx.head` insert after annotate. Annotate does not hold the spindle. Fold of a cooled spend page waits on it, so that fold does not seek while Class A holds the spindle. Lookup and load call `spindle_wait` once before each bulk read (identity / `create.loc`, then pin / stamp). The flag off does not lock. The write thread never waits on this gate. Script threads, RPC, scripthash extract, and the index builder do not wait. Pending `tx.head` keys stay in RAM until the insert starts.
+`--datadir-hdd` is the spindle exception. The write thread holds it across the Class A body pwrites, then starts the `tx.head` insert after annotate. Annotate does not hold the spindle. Fold of a cooled spend page holds it across the body copy, so that fold does not seek while Class A holds the spindle and Class A does not start until the copy finishes. Lookup and load call `spindle_wait` once before each bulk read (identity / `create.loc`, then pin / stamp). The flag off does not lock. The write thread never waits on this gate. Script threads, RPC, scripthash extract, and the index builder do not wait. Pending `tx.head` keys stay in RAM until the insert starts.
 
 ### Confirmed-tx readers: pin + retry (not a lock)
 

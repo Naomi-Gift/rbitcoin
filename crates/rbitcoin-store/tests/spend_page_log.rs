@@ -2651,3 +2651,92 @@ fn review_1501_sealed_tip() {
     assert_eq!(log.slot(16), Some(slot));
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[cfg(debug_assertions)]
+struct FoldGate {
+    entered: std::sync::mpsc::Sender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static FOLD_GATE: std::cell::RefCell<Option<FoldGate>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(debug_assertions)]
+fn review_1501_fold_probe() {
+    let gate = FOLD_GATE.with(|slot| slot.borrow_mut().take());
+    let Some(gate) = gate else {
+        return;
+    };
+    let _ = gate.entered.send(());
+    let _ = gate.release.recv();
+}
+
+#[cfg(debug_assertions)]
+struct ClearFoldProbe;
+
+#[cfg(debug_assertions)]
+impl Drop for ClearFoldProbe {
+    fn drop(&mut self) {
+        rbitcoin_store::Store::disarm_spend_fold_probe();
+        FOLD_GATE.with(|slot| {
+            slot.borrow_mut().take();
+        });
+    }
+}
+
+/// The cooled-page copy holds the `--datadir-hdd` spindle until it returns.
+/// Flag off does not lock.
+#[cfg(debug_assertions)]
+#[test]
+fn review_1501_fold_spindle() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let d = dir();
+    let s = rbitcoin_store::Store::create_tiny(&d).unwrap();
+    let _clear = ClearFoldProbe;
+    for hdd in [true, false] {
+        s.set_datadir_hdd(hdd);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                FOLD_GATE.with(|slot| {
+                    *slot.borrow_mut() = Some(FoldGate {
+                        entered: entered_tx,
+                        release: release_rx,
+                    });
+                });
+                rbitcoin_store::Store::arm_spend_fold_probe(review_1501_fold_probe);
+                s.checkpoint_spend_through(0)
+                    .expect("checkpoint reaches the fold");
+            });
+            entered_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("fold probe");
+            scope.spawn(|| {
+                s.spindle_wait();
+                let _ = done_tx.send(());
+            });
+            let early = done_rx.recv_timeout(Duration::from_millis(300));
+            release_tx.send(()).expect("release fold");
+            if hdd {
+                assert!(
+                    early.is_err(),
+                    "the next Class A burst can start while the fold is copying"
+                );
+                done_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("waiter finishes after the fold drops the spindle");
+            } else {
+                early.expect("flag off does not lock the fold");
+            }
+        });
+    }
+    drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
