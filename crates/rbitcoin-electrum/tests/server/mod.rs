@@ -1549,7 +1549,7 @@ fn get_history_height_window_and_status_full() {
 /// One block paying `0x51`, a pool, and a connection over a pipe that has
 /// subscribed to that script and read its confirmed status. The tests pause
 /// the clock, so a tick fires only when one advances it.
-struct HeldPoolPad {
+struct PoolPad {
     dir: rbitcoin_query::testutil::TempDir,
     q: Arc<Query>,
     mp: Arc<MempoolHub>,
@@ -1558,7 +1558,7 @@ struct HeldPoolPad {
     sh: String,
 }
 
-impl HeldPoolPad {
+impl PoolPad {
     async fn read(&mut self) -> Value {
         let mut line = String::new();
         tokio::time::timeout(Duration::from_secs(5), self.client.read_line(&mut line))
@@ -1581,7 +1581,8 @@ impl HeldPoolPad {
     }
 }
 
-async fn held_pool_pad() -> HeldPoolPad {
+/// A one-block store and a pool, served on a connection with no subscription.
+async fn pool_pad() -> PoolPad {
     use rbitcoin_query::TxApply;
     use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
 
@@ -1635,14 +1636,19 @@ async fn held_pool_pad() -> HeldPoolPad {
         Some(Arc::clone(&mp)),
         ElectrumStop::new(false),
     ));
-    let mut pad = HeldPoolPad {
+    PoolPad {
         dir,
         q,
         mp,
         tip_tx,
         client: BufReader::new(client),
         sh: electrum_scripthash_hex(&[0x51]),
-    };
+    }
+}
+
+/// [`pool_pad`] with the block's output script subscribed.
+async fn held_pool_pad() -> PoolPad {
+    let mut pad = pool_pad().await;
     let sh = pad.sh.clone();
     let first = pad
         .call(1, "blockchain.scripthash.subscribe", json!([sh]))
@@ -1697,10 +1703,7 @@ fn replace_block(q: &Query) {
 /// The server polls ticks and events before the next request, so a ping
 /// answered with nothing ahead of it means those reads pushed nothing. Once
 /// the pool is released, the next tick pushes the dropped script's null.
-async fn ping_then_null_push(
-    pad: &mut HeldPoolPad,
-    hold: rbitcoin_net::tx_relay::TemplateHold<'_>,
-) {
+async fn ping_then_null_push(pad: &mut PoolPad, hold: rbitcoin_net::tx_relay::TemplateHold<'_>) {
     assert_eq!(pad.mp.pool_settle_gen() % 2, 1, "the hold is out");
     let ping = pad.call(9, "server.ping", json!([])).await;
     assert_eq!(ping["id"], 9, "pushed while the pool was held: {ping}");
@@ -1765,9 +1768,65 @@ async fn announce_restatus_waits_for_a_held_pool() {
             replaced: vec![],
             replaced_scripthashes: vec![],
             scripthashes: vec![sh.try_into().unwrap()],
+            outpoints: Default::default(),
         })
         .unwrap();
     ping_then_null_push(&mut pad, hold).await;
+    let _ = std::fs::remove_dir_all(&pad.dir);
+}
+
+/// An announce pushes the status of each listed outpoint the connection
+/// subscribed, on a connection with no scripthash subscription. A replaced
+/// spend frees its outpoint, so the push says unspent.
+#[tokio::test]
+async fn announce_pushes_only_subscribed_outpoints() {
+    use bitcoin::hashes::Hash;
+    use bitcoin::{OutPoint, Txid};
+
+    let mut pad = pool_pad().await;
+    let watched = OutPoint {
+        txid: Txid::from_byte_array([0x11; 32]),
+        vout: 1,
+    };
+    let other = OutPoint {
+        txid: Txid::from_byte_array([0x22; 32]),
+        vout: 0,
+    };
+    let hex = watched.txid.to_string();
+    let sub = pad
+        .call(1, "blockchain.outpoint.subscribe", json!([hex.clone(), 1]))
+        .await;
+    assert_eq!(sub["result"]["spent"], false, "{sub}");
+    let announce = |outpoints: Vec<OutPoint>| rbitcoin_net::tx_relay::MempoolAnnounce {
+        txid: Txid::from_byte_array([0x45; 32]),
+        replaced: vec![Txid::from_byte_array([0x46; 32])],
+        replaced_scripthashes: vec![],
+        scripthashes: vec![],
+        outpoints: outpoints.into(),
+    };
+
+    pad.mp.announce.send(announce(vec![other])).unwrap();
+    let ping = pad.call(2, "server.ping", json!([])).await;
+    assert_eq!(
+        ping["id"], 2,
+        "pushed an outpoint nobody subscribed: {ping}"
+    );
+
+    pad.mp
+        .announce
+        .send(announce(vec![other, watched]))
+        .unwrap();
+    let push = pad.read().await;
+    assert_eq!(
+        push,
+        json!({
+            "jsonrpc": "2.0",
+            "method": "blockchain.outpoint.subscribe",
+            "params": [hex.clone(), 1, {"txid": hex, "vout": 1, "spent": false}],
+        })
+    );
+    let ping = pad.call(3, "server.ping", json!([])).await;
+    assert_eq!(ping["id"], 3, "one push per subscribed outpoint: {ping}");
     let _ = std::fs::remove_dir_all(&pad.dir);
 }
 

@@ -395,6 +395,7 @@ fn force_announce_picks_peers(
         replaced: vec![],
         replaced_scripthashes: vec![],
         scripthashes: vec![],
+        outpoints: Default::default(),
     };
     let follow = PeerFollowState::new();
     let stand_equal = relay_peer(peers, [127, 0, 0, 1], OutboundFullRelay);

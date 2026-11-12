@@ -5401,6 +5401,7 @@ fn on_tx_announce_none_lagged_closed_are_ok() {
         replaced: Vec::new(),
         replaced_scripthashes: Vec::new(),
         scripthashes: Vec::new(),
+        outpoints: Default::default(),
     };
     assert!(on_tx_announce(&hub, &out_tx, &follow, None, Some(Ok(ann.clone()))).is_ok());
 

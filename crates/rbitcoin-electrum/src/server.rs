@@ -532,7 +532,7 @@ where
                                 &mut writer,
                                 &query,
                                 mempool.clone(),
-                                &conn.outpoint_subs,
+                                conn.outpoint_subs.iter().copied().collect(),
                             )
                             .await?;
                         }
@@ -613,11 +613,22 @@ where
                     None
                 }
             } => {
-                // Only restatus hashes this tx (or its RBF victims) actually touch.
-                // Re-walking every subscribe on every mempool accept pegs CPUs
-                // (Cake: tens of gap-limit subs × full history + full-mempool scan).
+                // Only restatus outpoints and hashes this tx (or its RBF victims)
+                // actually touch. Re-walking every subscribe on every mempool
+                // accept pegs CPUs (Cake: tens of gap-limit subs × full history +
+                // full-mempool scan).
                 if let Some(Ok(ann)) = ann {
                     if let Some(mp) = &mempool {
+                        let touched_ops: Vec<([u8; 32], u32)> = ann
+                            .outpoints
+                            .iter()
+                            .map(|op| (op.txid.to_byte_array(), op.vout))
+                            .filter(|op| conn.outpoint_subs.contains(op))
+                            .collect();
+                        if !touched_ops.is_empty() {
+                            emit_outpoint_notes(&mut writer, &query, mempool.clone(), touched_ops)
+                                .await?;
+                        }
                         // Walk the tx's few scripthashes and probe the sub set,
                         // so the cost per accept does not grow with sub count.
                         let mut touched: Vec<[u8; 32]> = ann
@@ -1445,17 +1456,17 @@ pub async fn emit_sp_tip<W: AsyncWrite + Unpin>(
     writer.line(note).await
 }
 
+/// Push the current status of each of `outpoints`.
 pub async fn emit_outpoint_notes<W: AsyncWrite + Unpin>(
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
     mempool: Option<Arc<MempoolHub>>,
-    subs: &HashSet<([u8; 32], u32)>,
+    outpoints: Vec<([u8; 32], u32)>,
 ) -> Result<(), std::io::Error> {
-    let keys: Vec<([u8; 32], u32)> = subs.iter().copied().collect();
     let q = Arc::clone(query);
     let looked = budgeted_blocking(query, move || {
-        let mut out = Vec::with_capacity(keys.len());
-        for (txid, vout) in keys {
+        let mut out = Vec::with_capacity(outpoints.len());
+        for (txid, vout) in outpoints {
             let params = json!([txid_hex(&txid), vout]);
             if let Ok(status) = outpoint_status(&q, mempool.as_deref(), &params) {
                 out.push((txid, vout, status));
