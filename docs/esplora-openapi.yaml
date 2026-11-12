@@ -1219,7 +1219,7 @@ components:
         allowed: { type: boolean }
         vsize:
           type: integer
-          description: Present when `allowed` is true. `floor(weight / 4)`, not the ceiling Core uses.
+          description: Present when `allowed` is true. The sigop-adjusted admission weight divided by 4, rounded up, as `testmempoolaccept` reports it.
         fees:
           type: object
           description: Present when `allowed` is true.

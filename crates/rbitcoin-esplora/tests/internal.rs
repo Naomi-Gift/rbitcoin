@@ -316,6 +316,36 @@ async fn outspends_by_txid_outpoint_and_query(sock: &std::path::Path, pad: &Pad)
     assert!(resp.contains("Too many txids requested"), "{resp}");
 }
 
+/// Admission vsize rounds up. This spend has no sigops, so its admission
+/// weight equals its BIP141 weight.
+async fn test_rounds_vsize_up(sock: &std::path::Path, pad: &Pad) {
+    use bitcoin::consensus::encode::serialize_hex;
+
+    let witness_script = ScriptBuf::from_bytes(vec![0x51]);
+    let parent = spend_true(
+        pad.cbs[3],
+        1_000,
+        ScriptBuf::new_p2wsh(&witness_script.wscript_hash()),
+    );
+    let (st, resp) = http_post_unix(sock, "/tx", serialize_hex(&parent).as_bytes()).await;
+    assert_eq!(st, 200, "{resp}");
+    let mut child = spend_true(
+        parent.compute_txid(),
+        2_000,
+        ScriptBuf::from_bytes(vec![0x51]),
+    );
+    child.input[0].witness = Witness::from_slice(&[witness_script.as_bytes()]);
+    let weight = child.weight().to_wu();
+    assert_ne!(weight % 4, 0, "the fixture needs a weight that rounds");
+
+    let body = serde_json::to_vec(&json!([serialize_hex(&child)])).unwrap();
+    let (st, resp) = http_post_unix(sock, "/txs/test", &body).await;
+    assert_eq!(st, 200, "{resp}");
+    let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
+    assert_eq!(arr[0]["allowed"], true, "{resp}");
+    assert_eq!(arr[0]["vsize"].as_u64(), Some(weight.div_ceil(4)), "{resp}");
+}
+
 /// mempool.space's backend on the group-restricted socket: it tests and
 /// broadcasts three spends, pages the mempool, then pulls the bulk routes.
 #[tokio::test]
@@ -349,6 +379,7 @@ async fn esplora_unix_internal() {
     internal_txs_and_block_txs(&sock, &pad, &txs[0].compute_txid().to_string()).await;
     unix_block_txs_summary(&sock, &pad).await;
     outspends_by_txid_outpoint_and_query(&sock, &pad).await;
+    test_rounds_vsize_up(&sock, &pad).await;
 
     handle.shutdown().await;
     let _ = pad.dir;
