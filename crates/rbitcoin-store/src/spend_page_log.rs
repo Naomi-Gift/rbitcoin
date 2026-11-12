@@ -114,6 +114,13 @@ struct CommitSnapshot {
     pages: Vec<(u64, OpenPage)>,
 }
 
+/// Freeze captured while the caller held the utxo view.
+enum StagedFreeze {
+    /// `open` was empty. Nothing new to publish.
+    Empty,
+    Pages(CommitSnapshot),
+}
+
 /// `Clear` writes the commit with the held bit off. RAM still has the old
 /// generation until that rename succeeds.
 enum PublishHold {
@@ -160,9 +167,10 @@ struct Inner {
     /// `spent.body` length sampled at the freeze. Unset means the caller’s
     /// argument. A note between that argument and the freeze can sit past it.
     published_at_freeze: Option<u64>,
-    /// Snapshot taken while the caller held the utxo view. `prepare_commit`
-    /// publishes this instead of freezing again.
-    staged_freeze: Option<Option<CommitSnapshot>>,
+    /// Snapshot taken while the caller held the utxo view.
+    /// Absent after `before_freeze` returns is corrupt. `prepare_commit`
+    /// does not freeze a second time.
+    staged_freeze: Option<StagedFreeze>,
     /// Bumped each time a disconnect holds the fold.
     hold_ticks: u64,
     open_edges: u64,
@@ -315,7 +323,7 @@ impl SpendPageLog {
     /// Confirm calls this before it takes the utxo view. `note_slots` does
     /// not wait, so one batch may pass the cap and the next batch waits
     /// outside the view. The page-log lock is not held across the wait.
-    /// `commit_open` notifies once it has frozen the directory.
+    /// A freeze wakes this wait, including when the caller then fails.
     pub fn wait_open_edge_room(&self) {
         loop {
             let room = self.pace.room_mu.lock().unwrap_or_else(|e| e.into_inner());
@@ -589,8 +597,11 @@ impl SpendPageLog {
     /// after the view is released waits for the next checkpoint.
     #[doc(hidden)]
     pub fn freeze_open(&self) {
-        let snap = self.snapshot_commit();
-        self.lock().staged_freeze = Some(snap);
+        let staged = match self.snapshot_commit() {
+            Some(pages) => StagedFreeze::Pages(pages),
+            None => StagedFreeze::Empty,
+        };
+        self.lock().staged_freeze = Some(staged);
     }
 
     #[doc(hidden)]
@@ -646,9 +657,16 @@ impl SpendPageLog {
             let mut g = self.lock();
             g.published_at_freeze.take().unwrap_or(published)
         };
-        let snap = match self.lock().staged_freeze.take() {
-            Some(snap) => snap,
-            None => self.snapshot_commit(),
+        let staged = {
+            let mut g = self.lock();
+            g.staged_freeze.take()
+        };
+        let Some(staged) = staged else {
+            return Err(StoreError::Corrupt("spend freeze was not staged"));
+        };
+        let snap = match staged {
+            StagedFreeze::Empty => None,
+            StagedFreeze::Pages(snap) => Some(snap),
         };
         let Some(snap) = snap else {
             self.scrub_open_notes(&mut keep)?;

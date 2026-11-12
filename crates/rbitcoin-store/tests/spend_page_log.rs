@@ -3051,3 +3051,41 @@ fn review_1501_failed_freeze_wakes_the_edge_wait() {
     worker.join().unwrap();
     let _ = std::fs::remove_dir_all(&d);
 }
+
+/// A checkpoint that returns without freezing must not freeze on its own.
+///
+/// The second freeze would run outside the utxo view. That is corrupt.
+#[test]
+fn review_1501_unstaged_freeze_is_corrupt() {
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let d = dir();
+    let log = std::sync::Arc::new(SpendPageLog::create(&d));
+    let log_wait = std::sync::Arc::clone(&log);
+    let (tx, rx) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let err =
+            log_wait.prepare_commit_in(1, 8192, zeros, |_| Ok(true), |_page| Ok(()), |_| Ok(1));
+        let _ = tx.send(err);
+    });
+    let got = rx.recv_timeout(Duration::from_secs(2));
+    match got {
+        Ok(Err(StoreError::Corrupt("spend freeze was not staged"))) => {}
+        other => panic!("an unstaged freeze must be corrupt, got {other:?}"),
+    }
+    worker.join().unwrap();
+    log.prepare_commit_in(
+        1,
+        8192,
+        zeros,
+        |_| Ok(true),
+        |page| {
+            page.freeze_open();
+            Ok(())
+        },
+        |_| Ok(1),
+    )
+    .expect("an empty freeze is a real stage");
+    let _ = std::fs::remove_dir_all(&d);
+}
