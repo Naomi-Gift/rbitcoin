@@ -442,6 +442,66 @@ fn tip_announce_near_marks_are_headers() {
     );
 }
 
+/// The checks a session runs when a tip fires walk parents from header rows.
+/// None of them rebuilds an archived block.
+#[test]
+fn tip_announce_checks_rebuild_no_archived_block() {
+    let (_dir, hub) = open_tip_announce_hub("tip-announce-checks-rebuild-none");
+    let hub = &hub;
+    let tip_h = hub.tip_height().unwrap();
+    let parent = hub.tip_header().unwrap().prev_blockhash;
+    let older = hub
+        .query
+        .wire_header_at_height(Height(tip_h - 3))
+        .unwrap()
+        .block_hash();
+    assert!(
+        hub.query
+            .reconstruct_archived_block(&parent.to_byte_array())
+            .unwrap()
+            .is_some(),
+        "the pad parent is an archived body"
+    );
+    let ev = tip_event(hub, 0);
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let session = live_peer(&peers, 18447, 4, false);
+    session.note_best_header_sent(parent);
+    session.note_best_known(older);
+    hub.query.sample_reset_reconstruct_archived();
+
+    assert!(!tip_is_reorg_vs_sent(hub, Some(&session), &Ok(ev.clone())));
+    assert!(!peer_has_header(hub, Some(parent), Some(older), ev.hash));
+    assert!(peer_has_header(hub, Some(parent), Some(older), older));
+    assert_ann(
+        hub,
+        &ev,
+        marks(true, Some(parent), Some(older), false),
+        Ann::Headers,
+        "a peer with the parent gets the tip header",
+    );
+    assert_ann(
+        hub,
+        &ev,
+        marks(false, Some(parent), Some(older), false),
+        Ann::Inv,
+        "an inv peer behind the tip gets the inv",
+    );
+    // A peer three back needs the two headers below the tip as well.
+    let TipAnnounce::Headers(hs) =
+        tip_announce_decision(hub, &ev, true, None, Some(older), false)
+    else {
+        panic!("a peer three back gets headers");
+    };
+    assert_eq!(hs.len(), 3);
+    assert_eq!(hs[0].prev_blockhash, older);
+    assert_eq!(hs[2].block_hash(), ev.hash);
+    assert_eq!(
+        hub.query.sample_reset_reconstruct_archived(),
+        0,
+        "announce checks must not rebuild archived blocks"
+    );
+}
+
 /// Depth 5 is still compact. One deeper is a full block. A full block then
 /// releases the pending compact-fill slot.
 #[tokio::test]

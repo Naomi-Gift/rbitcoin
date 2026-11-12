@@ -3314,9 +3314,57 @@ fn submit_header_child_is_headers_only_tip() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// `prev_of` names the parent of genesis, a best-chain block, a disconnected
+/// once-confirmed block, a header-only tip, and a held side body without
+/// rebuilding any archived block.
+#[test]
+fn prev_of_reads_parent_without_archive_rebuild() {
+    let (_dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let gen = hub.tip_hash().unwrap();
+    let b1 = mine(gen, 1_300_031_000, 1);
+    hub.accept_block(b1.clone()).unwrap();
+    let b2 = mine(b1.block_hash(), 1_300_031_100, 2);
+    hub.accept_block(b2.clone()).unwrap();
+    let child = mine(b2.block_hash(), 1_300_031_200, 3);
+    hub.ensure_header(&child.header).unwrap();
+    let side = mine(gen, 1_300_031_300, 1);
+    hub.hold_body(Arc::new(side.clone()), false);
+    assert!(hub.held_body(&side.block_hash()).is_some());
+    hub.query.sample_reset_reconstruct_archived();
+
+    let zero = BlockHash::from_byte_array([0u8; 32]);
+    assert_eq!(hub.prev_of(&gen), Some(zero), "genesis");
+    assert_eq!(hub.prev_of(&b1.block_hash()), Some(gen), "genesis child");
+    assert_eq!(
+        hub.prev_of(&b2.block_hash()),
+        Some(b1.block_hash()),
+        "best chain"
+    );
+    assert_eq!(
+        hub.prev_of(&child.block_hash()),
+        Some(b2.block_hash()),
+        "header-only tip"
+    );
+    assert_eq!(hub.prev_of(&side.block_hash()), Some(gen), "held side body");
+    assert_eq!(
+        hub.prev_of(&BlockHash::from_byte_array([7u8; 32])),
+        None,
+        "unknown hash"
+    );
+    assert_eq!(hub.query.sample_reset_reconstruct_archived(), 0);
+    hub.invalidate_block(b2.block_hash()).unwrap();
+    hub.query.sample_reset_reconstruct_archived();
+    assert_eq!(
+        hub.prev_of(&b2.block_hash()),
+        Some(b1.block_hash()),
+        "disconnected once-confirmed block"
+    );
+    assert_eq!(hub.query.sample_reset_reconstruct_archived(), 0);
+}
+
 /// `best_header_height` and `chaintips` walk ancestry through `prev_of`,
-/// which read-locks `header_tips` and (via `load_side_body`)
-/// `held_bodies`. std's `RwLock` refuses a new reader while a writer
+/// which read-locks `header_tips` and (via `held_body`) `held_bodies`. std's `RwLock` refuses a new reader while a writer
 /// waits, so a walk that holds one of those guards deadlocks against a
 /// writer: the writer waits for the held read, and the walk's second read
 /// waits for the writer.
