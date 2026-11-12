@@ -699,7 +699,7 @@ fn omit_dust_default_drops_leq_1000_keeps_1001_and_empty_txs() {
 }
 
 #[test]
-fn omit_dust_546_matches_cake_electrs_leq() {
+fn omit_dust_546_drops_546_keeps_547() {
     let rows = vec![
         dust_row(1, vec![(0, [0xaa; 32], 546)]),
         dust_row(2, vec![(0, [0xbb; 32], 547)]),

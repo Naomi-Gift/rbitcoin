@@ -24,8 +24,8 @@ pub const SUBSCRIBE_CHUNK: Duration = Duration::from_secs(60);
 
 /// Omit served P2TR `output_pubkeys` with `value <=` this many sats.
 ///
-/// `0` serves every value. Default **1000**. **546** matches Cake electrs
-/// `sp_min_dust`. Index still stores every eligible tweak.
+/// `0` serves every value. Default **1000**. **545** matches Cake electrs
+/// `sp_min_dust` 546, which keeps `value >= 546`. Index still stores every eligible tweak.
 pub const DEFAULT_TWEAKS_MIN_DUST: u64 = 1000;
 
 #[doc(hidden)]
