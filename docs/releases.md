@@ -174,6 +174,9 @@ tick **nightly**, and leave **ref** empty. The `musl` legs fail at once on
 any other branch or with a ref, so `nightly` only ever names master. A
 second nightly on the same day moves both tags.
 
+Do not re-run a nightly. A re-run keeps its old SHA, so `docker-publish`
+refuses it instead of moving `nightly` back. Dispatch a new nightly.
+
 `docker-publish` runs one tag (or nightly) at a time across the repo (its own
 concurrency group), and each run reads the tag list at its start. Two tags
 cut together, such as `X.Y.0` and a patch on `vX.(Y-1).x`, cannot move

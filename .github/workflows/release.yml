@@ -459,6 +459,13 @@ jobs:
         run: |
           set -euo pipefail
           if [[ "$NIGHTLY" == true ]]; then
+            # A re-run keeps its run's SHA, which master may have passed,
+            # and would move `nightly` back onto it. Fresh nightlies run in
+            # trigger order (the workflow group), so only a re-run can.
+            if [[ "$GITHUB_RUN_ATTEMPT" != 1 ]]; then
+              echo "nightly re-run of ${GITHUB_SHA:0:12} refused: dispatch a new nightly instead" >&2
+              exit 1
+            fi
             tags="$(./scripts/docker-tags.sh --nightly "$(date -u +%Y%m%d)")"
           else
             tags="$(./scripts/docker-tags.sh "$GITHUB_REF_NAME")"
