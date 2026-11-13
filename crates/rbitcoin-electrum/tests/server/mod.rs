@@ -3243,7 +3243,6 @@ async fn sp_subscriptions_are_capped_per_connection() {
         )
         .await
         .unwrap();
-        drop(writer);
         serde_json::from_slice(&body).unwrap()
     };
     for wallet in 0..SP_MAX_SUBS {
@@ -3289,7 +3288,6 @@ async fn sp_resubscribe_keeps_the_earlier_start() {
         )
         .await
         .unwrap();
-        drop(writer);
         serde_json::from_slice(&body).unwrap()
     };
     let first = subscribe(&mut conn, 0, 4).await;
@@ -3643,7 +3641,6 @@ async fn pruned_scan_miss_is_not_an_empty_history() {
         .await
         .unwrap();
     assert!(conn.sp_scans.is_empty(), "a failed scan is over");
-    drop(writer);
     let text = String::from_utf8(body).unwrap();
     assert!(
         text.contains("window miss"),
@@ -3669,7 +3666,6 @@ async fn pruned_scan_miss_is_not_an_empty_history() {
     emit_sp_tip(&mut tip_writer, &q, &chain, &sub, 1, 1)
         .await
         .unwrap();
-    drop(tip_writer);
     let tip_text = String::from_utf8(tip_body).unwrap();
     assert!(
         tip_text.contains("window miss"),
@@ -3705,7 +3701,6 @@ async fn sp_subscribe_refuses_a_start_it_cannot_read() {
     )
     .await
     .unwrap();
-    drop(writer);
     let reply: Value = serde_json::from_slice(&body).expect("one reply line");
     assert_eq!(reply["id"], 7, "{reply}");
     assert!(reply.get("result").is_none(), "{reply}");
