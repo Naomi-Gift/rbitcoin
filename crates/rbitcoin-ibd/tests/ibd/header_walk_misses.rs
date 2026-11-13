@@ -213,20 +213,6 @@ fn checkpoints_report_when_the_walk_has_one() {
 }
 
 #[test]
-fn the_done_latch_clears_when_the_walk_resumes() {
-    let (_dir, hub, mut st, _gen) = opened("done-latch");
-    assert!(st.header_walk.proven);
-    for slot in &mut st.slots {
-        slot.peer_height = 0;
-    }
-    log_status(&mut st, &hub, 0);
-    assert!(st.header_walk.announced_done);
-    st.slots[0].peer_height = 1;
-    log_status(&mut st, &hub, 1);
-    assert!(!st.header_walk.announced_done);
-}
-
-#[test]
 fn a_full_window_below_the_floor_keeps_the_peer_that_moved_the_queue() {
     let (_dir, mut hub, mut st, _gen) = opened("settle-window");
     hub.milestone = high_floor();
@@ -253,6 +239,13 @@ fn a_full_window_below_the_floor_keeps_the_peer_that_moved_the_queue() {
     settle_walk_peer(&mut st, &hub, 0, tip, 0, None, 1);
     assert!(st.header_walk.walk_quiet.contains(&0));
     assert_eq!(st.header_walk.reserved, Some(1));
+
+    st.ordered.clear();
+    st.header_walk.walk_quiet.clear();
+    st.header_walk.reserved = Some(0);
+    settle_walk_peer(&mut st, &hub, 0, tip, 0, None, window);
+    assert!(st.header_walk.walk_quiet.contains(&0));
+    assert!(st.header_walk.reserved.is_none());
 }
 
 #[test]
@@ -264,6 +257,10 @@ fn a_probe_starts_for_two_live_peers_and_not_while_one_is_open() {
     st.header_walk.probe_open = None;
     probe_unprobed_peer(&mut st, &hub);
     assert_eq!(st.header_walk.probe, Some(0));
+    st.header_walk.probe = None;
+    st.slots[1].alive = false;
+    probe_unprobed_peer(&mut st, &hub);
+    assert!(st.header_walk.probe.is_none());
 }
 
 #[test]

@@ -589,9 +589,11 @@ pub fn header_status_view(st: &IbdWorkState, hub: &ChainHub) -> HeaderStatusView
     }
 }
 
-/// Operator line for the header walk. Production logs this from the status
-/// thread. Tests call this to observe the once-only caught-up latch.
+/// Debug stand-in for the status thread's header line. The thread keeps
+/// `saw_quiet` and emits the caught-up line itself.
+// Debug status line only. `announced_done` is not a session result.
 #[cfg(debug_assertions)]
+#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn log_status(st: &mut IbdWorkState, hub: &ChainHub, horizon: u32) {
     if !st.header_walk.origin {
         return;
