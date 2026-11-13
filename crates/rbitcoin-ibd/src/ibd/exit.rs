@@ -190,7 +190,7 @@ pub fn ibd_caught_up(st: &IbdWorkState, tip_h: u32) -> bool {
     }
     match header_lag_behind_peers(st, tip_h) {
         0 => true,
-        1 => st.headers_done,
+        // One block of lag uses the same latch as a larger gap.
         2 => false,
         _ => st.headers_done,
     }

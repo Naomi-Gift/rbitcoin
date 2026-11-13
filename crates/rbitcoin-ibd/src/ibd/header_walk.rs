@@ -216,7 +216,7 @@ pub const LOOKAHEAD_ASK: Duration = Duration::from_secs(5);
 #[doc(hidden)]
 pub const HEADER_MISS_DISCONNECT: u8 = 2;
 /// Recent block traffic permits two extra header misses, not indefinite silence.
-const PRODUCTIVE_HEADER_MISS_DISCONNECT: u8 = HEADER_MISS_DISCONNECT + 2;
+const PRODUCTIVE_HEADER_MISS_DISCONNECT: u8 = 4;
 /// Header-only timeouts must not destroy a productive block session. Match
 /// the minimum block-stall window; pings and unrelated bytes do not renew it.
 #[doc(hidden)]
@@ -466,7 +466,6 @@ pub fn install_origin(st: &mut IbdWorkState, hub: &ChainHub, loaded: OriginLoade
     st.header_walk.tip = WalkTip {
         hash,
         height,
-        height_wide: u64::from(height),
         work,
         milestone_hash,
         milestone_prev,
@@ -1544,7 +1543,6 @@ pub fn tip_from_base(st: &IbdWorkState) -> WalkTip {
     WalkTip {
         hash: st.header_walk.base_hash,
         height: st.header_walk.base_height,
-        height_wide: u64::from(st.header_walk.base_height),
         work: Work::from_be_bytes(st.header_walk.base_work),
         ..WalkTip::default()
     }
@@ -2654,9 +2652,6 @@ fn extend_connected(
     headers: &[Header],
     peer: Option<usize>,
 ) -> bool {
-    if headers.is_empty() || !pow_linked(headers) {
-        return false;
-    }
     if over_length(st, headers.len()) {
         st.header_walk.length_exceeded = true;
         return false;
