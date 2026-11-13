@@ -157,10 +157,10 @@ pub fn rehydrate_class_a_into_body_queue(
             break;
         }
         match rehydrate_one_height(hub, st, confirm_feed, ht)? {
-            RehydrateOne::Offered { .. } | RehydrateOne::Queued => {
+            RehydrateOne::Offered | RehydrateOne::Queued => {
                 n = n.saturating_add(1);
             }
-            RehydrateOne::Stop { .. } => break,
+            RehydrateOne::Stop => break,
         }
     }
     Ok(n)
@@ -168,9 +168,9 @@ pub fn rehydrate_class_a_into_body_queue(
 
 #[doc(hidden)]
 pub enum RehydrateOne {
-    Offered { bytes: u64 },
+    Offered,
     Queued,
-    Stop { failed: bool },
+    Stop,
 }
 
 #[doc(hidden)]
@@ -181,13 +181,13 @@ pub fn rehydrate_one_height(
     ht: u32,
 ) -> Result<RehydrateOne, String> {
     let Some(&hash) = st.height_to_hash.get(&ht) else {
-        return Ok(RehydrateOne::Stop { failed: false });
+        return Ok(RehydrateOne::Stop);
     };
     if hub.has_block(&hash) {
-        return Ok(RehydrateOne::Stop { failed: false });
+        return Ok(RehydrateOne::Stop);
     }
     if st.body.is_rejected(&hash) {
-        return Ok(RehydrateOne::Stop { failed: false });
+        return Ok(RehydrateOne::Stop);
     }
     if hub.query.block_queue_has_height(ht) {
         st.body.mark_pending(hash);
@@ -203,7 +203,7 @@ pub fn rehydrate_one_height(
             .is_block_archived(&hash.to_byte_array())
             .unwrap_or(false);
     if !has_class_a {
-        return Ok(RehydrateOne::Stop { failed: false });
+        return Ok(RehydrateOne::Stop);
     }
     rehydrate_offer_class_a(hub, st, confirm_feed, ht, hash)
 }
@@ -224,12 +224,12 @@ pub fn rehydrate_offer_class_a(
                 "ibd: Class A rehydrate h={ht}: header_txs missing after archive flag — re-getdata"
             );
             st.body.mark_missing(hash);
-            return Ok(RehydrateOne::Stop { failed: true });
+            return Ok(RehydrateOne::Stop);
         }
         Err(e) => {
             warn!("ibd: Class A rehydrate reconstruct h={ht} {hash}: {e} — re-getdata");
             st.body.mark_missing(hash);
-            return Ok(RehydrateOne::Stop { failed: true });
+            return Ok(RehydrateOne::Stop);
         }
     };
     let merkle_ok = block
@@ -243,13 +243,13 @@ pub fn rehydrate_offer_class_a(
         let _ = hub.query.clear_archived_body(hash.as_byte_array());
         st.body.demote_known(hash);
         st.body.mark_missing(hash);
-        return Ok(RehydrateOne::Stop { failed: true });
+        return Ok(RehydrateOne::Stop);
     }
     let mut payload = Vec::new();
     if block.consensus_encode(&mut payload).is_err() {
         warn!("ibd: Class A rehydrate encode h={ht} {hash} failed — re-getdata");
         st.body.mark_missing(hash);
-        return Ok(RehydrateOne::Stop { failed: true });
+        return Ok(RehydrateOne::Stop);
     }
     let header_fk = st.header_fks.get(&hash).copied().unwrap_or(Fk::NULL);
     if let Err(e) = hub
@@ -258,12 +258,10 @@ pub fn rehydrate_offer_class_a(
     {
         warn!("ibd: Class A rehydrate offer h={ht}: {e} — re-getdata");
         st.body.mark_missing(hash);
-        return Ok(RehydrateOne::Stop { failed: true });
+        return Ok(RehydrateOne::Stop);
     }
     st.body.mark_pending(hash);
     confirm_feed.note(ht, hash);
     st.max_ready_height = st.max_ready_height.max(ht);
-    Ok(RehydrateOne::Offered {
-        bytes: payload.len() as u64,
-    })
+    Ok(RehydrateOne::Offered)
 }

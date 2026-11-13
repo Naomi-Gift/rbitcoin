@@ -926,15 +926,10 @@ pub fn apply_write_reject(
 }
 
 /// Stop when the feed is stopped or confirm is cancelled. Either flag ends the stage.
+/// Scripts keep publishing while this is false.
 #[doc(hidden)]
 pub fn confirm_stage_stopping(stopped: bool, cancelled: bool) -> bool {
     stopped || cancelled
-}
-
-/// Scripts keep publishing only while both stop flags are clear.
-#[doc(hidden)]
-pub fn confirm_stage_running(stopped: bool, cancelled: bool) -> bool {
-    !stopped && !cancelled
 }
 
 /// Drop a stale write unless a session fault already counted the connected blocks.
@@ -2640,7 +2635,7 @@ pub fn spawn_confirm_engine(
                     }
                     confirm_thr_stats::add_script_send_wait(&stats, t_send.elapsed());
                     q_sc.note_write_send(wb, ww, parents);
-                    confirm_stage_running(feed_sc.stopped(), hub_sc.query.confirm_cancelled())
+                    !confirm_stage_stopping(feed_sc.stopped(), hub_sc.query.confirm_cancelled())
                 },
                 |e, meta, dropped| {
                     confirm_thr_stats::add_script_work(&stats, Duration::ZERO);

@@ -3426,14 +3426,11 @@ fn unproven_lead_is_either_cap() {
 
 #[test]
 fn confirm_stage_stops_on_either_flag() {
-    // Stopped or cancelled ends the stage. Scripts publish only while both are clear.
-    use rbitcoin_ibd::ibd::confirm::{confirm_stage_running, confirm_stage_stopping};
+    // Stopped or cancelled ends the stage. Scripts publish while this is false.
+    use rbitcoin_ibd::ibd::confirm::confirm_stage_stopping;
     assert!(confirm_stage_stopping(true, false));
     assert!(confirm_stage_stopping(false, true));
     assert!(!confirm_stage_stopping(false, false));
-    assert!(confirm_stage_running(false, false));
-    assert!(!confirm_stage_running(true, false));
-    assert!(!confirm_stage_running(false, true));
 }
 
 #[test]

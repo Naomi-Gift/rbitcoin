@@ -248,19 +248,15 @@ pub fn uring_recover_credit(last_tip: Option<u32>, tip: u32) -> bool {
 
 /// Cheap process-owned cache occupancy for IBD `ibd: sizes` (O(1) lens + brief locks).
 ///
-/// `conf_plans` is header plan occupancy in ConfirmParentCache. Pipeline pins /
-/// prep-ahead CreatePins are metered via [`process_mem_stats`] (plan thread
-/// publishes snapshots) plus conf_plans on Query.
+/// `conf_plans` is header plan occupancy in ConfirmParentCache. Prep-ahead
+/// CreatePins stay on the load thread's live snapshot. Write-loc packs are
+/// metered via [`process_mem_stats`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessOwnedSizes {
     pub conf_plans: usize,
     pub sh_runs: usize,
     /// Segmented `tx.head.*` occupancy (logical sizes; no shadow resize).
     pub head: rbitcoin_store::HeadResizeSizeSnapshot,
-    /// Prep-ahead in-flight CreatePin occupancy (from load-thread atomics).
-    pub inflight_layers: usize,
-    pub inflight_pins: usize,
-    pub inflight_bytes: u64,
     /// Confirmed hash→height map entries.
     pub h2h_keys: usize,
     /// Height-fence run count (no Vec clone).
@@ -275,24 +271,14 @@ pub struct ProcessOwnedSizes {
 
 /// Plan-thread published heap meters for structures not owned by [`Query`].
 ///
-/// Load publishes [`InFlight`] after note/prune; write publishes loc packs
-/// from TLS after note/prune. Sampled by the ~5s IBD sizes line.
+/// Write publishes loc packs from TLS after note/prune. Sampled by the ~5s
+/// IBD sizes line. Prep-ahead pins are not copied here.
 pub mod process_mem_stats {
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    static INFLIGHT_LAYERS: AtomicU64 = AtomicU64::new(0);
-    static INFLIGHT_PINS: AtomicU64 = AtomicU64::new(0);
-    static INFLIGHT_BYTES: AtomicU64 = AtomicU64::new(0);
     static WLOC_PACKS: AtomicU64 = AtomicU64::new(0);
     static WLOC_PAIRS: AtomicU64 = AtomicU64::new(0);
     static WLOC_BYTES: AtomicU64 = AtomicU64::new(0);
-
-    /// Publish latest prep-ahead occupancy (overwrite).
-    pub fn note(inflight_layers: usize, inflight_pins: usize, inflight_bytes: u64) {
-        INFLIGHT_LAYERS.store(inflight_layers as u64, Ordering::Relaxed);
-        INFLIGHT_PINS.store(inflight_pins as u64, Ordering::Relaxed);
-        INFLIGHT_BYTES.store(inflight_bytes, Ordering::Relaxed);
-    }
 
     /// Write-thread loc window occupancy (TLS; no lock on Query).
     pub fn note_wloc(packs: usize, pairs: usize, bytes: u64) {
@@ -303,9 +289,6 @@ pub mod process_mem_stats {
 
     #[derive(Clone, Copy, Debug, Default)]
     pub struct Snap {
-        pub inflight_layers: usize,
-        pub inflight_pins: usize,
-        pub inflight_bytes: u64,
         pub wloc_packs: usize,
         pub wloc_pairs: usize,
         pub wloc_bytes: u64,
@@ -313,9 +296,6 @@ pub mod process_mem_stats {
 
     pub fn load() -> Snap {
         Snap {
-            inflight_layers: INFLIGHT_LAYERS.load(Ordering::Relaxed) as usize,
-            inflight_pins: INFLIGHT_PINS.load(Ordering::Relaxed) as usize,
-            inflight_bytes: INFLIGHT_BYTES.load(Ordering::Relaxed),
             wloc_packs: WLOC_PACKS.load(Ordering::Relaxed) as usize,
             wloc_pairs: WLOC_PAIRS.load(Ordering::Relaxed) as usize,
             wloc_bytes: WLOC_BYTES.load(Ordering::Relaxed),
@@ -2806,9 +2786,6 @@ impl Query {
             conf_plans,
             sh_runs: self.sh_run.on_disk_run_count(),
             head,
-            inflight_layers: mem.inflight_layers,
-            inflight_pins: mem.inflight_pins,
-            inflight_bytes: mem.inflight_bytes,
             h2h_keys,
             fence_runs: self.store.height_fence_run_count(),
             bq_promoted: self.block_queue_promoted_count(),
