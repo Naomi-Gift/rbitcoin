@@ -1,10 +1,11 @@
 //! mempool/electrs `/internal/*` bulk REST and `/mempool/txids/page`.
 
-use crate::handlers::{outspend_json, spawn_join};
+use crate::handlers::{outspend_json, spawn_join, write_outspends};
 #[cfg(unix)]
 use crate::server::not_found;
 use crate::server::{
-    block_hash_hex, json_reply_here, parse_hash32, pin_or_reject, store_err, AppState,
+    block_hash_hex, json_bytes_reply, json_reply_here, parse_hash32, pin_or_reject, store_err,
+    AppState,
 };
 #[cfg(unix)]
 use crate::tx_json::{
@@ -313,41 +314,54 @@ pub async fn get_internal_block_txs(
     .await
 }
 
+/// Most txids one `POST /internal/txs/outspends/by-txid` may name.
+pub const MAX_OUTSPENDS_TXIDS: usize = 1_000;
+
+/// Most outspend slots one bulk outspends request may produce, summed over
+/// every txid (repeats included). Over it the request is a 400.
+pub const MAX_OUTSPENDS_ENTRIES: u64 = 250_000;
+
+/// One slot array per id, encoded slot by slot into the body. Every output
+/// count is read first, so a request over [`MAX_OUTSPENDS_ENTRIES`] is
+/// refused before any slot is built.
 pub fn outspends_for_txid_opts(st: &AppState, ids: Vec<Option<[u8; 32]>>) -> Response {
+    let mp = st.mempool.as_deref();
+    let mut nouts = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let nout = match id {
+            None => 0,
+            Some(id) => match st.query.tx_fk_by_txid(id) {
+                Ok(Some(fk)) => match st.query.store().get_tx_meta_and_outputs(fk) {
+                    Ok((meta, _)) => meta.output_count,
+                    Err(e) => return store_err(e),
+                },
+                _ => mp
+                    .and_then(|mp| mp.get_tx(&Txid::from_byte_array(*id)))
+                    .map_or(0, |tx| tx.output.len() as u32),
+            },
+        };
+        nouts.push(nout);
+    }
+    if nouts.iter().map(|&n| u64::from(n)).sum::<u64>() > MAX_OUTSPENDS_ENTRIES {
+        return bad_request("Too many outputs requested");
+    }
     let view = match pin_or_reject(&st.query, ChainViewKind::Tip, None) {
         Ok(v) => v,
         Err(r) => return r,
     };
-    let mp = st.mempool.as_deref();
-    let mut out = Vec::with_capacity(ids.len());
-    for id in ids {
-        let Some(id) = id else {
-            out.push(json!([]));
-            continue;
-        };
-        let nout = if let Ok(Some(fk)) = st.query.tx_fk_by_txid(&id) {
-            match st.query.store().get_tx_meta_and_outputs(fk) {
-                Ok((meta, _)) => meta.output_count,
-                Err(e) => return store_err(e),
-            }
-        } else if let Some(mp) = mp {
-            let tid = Txid::from_byte_array(id);
-            mp.get_tx(&tid)
-                .map(|tx| tx.output.len() as u32)
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        let mut slots = Vec::with_capacity(nout as usize);
-        for vout in 0..nout {
-            match outspend_json(&st.query, mp, &id, vout, view.as_ref()) {
-                Ok(v) => slots.push(v),
-                Err(e) => return store_err(e),
-            }
+    let mut body = vec![b'['];
+    for (i, (id, nout)) in ids.iter().zip(nouts).enumerate() {
+        if i > 0 {
+            body.push(b',');
         }
-        out.push(Value::Array(slots));
+        // An unparseable id has `nout == 0`, so it writes `[]`.
+        let id = id.as_ref().unwrap_or(&[0; 32]);
+        if let Err(e) = write_outspends(&mut body, &st.query, mp, id, nout, view.as_ref()) {
+            return store_err(e);
+        }
     }
-    json_reply_here(out)
+    body.push(b']');
+    json_bytes_reply(body)
 }
 
 #[cfg(unix)]
@@ -365,6 +379,9 @@ pub async fn post_outspends_by_txid(State(st): State<AppState>, body: Bytes) -> 
             Ok(v) => v,
             Err(r) => return r,
         };
+        if ids.len() > MAX_OUTSPENDS_TXIDS {
+            return bad_request("Too many txids requested");
+        }
         outspends_for_txids(&st, ids)
     })
     .await

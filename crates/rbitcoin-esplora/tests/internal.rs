@@ -359,6 +359,91 @@ async fn outspends_by_txid_outpoint_and_query(sock: &std::path::Path, pad: &Pad)
     assert!(resp.contains("Too many txids requested"), "{resp}");
 }
 
+/// One confirmed coinbase spend with `nout` OP_TRUE outputs. Returns its txid.
+fn mine_fan_tx(pad: &Pad, nout: u32) -> Txid {
+    use bitcoin::hashes::Hash;
+    use rbitcoin_consensus::mine_regtest_paying_bits;
+
+    let params = ChainParams::regtest();
+    let tip_h = pad.q.tip_height().unwrap().0;
+    let rec = pad
+        .q
+        .get_header(pad.q.tip_header_fk().unwrap().unwrap())
+        .unwrap();
+    let time = rec.timestamp + 600;
+    let h = tip_h + 1;
+    let bits = rbitcoin_query::expected_next_bits(&pad.q, &params, Height(h), time).unwrap();
+    let spk = ScriptBuf::from_bytes(vec![0x51]);
+    let mut fan = spend_true(pad.cbs[0], 0, spk.clone());
+    fan.output = (0..nout)
+        .map(|_| TxOut {
+            value: Amount::from_sat(10_000),
+            script_pubkey: spk.clone(),
+        })
+        .collect();
+    let b = mine_regtest_paying_bits(
+        bitcoin::BlockHash::from_byte_array(rec.hash),
+        time,
+        h,
+        spk,
+        vec![fan.clone()],
+        bits,
+    );
+    accept_and_connect_block(&pad.q, &params, Height(h), &b, Milestone::NONE).unwrap();
+    fan.compute_txid()
+}
+
+fn repeat_ids(id: &str, n: usize) -> Vec<String> {
+    (0..n).map(|_| id.to_string()).collect()
+}
+
+/// A confirmed 5,001-output tx: two copies answer in full; 50 copies pass
+/// the 250,000-entry cap and get 400 on the public and internal routes. The
+/// internal route also caps txids at 1,000.
+#[tokio::test]
+async fn outspends_bounds_total_entries() {
+    let pad = pad_hub("outspends-cap", 1);
+    let fan = mine_fan_tx(&pad, 5_001).to_string();
+    let sock_dir = rbitcoin_query::testutil::TempDir::for_socket().expect("temp dir");
+    let (handle, sock) = run_unix(
+        sock_dir.path(),
+        Arc::clone(&pad.q),
+        Some(Arc::clone(&pad.hub)),
+    )
+    .await;
+
+    let (st, resp) = http_get_unix(&sock, &format!("/txs/outspends?txids={fan},{fan}")).await;
+    assert_eq!(st, 200, "{}", &resp[..resp.len().min(200)]);
+    let arr: Vec<Vec<Value>> = serde_json::from_str(&resp).unwrap();
+    assert_eq!(arr.len(), 2);
+    assert!(arr.iter().all(|slots| slots.len() == 5_001));
+    assert_eq!(arr[1][5_000], json!({"spent": false}));
+
+    let over = repeat_ids(&fan, 50).join(",");
+    let (st, resp) = http_get_unix(&sock, &format!("/txs/outspends?txids={over}")).await;
+    assert_eq!(st, 400, "{}", &resp[..resp.len().min(200)]);
+    assert_eq!(resp, "Too many outputs requested");
+
+    let body = serde_json::to_vec(&repeat_ids(&fan, 50)).unwrap();
+    let (st, resp) = http_post_unix(&sock, "/internal/txs/outspends/by-txid", &body).await;
+    assert_eq!(st, 400, "{}", &resp[..resp.len().min(200)]);
+    assert_eq!(resp, "Too many outputs requested");
+
+    let unknown = "ff".repeat(32);
+    let body = serde_json::to_vec(&repeat_ids(&unknown, 1_000)).unwrap();
+    let (st, resp) = http_post_unix(&sock, "/internal/txs/outspends/by-txid", &body).await;
+    assert_eq!(st, 200, "{}", &resp[..resp.len().min(200)]);
+    let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
+    assert_eq!(arr.len(), 1_000);
+    let body = serde_json::to_vec(&repeat_ids(&unknown, 1_001)).unwrap();
+    let (st, resp) = http_post_unix(&sock, "/internal/txs/outspends/by-txid", &body).await;
+    assert_eq!(st, 400, "{}", &resp[..resp.len().min(200)]);
+    assert_eq!(resp, "Too many txids requested");
+
+    handle.shutdown().await;
+    let _ = pad.dir;
+}
+
 /// Admission vsize rounds up. This spend has no sigops, so its admission
 /// weight equals its BIP141 weight.
 async fn test_rounds_vsize_up(sock: &std::path::Path, pad: &Pad) {

@@ -394,6 +394,8 @@ paths:
           description: |
             Comma-separated txids, at most 50. A missing list or more than 50 ids is 400.
             A token that is not a hash is an empty array for that slot, not 400.
+            The output counts of every listed txid (repeats included) may sum to at
+            most 250,000; over that is 400 `Too many outputs requested`.
           schema: { type: string }
       responses:
         "200":
@@ -878,6 +880,10 @@ paths:
     post:
       tags: [internal]
       summary: "Outspends per txid (unknown txid → `[]`)"
+      description: |
+        At most 1,000 txids (more is 400 `Too many txids requested`). The output
+        counts of every listed txid (repeats included) may sum to at most 250,000;
+        over that is 400 `Too many outputs requested`.
       requestBody: { $ref: "#/components/requestBodies/TxidArray" }
       responses:
         "200":

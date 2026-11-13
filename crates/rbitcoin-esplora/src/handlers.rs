@@ -826,16 +826,36 @@ pub async fn tx_outspends(
         } else {
             None
         };
-        let mut arr = Vec::with_capacity(nout as usize);
-        for vout in 0..nout {
-            match outspend_json(&st.query, mp, &txid, vout, view.as_ref()) {
-                Ok(v) => arr.push(v),
-                Err(e) => return store_err(e),
-            }
+        let mut body = Vec::new();
+        if let Err(e) = write_outspends(&mut body, &st.query, mp, &txid, nout, view.as_ref()) {
+            return store_err(e);
         }
-        maybe_attach_view(json_reply_here(arr), view)
+        maybe_attach_view(crate::server::json_bytes_reply(body), view)
     })
     .await
+}
+
+/// Append the JSON array of `txid`'s first `nout` outspends to `out`. Each
+/// slot is encoded as it is read, so no `Value` tree is held for the array.
+#[doc(hidden)]
+pub fn write_outspends(
+    out: &mut Vec<u8>,
+    query: &Query,
+    mempool: Option<&MempoolHub>,
+    txid: &[u8; 32],
+    nout: u32,
+    view: Option<&rbitcoin_query::ChainView>,
+) -> Result<(), rbitcoin_query::QueryError> {
+    out.push(b'[');
+    for vout in 0..nout {
+        if vout > 0 {
+            out.push(b',');
+        }
+        let slot = outspend_json(query, mempool, txid, vout, view)?;
+        serde_json::to_writer(&mut *out, &slot).expect("Value encodes into a Vec");
+    }
+    out.push(b']');
+    Ok(())
 }
 
 pub fn outspend_json(
