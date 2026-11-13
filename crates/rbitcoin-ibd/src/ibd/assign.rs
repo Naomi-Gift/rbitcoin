@@ -377,10 +377,7 @@ fn retire_header_timeout_frontier_owners(st: &mut IbdWorkState, hash: BlockHash)
         .get(&hash)
         .map(|request| {
             request
-                .peers
-                .iter()
-                .chain(&request.retired)
-                .copied()
+                .holder_ids()
                 .filter(|peer| st.header_walk.header_timeout_peers.contains(peer))
                 .collect()
         })
@@ -627,9 +624,8 @@ pub fn collect_height_band(
 #[doc(hidden)]
 pub fn live_getdata_cover(st: &IbdWorkState, hash: &BlockHash) -> bool {
     st.inflight.get(hash).is_some_and(|req| {
-        req.peers
-            .iter()
-            .any(|pid| st.slots.iter().any(|s| s.id == *pid && s.alive))
+        req.racing()
+            .any(|pid| st.slots.iter().any(|s| s.id == pid && s.alive))
     })
 }
 
@@ -700,7 +696,7 @@ pub fn bq_wire_for_hash(hub: &ChainHub, ht: u32, want: BlockHash) -> BqWireAt {
 /// cover, soft filled, conf stuck on a later hole).
 #[doc(hidden)]
 pub fn inflight_needs_racer(req: &state::InflightReq) -> bool {
-    req.peers.is_empty() && !req.retired.is_empty()
+    req.is_empty() && !req.retired_is_empty()
 }
 
 /// A free getdata window slot, or a racer for a hash whose only holders are
@@ -902,7 +898,7 @@ pub fn issue_batch(
         .filter(|h| {
             st.inflight
                 .get(*h)
-                .is_some_and(|e| e.len() == 1 && e.retired.is_empty())
+                .is_some_and(|e| e.len() == 1 && e.retired_is_empty())
         })
         .count();
     *room = room.saturating_sub(new_unique);
@@ -968,11 +964,11 @@ pub fn pre_hole_should_extra_racer(st: &IbdWorkState, hash: BlockHash, alive: &[
     let Some(req) = st.inflight.get(&hash) else {
         return true;
     };
-    if req.peers.is_empty() {
+    if req.is_empty() {
         return true;
     }
     let now = Instant::now();
-    let aged = req.peers.iter().all(|&pid| {
+    let aged = req.racing().all(|pid| {
         let since = req.owner_asked_at(pid).unwrap_or(req.started_at);
         now.duration_since(since) >= TIP_HOLE_RX_STALE
     });
@@ -986,7 +982,7 @@ pub fn pre_hole_should_extra_racer(st: &IbdWorkState, hash: BlockHash, alive: &[
         return false;
     }
     let slow = median / 4;
-    req.peers.iter().any(|&pid| {
+    req.racing().any(|pid| {
         st.slots
             .iter()
             .find(|s| s.id == pid && s.alive)
@@ -1139,9 +1135,7 @@ pub fn fifo_blocked_owner_to_drop(
         .map(|s| (s.in_flight.len(), peer_bps(slots, s.id)))
         .min_by(|&(qa, ba), &(qb, bb)| tip_hole_drain_cmp(qa, ba, qb, bb))?;
     let now = Instant::now();
-    req.peers
-        .iter()
-        .copied()
+    req.racing()
         .filter(|&id| {
             let Some(slot) = slots.iter().find(|s| s.id == id && s.alive) else {
                 return false;
@@ -1189,7 +1183,7 @@ pub fn tip_hole_owner_to_drop(
     per_peer: usize,
     estimate: u64,
 ) -> Option<usize> {
-    let owners: Vec<usize> = req.peers.iter().copied().collect();
+    let owners: Vec<usize> = req.racing().collect();
     let owners = owners.as_slice();
     if owners.is_empty() {
         return None;
@@ -1267,9 +1261,7 @@ pub fn retire_hash_owner(st: &mut IbdWorkState, hash: BlockHash, pid: usize) {
 fn reask_aged_retired_owner(st: &mut IbdWorkState, hash: BlockHash) -> bool {
     let now = Instant::now();
     let Some(pid) = st.inflight.get(&hash).and_then(|req| {
-        req.retired
-            .iter()
-            .copied()
+        req.retired_ids()
             .filter_map(|pid| {
                 let asked = req.owner_asked_at(pid)?;
                 (now.duration_since(asked) >= TIP_HOLE_RX_STALE).then_some((pid, asked))
@@ -1359,7 +1351,7 @@ pub fn steal_hung_densify(
             if ht <= tip_batch_hi {
                 return None;
             }
-            let &pid = req.peers.iter().next()?;
+            let pid = req.racing().next()?;
             Some((*h, ht, pid, req.owner_asked_at(pid)?))
         })
         .collect();
@@ -1381,11 +1373,7 @@ pub fn steal_hung_densify(
         .collect();
     let mut issued = 0u64;
     for h in hung {
-        let Some(owner) = st
-            .inflight
-            .get(&h)
-            .and_then(|req| req.peers.iter().copied().next())
-        else {
+        let Some(owner) = st.inflight.get(&h).and_then(|req| req.racing().next()) else {
             continue;
         };
         let owner_bps = peer_bps(&st.slots, owner);

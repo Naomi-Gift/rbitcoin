@@ -757,15 +757,19 @@ fn ibd_cover_tip_holes() {
     race(&mut st, &three, hole, TIP_HOLE_MAX_PEERS);
     let r = &st.inflight[&hole];
     assert!(
-        r.holds(1) && !r.peers.contains(&1) && r.peers.contains(&0),
+        r.holds(1) && !r.is_racing(1) && r.is_racing(0),
         "silent owner leaves when a sibling streams; peers={:?}",
-        r.peers
+        r.racing_set()
     );
     for _ in 0..4 {
         race(&mut st, &three, hole, TIP_HOLE_MAX_PEERS);
     }
     let r = &st.inflight[&hole];
-    assert_eq!(r.peers, HashSet::from([0]), "the streaming racer stays");
+    assert_eq!(
+        r.racing_set(),
+        HashSet::from([0]),
+        "the streaming racer stays"
+    );
     assert!(r.holds(1) && r.holds(2));
     assert!(
         st.slots[1].in_flight.contains(&hole),
@@ -846,13 +850,13 @@ fn ibd_cover_tip_holes() {
         seed_ewma(&mut st.slots[pid], bps);
     }
     race(&mut st, &three, hole, 2);
-    assert_eq!(st.inflight[&hole].peers, HashSet::from([1, 2]));
+    assert_eq!(st.inflight[&hole].racing_set(), HashSet::from([1, 2]));
     st.inflight.get_mut(&hole).unwrap().started_at = ago(7);
     rx_now(&mut st, 1);
     rx_now(&mut st, 2);
     race(&mut st, &three, hole, 2);
     assert_eq!(
-        st.inflight[&hole].peers,
+        st.inflight[&hole].racing_set(),
         HashSet::from([1, 2]),
         "tight pack with live rx keeps owners"
     );
@@ -872,9 +876,9 @@ fn ibd_cover_tip_holes() {
     race(&mut st, &three, hole, 3);
     let r = &st.inflight[&hole];
     assert!(
-        !r.peers.contains(&0),
+        !r.is_racing(0),
         "slow outlier leaves; peers={:?}",
-        r.peers
+        r.racing_set()
     );
 
     // Peer 0 is the only live peer. It keeps an aged hole while it
@@ -886,40 +890,36 @@ fn ibd_cover_tip_holes() {
     rx_now(&mut st, 0);
     let req = st.inflight.get_mut(&hole).unwrap();
     req.started_at = ago(31);
-    req.asked_at.insert(0, ago(31));
+    req.set_asked_at(0, ago(31));
     race(&mut st, &[0], hole, TIP_HOLE_MAX_PEERS);
     assert!(
-        st.inflight[&hole].peers.contains(&0),
+        st.inflight[&hole].is_racing(0),
         "a sole streaming peer keeps the hole"
     );
     st.slots[0].rate.progress_ms = 0;
     race(&mut st, &[0], hole, TIP_HOLE_MAX_PEERS);
     let r = &st.inflight[&hole];
     assert!(
-        r.peers.contains(&0) && r.holds(0),
+        r.is_racing(0) && r.holds(0),
         "a silent retired owner is re-asked when no other peer exists"
     );
 
     st.slots[1].alive = true;
     seed_ewma(&mut st.slots[1], 2_000_000);
     race(&mut st, &[0, 1], hole, TIP_HOLE_MAX_PEERS);
-    assert!(st.inflight[&hole].peers.contains(&1));
+    assert!(st.inflight[&hole].is_racing(1));
 
     // Peer 1 streams but holds it 31 s while peer 2 is connected.
     rx_now(&mut st, 1);
-    st.inflight
-        .get_mut(&hole)
-        .unwrap()
-        .asked_at
-        .insert(1, ago(31));
+    st.inflight.get_mut(&hole).unwrap().set_asked_at(1, ago(31));
     st.slots[2].alive = true;
     seed_ewma(&mut st.slots[2], 1_000_000);
     race(&mut st, &three, hole, TIP_HOLE_MAX_PEERS);
     let r = &st.inflight[&hole];
     assert!(
-        !r.peers.contains(&0) && r.peers.contains(&1) && r.peers.contains(&2),
+        !r.is_racing(0) && r.is_racing(1) && r.is_racing(2),
         "the silent owner leaves before the aged one; peers={:?}",
-        r.peers
+        r.racing_set()
     );
 
     // The hash is old but peer 2 was asked just now: age counts from the
@@ -931,9 +931,9 @@ fn ibd_cover_tip_holes() {
     race(&mut st, &[0, 1, 2, 3], hole, 1);
     let r = &st.inflight[&hole];
     assert!(
-        r.peers.contains(&2) && !r.peers.contains(&3),
+        r.is_racing(2) && !r.is_racing(3),
         "an owner asked just now is not aged; peers={:?}",
-        r.peers
+        r.racing_set()
     );
 
     // A fast peer with densify queued drains sooner than an idle slow
@@ -952,15 +952,11 @@ fn ibd_cover_tip_holes() {
         0
     );
     race(&mut st, &[0, 1], hole, 1);
-    assert_eq!(st.inflight[&hole].peers, HashSet::from([0]));
+    assert_eq!(st.inflight[&hole].racing_set(), HashSet::from([0]));
     rx_now(&mut st, 0);
-    st.inflight
-        .get_mut(&hole)
-        .unwrap()
-        .asked_at
-        .insert(0, ago(6));
+    st.inflight.get_mut(&hole).unwrap().set_asked_at(0, ago(6));
     race(&mut st, &[0, 1], hole, 1);
-    assert_eq!(st.inflight[&hole].peers, HashSet::from([0]));
+    assert_eq!(st.inflight[&hole].racing_set(), HashSet::from([0]));
 
     // Peer 0 has densify ahead of the hole. Alone it keeps it. Once a
     // faster empty peer connects, it keeps it for 5 s, then leaves it.
@@ -971,14 +967,10 @@ fn ibd_cover_tip_holes() {
     st.slots[0].in_flight.insert(h(0x99));
     race(&mut st, &[0], hole, 1);
     rx_now(&mut st, 0);
-    st.inflight
-        .get_mut(&hole)
-        .unwrap()
-        .asked_at
-        .insert(0, ago(6));
+    st.inflight.get_mut(&hole).unwrap().set_asked_at(0, ago(6));
     race(&mut st, &[0], hole, 1);
     assert_eq!(
-        st.inflight[&hole].peers,
+        st.inflight[&hole].racing_set(),
         HashSet::from([0]),
         "no one else to race"
     );
@@ -987,25 +979,20 @@ fn ibd_cover_tip_holes() {
     st.inflight
         .get_mut(&hole)
         .unwrap()
-        .asked_at
-        .insert(0, Instant::now());
+        .set_asked_at(0, Instant::now());
     race(&mut st, &[0, 1], hole, 1);
     assert_eq!(
-        st.inflight[&hole].peers,
+        st.inflight[&hole].racing_set(),
         HashSet::from([0]),
         "young owner has not had time to reach the hash"
     );
-    st.inflight
-        .get_mut(&hole)
-        .unwrap()
-        .asked_at
-        .insert(0, ago(6));
+    st.inflight.get_mut(&hole).unwrap().set_asked_at(0, ago(6));
     race(&mut st, &[0, 1], hole, 2);
     let r = &st.inflight[&hole];
     assert!(
-        r.holds(0) && r.peers == HashSet::from([1]),
+        r.holds(0) && r.racing_set() == HashSet::from([1]),
         "densify-FIFO owner leaves for the empty fast peer; peers={:?}",
-        r.peers
+        r.racing_set()
     );
     assert_eq!(getdata_asks(&mut wire, hole), vec![1, 1, 0, 0, 0, 0]);
 
@@ -1014,14 +1001,10 @@ fn ibd_cover_tip_holes() {
     st.slots[2].alive = true;
     seed_ewma(&mut st.slots[2], 50_000_000);
     rx_now(&mut st, 1);
-    st.inflight
-        .get_mut(&hole)
-        .unwrap()
-        .asked_at
-        .insert(1, ago(6));
+    st.inflight.get_mut(&hole).unwrap().set_asked_at(1, ago(6));
     race(&mut st, &three, hole, 2);
     let r = &st.inflight[&hole];
-    assert!(r.peers.contains(&1) && !r.holds(2));
+    assert!(r.is_racing(1) && !r.holds(2));
 
     // Peers who still owe the block count toward the race cap.
     let four = [0, 1, 2, 3];
@@ -1034,11 +1017,7 @@ fn ibd_cover_tip_holes() {
     race(&mut st, &four, hole, 2);
     assert_eq!(getdata_asks(&mut wire, hole), vec![1, 1, 0, 0, 0, 0]);
     st.slots[0].in_flight.insert(h(0x99));
-    st.inflight
-        .get_mut(&hole)
-        .unwrap()
-        .asked_at
-        .insert(0, ago(6));
+    st.inflight.get_mut(&hole).unwrap().set_asked_at(0, ago(6));
     for pid in four {
         rx_now(&mut st, pid);
     }
@@ -1046,7 +1025,7 @@ fn ibd_cover_tip_holes() {
         race(&mut st, &four, hole, 2);
     }
     let r = &st.inflight[&hole];
-    assert!(!r.peers.contains(&0) && r.holds(0) && r.holds(1));
+    assert!(!r.is_racing(0) && r.holds(0) && r.holds(1));
     assert!(!r.holds(2) && !r.holds(3));
     assert_eq!(
         getdata_asks(&mut wire, hole),
@@ -1117,14 +1096,10 @@ fn ibd_cover_tip_holes() {
     st.inflight.get_mut(&gap).unwrap().started_at = ago(31);
     assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
     assert_eq!(racers(&st, gap_ht), 1, "an old request with a fresh ask");
-    st.inflight
-        .get_mut(&gap)
-        .unwrap()
-        .asked_at
-        .insert(0, ago(31));
+    st.inflight.get_mut(&gap).unwrap().set_asked_at(0, ago(31));
     assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
     let r = &st.inflight[&gap];
-    assert!(r.holds(0) && !r.peers.contains(&0), "aged owner is retired");
+    assert!(r.holds(0) && !r.is_racing(0), "aged owner is retired");
     assert_eq!(r.len(), 1, "one fresh racer replaces it");
     assert_eq!(r.holders(), PRE_HOLE_MAX_PEERS);
 
@@ -1145,8 +1120,7 @@ fn ibd_cover_tip_holes() {
 
     let hash = h(0x71);
     let mut req = state::InflightReq::new(0);
-    req.asked_at
-        .insert(0, Instant::now() - Duration::from_secs(6));
+    req.set_asked_at(0, Instant::now() - Duration::from_secs(6));
     req.add_peer(1);
     req.retire_peer(1);
     let mut owner = dummy_slot(0);
@@ -1216,9 +1190,9 @@ fn ibd_cover_tip_holes_recovers_all_retired() {
     retire_hash_owner(&mut st, hole, 0);
     let r = &st.inflight[&hole];
     assert!(
-        r.peers.is_empty() && r.holds(0),
+        r.is_empty() && r.holds(0),
         "the stall-retired owner keeps its request; peers={:?}",
-        r.peers
+        r.racing_set()
     );
 
     // Retired holders are not coverage: a fresh peer is asked, the retired
@@ -1226,8 +1200,13 @@ fn ibd_cover_tip_holes_recovers_all_retired() {
     let issued = cover_tip_holes(&mut st, &hub, &cfg, &alive, &[hole], 1);
     assert!(issued >= 1, "an all-retired hole must be re-covered");
     let r = &st.inflight[&hole];
-    assert_eq!(r.len(), 1, "exactly one fresh racer; peers={:?}", r.peers);
-    assert!(!r.peers.contains(&0), "the retired owner is not re-asked");
+    assert_eq!(
+        r.len(),
+        1,
+        "exactly one fresh racer; peers={:?}",
+        r.racing_set()
+    );
+    assert!(!r.is_racing(0), "the retired owner is not re-asked");
     let asks = getdata_asks(&mut wire, hole);
     assert_eq!(asks[0], 1, "the retired owner is never re-asked");
     assert_eq!(
@@ -1251,11 +1230,16 @@ fn ibd_cover_tip_holes_recovers_all_retired() {
     retire_hash_owner(&mut st, hole, 0);
     retire_hash_owner(&mut st, hole, 1);
     let r = &st.inflight[&hole];
-    assert!(r.peers.is_empty() && r.holders() == PRE_HOLE_MAX_PEERS);
+    assert!(r.is_empty() && r.holders() == PRE_HOLE_MAX_PEERS);
     let issued = cover_tip_holes(&mut st, &hub, &cfg, &alive, &[hole], PRE_HOLE_MAX_PEERS);
     assert!(issued >= 1, "an all-retired pre-hole must be re-covered");
     let r = &st.inflight[&hole];
-    assert_eq!(r.len(), 1, "exactly one fresh racer; peers={:?}", r.peers);
+    assert_eq!(
+        r.len(),
+        1,
+        "exactly one fresh racer; peers={:?}",
+        r.racing_set()
+    );
 
     // A live racer keeps the sleeping-holder cap: two retired holders plus
     // one racer already close the pre-hole cap.
@@ -1276,9 +1260,9 @@ fn ibd_cover_tip_holes_recovers_all_retired() {
     {
         let req = st.inflight.get_mut(&hole).unwrap();
         for (pid, age) in [(0usize, 40u64), (1, 35), (2, 32), (3, 31)] {
-            req.asked_at.insert(pid, now - Duration::from_secs(age));
+            req.set_asked_at(pid, now - Duration::from_secs(age));
         }
-        assert!(req.peers.is_empty());
+        assert!(req.is_empty());
         assert!(req.holders() >= PRE_HOLE_MAX_PEERS);
     }
     assert_eq!(
@@ -1287,11 +1271,11 @@ fn ibd_cover_tip_holes_recovers_all_retired() {
     );
     let r = &st.inflight[&hole];
     assert_eq!(
-        r.peers,
+        r.racing_set(),
         HashSet::from([0]),
         "the longest-held retired owner is re-asked"
     );
-    assert!(r.retired.contains(&1));
+    assert!(r.is_retired(1));
 
     // Below the cap a racerless hash keeps the full fill: one retired holder
     // plus three fresh peers for the tip+1 cap, not one racer per pass.
@@ -1340,7 +1324,7 @@ fn ibd_cover_tip_holes_retired_cap_stays_one_racer() {
         retire_hash_owner(&mut st, hole, pid);
     }
     let r = &st.inflight[&hole];
-    assert!(r.peers.is_empty());
+    assert!(r.is_empty());
     assert_eq!(r.holders(), TIP_HOLE_MAX_PEERS);
 
     assert_eq!(
@@ -1349,7 +1333,7 @@ fn ibd_cover_tip_holes_retired_cap_stays_one_racer() {
     );
     let r = &st.inflight[&hole];
     assert_eq!(
-        r.peers,
+        r.racing_set(),
         HashSet::from([TIP_HOLE_MAX_PEERS]),
         "the peer who does not already hold the hash is the one racer"
     );
@@ -1667,7 +1651,7 @@ fn assign_depth_densify_cache_and_early_exits() {
     }
     st.densify_scan_lo = 33;
     assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
-    assert!(st.inflight[&h(33)].peers.contains(&1));
+    assert!(st.inflight[&h(33)].is_racing(1));
     assert_eq!(st.slots[1].in_flight.len(), 16);
     assert!(st.slots[0].in_flight.len() <= 8 && st.slots[2].in_flight.len() <= 8);
 
@@ -1727,13 +1711,13 @@ fn assign_depth_densify_cache_and_early_exits() {
     let age_owner = |st: &mut IbdWorkState, pid: usize| {
         let req = st.inflight.get_mut(&hung).unwrap();
         req.started_at = ago(31);
-        req.asked_at.insert(pid, ago(31));
+        req.set_asked_at(pid, ago(31));
     };
     st.slots[1].alive = true;
     seed_ewma(&mut st.slots[1], 1_000_000);
     assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
     assert_eq!(
-        st.inflight[&hung].peers,
+        st.inflight[&hung].racing_set(),
         HashSet::from([0]),
         "a young request is not hung"
     );
@@ -1741,7 +1725,7 @@ fn assign_depth_densify_cache_and_early_exits() {
     age_owner(&mut st, 0);
     assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
     assert_eq!(
-        st.inflight[&hung].peers,
+        st.inflight[&hung].racing_set(),
         HashSet::from([0]),
         "no faster peer"
     );
@@ -1754,7 +1738,7 @@ fn assign_depth_densify_cache_and_early_exits() {
     seed_ewma(&mut st.slots[1], 1_000_000);
     assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
     assert_eq!(
-        st.inflight[&hung].peers,
+        st.inflight[&hung].racing_set(),
         HashSet::from([0]),
         "an equal-bps peer does not steal"
     );
@@ -1762,14 +1746,18 @@ fn assign_depth_densify_cache_and_early_exits() {
     seed_ewma(&mut st.slots[1], 2_000_000);
     st.slots[0].rate.note_rx(ibd_mono_ms().max(1));
     assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
-    assert_eq!(st.inflight[&hung].peers, HashSet::from([0]), "live rx");
+    assert_eq!(
+        st.inflight[&hung].racing_set(),
+        HashSet::from([0]),
+        "live rx"
+    );
     st.slots[0].rate.progress_ms = 0;
     assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
     let r = &st.inflight[&hung];
     assert!(
-        r.peers == HashSet::from([1]) && r.holds(0),
+        r.racing_set() == HashSet::from([1]) && r.holds(0),
         "hung densify moves to the faster peer; peers={:?}",
-        r.peers
+        r.racing_set()
     );
     st.slots[0].rate = Default::default();
     seed_ewma(&mut st.slots[0], 9_000_000);
@@ -1779,9 +1767,9 @@ fn assign_depth_densify_cache_and_early_exits() {
     assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
     let r = &st.inflight[&hung];
     assert!(
-        r.peers == HashSet::from([2]) && r.holds(0) && r.holds(1),
+        r.racing_set() == HashSet::from([2]) && r.holds(0) && r.holds(1),
         "steal skips a peer that already holds the hash; peers={:?}",
-        r.peers
+        r.racing_set()
     );
 
     // No faster peer has a free slot: the hung owner is retired, keeps
@@ -1807,9 +1795,9 @@ fn assign_depth_densify_cache_and_early_exits() {
     assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
     let r = &st.inflight[&hung];
     assert!(
-        r.holds(0) && r.peers.is_empty(),
+        r.holds(0) && r.is_empty(),
         "no free faster slot retires the hung owner; peers={:?}",
-        r.peers
+        r.racing_set()
     );
     assert!(st.slots[0].in_flight.contains(&hung));
     assert!(st.densify_scan_lo <= 40, "scan_lo={}", st.densify_scan_lo);
@@ -1819,9 +1807,9 @@ fn assign_depth_densify_cache_and_early_exits() {
     assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
     let r = &st.inflight[&hung];
     assert!(
-        r.peers.contains(&1) && r.holds(0) && !r.peers.contains(&0),
+        r.is_racing(1) && r.holds(0) && !r.is_racing(0),
         "the freed peer is asked; the hung peer stays retired; peers={:?}",
-        r.peers
+        r.racing_set()
     );
     assert_eq!(getdata_asks(&mut wire, hung), vec![1, 1, 0]);
 
@@ -2050,9 +2038,9 @@ fn retained_header_timeout_frontier_recovers_below_and_above_racing_threshold() 
             "assignment must ask the alternative peer below and above the racing threshold"
         );
         if matches!(depth, AssignDepth::Critical) {
-            assert!(st.inflight[&h(1)].retired.contains(&0));
+            assert!(st.inflight[&h(1)].is_retired(0));
         }
-        assert!(st.inflight[&h(1)].peers.contains(&1));
+        assert!(st.inflight[&h(1)].is_racing(1));
         assert!(
             st.slots[0].in_flight.contains(&h(1)),
             "the retained peer keeps its outstanding request"
@@ -2093,7 +2081,7 @@ fn tip_hole_in_front_of_queued_bodies_is_requested() {
         "hole in front of queued bodies is requested; inflight={:?}",
         st.inflight.keys().collect::<Vec<_>>()
     );
-    assert!(st.inflight[&h(1)].peers.contains(&0));
+    assert!(st.inflight[&h(1)].is_racing(0));
 
     restart_on(&mut st, &hub, &mut wire, &[0]);
     plant_work_path(&mut st, 1, 8);
@@ -2105,11 +2093,9 @@ fn tip_hole_in_front_of_queued_bodies_is_requested() {
         .insert(h(1), rbitcoin_ibd::ibd::state::InflightReq::new(1));
     assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Full, None);
     assert!(
-        st.inflight
-            .get(&h(1))
-            .is_some_and(|req| req.peers.contains(&0)),
+        st.inflight.get(&h(1)).is_some_and(|req| req.is_racing(0)),
         "a gone holder does not cover the hole; inflight={:?}",
-        st.inflight.get(&h(1)).map(|req| req.peers.clone())
+        st.inflight.get(&h(1)).map(|req| req.racing_set())
     );
 
     let _ = std::fs::remove_dir_all(dir);

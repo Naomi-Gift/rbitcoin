@@ -499,7 +499,7 @@ fn first_challenge_timeout_keeps_productive_frontier_ownership() {
     assert!(st.slots[0].alive);
     assert!(!st.header_walk.header_timeout_peers.contains(&0));
     assert_eq!(st.header_walk.header_misses.get(&0), Some(&1));
-    assert!(st.inflight[&owed].peers.contains(&0));
+    assert!(st.inflight[&owed].is_racing(0));
     assert!(st.slots[0].in_flight.contains(&owed));
     assert!(!st.header_walk.walk_quiet.contains(&0));
     assert!(wants_lookahead(&st));
