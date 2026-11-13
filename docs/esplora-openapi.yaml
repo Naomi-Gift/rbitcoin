@@ -135,7 +135,8 @@ paths:
   /block/{hash}:
     get:
       tags: [blocks]
-      summary: Block summary (best chain only)
+      summary: Block summary (active or archived stale block)
+      description: Height resolution walks at most 10,000 headers to an active ancestor or genesis; beyond that, 404. Median time uses this branch.
       parameters: [{ $ref: "#/components/parameters/BlockHash" }]
       responses:
         "200":
@@ -157,6 +158,7 @@ paths:
     get:
       tags: [blocks]
       summary: Whether the block is on the best chain
+      description: Stored stale headers retain their original height and have null next_best. Height resolution is limited to 10,000 headers; beyond that, 404.
       parameters: [{ $ref: "#/components/parameters/BlockHash" }]
       responses:
         "200":
@@ -1080,7 +1082,7 @@ components:
       required: [in_best_chain, height, next_best]
       properties:
         in_best_chain: { type: boolean }
-        height: { type: [integer, "null"] }
+        height: { type: integer }
         next_best:
           oneOf: [{ $ref: "#/components/schemas/Hash" }, { type: "null" }]
     TxStatus:

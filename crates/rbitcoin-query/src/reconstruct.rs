@@ -20,7 +20,7 @@ pub struct BlockTxStatRows {
     pub txstat_bytes: u64,
 }
 
-/// Stamped `txstat.body` rows for one confirmed block (every row non-zero).
+/// Stamped `txstat.body` rows for one stored block (every row non-zero).
 #[derive(Debug, Clone)]
 pub struct StampedTxstatBlock {
     pub rec: HeaderRecord,
@@ -575,6 +575,14 @@ impl Query {
         let Some((header_fk, rec)) = self.header_at_height(height)? else {
             return Ok(None);
         };
+        self.stamped_txstat_header(header_fk, rec)
+    }
+
+    fn stamped_txstat_header(
+        &self,
+        header_fk: Fk,
+        rec: HeaderRecord,
+    ) -> Result<Option<StampedTxstatBlock>, QueryError> {
         let Some((first, n)) = self.store.header_txs.get_range(header_fk)? else {
             return Ok(None);
         };
@@ -607,8 +615,8 @@ impl Query {
         }))
     }
 
-    /// Txid, fee, weight, and output value of every tx in best-chain block
-    /// `hash`, coinbase first. `None` when `hash` is not on the best chain.
+    /// Txid, fee, weight, and output value of every tx in stored block
+    /// `hash`, coinbase first. `None` for an unknown or header-only block.
     ///
     /// Reads `txstat`, `create.loc`, `txout.body`, and `txid.body` over the
     /// block's create span. A block with unstamped `txstat` rows gives the
@@ -618,15 +626,15 @@ impl Query {
         &self,
         hash: &[u8; 32],
     ) -> Result<Option<Vec<BlockTxSummary>>, QueryError> {
-        let Some(height) = self.height_of_hash(hash)? else {
+        let Some((header_fk, rec)) = self.get_header_by_hash(hash)? else {
             return Ok(None);
         };
-        let Some(stamped) = self.stamped_txstat_block(height)? else {
-            return self.block_tx_summary_from_wire(hash);
-        };
-        if stamped.rec.hash != *hash {
+        if self.store.header_txs.get_range(header_fk)?.is_none() {
             return Ok(None);
         }
+        let Some(stamped) = self.stamped_txstat_header(header_fk, rec)? else {
+            return self.block_tx_summary_from_wire(hash);
+        };
         let (Some(first), Some(last)) = (stamped.fks.first(), stamped.fks.last()) else {
             return Err(StoreError::Corrupt(
                 "invariant: stamped block without creates",

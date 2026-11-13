@@ -1362,10 +1362,7 @@ fn block_tx_summary_from_wire_reads_the_requested_header() {
         a.iter().map(|r| (r.txid, r.value_sat)).collect::<Vec<_>>(),
         vec![(cba.tx.txid, a_value)],
     );
-    assert!(
-        q.block_tx_summary(&ha.hash).unwrap().is_none(),
-        "a replaced block is off the best chain"
-    );
+    assert_eq!(q.block_tx_summary(&ha.hash).unwrap().unwrap(), a);
     let b = q.block_tx_summary(&hb.hash).unwrap().expect("best chain");
     assert_eq!(
         b.iter().map(|r| (r.txid, r.value_sat)).collect::<Vec<_>>(),

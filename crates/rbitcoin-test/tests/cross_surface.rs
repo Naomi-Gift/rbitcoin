@@ -747,6 +747,93 @@ async fn pin_esplora_block_json_raw_status(
     assert_eq!(pst["next_best"], tip_hash, "{body}");
 }
 
+#[allow(clippy::cognitive_complexity)] // One invalidate/reconsider HTTP session across block routes.
+async fn pin_esplora_stale_block(rpc: SocketAddr, http: SocketAddr) {
+    let mined = jsonrpc(rpc, "generate", json!([2])).await;
+    let hashes = mined["result"].as_array().expect("mined hashes");
+    let first = hashes[0].as_str().unwrap();
+    let tip = hashes[1].as_str().unwrap();
+    let header = jsonrpc(rpc, "getblockheader", json!([tip, true])).await;
+    let height = header["result"]["height"].clone();
+    let summary = http_get(http, &format!("/block/{tip}")).await;
+    assert_eq!(summary.0, 200, "{}", summary.1);
+    let expected: Value = serde_json::from_str(&summary.1).unwrap();
+    let raw = http_get_raw(http, &format!("/block/{tip}/raw")).await;
+    let ids = http_get(http, &format!("/block/{tip}/txids")).await;
+    let txids: Vec<Value> = serde_json::from_str(&ids.1).unwrap();
+    let tx_summary = http_get(http, &format!("/block/{tip}/txs/summary")).await;
+
+    for _ in 0..2 {
+        let invalidated = jsonrpc(rpc, "invalidateblock", json!([first])).await;
+        assert!(invalidated["error"].is_null(), "{invalidated}");
+        let (status, body) = http_get(http, &format!("/block/{tip}/status")).await;
+        assert_eq!(status, 200, "{body}");
+        let status: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            status,
+            json!({"in_best_chain": false, "height": height, "next_best": null})
+        );
+        let (code, body) = http_get(http, &format!("/block/{tip}")).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(serde_json::from_str::<Value>(&body).unwrap(), expected);
+        assert_eq!(http_get_raw(http, &format!("/block/{tip}/raw")).await, raw);
+        assert_eq!(http_get(http, &format!("/block/{tip}/txids")).await, ids);
+        assert_eq!(
+            http_get(http, &format!("/block/{tip}/txs/summary")).await,
+            tx_summary
+        );
+        let (code, body) = http_get(http, &format!("/block/{tip}/header")).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            rbitcoin_primitives::hex_decode(body.trim()).unwrap(),
+            raw.1[..80]
+        );
+        let (code, body) = http_get(http, &format!("/block/{tip}/txid/0")).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body, txids[0].as_str().unwrap());
+        for suffix in ["txs", "txs/0"] {
+            let (code, body, txs) =
+                esplora_json_array(http, &format!("/block/{tip}/{suffix}")).await;
+            assert_eq!(code, 200, "{body}");
+            assert_eq!(txs[0]["txid"], txids[0]);
+            assert_eq!(txs[0]["status"]["confirmed"], false);
+        }
+        let (code, body) = http_get(
+            http,
+            &format!("/tx/{}/status?asof={tip}", txids[0].as_str().unwrap()),
+        )
+        .await;
+        assert_eq!(code, 404, "stale asof: {body}");
+        let unknown = "ff".repeat(32);
+        for suffix in [
+            "",
+            "/status",
+            "/header",
+            "/raw",
+            "/txids",
+            "/txid/0",
+            "/txs",
+            "/txs/0",
+            "/txs/summary",
+        ] {
+            assert_eq!(
+                http_get_raw(http, &format!("/block/{unknown}{suffix}"))
+                    .await
+                    .0,
+                404
+            );
+        }
+        let reconsidered = jsonrpc(rpc, "reconsiderblock", json!([first])).await;
+        assert!(reconsidered["error"].is_null(), "{reconsidered}");
+        let (code, body) = http_get(http, &format!("/block/{tip}/status")).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            serde_json::from_str::<Value>(&body).unwrap()["in_best_chain"],
+            true
+        );
+    }
+}
+
 async fn pin_esplora_txid_raw_hex_merkleblock(
     esplora_addr: SocketAddr,
     tip_hash: &str,
@@ -2676,6 +2763,8 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
     assert!(history, "fee history missing connected height {tip}");
+
+    pin_esplora_stale_block(rpc_addr, esplora_addr).await;
 
     let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
     let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;

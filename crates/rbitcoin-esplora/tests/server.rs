@@ -1238,9 +1238,14 @@ async fn block_txs_summary_rows_and_misses() {
         alt.nonce,
     );
     q.connect_block(Height(3), &alt, &[alt_cb]).unwrap();
-    let (st_ids, _) = http_get(addr, &format!("/block/{hash}/txids")).await;
+    let (st_ids, stale_ids) = http_get(addr, &format!("/block/{hash}/txids")).await;
     let (st, body) = http_get(addr, &format!("/block/{hash}/txs/summary")).await;
-    assert_eq!((st, st_ids), (404, 404), "reorged out: {body}");
+    assert_eq!((st, st_ids), (200, 200), "reorged out: {body}");
+    assert_eq!(serde_json::from_str::<Vec<Value>>(&body).unwrap(), rows);
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&stale_ids).unwrap(),
+        ids
+    );
     let alt_hex = block_hash_hex(&alt.hash);
     let (st, body) = http_get(addr, &format!("/block/{alt_hex}/txs/summary")).await;
     assert_eq!(st, 200, "{body}");
