@@ -252,14 +252,14 @@ impl SpTweaksTable {
         let mut buf = vec![0u8; (n_offs as usize) * SLOT as usize];
         seg.idx
             .read_at(FILE_HEADER_LEN as u64 + local * SLOT, &mut buf)?;
-        let mut starts = Vec::with_capacity(n as usize);
-        for i in 0..n as usize {
-            let s = i * SLOT as usize;
-            starts.push(u32::from_le_bytes(buf[s..s + 4].try_into().unwrap()));
+        let (raw, _) = buf.as_chunks::<{ SLOT as usize }>();
+        let n_rows = n as usize;
+        let mut starts = Vec::with_capacity(n_rows);
+        for row in &raw[..n_rows] {
+            starts.push(le_u32!(row, 0));
         }
         let end = if need_next {
-            let s = n as usize * SLOT as usize;
-            u64::from(u32::from_le_bytes(buf[s..s + 4].try_into().unwrap()))
+            u64::from(le_u32!(raw[n_rows], 0))
         } else {
             seg.body.logical_len()
         };

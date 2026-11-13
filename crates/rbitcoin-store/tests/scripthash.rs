@@ -1520,6 +1520,109 @@ fn create_fks_matches_entries() {
 }
 
 #[test]
+fn alloc_header_reads_the_counts() {
+    let dir = tmp();
+    let body = TableFile::create(dir.join("shal.body"), TableKind::ScriptHash).unwrap();
+    let err = match read_alloc_header(&body) {
+        Ok(_) => panic!("open accepted a missing alloc header"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, StoreError::Corrupt(m) if m.contains("missing alloc header")),
+        "{err:?}"
+    );
+
+    let wrote = match init_empty_body(&body) {
+        Ok(state) => state,
+        Err(err) => panic!("{err:?}"),
+    };
+    let (state, ver) = match read_alloc_header(&body) {
+        Ok(v) => v,
+        Err(err) => panic!("{err:?}"),
+    };
+    assert_eq!(ver, SH_ALLOC_VERSION);
+    assert_eq!(state.live_count, wrote.live_count);
+    assert_eq!(state.bump, payload_start(FILE_HEADER_LEN));
+    assert_eq!(state.free_head, [0; SH_MAX_CLASS as usize + 1]);
+
+    let mut next = state;
+    next.live_count = 4;
+    next.bump = state.bump + 8;
+    next.free_head[3] = 8192;
+    write_alloc_header(&body, &next).unwrap();
+    let (state, ver) = match read_alloc_header(&body) {
+        Ok(v) => v,
+        Err(err) => panic!("{err:?}"),
+    };
+    assert_eq!(ver, SH_ALLOC_VERSION);
+    assert_eq!(state.live_count, 4);
+    assert_eq!(state.bump, next.bump);
+    assert_eq!(state.free_head[3], 8192);
+}
+
+#[test]
+fn undo_record_reads_the_page_fields() {
+    use rbitcoin_store::scripthash::unlink::{
+        encode_undo, read_undo, HeadWord, UndoRec, HEAD_MAIN, UNDO_AT, UNDO_LEN,
+    };
+    use rbitcoin_store::scripthash_pages::SH_PAGE_SIZE;
+
+    let dir = tmp();
+    let body = TableFile::create(dir.join("undo.body"), TableKind::ScriptHash).unwrap();
+    let missing = match read_undo(&body) {
+        Ok(v) => v,
+        Err(err) => panic!("{err:?}"),
+    };
+    assert!(missing.is_none());
+
+    let page = SH_PAGE_SIZE as u64;
+    body.set_logical_len(page * 3).unwrap();
+    let rec = UndoRec {
+        target: page,
+        image: page * 2,
+        word: Some(HeadWord {
+            tag: HEAD_MAIN,
+            index: 7,
+            off: page,
+            old: [1, 2, 3, 4, 5, 6, 7, 8],
+        }),
+    };
+    let mut raw = [0u8; UNDO_LEN];
+    encode_undo(&mut raw, &rec).unwrap();
+    body.write_at(FILE_HEADER_LEN as u64 + UNDO_AT as u64, &raw)
+        .unwrap();
+    let got = match read_undo(&body) {
+        Ok(Some(v)) => v,
+        Ok(None) => panic!("undo missing"),
+        Err(err) => panic!("{err:?}"),
+    };
+    assert_eq!(got.target, page);
+    assert_eq!(got.image, page * 2);
+    let word = got.word.expect("head word");
+    assert_eq!(word.tag, HEAD_MAIN);
+    assert_eq!(word.index, 7);
+    assert_eq!(word.off, page);
+    assert_eq!(word.old, [1, 2, 3, 4, 5, 6, 7, 8]);
+
+    let bad = UndoRec {
+        target: 100,
+        image: page,
+        word: None,
+    };
+    encode_undo(&mut raw, &bad).unwrap();
+    body.write_at(FILE_HEADER_LEN as u64 + UNDO_AT as u64, &raw)
+        .unwrap();
+    let err = match read_undo(&body) {
+        Ok(_) => panic!("open accepted a non-page undo"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, StoreError::Corrupt(m) if m.contains("not a page")),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn bulk_dense_five_fks_use_class0_slab() {
     {
         let dir = tmp();

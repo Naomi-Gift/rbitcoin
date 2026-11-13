@@ -29,7 +29,7 @@ use crate::scripthash_slabs::{
 };
 use crate::scripthash_sorted_head::SortedHead;
 use bitcoin_hashes::{sha256, Hash};
-use rbitcoin_primitives::{uleb128_len, Fk, TableKind};
+use rbitcoin_primitives::{le_u64, uleb128_len, Fk, TableKind};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -3212,7 +3212,7 @@ pub fn write_alloc_header(body: &TableFile, state: &AllocState) -> Result<(), St
 /// header field layout. An empty older header is reset; a durable pre-v3 body refuses.
 #[doc(hidden)]
 pub fn read_alloc_header(body: &TableFile) -> Result<(AllocState, u16), StoreError> {
-    let mut buf = vec![0u8; SH_ALLOC_HEADER_LEN];
+    let mut buf = [0u8; SH_ALLOC_HEADER_LEN];
     let avail = body
         .logical_len()
         .saturating_sub(FILE_HEADER_LEN as u64)
@@ -3233,15 +3233,17 @@ pub fn read_alloc_header(body: &TableFile) -> Result<(AllocState, u16), StoreErr
     if ver != 1 && ver != 2 && ver != SH_ALLOC_VERSION {
         return Err(StoreError::Corrupt("unsupported scripthash alloc version"));
     }
-    let live_count = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-    let bump = u64::from_le_bytes(buf[16..24].try_into().unwrap());
+    let live_count = le_u64!(buf, 8);
+    let bump = le_u64!(buf, 16);
     let mut free_head = [0u64; SH_MAX_CLASS as usize + 1];
     let mut off = 24usize;
     for h in &mut free_head {
         if off + 8 > avail {
             break;
         }
-        *h = u64::from_le_bytes(buf[off..off + 8].try_into().unwrap());
+        let mut word = [0u8; 8];
+        word.copy_from_slice(&buf[off..off + 8]);
+        *h = u64::from_le_bytes(word);
         off += 8;
     }
     Ok((
