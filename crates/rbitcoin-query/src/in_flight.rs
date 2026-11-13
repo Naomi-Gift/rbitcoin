@@ -36,12 +36,38 @@ pub struct HeightKeys {
     pub txids: Vec<([u8; 32], Fk)>,
     pub out_ids: Vec<u64>,
     pub approx_bytes: u64,
+    /// Lowest id in `out_ids`. A drop reads this before walking the vec.
+    lowest_out: Option<u64>,
 }
 
 impl HeightKeys {
     #[doc(hidden)]
     pub fn is_empty(&self) -> bool {
         self.txids.is_empty() && self.out_ids.is_empty()
+    }
+
+    /// Lowest create id noted on this pack.
+    #[doc(hidden)]
+    pub fn lowest_out(&self) -> Option<u64> {
+        self.lowest_out
+    }
+
+    fn push_out(&mut self, id: u64) {
+        self.out_ids.push(id);
+        self.lowest_out = Some(match self.lowest_out {
+            Some(cur) if cur < id => cur,
+            _ => id,
+        });
+    }
+
+    fn absorb_lowest(&mut self, low: Option<u64>) {
+        let Some(id) = low else {
+            return;
+        };
+        self.lowest_out = Some(match self.lowest_out {
+            Some(cur) if cur < id => cur,
+            _ => id,
+        });
     }
 }
 
@@ -58,6 +84,20 @@ pub struct InFlight {
     pub approx_bytes: u64,
     /// Lowest create id still in `outs`. Pin does not call [`Self::get_out`] below it.
     min_out: Option<u64>,
+}
+
+/// Lowest id on `keys` that is still in `outs`.
+fn live_lowest(outs: &U64Map<CreatePin>, keys: &HeightKeys) -> Option<u64> {
+    if let Some(id) = keys.lowest_out() {
+        if outs.contains_key(&id) {
+            return Some(id);
+        }
+    }
+    keys.out_ids
+        .iter()
+        .copied()
+        .filter(|id| outs.contains_key(id))
+        .min()
 }
 
 impl InFlight {
@@ -78,7 +118,7 @@ impl InFlight {
             keys.txids.push((pin.tx().txid, fk));
             if let Some(id) = fk.get() {
                 self.outs.insert(id, Arc::clone(pin));
-                keys.out_ids.push(id);
+                keys.push_out(id);
                 self.min_out = Some(match self.min_out {
                     Some(min) if min < id => min,
                     _ => id,
@@ -118,6 +158,7 @@ impl InFlight {
         slot.approx_bytes = slot.approx_bytes.saturating_add(keys.approx_bytes);
         slot.txids.extend(keys.txids);
         slot.out_ids.extend(keys.out_ids);
+        slot.absorb_lowest(keys.lowest_out);
     }
 
     #[doc(hidden)]
@@ -176,22 +217,21 @@ impl InFlight {
         }
     }
 
-    /// Lowest id still listed on a surviving height, including untagged.
+    /// Lowest id still in `outs` on a surviving height, including untagged.
     ///
-    /// `by_height` is already the kept packs when prune calls this.
+    /// Each pack stores its lowest id. That id is one lookup. The pack's id
+    /// list is walked only when the stored id was removed with another pack.
     fn recompute_min_out(&mut self) {
         let mut min: Option<u64> = None;
-        let mut consider = |ids: &[u64]| {
-            for id in ids {
-                if self.outs.contains_key(id) {
-                    min = Some(min.map_or(*id, |cur| cur.min(*id)));
-                }
+        let mut consider = |id: Option<u64>| {
+            if let Some(id) = id {
+                min = Some(min.map_or(id, |cur| cur.min(id)));
             }
         };
         for keys in self.by_height.values() {
-            consider(&keys.out_ids);
+            consider(live_lowest(&self.outs, keys));
         }
-        consider(&self.untagged.out_ids);
+        consider(live_lowest(&self.outs, &self.untagged));
         self.min_out = min;
     }
 
