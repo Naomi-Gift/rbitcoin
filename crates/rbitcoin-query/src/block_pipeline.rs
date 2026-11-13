@@ -644,6 +644,11 @@ pub struct StructuralScratch {
     pub meta_prefetch: Vec<Option<(rbitcoin_primitives::Fk, u8, u32)>>,
     /// Offsets `meta_prefetch` was read for. Each block's disk offsets must match its slice.
     pub meta_offs: Vec<u64>,
+    /// One bit per abs job in write order. Set when that job is in `meta_offs`.
+    /// A block copies its slice instead of rebuilding the skip map.
+    pub meta_keep: Vec<bool>,
+    /// Next unused index in [`Self::meta_keep`].
+    pub meta_job_at: usize,
     pub meta_at: Option<usize>,
 }
 
@@ -667,6 +672,8 @@ impl Default for StructuralScratch {
             slots: AnnotateSlots::default(),
             meta_prefetch: Vec::new(),
             meta_offs: Vec::new(),
+            meta_keep: Vec::new(),
+            meta_job_at: 0,
             meta_at: None,
         }
     }
@@ -682,6 +689,8 @@ impl StructuralScratch {
         self.batch_vouts.clear();
         self.meta_prefetch.clear();
         self.meta_offs.clear();
+        self.meta_keep.clear();
+        self.meta_job_at = 0;
         self.meta_at = None;
     }
 
@@ -752,7 +761,9 @@ pub fn structural_validate_spends(
     let mut spent_strong_ns = 0u64;
     let mut multi_list_ns = 0u64;
     if !scratch.abs_jobs.is_empty() {
-        fill_overlay_skip(spends, class_a_wave, &mut scratch.skip);
+        if scratch.meta_at.is_none() {
+            fill_overlay_skip(spends, class_a_wave, &mut scratch.skip);
+        }
         let loaded = structural_load_durable_spent(query, tip, scratch)?;
         multi_list_ns = loaded.0;
         spent_strong_ns = loaded.1;
@@ -956,10 +967,9 @@ pub fn overlay_meta_is_skip(
     skip.get(&(id, vout)).copied().flatten() == Some((sfk, vin))
 }
 
-/// Absolute `spent.body` offsets this write still has to read.
+/// Disk offsets for this write, and one keep bit per abs job.
 ///
-/// Overlay skips use the same rule as [`structural_load_durable_spent`].
-/// The write reads this list once, then each block applies its slice.
+/// A block copies its bits. It does not rebuild the skip map.
 #[doc(hidden)]
 pub fn write_meta_abs_offs<'a>(
     blocks: impl IntoIterator<
@@ -975,20 +985,24 @@ pub fn write_meta_abs_offs<'a>(
         ),
     >,
     class_a_wave: &ClassAWave,
-) -> Vec<u64> {
+) -> (Vec<u64>, Vec<bool>) {
     let mut offs = Vec::new();
+    let mut keep = Vec::new();
+    let mut skip = OverlayMetaSkip::with_hasher(Default::default());
     for (spends, jobs) in blocks {
-        let mut skip = OverlayMetaSkip::with_hasher(Default::default());
+        skip.clear();
         fill_overlay_skip(spends, class_a_wave, &mut skip);
         for &job in jobs {
             let (id, vout, abs, sfk, vin) = job;
             if overlay_meta_is_skip(id, vout, sfk, vin, &skip) {
+                keep.push(false);
                 continue;
             }
+            keep.push(true);
             offs.push(abs);
         }
     }
-    offs
+    (offs, keep)
 }
 
 #[doc(hidden)]
@@ -1023,7 +1037,7 @@ pub fn structural_abs_heights(
     Ok(())
 }
 
-/// True when `planned[at..]` is exactly `abs_offs`.
+/// True when `planned[at..at + abs_offs.len()]` equals `abs_offs`.
 ///
 /// A shorter plan, a wrap, or a different offset is a miss. The load uses
 /// this so a block cannot apply another block's spender meta.
@@ -1057,14 +1071,36 @@ pub fn structural_load_durable_spent(
 ) -> Result<(u64, u64), ConfirmError> {
     use std::time::Instant;
     let mut ovl_n = 0u64;
-    for &job in &scratch.abs_jobs {
-        let (id, vout, abs, sfk, vin) = job;
-        if overlay_meta_is_skip(id, vout, sfk, vin, &scratch.skip) {
-            ovl_n = ovl_n.saturating_add(1);
-            continue;
+    if scratch.meta_at.is_some() {
+        let start = scratch.meta_job_at;
+        let n = scratch.abs_jobs.len();
+        let end = start.saturating_add(n);
+        if end > scratch.meta_keep.len() {
+            return Err(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
+                "invariant: structural meta prefetch short",
+            )));
         }
-        scratch.disk_jobs.push(job);
-        scratch.abs_offs.push(abs);
+        for i in 0..n {
+            let job = scratch.abs_jobs[i];
+            if !scratch.meta_keep[start + i] {
+                ovl_n = ovl_n.saturating_add(1);
+                continue;
+            }
+            let (_, _, abs, _, _) = job;
+            scratch.disk_jobs.push(job);
+            scratch.abs_offs.push(abs);
+        }
+        scratch.meta_job_at = end;
+    } else {
+        for &job in &scratch.abs_jobs {
+            let (id, vout, abs, sfk, vin) = job;
+            if overlay_meta_is_skip(id, vout, sfk, vin, &scratch.skip) {
+                ovl_n = ovl_n.saturating_add(1);
+                continue;
+            }
+            scratch.disk_jobs.push(job);
+            scratch.abs_offs.push(abs);
+        }
     }
     crate::note_confirm(&query.confirm_stats().spend_overlay_skip_n, ovl_n);
     if scratch.abs_offs.is_empty() {

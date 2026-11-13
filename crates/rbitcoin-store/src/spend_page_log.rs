@@ -99,6 +99,7 @@ pub type SpendSyncWake = Arc<(Mutex<bool>, Condvar)>;
 
 #[derive(Clone)]
 struct OpenPage {
+    /// Sorted by rel. [`OpenPage::hit`] searches with `partition_point`.
     slots: Vec<(u16, [u8; SLOT])>,
     /// Bit `rel` is set when `slots` names that slot.
     present: [u64; OPEN_SLOT_PRESENCE_BYTES / 8],
@@ -116,7 +117,6 @@ fn open_page(slots: Vec<(u16, [u8; SLOT])>, base: Option<Arc<[u8]>>) -> OpenPage
 }
 
 impl OpenPage {
-    /// Sort `slots` and rebuild [`Self::present`] from that list.
     fn reindex(&mut self) {
         self.slots.sort_by_key(|(rel, _)| *rel);
         self.present = presence_from(&self.slots);
