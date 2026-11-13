@@ -252,6 +252,36 @@ fn same_txid_overwrite_does_not_double_count_creates_bytes() {
 }
 
 #[test]
+fn prune_keeps_the_next_pack_lowest_out() {
+    let mut m = InFlight::new();
+    let low = pin(10);
+    let mid = pin(30);
+    let high = pin(20);
+    m.note_pins([(Fk(10), &low), (Fk(30), &mid)], Some(1));
+    m.note_pins([(Fk(20), &high)], Some(2));
+    assert_eq!(m.by_height.get(&1).unwrap().lowest_out(), Some(10));
+    assert_eq!(m.by_height.get(&2).unwrap().lowest_out(), Some(20));
+    let lower = pin(15);
+    m.note_pins([(Fk(15), &lower)], Some(2));
+    assert_eq!(m.by_height.get(&2).unwrap().lowest_out(), Some(15));
+    m.prune_below_height(Some(2));
+    assert_eq!(m.min_out_id(), Some(15));
+    assert_eq!(m.by_height.get(&2).unwrap().lowest_out(), Some(15));
+
+    let again = pin(20);
+    let later = pin(40);
+    m.note_pins([(Fk(20), &again), (Fk(40), &later)], Some(3));
+    m.prune_below_height(Some(3));
+    assert_eq!(
+        m.min_out_id(),
+        Some(40),
+        "a shared id removed with the older pack is not the survivor's minimum"
+    );
+    assert!(m.get_out(20).is_none());
+    assert!(m.get_out(40).is_some());
+}
+
+#[test]
 fn min_out_id_follows_note_and_prune() {
     let mut m = InFlight::new();
     assert_eq!(m.min_out_id(), None);
