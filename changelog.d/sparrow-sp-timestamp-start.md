@@ -21,5 +21,7 @@ Fixed
   first. A subscribe to an address the connection already has keeps the
   earlier start. A `"FROM-TO"` start scans that closed range instead of
   running to the tip. A reorg during a history scan scans the replaced
-  heights again. A start the node cannot read is the error of the
-  subscribe request.
+  heights again. A start the node cannot read, or one
+  that is not a height, a time or a range, is the error of the subscribe
+  request. The node runs at most 32 history scans at once and refuses a
+  subscribe past that.

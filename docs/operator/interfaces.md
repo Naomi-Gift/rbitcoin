@@ -109,7 +109,7 @@ timeout (`TimeoutLayer`, status 408). `admit_connection` holds the wait.
 | Max request line | 1 MiB | One JSON-RPC line including `\n` |
 | Idle timeout | 120 s | No complete request → disconnect |
 | Max scripthash subs / conn | 10000 (`--electrum-max-subs`) | Notify fan-out cap. A wallet subscribes every address up to its gap limit; each sub is ~170 B (≈0.45 GB worst case at 256 connections) plus one posting check per block against that block's shared touch set; a reorg restatuses every sub |
-| Max silent-payment addresses / conn | 16 (`--electrum-max-sp-subs`) | Each address scans every new block with its own key, and its subscribe scans history from its start. History scans share three process-wide permits, 256 heights at a time. |
+| Max silent-payment addresses / conn | 16 (`--electrum-max-sp-subs`) | Each address scans every new block with its own key, and its subscribe scans history from its start. At most 32 history scans run in the process; a subscribe past that is refused. They share three process-wide permits, 256 heights at a time. |
 | Max broadcast hex | ~8 MiB | `transaction.broadcast` hex length |
 | Max batch items | 345 | Requests in one JSON-RPC batch line; more is one `-32600`. The reply is written one slot at a time, so a slow reader holds back the server, not RAM |
 | Batch reads at once | half the blocking pool, at least 1 (2 at 4 threads) | Read-only batch items in flight per connection (tasks and unwritten replies). Node-wide disk slots are `--store-read-budget`, not half the pool. One batch no longer keeps half the pool by occupying it. The tasks wait asynchronously when the budget is taken |

@@ -28,10 +28,15 @@ way:
   16 addresses by default (`--electrum-max-sp-subs`), each with one scan.
 - The scan reads one chunk ahead of what the client has taken and no
   further.
+- The process runs at most 32 history scans at once, across connections.
+  A subscribe past that is refused in its reply until a scan ends.
 
-What is not bounded: a connected client may ask for the whole chain, once
-per address, and the node scans it for as long as that client stays
-connected. That is the
+What is not bounded: a connected client may ask for the whole chain, and
+ask again. A subscribe to an address it already holds starts that scan
+over, as Frigate requires, and a reorg restarts running scans above its
+fork. The node scans for as long as such a client stays connected, in at
+most 32 scans, three chunks at a time. Each chunk takes a store read
+permit like any other API read and gives it back after 256 heights. That is the
 request a restoring wallet makes.
 
 The 065 regression `sp_scan_stops_when_the_client_hangs_up` is replaced by
@@ -44,4 +49,5 @@ The 065 regression `sp_scan_stops_when_the_client_hangs_up` is replaced by
 `sp_scan_stops_when_the_session_drops_it`,
 `sp_unsubscribe_drops_a_running_scan`,
 `sp_subscriptions_are_capped_per_connection`,
+`sp_scans_are_capped_across_connections`,
 `sp_chunk_end_covers_one_height_and_stops_at_the_tip`.
