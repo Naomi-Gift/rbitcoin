@@ -352,6 +352,9 @@ pub struct BlockQueue {
     /// `has_hash` is one map lookup.
     pub by_hash: HashMap<[u8; 32], QueuedHeights>,
     pub bytes: u64,
+    /// Rows whose body is `Promoted`. Updated when a row is promoted or
+    /// removed, so a sizes snapshot does not walk `index`.
+    promoted: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -386,6 +389,7 @@ impl BlockQueue {
             height_to_id: HeightWindow::new(),
             by_hash: HashMap::new(),
             bytes: 0,
+            promoted: 0,
         }
     }
 
@@ -506,6 +510,9 @@ impl BlockQueue {
             return Ok(false);
         };
         self.bytes = self.bytes.saturating_sub(e.body.charge());
+        if matches!(e.body, QueuedBody::Promoted { .. }) {
+            self.promoted = self.promoted.saturating_sub(1);
+        }
         if self.height_to_id.get(e.height) == Some(id) {
             self.height_to_id.remove(e.height);
         }
@@ -769,15 +776,13 @@ impl BlockQueue {
                 old
             };
             self.bytes = self.bytes.saturating_sub(old).saturating_add(charge);
+            self.promoted = self.promoted.saturating_add(1);
             n += 1;
         }
         Ok(n)
     }
 
     pub fn promoted_count(&self) -> usize {
-        self.index
-            .values()
-            .filter(|e| matches!(e.body, QueuedBody::Promoted { .. }))
-            .count()
+        self.promoted
     }
 }
