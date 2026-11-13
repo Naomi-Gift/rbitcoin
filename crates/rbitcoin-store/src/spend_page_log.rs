@@ -29,6 +29,33 @@ pub const LOG_IMAGE_CAP: u64 = 1024 * 1024 * 1024;
 const SLOT: usize = 8;
 const COMMIT_HEAD: usize = 28;
 const COMMIT_REC: usize = 24;
+/// One bit per slot on a 4 KiB spend page (512 slots).
+pub const OPEN_SLOT_PRESENCE_BYTES: usize = 64;
+
+/// True when open-page slot `rel` is named in `present`.
+///
+/// `rel` past the 512 slots on a page is absent. A committed image is not
+/// this index: the image itself is the slot array.
+#[doc(hidden)]
+pub fn open_slot_present(present: &[u64; OPEN_SLOT_PRESENCE_BYTES / 8], rel: u16) -> bool {
+    let rel = rel as usize;
+    if rel >= OPEN_SLOT_PRESENCE_BYTES * 8 {
+        return false;
+    }
+    present[rel / 64] & (1u64 << (rel % 64)) != 0
+}
+
+fn presence_from(slots: &[(u16, [u8; SLOT])]) -> [u64; OPEN_SLOT_PRESENCE_BYTES / 8] {
+    let mut present = [0u64; OPEN_SLOT_PRESENCE_BYTES / 8];
+    for &(rel, _) in slots {
+        let rel = rel as usize;
+        if rel >= OPEN_SLOT_PRESENCE_BYTES * 8 {
+            continue;
+        }
+        present[rel / 64] |= 1u64 << (rel % 64);
+    }
+    present
+}
 
 /// True when a spend checkpoint should run before the ten-minute timer.
 pub fn spend_checkpoint_early(open_edges: u64, image_bytes: u64) -> bool {
@@ -70,9 +97,44 @@ type KeptPage = (u64, PageSlots);
 /// Condvar `rbtc-spend-sync` waits on. The flag is the thread's stop bit.
 pub type SpendSyncWake = Arc<(Mutex<bool>, Condvar)>;
 
+#[derive(Clone)]
 struct OpenPage {
+    /// Sorted by rel. [`OpenPage::hit`] searches with `partition_point`.
     slots: Vec<(u16, [u8; SLOT])>,
+    /// Bit `rel` is set when `slots` names that slot.
+    present: [u64; OPEN_SLOT_PRESENCE_BYTES / 8],
     base: Option<Arc<[u8]>>,
+}
+
+fn open_page(slots: Vec<(u16, [u8; SLOT])>, base: Option<Arc<[u8]>>) -> OpenPage {
+    let mut page = OpenPage {
+        slots,
+        present: [0; OPEN_SLOT_PRESENCE_BYTES / 8],
+        base,
+    };
+    page.reindex();
+    page
+}
+
+impl OpenPage {
+    fn reindex(&mut self) {
+        self.slots.sort_by_key(|(rel, _)| *rel);
+        self.present = presence_from(&self.slots);
+    }
+
+    fn hit(&self, rel: u16) -> Option<[u8; SLOT]> {
+        if open_slot_present(&self.present, rel) {
+            let i = self.slots.partition_point(|(r, _)| *r < rel);
+            return self
+                .slots
+                .get(i)
+                .filter(|(r, _)| *r == rel)
+                .map(|(_, meta)| *meta);
+        }
+        self.base
+            .as_deref()
+            .and_then(|base| slot_in_image(base, rel))
+    }
 }
 
 /// A slot `keep` rejected from an image that may already have been copied
@@ -358,18 +420,50 @@ impl SpendPageLog {
         let page_off = abs & !(BODY_PAGE_SIZE - 1);
         let rel = ((abs - page_off) / SLOT as u64) as u16;
         let g = self.lock();
-        if let Some(meta) = page_hit(g.later.get(&page_off), rel) {
-            return Some(meta);
+        noted_slot(&g, page_off, rel)
+    }
+
+    /// Same bytes as [`Self::slot`] for each offset. One directory lock for
+    /// the whole slice. The caller reads `spent.body` after this returns.
+    pub fn slots_at(&self, abs: &[u64]) -> Vec<Option<[u8; SLOT]>> {
+        #[cfg(debug_assertions)]
+        if crate::io_handle::hidden_after_pread() {
+            return vec![None; abs.len()];
         }
-        if let Some(meta) = page_hit(g.open.get(&page_off), rel) {
-            return Some(meta);
+        if abs.is_empty() {
+            return Vec::new();
         }
-        if let Some(meta) = page_hit(g.frozen.get(&page_off), rel) {
-            return Some(meta);
+        let mut order: Vec<(u64, u16, usize)> = abs
+            .iter()
+            .enumerate()
+            .map(|(i, &off)| {
+                let page_off = off & !(BODY_PAGE_SIZE - 1);
+                let rel = ((off - page_off) / SLOT as u64) as u16;
+                (page_off, rel, i)
+            })
+            .collect();
+        order.sort_unstable_by_key(|(page, _, i)| (*page, *i));
+        let mut out = vec![None; abs.len()];
+        let g = self.lock();
+        let mut start = 0;
+        while start < order.len() {
+            let page_off = order[start].0;
+            let mut end = start + 1;
+            while end < order.len() && order[end].0 == page_off {
+                end += 1;
+            }
+            let later = g.later.get(&page_off);
+            let open = g.open.get(&page_off);
+            let frozen = g.frozen.get(&page_off);
+            let image = g.committed.get(&page_off).map(|page| page.image.as_ref());
+            for &(_, rel, i) in &order[start..end] {
+                if let Some(meta) = noted_from(later, open, frozen, image, rel) {
+                    out[i] = Some(meta);
+                }
+            }
+            start = end;
         }
-        g.committed
-            .get(&page_off)
-            .and_then(|page| slot_in_image(&page.image, rel))
+        out
     }
 
     pub fn note_slots(&self, slots: &[(u64, [u8; SLOT])]) -> Result<(), StoreError> {
@@ -896,6 +990,7 @@ impl SpendPageLog {
                     page.slots
                         .retain(|(rel, meta)| slot_from_image(&image, *rel) != *meta);
                     page.base = Some(Arc::clone(&image));
+                    page.reindex();
                     let left = page.slots.len() as u64;
                     g.open_edges = g.open_edges.saturating_sub(before.saturating_sub(left));
                     if left == 0 {
@@ -1029,15 +1124,7 @@ impl SpendPageLog {
         let mut pages: SnapshotPages = g
             .frozen
             .iter()
-            .map(|(off, page)| {
-                (
-                    *off,
-                    OpenPage {
-                        slots: page.slots.clone(),
-                        base: page.base.clone(),
-                    },
-                )
-            })
+            .map(|(off, page)| (*off, page.clone()))
             .collect();
         fold_open_into_snapshot(&mut pages, &g.open, &g.committed);
         merge_later(&mut g, reset_edges);
@@ -1075,6 +1162,7 @@ impl SpendPageLog {
                 }
             }
             page.slots = live;
+            page.reindex();
             let remove = page.slots.is_empty() && page.base.is_none();
             g.open_edges = g.open_edges.saturating_sub(dropped);
             if remove {
@@ -1555,18 +1643,13 @@ fn fold_open_into_snapshot(
     for (i, (off, _)) in pages.iter().enumerate() {
         index.entry(*off).or_insert(i);
     }
-    for (off, open_page) in open {
+    for (off, noted) in open {
         if let Some(&i) = index.get(off) {
-            overlay_slots(&mut pages[i].1.slots, &open_page.slots);
+            overlay_slots(&mut pages[i].1.slots, &noted.slots);
+            pages[i].1.reindex();
         } else {
             index.insert(*off, pages.len());
-            pages.push((
-                *off,
-                OpenPage {
-                    slots: open_page.slots.clone(),
-                    base: open_page.base.clone(),
-                },
-            ));
+            pages.push((*off, noted.clone()));
         }
     }
     for (off, page) in pages.iter_mut() {
@@ -1651,6 +1734,7 @@ where
             }
         }
         page.slots = slots;
+        page.reindex();
         if page.slots.is_empty() {
             rejected.push(page_off);
         } else {
@@ -1842,18 +1926,22 @@ fn insert_note(
     meta: [u8; SLOT],
     base_if_new: Option<Arc<[u8]>>,
 ) -> Result<bool, StoreError> {
-    pages.entry(page_off).or_insert_with(|| OpenPage {
-        slots: Vec::new(),
-        base: base_if_new,
-    });
+    pages
+        .entry(page_off)
+        .or_insert_with(|| open_page(Vec::new(), base_if_new));
     let Some(page) = pages.get_mut(&page_off) else {
         return Err(StoreError::Corrupt("spend page directory missing"));
     };
-    if let Some(slot) = page.slots.iter_mut().find(|(r, _)| *r == rel) {
-        slot.1 = meta;
+    let i = page.slots.partition_point(|(r, _)| *r < rel);
+    if page.slots.get(i).is_some_and(|(r, _)| *r == rel) {
+        page.slots[i].1 = meta;
         return Ok(false);
     }
-    page.slots.push((rel, meta));
+    page.slots.insert(i, (rel, meta));
+    let rel = rel as usize;
+    if rel < OPEN_SLOT_PRESENCE_BYTES * 8 {
+        page.present[rel / 64] |= 1u64 << (rel % 64);
+    }
     Ok(true)
 }
 
@@ -1872,6 +1960,7 @@ fn merge_later(g: &mut Inner, reset_edges: bool) {
         if let Some(dst) = g.open.get_mut(&off) {
             let before = dst.slots.len() as u64;
             overlay_slots(&mut dst.slots, &page.slots);
+            dst.reindex();
             let added = (dst.slots.len() as u64).saturating_sub(before);
             if reset_edges {
                 g.open_edges = g.open_edges.saturating_add(dst.slots.len() as u64);
@@ -1888,13 +1977,31 @@ fn merge_later(g: &mut Inner, reset_edges: bool) {
 }
 
 fn page_hit(page: Option<&OpenPage>, rel: u16) -> Option<[u8; SLOT]> {
-    let page = page?;
-    if let Some((_, meta)) = page.slots.iter().find(|(r, _)| *r == rel) {
-        return Some(*meta);
-    }
-    page.base
-        .as_deref()
-        .and_then(|base| slot_in_image(base, rel))
+    page?.hit(rel)
+}
+
+fn noted_from(
+    later: Option<&OpenPage>,
+    open: Option<&OpenPage>,
+    frozen: Option<&OpenPage>,
+    image: Option<&[u8]>,
+    rel: u16,
+) -> Option<[u8; SLOT]> {
+    page_hit(later, rel)
+        .or_else(|| page_hit(open, rel))
+        .or_else(|| page_hit(frozen, rel))
+        .or_else(|| image.and_then(|image| slot_in_image(image, rel)))
+}
+
+/// Directory bytes for one slot. `None` means `spent.body` still holds it.
+fn noted_slot(g: &Inner, page_off: u64, rel: u16) -> Option<[u8; SLOT]> {
+    noted_from(
+        g.later.get(&page_off),
+        g.open.get(&page_off),
+        g.frozen.get(&page_off),
+        g.committed.get(&page_off).map(|page| page.image.as_ref()),
+        rel,
+    )
 }
 
 /// `None` when `rel` sits past the stored image. The body still holds it.
@@ -1998,6 +2105,7 @@ fn overlay_missing_slots(page: &mut OpenPage, slots: PageSlots) -> u64 {
         page.slots.push((rel, meta));
         added = added.saturating_add(1);
     }
+    page.reindex();
     added
 }
 
@@ -2008,7 +2116,7 @@ fn park_open_slots(g: &mut Inner, page_off: u64, slots: PageSlots) {
         g.open_edges = g.open_edges.saturating_add(added);
     } else {
         g.open_edges = g.open_edges.saturating_add(slots.len() as u64);
-        g.open.insert(page_off, OpenPage { slots, base: None });
+        g.open.insert(page_off, open_page(slots, None));
     }
 }
 

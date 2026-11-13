@@ -380,6 +380,32 @@ pub fn structural_run(
     }
     let mut tot = StructuralPhaseNs::default();
     let bip34_ancestor = bip34_ancestor_for_write(query, params, prepared);
+    let (offs, keep) = crate::block_pipeline::write_meta_abs_offs(
+        prepared
+            .iter()
+            .zip(abs_jobs.iter())
+            .map(|(p, jobs)| (p.spends.as_slice(), jobs.as_slice())),
+        class_a_wave,
+    );
+    reuse.scratch.meta_offs = offs;
+    reuse.scratch.meta_keep = keep;
+    reuse.scratch.meta_job_at = 0;
+    if !reuse.scratch.meta_offs.is_empty() {
+        let meta_backend = rbitcoin_store::spend_meta_backend();
+        let t_meta = Instant::now();
+        reuse.scratch.meta_prefetch = query
+            .store()
+            .get_spender_meta_at_abs_batch_backend(&reuse.scratch.meta_offs, meta_backend)
+            .map_err(ConfirmError::from)?;
+        let meta_ns = t_meta.elapsed().as_nanos() as u64;
+        crate::note_confirm(&query.confirm_stats().spend_meta_ns, meta_ns);
+        crate::note_confirm(
+            &query.confirm_stats().spend_meta_n,
+            reuse.scratch.meta_offs.len() as u64,
+        );
+        let _ = meta_backend;
+    }
+    reuse.scratch.meta_at = Some(0);
     for (i, p) in prepared.iter().enumerate() {
         rbitcoin_consensus::note_block_height(p.height.0);
         let ctx = ValidationContext::at(params, p.height, milestone);
@@ -406,6 +432,13 @@ pub fn structural_run(
         tot.spent_pending_ns = tot.spent_pending_ns.saturating_add(ph.spent_pending_ns);
         tot.create_h_ns = tot.create_h_ns.saturating_add(ph.create_h_ns);
         tot.bip68_ns = tot.bip68_ns.saturating_add(ph.bip68_ns);
+    }
+    if reuse.scratch.meta_at != Some(reuse.scratch.meta_offs.len())
+        || reuse.scratch.meta_job_at != reuse.scratch.meta_keep.len()
+    {
+        return Err(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
+            "invariant: structural meta prefetch short",
+        )));
     }
     // Window counters (may race with sampler; last-write uses `tot` instead).
     crate::note_confirm(
