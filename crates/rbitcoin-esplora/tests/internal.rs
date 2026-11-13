@@ -419,15 +419,20 @@ async fn outspends_bounds_total_entries() {
     assert!(arr.iter().all(|slots| slots.len() == 5_001));
     assert_eq!(arr[1][5_000], json!({"spent": false}));
 
+    // The cap reads output counts from `create.loc`; no output is decoded.
+    let txs = &pad.q.store().txs;
+    let _ = txs.sample_reset_outputs_decoded();
     let over = repeat_ids(&fan, 50).join(",");
     let (st, resp) = http_get_unix(&sock, &format!("/txs/outspends?txids={over}")).await;
     assert_eq!(st, 400, "{}", &resp[..resp.len().min(200)]);
     assert_eq!(resp, "Too many outputs requested");
+    assert_eq!(txs.sample_reset_outputs_decoded(), 0);
 
     let body = serde_json::to_vec(&repeat_ids(&fan, 50)).unwrap();
     let (st, resp) = http_post_unix(&sock, "/internal/txs/outspends/by-txid", &body).await;
     assert_eq!(st, 400, "{}", &resp[..resp.len().min(200)]);
     assert_eq!(resp, "Too many outputs requested");
+    assert_eq!(txs.sample_reset_outputs_decoded(), 0);
 
     let unknown = "ff".repeat(32);
     let body = serde_json::to_vec(&repeat_ids(&unknown, 1_000)).unwrap();

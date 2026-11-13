@@ -2,7 +2,7 @@
 
 #[cfg(unix)]
 use crate::handlers::outspend_json;
-use crate::handlers::{spawn_join, write_outspends};
+use crate::handlers::{confirmed_output_count, spawn_join, write_outspends};
 #[cfg(unix)]
 use crate::server::not_found;
 use crate::server::{
@@ -324,18 +324,19 @@ pub const MAX_OUTSPENDS_TXIDS: usize = 1_000;
 /// every txid (repeats included). Over it the request is a 400.
 pub const MAX_OUTSPENDS_ENTRIES: u64 = 250_000;
 
-/// One slot array per id, encoded slot by slot into the body. Every output
-/// count is read first, so a request over [`MAX_OUTSPENDS_ENTRIES`] is
-/// refused before any slot is built.
+/// One slot array per id, encoded slot by slot into the body. Output counts
+/// are summed first, and the request is refused as soon as the sum passes
+/// [`MAX_OUTSPENDS_ENTRIES`], before any slot is built.
 pub fn outspends_for_txid_opts(st: &AppState, ids: Vec<Option<[u8; 32]>>) -> Response {
     let mp = st.mempool.as_deref();
     let mut nouts = Vec::with_capacity(ids.len());
+    let mut total = 0u64;
     for id in &ids {
         let nout = match id {
             None => 0,
             Some(id) => match st.query.tx_fk_by_txid(id) {
-                Ok(Some(fk)) => match st.query.store().get_tx_meta_and_outputs(fk) {
-                    Ok((meta, _)) => meta.output_count,
+                Ok(Some(fk)) => match confirmed_output_count(&st.query, fk) {
+                    Ok(n) => n,
                     Err(e) => return store_err(e),
                 },
                 _ => mp
@@ -343,10 +344,11 @@ pub fn outspends_for_txid_opts(st: &AppState, ids: Vec<Option<[u8; 32]>>) -> Res
                     .map_or(0, |tx| tx.output.len() as u32),
             },
         };
+        total += u64::from(nout);
+        if total > MAX_OUTSPENDS_ENTRIES {
+            return bad_request("Too many outputs requested");
+        }
         nouts.push(nout);
-    }
-    if nouts.iter().map(|&n| u64::from(n)).sum::<u64>() > MAX_OUTSPENDS_ENTRIES {
-        return bad_request("Too many outputs requested");
     }
     let view = match pin_or_reject(&st.query, ChainViewKind::Tip, None) {
         Ok(v) => v,

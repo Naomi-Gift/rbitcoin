@@ -800,8 +800,8 @@ pub async fn tx_outspends(
             Err(e) => return store_err(e),
         };
         let nout = if let Some(fk) = fk {
-            match st.query.store().get_tx_meta_and_outputs(fk) {
-                Ok((meta, _)) => meta.output_count,
+            match confirmed_output_count(&st.query, fk) {
+                Ok(n) => n,
                 Err(e) => return store_err(e),
             }
         } else {
@@ -833,6 +833,20 @@ pub async fn tx_outspends(
         maybe_attach_view(crate::server::json_bytes_reply(body), view)
     })
     .await
+}
+
+/// A confirmed tx's output count from its `create.loc` row. No output is
+/// decoded.
+#[doc(hidden)]
+pub fn confirmed_output_count(query: &Query, fk: Fk) -> Result<u32, StoreError> {
+    query
+        .store()
+        .tx_create_loc_range_batch(&[fk])?
+        .into_iter()
+        .next()
+        .flatten()
+        .map(|pair| pair.n_out)
+        .ok_or(StoreError::NotFound)
 }
 
 /// Append the JSON array of `txid`'s first `nout` outspends to `out`. Each
