@@ -32,6 +32,8 @@ pub const SP_SCAN_PERMITS: usize = 3;
 pub struct SpSub {
     pub scan: SecretKey,
     pub start: u32,
+    /// Last height of a `"FROM-TO"` start. `None` scans to the tip.
+    pub end: Option<u32>,
     pub labels: Vec<u32>,
     spend_keys: Vec<PublicKey>,
     pub address: String,
@@ -54,22 +56,14 @@ pub fn parse_sub(
     let scan = SecretKey::from_slice(&scan_bytes).map_err(|e| e.to_string())?;
     let spend_bytes = decode_hex_bytes(spend_hex)?;
     let spend = PublicKey::from_slice(&spend_bytes).map_err(|e| e.to_string())?;
-    let start = match params.as_array().and_then(|a| a.get(2)) {
-        Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
-        Some(Value::String(s)) => s
-            .split('-')
-            .next()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(0),
-        _ => 0,
-    };
-    // Past the last second a header can carry is past every block.
-    let start = u32::try_from(start).unwrap_or(u32::MAX);
-    let start = match tip {
-        Some(tip) if start > SP_START_TIME_THRESHOLD => height_before_time(start, tip, block_time)?,
-        Some(tip) => start.min(tip),
-        None if start > SP_START_TIME_THRESHOLD => 0,
-        None => start,
+    let (start, end) = match params.as_array().and_then(|a| a.get(2)) {
+        Some(Value::String(s)) if s.contains('-') => {
+            let (from, to) = height_range(s, tip)?;
+            (from, Some(to))
+        }
+        Some(Value::Number(n)) => (open_start(n.as_u64().unwrap_or(0), tip, block_time)?, None),
+        Some(Value::String(s)) => (open_start(s.parse().unwrap_or(0), tip, block_time)?, None),
+        _ => (0, None),
     };
     let mut labels = vec![0u32];
     if let Some(arr) = params
@@ -99,10 +93,42 @@ pub fn parse_sub(
     Ok(SpSub {
         scan,
         start,
+        end,
         labels,
         spend_keys,
         address,
     })
+}
+
+/// A start with no end: a height bounded by the tip, or a Unix time.
+fn open_start(
+    start: u64,
+    tip: Option<u32>,
+    block_time: &dyn Fn(u32) -> Result<u32, String>,
+) -> Result<u32, String> {
+    // Past the last second a header can carry is past every block.
+    let start = u32::try_from(start).unwrap_or(u32::MAX);
+    Ok(match tip {
+        Some(tip) if start > SP_START_TIME_THRESHOLD => height_before_time(start, tip, block_time)?,
+        Some(tip) => start.min(tip),
+        None if start > SP_START_TIME_THRESHOLD => 0,
+        None => start,
+    })
+}
+
+/// Frigate `"FROM-TO"`: a closed range of confirmed heights.
+fn height_range(range: &str, tip: Option<u32>) -> Result<(u32, u32), String> {
+    let (from, to) = range.split_once('-').unwrap_or((range, ""));
+    let (Ok(from), Ok(to)) = (from.parse::<u32>(), to.parse::<u32>()) else {
+        return Err("start range must contain integer block heights".into());
+    };
+    if to < from {
+        return Err("start range must satisfy 0 <= from <= to".into());
+    }
+    match tip {
+        Some(tip) if to > tip => Err(format!("start range 'to' ({to}) exceeds tip ({tip})")),
+        _ => Ok((from, to)),
+    }
 }
 
 /// The height a timestamp start scans from: the last block whose header

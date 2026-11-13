@@ -3318,6 +3318,43 @@ async fn sp_resubscribe_keeps_the_earlier_start() {
     assert_eq!(live["result"]["start_height"], 2, "{live}");
 }
 
+/// `"FROM-TO"` scans that range and no further. The subscription is then
+/// live for blocks connected after it.
+#[tokio::test]
+async fn sp_range_start_scans_only_the_range() {
+    use crate::silent_scan::SpChain;
+
+    let mut chain = SpChain::new("el-sp-range", 9, &[2, 5, 8]);
+    let mut s = sp_session(&chain.q);
+    s.send
+        .write_all(sp_subscribe_line(1, chain.sub(json!("1-5"))).as_bytes())
+        .await
+        .unwrap();
+    let reply = sp_next_line(&mut s.client).await;
+    assert_eq!(reply["result"]["start_height"], 1, "{reply}");
+    let (history, _) = sp_read_history(&mut s.client, &reply["result"]).await;
+    let heights: Vec<u64> = history
+        .iter()
+        .map(|h| h["height"].as_u64().unwrap())
+        .collect();
+    assert_eq!(heights, vec![2, 5], "height 8 is past the range");
+
+    chain.extend(10, &[10]);
+    s.tip_tx
+        .send(TipNotify {
+            height: 10,
+            header_hex: String::new(),
+            reorg_from_height: None,
+        })
+        .unwrap();
+    let (history, _) = sp_read_history(&mut s.client, &reply["result"]).await;
+    let heights: Vec<u64> = history
+        .iter()
+        .map(|h| h["height"].as_u64().unwrap())
+        .collect();
+    assert_eq!(heights, vec![10], "heights 6 to 9 were not asked for");
+}
+
 /// An unsubscribe stops the history scan it names.
 #[tokio::test]
 async fn sp_unsubscribe_drops_a_running_scan() {

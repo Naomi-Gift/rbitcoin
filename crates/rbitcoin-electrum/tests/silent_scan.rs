@@ -651,3 +651,49 @@ fn sp_chain_fixture_pays_the_synthetic_keys() {
     assert_eq!(hits.len(), 1, "{hits:?}");
     assert_eq!(hits[0]["height"], 7);
 }
+
+/// Frigate `"FROM-TO"`: a closed range of heights.
+#[test]
+fn range_start_is_a_closed_range() {
+    let parse = |start: &str| {
+        parse_sub(
+            &json!([SYNTH_SCAN, SYNTH_SPEND, start]),
+            Network::Regtest,
+            Some(100),
+            &no_times,
+        )
+    };
+    let err = |start: &str| match parse(start) {
+        Err(e) => e,
+        Ok(sub) => panic!("{start} parsed to {}..={:?}", sub.start, sub.end),
+    };
+    let range = parse("12-20").unwrap();
+    assert_eq!((range.start, range.end), (12, Some(20)));
+    assert_eq!(subscribe_result(&range)["start_height"], 12);
+    let one = parse("7-7").unwrap();
+    assert_eq!((one.start, one.end), (7, Some(7)));
+    let to_tip = parse("0-100").unwrap();
+    assert_eq!((to_tip.start, to_tip.end), (0, Some(100)));
+    assert!(err("20-12").contains("from <= to"), "{}", err("20-12"));
+    assert!(err("5-101").contains("exceeds tip"), "{}", err("5-101"));
+    assert!(err("a-9").contains("integer"), "{}", err("a-9"));
+    assert!(err("3-").contains("integer"), "{}", err("3-"));
+    // A height alone runs to the tip and on.
+    let open = parse_sub(
+        &json!([SYNTH_SCAN, SYNTH_SPEND, 12]),
+        Network::Regtest,
+        Some(100),
+        &no_times,
+    )
+    .unwrap();
+    assert_eq!((open.start, open.end), (12, None));
+    // No chain: no tip to exceed.
+    let empty = parse_sub(
+        &json!([SYNTH_SCAN, SYNTH_SPEND, "3-9"]),
+        Network::Regtest,
+        None,
+        &no_times,
+    )
+    .unwrap();
+    assert_eq!((empty.start, empty.end), (3, Some(9)));
+}

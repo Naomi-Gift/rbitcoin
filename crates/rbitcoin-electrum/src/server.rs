@@ -1390,7 +1390,7 @@ where
         None,
     );
     writer.line(rpc_result(&id, &result, None)).await?;
-    let last = tip.unwrap_or(sub.start).max(sub.start);
+    let last = sub.end.unwrap_or(tip.unwrap_or(sub.start).max(sub.start));
     drop_sp_address(conn, &sub.address);
     conn.sp_scans
         .push(SpScanRun::start(query, chain, sub, last));
@@ -1620,8 +1620,8 @@ pub async fn next_sp_scan_step(
     .await
 }
 
-/// Scan `sub.start..=last` in chunks, then on to the tip while it keeps
-/// moving, one step per chunk. Stops when the receiver is gone. Returns the
+/// Scan `sub.start..=last` in chunks, one step per chunk. A start with no
+/// end goes on to the tip while it keeps moving. Stops when the receiver is gone. Returns the
 /// chunks scanned.
 #[doc(hidden)]
 pub async fn run_sp_scan(
@@ -1659,7 +1659,7 @@ pub async fn run_sp_scan(
             }
         };
         chunks += 1;
-        if end == last {
+        if end == last && sub.end.is_none() {
             // Blocks connected since `last` was read are history too.
             last = query.tip_height().map_or(last, |tip| tip.0.max(last));
         }
@@ -1728,10 +1728,13 @@ pub async fn write_sp_scan_step<W: AsyncWrite + Unpin>(
         through: step.through,
     };
     drop_sp_address(conn, address);
-    // A block whose tip event came before this step had no subscription.
     let tip = query.tip_height().map_or(live.through, |tip| tip.0);
     if tip > live.through {
-        emit_sp_tip(writer, query, chain, &live.sub, live.through + 1, tip).await?;
+        // A block whose tip event came before this step had no subscription.
+        // A closed range did not ask for the heights above it.
+        if live.sub.end.is_none() {
+            emit_sp_tip(writer, query, chain, &live.sub, live.through + 1, tip).await?;
+        }
         live.through = tip;
     }
     conn.sp_subs.push(live);
