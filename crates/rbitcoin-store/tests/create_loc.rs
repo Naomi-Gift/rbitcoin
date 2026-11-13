@@ -385,6 +385,21 @@ fn create_loc_window_1024_and_1025() {
     );
 }
 
+/// Create 1025 starts where the first checkpoint says create 1024 ended.
+#[test]
+fn create_loc_open_reads_the_next_window() {
+    let dir = TempDir::labeled("create-loc-next-window").unwrap();
+    let loc = CreateLoc::create(dir.path()).unwrap();
+    loc.append(&chain(&vec![1u32; 1025], &vec![8u64; 1025]))
+        .unwrap();
+    drop(loc);
+    let loc = CreateLoc::open(dir.path()).unwrap();
+    let got = loc.range_batch(&[Fk(1025)]).unwrap();
+    let start = FILE_HEADER_LEN as u64 + 1024 * 8;
+    assert_eq!(got[0].unwrap().txout, (start, 8));
+    assert_eq!(got[0].unwrap().spent, (start, 8));
+}
+
 #[test]
 fn create_loc_n_out_zero_append_corrupt() {
     let dir = TempDir::labeled("create-loc-zero").unwrap();

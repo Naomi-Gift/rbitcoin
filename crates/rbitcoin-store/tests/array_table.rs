@@ -705,3 +705,39 @@ fn sparse_set_after_truncate_is_corrupt() {
     assert_eq!(t.get(0).unwrap(), 1);
     let _ = std::fs::remove_file(&path);
 }
+
+/// Open copies each flushed 8-byte slot into the in-RAM image.
+/// A body that is not a multiple of 8 stays corrupt.
+#[test]
+fn array_open_reads_flushed_slots() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    {
+        let t = ArrayTable::create(&path, TableKind::Confirmed).unwrap();
+        t.set_many(
+            &rbitcoin_store::ClassCWrite::for_test(),
+            &[(0, 0x1111), (1, 0x2222_3333_4444_5555)],
+        )
+        .unwrap();
+        t.flush().unwrap();
+    }
+    let t = ArrayTable::open(&path, TableKind::Confirmed).unwrap();
+    assert_eq!(t.len(), 2);
+    assert_eq!(t.get(0).unwrap(), 0x1111);
+    assert_eq!(t.get(1).unwrap(), 0x2222_3333_4444_5555);
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn array_open_rejects_a_ragged_body() {
+    let path = tmp_path();
+    let _ = std::fs::remove_file(&path);
+    let f = rbitcoin_store::file::TableFile::create(&path, TableKind::Confirmed).unwrap();
+    f.set_logical_len(FILE_HEADER_LEN as u64 + 1).unwrap();
+    drop(f);
+    assert!(matches!(
+        ArrayTable::open(&path, TableKind::Confirmed),
+        Err(StoreError::Corrupt("array table size"))
+    ));
+    let _ = std::fs::remove_file(&path);
+}
