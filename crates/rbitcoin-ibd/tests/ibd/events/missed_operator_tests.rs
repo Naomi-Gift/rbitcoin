@@ -586,7 +586,7 @@ fn framed_body_keeps_the_height_window_and_a_side_block() {
     let side = mine(gen, 1_600_000_200, 1);
     let side_hash = side.block_hash();
     let side_bytes = serialize(&side);
-    offer_framed(&mut st, &hub, side_hash, 0, &side_bytes, 0);
+    offer_framed(&mut st, &hub, side_hash, 1, &side_bytes, 0);
     assert!(st.reorg.held_bodies.contains(&side_hash));
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -848,8 +848,10 @@ fn off_path_suffix_drops_only_hashes_above_the_keep() {
     }
     st.ordered.push_back(unknown);
     st.ordered.push_back(below);
+    st.ordered.push_back(keep_h);
     st.ordered_set.insert(unknown);
     st.ordered_set.insert(below);
+    st.ordered_set.insert(keep_h);
     let cleared = apply_soft_wire_reject(
         &mut st,
         5,
