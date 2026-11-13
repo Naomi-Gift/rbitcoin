@@ -165,6 +165,24 @@ fn work_chain_progress_fetch_hole_requires_body_queue() {
         .block_queue_enqueue(1, h1.to_byte_array(), 1, b"x")
         .unwrap();
     assert!(claim_ready(&hub, &mut body2, 1, &h1));
+    let mut span = rbitcoin_ibd::ibd::progress::QueuedHashSpan::load(&hub, 1, 2);
+    assert_eq!(span.hash_at(&hub, 1), Some(h1.to_byte_array()));
+    assert_eq!(span.hash_at(&hub, 2), None, "an empty height stays empty");
+    let mut inverted = rbitcoin_ibd::ibd::progress::QueuedHashSpan::load(&hub, 2, 1);
+    assert_eq!(
+        inverted.hash_at(&hub, 1),
+        Some(h1.to_byte_array()),
+        "an inverted span still reads the live queue"
+    );
+    hub.query.block_queue_dequeue_height(1).unwrap();
+    assert_eq!(
+        span.hash_at(&hub, 1),
+        None,
+        "a listed height is read again after confirm dequeues it"
+    );
+    hub.query
+        .block_queue_enqueue(1, h1.to_byte_array(), 1, b"x")
+        .unwrap();
     let hole_ready = tip_fetch_hole(&hub, &h2h, &mut body2);
     assert_eq!(hole_ready, 0, "BQ-ready tip+1 → hole=0");
 

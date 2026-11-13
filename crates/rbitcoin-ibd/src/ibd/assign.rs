@@ -598,15 +598,17 @@ pub fn collect_height_band(
         return out;
     }
     let hi = hi.min(st.max_ordered_height.max(lo));
+    let span_hi = hi.min(lo.saturating_add(FAR_SCAN_BUDGET as u32 - 1));
+    let mut span = super::progress::QueuedHashSpan::load(hub, lo, span_hi);
     let mut prefix = lo;
     let mut tracking = true;
     for (walked, ht) in (lo..=hi).enumerate() {
         if out.len() >= cap || walked >= FAR_SCAN_BUDGET {
             break;
         }
-        let need = need_hash_at(st, hub, ht, room);
+        let need = need_hash_at_in(st, hub, ht, room, &mut span);
         if tracking {
-            if need.is_none() && densify_prefix_filled(st, hub, ht) {
+            if need.is_none() && densify_prefix_filled_in(st, hub, ht, &mut span) {
                 prefix = ht.saturating_add(1);
             } else {
                 tracking = false;
@@ -640,11 +642,15 @@ pub fn rewind_densify_scan_lo(st: &mut IbdWorkState, hub: &ChainHub, path_lo: u3
     if hi <= start {
         return;
     }
+    let mut span = super::progress::QueuedHashSpan::load(hub, start, hi - 1);
     for ht in start..hi {
         let Some(&hash) = st.height_to_hash.get(&ht) else {
             return;
         };
-        if !super::progress::claim_ready(hub, &mut st.body, ht, &hash) {
+        let ready = super::progress::claim_ready_queued(hub, &mut st.body, ht, &hash, || {
+            span.hash_at(hub, ht)
+        });
+        if !ready {
             st.densify_scan_lo = ht;
             return;
         }
@@ -654,10 +660,20 @@ pub fn rewind_densify_scan_lo(st: &mut IbdWorkState, hub: &ChainHub, path_lo: u3
 
 #[doc(hidden)]
 pub fn densify_prefix_filled(st: &mut IbdWorkState, hub: &ChainHub, ht: u32) -> bool {
+    let mut span = super::progress::QueuedHashSpan::load(hub, ht, ht);
+    densify_prefix_filled_in(st, hub, ht, &mut span)
+}
+
+fn densify_prefix_filled_in(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    ht: u32,
+    span: &mut super::progress::QueuedHashSpan,
+) -> bool {
     let Some(&h) = st.height_to_hash.get(&ht) else {
         return false;
     };
-    if super::progress::claim_ready(hub, &mut st.body, ht, &h) {
+    if super::progress::claim_ready_queued(hub, &mut st.body, ht, &h, || span.hash_at(hub, ht)) {
         return true;
     }
     if live_getdata_cover(st, &h) {
@@ -677,8 +693,12 @@ pub enum BqWireAt {
 
 #[doc(hidden)]
 pub fn bq_wire_for_hash(hub: &ChainHub, ht: u32, want: BlockHash) -> BqWireAt {
+    bq_wire_queued(hub, ht, want, hub.query.block_queue_hash_at_height(ht))
+}
+
+fn bq_wire_queued(hub: &ChainHub, ht: u32, want: BlockHash, queued: Option<[u8; 32]>) -> BqWireAt {
     use bitcoin::hashes::Hash as _;
-    match hub.query.block_queue_hash_at_height(ht) {
+    match queued {
         Some(bq_h) if bq_h == want.to_byte_array() => BqWireAt::Ready,
         Some(_) => {
             let _ = hub.query.block_queue_dequeue_height(ht);
@@ -714,9 +734,20 @@ pub fn need_hash_at(
     ht: u32,
     room: usize,
 ) -> Option<BlockHash> {
+    let mut span = super::progress::QueuedHashSpan::load(hub, ht, ht);
+    need_hash_at_in(st, hub, ht, room, &mut span)
+}
+
+fn need_hash_at_in(
+    st: &mut IbdWorkState,
+    hub: &ChainHub,
+    ht: u32,
+    room: usize,
+    span: &mut super::progress::QueuedHashSpan,
+) -> Option<BlockHash> {
     use bitcoin::hashes::Hash as _;
     let &h = st.height_to_hash.get(&ht)?;
-    if super::progress::claim_ready(hub, &mut st.body, ht, &h) {
+    if super::progress::claim_ready_queued(hub, &mut st.body, ht, &h, || span.hash_at(hub, ht)) {
         return None;
     }
     if live_getdata_cover(st, &h)
@@ -733,7 +764,7 @@ pub fn need_hash_at(
     if st.body.is_known_archived(&h) {
         return None;
     }
-    if bq_wire_for_hash(hub, ht, h) == BqWireAt::Ready {
+    if bq_wire_queued(hub, ht, h, span.hash_at(hub, ht)) == BqWireAt::Ready {
         return None;
     }
     let held = st.body.is_pending(&h) && confirm_pipeline_holds(st, hub, h, ht);
@@ -910,7 +941,6 @@ pub fn issue_batch(
 /// Stops at the first **claim-ready** body (body-queue wire / confirmed) so
 /// densify priority matches operator `hole=` (fetch gap, not confirm backlog).
 pub fn contiguous_tip_holes(st: &mut IbdWorkState, hub: &ChainHub, max: usize) -> Vec<BlockHash> {
-    use super::progress::claim_ready;
     let path_lo = match hub.tip_height() {
         None => 0u32,
         Some(t) => t.saturating_add(1),
@@ -918,6 +948,7 @@ pub fn contiguous_tip_holes(st: &mut IbdWorkState, hub: &ChainHub, max: usize) -
     let mut holes = Vec::new();
     // The walk breaks at `max` holes, so the last height is `path_lo + max - 1`.
     let limit = path_lo.saturating_add(max.saturating_sub(1) as u32);
+    let mut span = super::progress::QueuedHashSpan::load(hub, path_lo, limit);
     for ht in path_lo..=limit {
         if holes.len() >= max {
             break;
@@ -928,7 +959,9 @@ pub fn contiguous_tip_holes(st: &mut IbdWorkState, hub: &ChainHub, max: usize) -
         if st.body.is_rejected(&hash) || dropped_verdict(st, &hash) {
             break;
         }
-        if claim_ready(hub, &mut st.body, ht, &hash) {
+        if super::progress::claim_ready_queued(hub, &mut st.body, ht, &hash, || {
+            span.hash_at(hub, ht)
+        }) {
             break;
         }
         holes.push(hash);
@@ -938,18 +971,20 @@ pub fn contiguous_tip_holes(st: &mut IbdWorkState, hub: &ChainHub, max: usize) -
 
 /// First non-claim-ready height in `path_lo .. path_lo+max-1` (after a ready prefix).
 pub fn first_pre_hole(st: &mut IbdWorkState, hub: &ChainHub, max: usize) -> Option<BlockHash> {
-    use super::progress::claim_ready;
     let path_lo = match hub.tip_height() {
         None => 0u32,
         Some(t) => t.saturating_add(1),
     };
     let hi = path_lo.saturating_add(max.saturating_sub(1) as u32);
+    let mut span = super::progress::QueuedHashSpan::load(hub, path_lo, hi);
     for ht in path_lo..=hi {
         let &hash = st.height_to_hash.get(&ht)?;
         if st.body.is_rejected(&hash) || dropped_verdict(st, &hash) {
             continue;
         }
-        if claim_ready(hub, &mut st.body, ht, &hash) {
+        if super::progress::claim_ready_queued(hub, &mut st.body, ht, &hash, || {
+            span.hash_at(hub, ht)
+        }) {
             continue;
         }
         return Some(hash);

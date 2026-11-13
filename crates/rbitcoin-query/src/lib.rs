@@ -2680,6 +2680,11 @@ impl Query {
         self.block_queue.lock().unwrap().hash_at_height(height)
     }
 
+    /// Queued hashes in `lo..=hi`, under one lock. Empty heights are omitted.
+    pub fn block_queue_hashes_in_span(&self, lo: u32, hi: u32) -> Vec<(u32, [u8; 32])> {
+        self.block_queue.lock().unwrap().hashes_in_span(lo, hi)
+    }
+
     /// Lookup finished TipOnly for this height (even if some keys missed).
     pub fn block_queue_mark_resolve_complete(&self, height: u32) -> Result<(), QueryError> {
         self.block_queue

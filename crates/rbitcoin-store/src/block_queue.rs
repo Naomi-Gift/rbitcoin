@@ -235,6 +235,43 @@ impl HeightWindow {
         }
     }
 
+    /// Occupied ids whose height is in `lo..=hi`. The unknown-height row is
+    /// included only when the span includes `u32::MAX`.
+    fn ids_in_span(&self, lo: u32, hi: u32) -> Vec<(u32, u64)> {
+        let mut out = Vec::new();
+        if lo > hi {
+            return out;
+        }
+        if self.live > 0 && !self.slots.is_empty() && lo < u32::MAX {
+            // `base` can sit at `u32::MAX - 1` with one slot. Adding the
+            // length first overflows that height in debug.
+            let last = self
+                .base
+                .saturating_add(u32::try_from(self.slots.len() - 1).unwrap_or(u32::MAX));
+            if hi >= self.base && lo <= last {
+                let from_h = lo.max(self.base);
+                let to_h = hi.min(last);
+                let mut i = (from_h - self.base) as usize;
+                let end = (to_h - self.base) as usize;
+                if i < self.start {
+                    i = self.start;
+                }
+                while i <= end && i < self.slots.len() {
+                    if let Some(id) = self.slots[i] {
+                        out.push((self.base + i as u32, id));
+                    }
+                    i += 1;
+                }
+            }
+        }
+        if hi == u32::MAX {
+            if let Some(id) = self.unknown {
+                out.push((u32::MAX, id));
+            }
+        }
+        out
+    }
+
     fn heights(&self) -> impl Iterator<Item = u32> + '_ {
         let base = self.base;
         let unknown = self.unknown.map(|_| u32::MAX);
@@ -632,6 +669,15 @@ impl BlockQueue {
     /// Hash of the first queue entry at `height`, if any (no payload clone).
     pub fn hash_at_height(&self, height: u32) -> Option<[u8; 32]> {
         self.entry_for_height(height).map(|e| e.hash)
+    }
+
+    /// Hashes queued in `lo..=hi`, in height order. Empty heights are omitted.
+    pub fn hashes_in_span(&self, lo: u32, hi: u32) -> Vec<(u32, [u8; 32])> {
+        self.height_to_id
+            .ids_in_span(lo, hi)
+            .into_iter()
+            .filter_map(|(height, id)| self.index.get(&id).map(|e| (height, e.hash)))
+            .collect()
     }
 
     /// Enqueue-stamped Σ inputs (`None` if height missing).
