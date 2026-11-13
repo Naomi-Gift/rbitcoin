@@ -1381,6 +1381,22 @@ where
             .await?;
         return Ok(());
     }
+    // The reply is the one place an error reaches the client: a note has
+    // no error member. A start that cannot be read is refused here.
+    let (q, c, start) = (Arc::clone(query), Arc::clone(chain), sub.start);
+    let readable = budgeted_blocking(query, move || {
+        rbitcoin_query::tweaks_at_height(&q, &c, Height(start))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    if let Err(message) = readable {
+        writer
+            .line(json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": message}}))
+            .await?;
+        return Ok(());
+    }
     let result = crate::silent_scan::subscribe_result(&sub);
     rbitcoin_log::api_call(
         "electrum",

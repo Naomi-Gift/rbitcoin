@@ -3561,56 +3561,75 @@ async fn silentpayments_unsubscribe_stops_only_the_matching_address() {
     handle.shutdown().await;
 }
 
-/// A pruned height whose keep file is gone is an error. The scan must not
-/// report progress 1.0 with an empty history, or the client walks past it.
-#[tokio::test(flavor = "current_thread")]
-async fn pruned_scan_miss_is_not_an_empty_history() {
+/// Two pruned blocks with no sealed tweak rows: each height reads from its
+/// keep file. The file of height 1 is gone.
+fn sp_pruned_chain_missing_height_1() -> (rbitcoin_query::testutil::TempDir, Arc<Query>) {
     use rbitcoin_query::TxApply;
     use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
-    use std::io::Cursor;
-    use std::net::SocketAddr;
-    use std::time::Duration;
 
     let (dir, q) = tmp_store();
     q.set_sptweaks_enabled(true, Height(0)).unwrap();
     q.set_prune_seqsigwit(true).unwrap();
     let mut script = vec![0x51, 0x20];
     script.extend_from_slice(&[0x11; 32]);
-    let merkle = [0x44; 32];
-    let header = HeaderRecord {
-        prev_fk: Fk::NULL,
-        version: 1,
-        timestamp: 1,
-        bits: 0x207fffff,
-        nonce: 0,
-        merkle_root: merkle,
-        hash: merkle,
-        size: 0,
-        weight: 0,
-    };
-    q.connect_block(
-        Height(0),
-        &header,
-        &[TxApply {
-            tx: TxRecord {
-                txid: merkle,
-                version: 1,
-                locktime: 0,
-                input_count: 1,
-                output_count: 1,
-            },
-            inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
-            outputs: vec![OutputRecord::unspent(50_0000_0000, script)],
-        }],
-    )
-    .unwrap();
-    std::fs::remove_file(q.store().path().join("seqsigwit.window/0.bin")).unwrap();
+    let mut prev = (Fk::NULL, None::<[u8; 32]>);
+    for h in 0..2u32 {
+        let mut merkle = [0x44; 32];
+        merkle[0] = h as u8;
+        let hash = match prev.1 {
+            None => merkle,
+            Some(parent) => {
+                rbitcoin_store::block_header_hash(1, &parent, &merkle, 1, 0x207fffff, 0)
+            }
+        };
+        let header = HeaderRecord {
+            prev_fk: prev.0,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: merkle,
+            hash,
+            size: 0,
+            weight: 0,
+        };
+        let fk = q
+            .connect_block(
+                Height(h),
+                &header,
+                &[TxApply {
+                    tx: TxRecord {
+                        txid: merkle,
+                        version: 1,
+                        locktime: 0,
+                        input_count: 1,
+                        output_count: 1,
+                    },
+                    inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                    outputs: vec![OutputRecord::unspent(50_0000_0000, script.clone())],
+                }],
+            )
+            .unwrap();
+        prev = (fk, Some(hash));
+    }
+    std::fs::remove_file(q.store().path().join("seqsigwit.window/1.bin")).unwrap();
     q.clear_seqsigwit_ram_window();
-    let q = Arc::new(q);
+    (dir, Arc::new(q))
+}
+
+const SP_MISS_SCAN: &str = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
+const SP_MISS_SPEND: &str = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
+
+/// A pruned height whose keep file is gone is an error. The scan must not
+/// report progress 1.0 with an empty history, or the client walks past it.
+#[tokio::test(flavor = "current_thread")]
+async fn pruned_scan_miss_is_not_an_empty_history() {
+    use std::io::Cursor;
+    use std::net::SocketAddr;
+
+    let (dir, q) = sp_pruned_chain_missing_height_1();
     let chain = Arc::new(ChainParams::regtest());
-    let scan = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
-    let spend = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
-    let params = json!([scan, spend, 0]);
+    let params = json!([SP_MISS_SCAN, SP_MISS_SPEND, 0]);
     let mut body = Vec::new();
     let mut writer = ConnWrite::new(Cursor::new(&mut body), Duration::from_secs(2));
     let mut conn = ElectrumConn::new();
@@ -3618,18 +3637,20 @@ async fn pruned_scan_miss_is_not_an_empty_history() {
     serve_sp_subscribe(&mut writer, &q, &chain, &peer, json!(1), &params, &mut conn)
         .await
         .unwrap();
+    assert_eq!(conn.sp_scans.len(), 1, "height 0 reads, so the scan starts");
     let (address, step) = next_sp_scan_step(&mut conn.sp_scans).await;
     write_sp_scan_step(&mut writer, &q, &chain, &mut conn, &address, step)
         .await
         .unwrap();
     assert!(conn.sp_scans.is_empty(), "a failed scan is over");
+    drop(writer);
     let text = String::from_utf8(body).unwrap();
     assert!(
         text.contains("window miss"),
         "a keep-file miss has to be an error, got {text}"
     );
     assert!(
-        !text.contains("\"progress\":1.0") && !text.contains("\"progress\": 1.0"),
+        !text.contains("1.0"),
         "the miss must not finish the scan, got {text}"
     );
     assert!(
@@ -3639,24 +3660,63 @@ async fn pruned_scan_miss_is_not_an_empty_history() {
     let sub = rbitcoin_electrum::silent_scan::parse_sub(
         &params,
         bitcoin::Network::Regtest,
-        Some(0),
+        Some(1),
         &no_times,
     )
     .unwrap();
     let mut tip_body = Vec::new();
     let mut tip_writer = ConnWrite::new(Cursor::new(&mut tip_body), Duration::from_secs(2));
-    emit_sp_tip(&mut tip_writer, &q, &chain, &sub, 0, 0)
+    emit_sp_tip(&mut tip_writer, &q, &chain, &sub, 1, 1)
         .await
         .unwrap();
+    drop(tip_writer);
     let tip_text = String::from_utf8(tip_body).unwrap();
     assert!(
         tip_text.contains("window miss"),
         "a tip note must not hide the miss, got {tip_text}"
     );
     assert!(
-        !tip_text.contains("progress"),
+        !tip_text.contains("1.0"),
         "a tip miss must not report the height scanned, got {tip_text}"
     );
+    drop(q);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A start the node cannot read is refused in the reply to the subscribe.
+/// A JSON-RPC notification has no error member for it.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_subscribe_refuses_a_start_it_cannot_read() {
+    use std::io::Cursor;
+
+    let (dir, q) = sp_pruned_chain_missing_height_1();
+    let chain = Arc::new(ChainParams::regtest());
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(Cursor::new(&mut body), Duration::from_secs(2));
+    let mut conn = ElectrumConn::new();
+    serve_sp_subscribe(
+        &mut writer,
+        &q,
+        &chain,
+        &"127.0.0.1:9".parse().unwrap(),
+        json!(7),
+        &json!([SP_MISS_SCAN, SP_MISS_SPEND, 1]),
+        &mut conn,
+    )
+    .await
+    .unwrap();
+    drop(writer);
+    let reply: Value = serde_json::from_slice(&body).expect("one reply line");
+    assert_eq!(reply["id"], 7, "{reply}");
+    assert!(reply.get("result").is_none(), "{reply}");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("window miss"),
+        "{reply}"
+    );
+    assert!(conn.sp_scans.is_empty(), "no scan starts: {reply}");
     drop(q);
     let _ = std::fs::remove_dir_all(&dir);
 }
