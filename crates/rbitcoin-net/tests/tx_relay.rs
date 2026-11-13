@@ -2182,8 +2182,8 @@ fn unindex_drops_relay_seq_and_accept_at() {
     assert!(hub.contains(&stay.compute_txid()));
     assert!(hub.relay_seq_of(&gone_w).is_none());
     assert!(hub.relay_seq_of(&stay_w).is_some());
-    // A live tx stays indexed. A gone tx that is not parked drops its maps.
-    // An orphan that is only parked keeps them.
+    // A live tx stays indexed. A gone tx drops its maps, parked or not:
+    // parked is not a tx the node has.
     hub.unindex_if_absent(&stay);
     assert!(hub.relay_seq_of(&stay_w).is_some());
     let orphan = Transaction {
@@ -2218,8 +2218,8 @@ fn unindex_drops_relay_seq_and_accept_at() {
     assert!(hub.relay_seq_of(&orphan_w).is_some());
     hub.unindex_if_absent(&orphan);
     assert!(
-        hub.relay_seq_of(&orphan_w).is_some(),
-        "a parked orphan is still indexed"
+        hub.relay_seq_of(&orphan_w).is_none(),
+        "a parked orphan is not indexed"
     );
     let absent = spend_true(cbs[2], 3_000, ScriptBuf::from_bytes(vec![0x51]));
     let absent_w = absent.compute_wtxid();
@@ -2787,7 +2787,7 @@ fn accept_from_peer_erase_drops_orphan() {
         .unwrap_err();
     assert!(matches!(err, AcceptError::Orphaned { .. }), "{err}");
     assert_eq!(hub.orphan_snapshot()[0].announcers, vec![4]);
-    hub.add_orphan_announcer(&tx.compute_txid(), 8);
+    hub.add_orphan_announcer(&tx.compute_wtxid(), 8);
     assert_eq!(hub.orphan_snapshot()[0].announcers, vec![4, 8]);
     hub.erase_orphans_for_peer(4);
     assert_eq!(hub.orphan_count(), 1);
@@ -3365,6 +3365,172 @@ fn accept_package_does_not_park_orphan_member() {
     let _ = std::fs::remove_dir_all(&store_dir);
 }
 
+/// Core `p2p_orphan_handling.py` `test_orphan_in_mempool`: two witnesses of
+/// one child both wait. An RPC package leaves them parked. The peer's resent
+/// parent erases them once their txid is in the mempool.
+#[test]
+fn orphan_witnesses_wait_until_a_resent_parent_finds_their_txid_pooled() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let parent = spend_true(cbs[11], 0, ScriptBuf::from_bytes(vec![0x51]));
+    let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9990_0000);
+    let malleate = |tx: &Transaction| {
+        let mut bad = tx.clone();
+        bad.input[0].witness = Witness::from_slice(&[[1u8]]);
+        bad
+    };
+    let parent_bad = malleate(&parent);
+    let child_bad = malleate(&child);
+    let peer = TxOrigin::Relay(Some(4));
+    hub.accept_tx_from(&parent_bad, peer)
+        .expect_err("a 0-fee parent");
+    for tx in [&child, &child_bad] {
+        let err = hub.accept_tx_from(tx, peer).unwrap_err();
+        assert!(matches!(err, AcceptError::Orphaned { .. }), "{err:?}");
+    }
+    let parked = |tx: &Transaction| {
+        hub.lock_read()
+            .orphanage
+            .contains_wtxid(&tx.compute_wtxid())
+    };
+    assert!(
+        parked(&child) && parked(&child_bad),
+        "both witnesses of the child wait"
+    );
+    assert!(
+        !hub.try_contains(&child.compute_txid()),
+        "a parked orphan is not a tx the node has"
+    );
+
+    let rows = hub.submit_package_rpc(&[parent.clone(), child.clone()]);
+    assert!(rows.iter().all(|r| r.result.is_ok()), "{rows:?}");
+    assert!(
+        parked(&child) && parked(&child_bad),
+        "an RPC package leaves both orphans parked"
+    );
+
+    let _ = hub.accept_tx_from(&parent_bad, peer);
+    assert!(
+        !parked(&child) && !parked(&child_bad),
+        "the resent parent erases the peer's orphans whose txid is pooled"
+    );
+    assert!(hub.try_contains(&child.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core `sendrawtransaction` runs ATMP, which does not read the orphanage.
+/// A parked tx whose parents are now in the mempool is admitted.
+#[test]
+fn local_submit_admits_a_parked_tx_whose_parent_is_pooled() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let parent = spend_true(cbs[10], 10_000, ScriptBuf::from_bytes(vec![0x51]));
+    let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9980_0000);
+    hub.accept_tx_from(&parent, TxOrigin::Local)
+        .expect("the parent pays for itself");
+    assert!(hub.lock_write().orphanage.insert_from(
+        child.clone(),
+        BTreeSet::from([parent.compute_txid()]),
+        Some(4),
+    ));
+    hub.accept_tx_from(&child, TxOrigin::Local)
+        .expect("a local submit ignores the orphanage");
+    assert!(hub.try_contains(&child.compute_txid()));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core `MempoolAcceptedTx`: a relay admit erases the parked copy of the
+/// same wtxid, with the peer weight it held.
+#[test]
+fn relay_admit_erases_the_parked_copy() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let parent = spend_true(cbs[9], 10_000, ScriptBuf::from_bytes(vec![0x51]));
+    let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9980_0000);
+    hub.accept_tx_from(&parent, TxOrigin::Local)
+        .expect("the parent pays for itself");
+    assert!(hub.lock_write().orphanage.insert_from(
+        child.clone(),
+        BTreeSet::from([parent.compute_txid()]),
+        Some(4),
+    ));
+    hub.accept_tx_from(&child, TxOrigin::Relay(Some(5)))
+        .expect("its parent is pooled");
+    let g = hub.lock_read();
+    assert!(
+        !g.orphanage.contains_wtxid(&child.compute_wtxid()),
+        "the admitted wtxid leaves the orphanage"
+    );
+    assert_eq!(g.orphanage.peer_orphan_weight(4), 0);
+    drop(g);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core's `MempoolAcceptedTx` is peer relay only. A multi-tx
+/// `testmempoolaccept` member commits with no peer, so the parked copy of
+/// it stays parked under its peer.
+#[test]
+fn test_package_member_leaves_its_parked_copy() {
+    let (_store, q, cbs) = pad_cbs(12);
+    let dir = tmp();
+    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+    hub.set_relay_enabled(true);
+    let parent = spend_true(cbs[7], 10_000, ScriptBuf::from_bytes(vec![0x51]));
+    let child = spend_vout(OutPoint::new(parent.compute_txid(), 0), 49_9980_0000);
+    hub.accept_tx_from(&parent, TxOrigin::Local)
+        .expect("the parent pays for itself");
+    assert!(hub.lock_write().orphanage.insert_from(
+        child.clone(),
+        BTreeSet::from([parent.compute_txid()]),
+        Some(4),
+    ));
+    hub.accept_test_package_member(&child)
+        .expect("its parent is pooled");
+    assert_eq!(
+        hub.lock_read()
+            .orphanage
+            .announcers_of(&child.compute_wtxid()),
+        vec![4],
+        "a test member does not erase the parked copy"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Core's `ProcessValidTx` erases a relayed 1p1c parent's parked copy by
+/// wtxid, as it does the child's.
+#[test]
+fn peer_anchor_pair_erases_the_parents_parked_copy() {
+    let (_store, q, cbs) = pad_cbs(12);
+    for (round, on_async) in [false, true].into_iter().enumerate() {
+        let dir = tmp();
+        let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
+        hub.set_relay_enabled(true);
+        let parent = zero_fee_anchor(cbs[round * 2]);
+        let child = spend_anchor(&parent, cbs[round * 2 + 1], 50_000);
+        from_peer(&hub, &parent, 7, on_async).expect_err("alone");
+        assert!(hub.lock_write().orphanage.insert_from(
+            parent.clone(),
+            BTreeSet::from([Txid::from_byte_array([0x5b; 32])]),
+            Some(9),
+        ));
+        from_peer(&hub, &child, 8, on_async).expect("1p1c");
+        assert!(hub.contains(&parent.compute_txid()));
+        assert!(
+            !hub.lock_read()
+                .orphanage
+                .contains_wtxid(&parent.compute_wtxid()),
+            "the admitted parent leaves the orphanage"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
 /// A child already in the orphan pool is still a package member.
 /// `submitpackage` and Electrum use this hub path.
 #[test]
@@ -3422,7 +3588,7 @@ fn hub_package_admits_its_parked_child() {
         );
     }
     assert!(
-        hub.add_orphan_announcer(&child_id, 4),
+        hub.add_orphan_announcer(&child.compute_wtxid(), 4),
         "the parked child takes the peer"
     );
     let accepted = hub
@@ -3431,9 +3597,19 @@ fn hub_package_admits_its_parked_child() {
     assert_eq!(accepted.len(), 2);
     assert!(hub.try_contains(&parent_id));
     assert!(hub.try_contains(&child_id));
+    assert_eq!(
+        hub.lock_read()
+            .orphanage
+            .announcers_of(&child.compute_wtxid()),
+        vec![4],
+        "the admitted child stays parked under its peer, as Core's RPC package leaves it"
+    );
+    hub.lock_write()
+        .orphanage
+        .remove_wtxid(&child.compute_wtxid());
     assert!(
         !hub.lock_write().orphanage.has_announcer(4),
-        "admitting the lifted child must drop its in-flight peer"
+        "the package must not leave the peer in the in-flight map"
     );
     assert!(
         hub.try_contains(&sibling_id),
@@ -3487,10 +3663,10 @@ fn hub_package_admits_its_parked_child() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A parent can land while its child is lifted. Putting the child back
-/// under that parent leaves it parked with nobody left to wake it.
+/// A failed package leaves a parked member where it was, with every peer
+/// that announced it. The package never takes it out of the orphanage.
 #[test]
-fn failed_package_does_not_park_child_under_a_live_parent() {
+fn failed_package_leaves_its_parked_child_parked() {
     let (_store, q, cbs) = pad_cbs(3);
     let spk = ScriptBuf::from_bytes(vec![0x51]);
     let dir = tmp();
@@ -3513,7 +3689,7 @@ fn failed_package_does_not_park_child_under_a_live_parent() {
         let mut g = hub.lock_write();
         g.park_orphan_from(&child, missing, Some(4));
     }
-    hub.add_orphan_announcer(&child_id, 8);
+    hub.add_orphan_announcer(&child.compute_wtxid(), 8);
     let dummy = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -3536,13 +3712,10 @@ fn failed_package_does_not_park_child_under_a_live_parent() {
         .expect_err("the second member has no parent");
     assert!(
         !matches!(err, AcceptError::Duplicate(id) if id == child_id),
-        "the live parent must not make the lifted child a duplicate, got {err:?}"
+        "the live parent must not make the parked child a duplicate, got {err:?}"
     );
-    assert!(
-        hub.contains(&child_id),
-        "a child whose parents are already in the mempool must be admitted, not parked, got {err:?}"
-    );
-    assert_eq!(hub.orphan_count(), 0);
+    assert!(!hub.contains(&child_id), "the rollback removes the child");
+    assert_eq!(hub.orphan_snapshot()[0].announcers, vec![4, 8]);
     assert!(hub.contains(&parent_id));
     let _ = std::fs::remove_dir_all(&dir);
 
@@ -3577,7 +3750,7 @@ fn failed_package_does_not_park_child_under_a_live_parent() {
         let mut g = hub.lock_write();
         g.park_orphan_from(&child, missing, Some(4));
     }
-    hub.add_orphan_announcer(&child_id, 8);
+    hub.add_orphan_announcer(&child.compute_wtxid(), 8);
     let dummy = Transaction {
         version: Version::TWO,
         lock_time: LockTime::ZERO,
@@ -3608,72 +3781,8 @@ fn failed_package_does_not_park_child_under_a_live_parent() {
     assert_eq!(
         parked[0].announcers,
         vec![4, 8],
-        "putting the child back must keep the peers who announced it"
+        "the parked child keeps the peers who announced it"
     );
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// A prioritised child is under the relay floor until its delta is applied.
-/// A failed package must still admit it once its parent is in the mempool.
-#[test]
-fn failed_package_admits_prioritised_child() {
-    let (_store, q, cbs) = pad_cbs(3);
-    let dir = tmp();
-    let hub = MempoolHub::open(&dir, Arc::clone(&q)).unwrap();
-    hub.set_relay_enabled(true);
-    let spk = ScriptBuf::from_bytes(vec![0x51]);
-    let parent = spend_true(cbs[2], 10_000, spk);
-    let parent_id = parent.compute_txid();
-    hub.accept_tx(&parent).expect("parent pays for itself");
-    let parent_value = 50_0000_0000 - 10_000;
-    let child = spend_vout(
-        OutPoint {
-            txid: parent_id,
-            vout: 0,
-        },
-        parent_value - 1,
-    );
-    let child_id = child.compute_txid();
-    let err = hub
-        .accept_tx(&child)
-        .expect_err("one sat is under the relay floor");
-    assert!(
-        matches!(err, AcceptError::Policy("min relay fee")),
-        "raw fee must miss the floor before the delta, got {err:?}"
-    );
-    hub.prioritise_tx(child_id, 1_000_000);
-    {
-        let mut missing = BTreeSet::new();
-        missing.insert(parent_id);
-        let mut g = hub.lock_write();
-        g.park_orphan_from(&child, missing, Some(4));
-    }
-    let dummy = Transaction {
-        version: Version::TWO,
-        lock_time: LockTime::ZERO,
-        input: vec![TxIn {
-            previous_output: OutPoint {
-                txid: Txid::from_byte_array([0x46; 32]),
-                vout: 0,
-            },
-            script_sig: ScriptBuf::new(),
-            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
-            witness: Witness::new(),
-        }],
-        output: vec![TxOut {
-            value: Amount::from_sat(1),
-            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-        }],
-    };
-    let err = hub
-        .accept_package(&[child, dummy])
-        .expect_err("the second member has no parent");
-    assert!(
-        hub.contains(&child_id),
-        "a prioritised child must be admitted after the package fails, got {err:?}"
-    );
-    assert_eq!(hub.orphan_count(), 0);
-    assert!(hub.contains(&parent_id));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -5968,13 +6077,12 @@ async fn add_orphan_announcer_does_not_panic_on_tokio_worker() {
         .accept_tx_from(&tx, TxOrigin::Relay(Some(4)))
         .unwrap_err();
     assert!(matches!(err, AcceptError::Orphaned { .. }), "{err}");
-    let txid = tx.compute_txid();
     let wtxid = tx.compute_wtxid();
     let join = tokio::spawn(async move {
         let name = std::thread::current().name().unwrap_or("").to_string();
         let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            assert!(hub.add_orphan_announcer(&txid, 8));
-            assert!(hub.add_orphan_announcer_wtxid(&wtxid, 9));
+            assert!(hub.add_orphan_announcer(&wtxid, 8));
+            assert!(hub.add_orphan_announcer(&wtxid, 9));
             hub.erase_orphans_for_peer(4);
             hub.erase_orphans_for_peer(8);
             hub.erase_orphans_for_peer(9);

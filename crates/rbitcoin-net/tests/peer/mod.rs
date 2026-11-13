@@ -2980,6 +2980,278 @@ fn always_relay_recent_reject_is_not_relayed() {
     recent_reject_skips_atmp_on_second_send(false);
 }
 
+/// Core `ReceivedTx`: a tx whose wtxid is parked is dropped before
+/// validation, with no new announcer. A parked copy whose parent is now
+/// pooled is not admitted by a resend. A tx the mempool holds as well is
+/// handled as a duplicate, so a forcerelay peer still relays it.
+#[test]
+fn resent_parked_tx_is_not_validated_again() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+    use std::collections::BTreeSet;
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("resent-parked");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_header().unwrap();
+    let (_tip, time, cbs) = rbitcoin_query::pad_empty_from(
+        &hub.query,
+        &ChainParams::regtest(),
+        hub.tip_hash().unwrap(),
+        tip.time,
+        1,
+        101,
+        1,
+    );
+    hub.clock.set_mock(i64::from(time) + 1);
+    let mp =
+        rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+    mp.set_relay_enabled(true);
+    assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
+    let spend = |prev: OutPoint, value: u64| Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: prev,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let parent = spend(OutPoint::new(cbs[0], 0), 50_0000_0000 - 10_000);
+    let child = spend(
+        OutPoint::new(parent.compute_txid(), 0),
+        50_0000_0000 - 20_000,
+    );
+    mp.accept_tx_from(&parent, rbitcoin_net::tx_relay::TxOrigin::Local)
+        .expect("the parent pays for itself");
+    assert!(mp.lock_write().orphanage.insert_from(
+        child.clone(),
+        BTreeSet::from([parent.compute_txid()]),
+        Some(4),
+    ));
+
+    let orphan = spend(
+        OutPoint::new(bitcoin::Txid::from_byte_array([0x5a; 32]), 0),
+        10_000,
+    );
+    let missing = BTreeSet::from([orphan.input[0].previous_output.txid]);
+    assert!(mp
+        .lock_write()
+        .orphanage
+        .insert_from(orphan.clone(), missing, Some(4)));
+
+    let register = |forcerelay: bool, port: u16| {
+        let peers = rbitcoin_net::peers::PeerHub::new();
+        peers.set_forcerelay_perm(forcerelay);
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+        let ver = VersionMessage {
+            version: 70016,
+            services: ServiceFlags::NETWORK,
+            timestamp: 0,
+            receiver: Address::new(&addr, ServiceFlags::NONE),
+            sender: Address::new(&addr, ServiceFlags::NONE),
+            nonce: u64::from(port),
+            user_agent: "/rbitcoin:test/".into(),
+            start_height: 0,
+            relay: true,
+        };
+        let sess = peers.register(
+            addr,
+            addr,
+            &ver,
+            true,
+            rbitcoin_net::peers::PeerConnType::Inbound,
+        );
+        (peers, sess)
+    };
+    let (_plain_hub, plain) = register(false, 18451);
+    let (_force_hub, force) = register(true, 18452);
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let send = |tx: &Transaction, peer: &rbitcoin_net::peers::LivePeer| {
+        rt.block_on(async {
+            let (out_tx, _out_rx) = mpsc::unbounded_channel();
+            let mut follow = PeerFollowState::new();
+            handle_peer_frame(
+                frame_for(NetworkMessage::Tx(tx.clone())),
+                &hub,
+                &out_tx,
+                &mut follow,
+                Some(peer),
+            )
+            .await
+            .unwrap();
+        })
+    };
+    let announcers = |tx: &Transaction| mp.lock_read().orphanage.announcers_of(&tx.compute_wtxid());
+
+    send(&child, plain.as_ref());
+    assert!(
+        !mp.contains(&child.compute_txid()),
+        "a parked wtxid is not validated again"
+    );
+    assert_eq!(announcers(&child), vec![4]);
+    send(&orphan, plain.as_ref());
+    assert_eq!(
+        announcers(&orphan),
+        vec![4],
+        "a resent orphan adds no announcer"
+    );
+
+    mp.accept_tx_from(&child, rbitcoin_net::tx_relay::TxOrigin::Local)
+        .expect("a local submit ignores the orphanage");
+    assert_eq!(announcers(&child), vec![4], "still parked");
+    rbitcoin_log::capture_logs(true);
+    send(&child, force.as_ref());
+    let logs = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let needle = format!("Force relaying tx {}", child.compute_txid());
+    assert!(
+        logs.iter().any(|(_, m)| m.contains(&needle)),
+        "a pooled tx is relayed for a forcerelay peer, got {logs:?}"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// Core `AlreadyHaveTx` asks the mempool, not the orphanage, by txid, and
+/// `AddTxAnnouncement` adds no orphan announcer for a tx with no missing
+/// parent. A child in the mempool that is also parked, beside a parked
+/// different witness, is neither requested nor given a new announcer.
+#[test]
+fn inv_of_a_pooled_tx_that_is_also_parked_is_not_requested() {
+    use bitcoin::absolute::LockTime;
+    use bitcoin::transaction::Version as TxVersion;
+    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
+
+    let (dir, hub) = rbitcoin_net::chain::tiny_regtest_hub_labeled("inv-pooled-parked");
+    hub.ensure_genesis().unwrap();
+    let tip = hub.tip_header().unwrap();
+    let (_tip, time, cbs) = rbitcoin_query::pad_empty_from(
+        &hub.query,
+        &ChainParams::regtest(),
+        hub.tip_hash().unwrap(),
+        tip.time,
+        1,
+        101,
+        1,
+    );
+    hub.clock.set_mock(i64::from(time) + 1);
+    let mp =
+        rbitcoin_net::tx_relay::MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+    mp.set_relay_enabled(true);
+    assert!(hub.attach_mempool(Arc::clone(&mp)).is_ok());
+    let spend = |prev: OutPoint, value: u64, witness: Witness| Transaction {
+        version: TxVersion::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: prev,
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness,
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
+        }],
+    };
+    let parent = spend(
+        OutPoint::new(cbs[0], 0),
+        50_0000_0000 - 10_000,
+        Witness::new(),
+    );
+    let pout = OutPoint::new(parent.compute_txid(), 0);
+    let child = spend(pout, 50_0000_0000 - 20_000, Witness::new());
+    let child_bad = spend(pout, 50_0000_0000 - 20_000, Witness::from_slice(&[[1u8]]));
+    for tx in [&child, &child_bad] {
+        let err = mp
+            .accept_tx_from(tx, rbitcoin_net::tx_relay::TxOrigin::Relay(Some(4)))
+            .unwrap_err();
+        assert!(
+            matches!(err, rbitcoin_mempool::AcceptError::Orphaned { .. }),
+            "{err:?}"
+        );
+    }
+    mp.accept_package(&[parent, child.clone()])
+        .expect("the package admits the parked child");
+    let parked = mp
+        .lock_read()
+        .orphanage
+        .announcers_of(&child.compute_wtxid());
+    assert_eq!(parked, vec![4], "the admitted child is still parked");
+
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 18450);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 9,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let peer = peers.register(
+        addr,
+        addr,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    let (out_tx, mut rx) = mpsc::unbounded_channel();
+    let mut follow = PeerFollowState::new();
+    let unknown = bitcoin::Txid::from_byte_array([7; 32]);
+    on_inv(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &[Inventory::WitnessTransaction(unknown)],
+    )
+    .unwrap();
+    assert_eq!(
+        sole_getdata(&mut rx),
+        vec![Inventory::WitnessTransaction(unknown)],
+        "this peer's inv of an unknown tx is requested"
+    );
+    on_inv(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &[Inventory::WTx(child.compute_wtxid())],
+    )
+    .unwrap();
+    assert_eq!(
+        mp.lock_read()
+            .orphanage
+            .announcers_of(&child.compute_wtxid()),
+        vec![4],
+        "an inv of a pooled tx adds no orphan announcer"
+    );
+    on_inv(
+        &hub,
+        &out_tx,
+        &mut follow,
+        Some(peer.as_ref()),
+        &[Inventory::WitnessTransaction(child.compute_txid())],
+    )
+    .unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "a txid in the mempool is not requested, whatever is parked"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 /// Core `AlreadyHaveTx`: a tx in `m_lazy_recent_rejects` is not requested
 /// when another peer announces it, by txid or by wtxid
 /// (`p2p_orphan_handling.py` `test_orphan_inherit_rejection`).

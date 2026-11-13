@@ -5139,14 +5139,10 @@ pub fn on_inv_txid(
     if mp.try_recent_reject_txid(txid) {
         return None;
     }
-    let in_orphan = mp.try_orphan_missing(txid).is_some();
-    if mp.try_contains(txid) && !in_orphan {
-        if let Some(s) = session {
-            let _ = mp.add_orphan_announcer(txid, s.id);
-        }
-        if !asks_back_local_tx(mp, session, txid) {
-            return None;
-        }
+    // Core `AlreadyHaveTx` does not ask the orphanage by txid: a parked
+    // witness may not be the one announced.
+    if mp.try_contains(txid) && !asks_back_local_tx(mp, session, txid) {
+        return None;
     }
     if let Some(s) = session {
         match mp.note_inv_tx_requested(s.id, txid.to_byte_array(), s.inbound, s.clock_now(), false)
@@ -5213,12 +5209,25 @@ pub fn on_inv_wtxid(
         return Some(Inventory::WTx(*wtxid));
     }
     let s = session?;
-    let _ = mp.add_orphan_announcer_wtxid(wtxid, s.id);
-    if let Some(tx) = mp.try_orphan_tx_wtxid(wtxid) {
-        let missing = mp.orphan_getdata_parents(&tx);
-        mp.schedule_orphan_parents(&missing, s.id, s.inbound, s.clock_now());
-    }
+    let tx = mp.try_orphan_tx_wtxid(wtxid)?;
+    note_parked_announcer(mp, s, &tx);
     None
+}
+
+/// Core `AddTxAnnouncement` for a parked orphan: `s` becomes an announcer
+/// and is asked for the missing parents. An orphan with no parent left to
+/// fetch, such as one whose txid is already pooled, takes no announcer.
+fn note_parked_announcer(
+    mp: &crate::tx_relay::MempoolHub,
+    s: &crate::peers::LivePeer,
+    parked: &Transaction,
+) {
+    let missing = mp.orphan_getdata_parents(parked);
+    if missing.is_empty() {
+        return;
+    }
+    let _ = mp.add_orphan_announcer(&parked.compute_wtxid(), s.id);
+    mp.schedule_orphan_parents(&missing, s.id, s.inbound, s.clock_now());
 }
 
 struct HeadersApply {
@@ -6802,6 +6811,37 @@ fn note_blocksonly_sender(
     }
 }
 
+/// The other announcers of a parked `tx` become its announcers. With a
+/// `session`, its missing parents are asked for from it and from the
+/// announcers still live.
+fn fetch_parked_parents(
+    mp: &crate::tx_relay::MempoolHub,
+    tx: &Transaction,
+    wtxid: &bitcoin::Wtxid,
+    session: Option<&crate::peers::LivePeer>,
+    extra_from: &[u64],
+) {
+    for p in extra_from {
+        let _ = mp.add_orphan_announcer(wtxid, *p);
+    }
+    if mp.try_orphan_missing(wtxid).is_some() {
+        schedule_orphan_parent_getdata(mp, tx, session, extra_from);
+    }
+}
+
+/// Core `AlreadyHaveTx` for a received tx, which is dropped unvalidated: a
+/// recent reject, or a parked wtxid whose sender is no new announcer. Unlike
+/// Core, a mempool hit is not had here; it goes on to the duplicate handling
+/// in [`on_tx`].
+fn already_had_unvalidated(
+    mp: &crate::tx_relay::MempoolHub,
+    txid: &bitcoin::Txid,
+    wtxid: &bitcoin::Wtxid,
+) -> bool {
+    mp.try_recent_reject(wtxid)
+        || (mp.try_orphan_missing(wtxid).is_some() && !mp.try_contains(txid))
+}
+
 pub async fn on_tx(
     hub: &ChainHub,
     _out_tx: &mpsc::UnboundedSender<PeerOut>,
@@ -6829,9 +6869,8 @@ pub async fn on_tx(
             let from = session.map(|s| s.id);
             let trusted = session
                 .is_some_and(|s| s.peer_hub().is_some_and(|ph| ph.session_is_trusted_peer(s)));
-            // A recent reject is final for every peer except the trusted one.
-            // That session already accepted the tx, so judge it again.
-            if mp.try_recent_reject(&wtxid) && !trusted {
+            // The trusted peer already accepted the tx, so judge it again.
+            if !trusted && already_had_unvalidated(mp, &txid, &wtxid) {
                 mp.resolve_tx_request(&txid, &wtxid, false);
                 maybe_force_relay_recent_reject(hub, session, mp, txid, wtxid);
                 return Ok(());
@@ -6902,20 +6941,10 @@ pub async fn on_tx(
                         }
                         TxAcceptLog::Park(_missing) => {
                             rbitcoin_log::debug!("txrelay: park {txid} missingorspent");
-                            for p in &extra_from {
-                                let _ = mp.add_orphan_announcer(&txid, *p);
-                            }
-                            if mp.try_orphan_missing(&txid).is_some() {
-                                schedule_orphan_parent_getdata(mp, tx, session, &extra_from);
-                            }
+                            fetch_parked_parents(mp, tx, &wtxid, session, &extra_from);
                         }
                         TxAcceptLog::ParentFetch(_missing) => {
-                            for p in &extra_from {
-                                let _ = mp.add_orphan_announcer(&txid, *p);
-                            }
-                            if mp.try_orphan_missing(&txid).is_some() {
-                                schedule_orphan_parent_getdata(mp, tx, session, &extra_from);
-                            }
+                            fetch_parked_parents(mp, tx, &wtxid, session, &extra_from);
                         }
                         TxAcceptLog::Reject => {
                             follow.ban_score =

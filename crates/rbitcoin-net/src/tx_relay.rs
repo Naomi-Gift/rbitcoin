@@ -703,6 +703,13 @@ impl TxOrigin {
             TxOrigin::Relay(from) => from,
         }
     }
+
+    /// Origin of a 1p1c parent admitted on behalf of `self`. The parent is a
+    /// relayed body from the extra pool, never this node's own submit: it
+    /// carries the peer of `self`, or no peer for a local submit.
+    fn pair_parent(self) -> TxOrigin {
+        TxOrigin::Relay(self.peer())
+    }
 }
 
 /// Broadcast unit for mempool accepts (P2P inv, Electrum status, Esplora WS).
@@ -934,9 +941,6 @@ pub enum AcceptPath {
     /// Relay or a local submit: trims, pairs or parks an orphan, records a
     /// failure, and may evict a TRUC sibling.
     Relay,
-    /// A lifted member put back after its package failed: as [`Self::Relay`],
-    /// but it does not evict a TRUC sibling the rollback just restored.
-    PutBack,
     /// A `submitpackage` member. The caller trims afterwards, and an orphan
     /// comes back instead of being paired or parked.
     PackageMember,
@@ -958,16 +962,14 @@ impl AcceptPath {
     fn sibling_eviction(self) -> rbitcoin_mempool::SiblingEviction {
         match self {
             AcceptPath::Relay | AcceptPath::PackageMember => rbitcoin_mempool::SiblingEviction::On,
-            AcceptPath::PutBack | AcceptPath::TestPackageMember => {
-                rbitcoin_mempool::SiblingEviction::Off
-            }
+            AcceptPath::TestPackageMember => rbitcoin_mempool::SiblingEviction::Off,
         }
     }
 
     /// The prepare failure goes straight back to the caller.
     fn returns_failure(self, e: &AcceptError) -> bool {
         match self {
-            AcceptPath::Relay | AcceptPath::PutBack => false,
+            AcceptPath::Relay => false,
             AcceptPath::PackageMember => matches!(e, AcceptError::Orphaned { .. }),
             AcceptPath::TestPackageMember => true,
         }
@@ -2451,14 +2453,15 @@ impl MempoolHub {
         self.lock_read().graph.contains(txid)
     }
 
-    /// Session INV filter: never parks. Busy write → `false` (may re-getdata).
-    /// Live graph, orphanage, recent-confirmed ring, or Class A at tip (Core AlreadyHave).
+    /// The node has this tx: live graph, recent-confirmed ring, or Class A
+    /// at tip. Not the orphanage, which can hold any witness of a txid (Core
+    /// `AlreadyHaveTx` never asks it by txid). Busy write → `false`.
     pub fn try_contains(&self, txid: &Txid) -> bool {
         if self
             .inner
             .try_read()
             .ok()
-            .is_some_and(|g| g.graph.contains(txid) || g.orphanage.contains(txid))
+            .is_some_and(|g| g.graph.contains(txid))
         {
             return true;
         }
@@ -2719,10 +2722,27 @@ impl MempoolHub {
         }
     }
 
-    /// Runs under the write lock that commits `result`.
-    fn note_origin(&self, origin: TxOrigin, result: &Result<AcceptResult, AcceptError>) {
-        if let (TxOrigin::Local, Ok(r)) = (origin, result) {
-            self.local_origin.lock().unwrap().mark(r.txid);
+    /// Runs under the write lock that commits `result`. A tx a peer relayed
+    /// erases the parked copy of the same wtxid, as Core's `MempoolAcceptedTx`
+    /// on the peer path. A local admit is marked local. Neither it nor an
+    /// admit with no peer (a `testmempoolaccept` member, a `mempool.dat`
+    /// load) touches the orphanage, as in Core.
+    fn note_committed(
+        &self,
+        g: &mut ActiveMempool,
+        tx: &Transaction,
+        origin: TxOrigin,
+        result: &Result<AcceptResult, AcceptError>,
+    ) {
+        let Ok(r) = result else {
+            return;
+        };
+        match origin {
+            TxOrigin::Local => self.local_origin.lock().unwrap().mark(r.txid),
+            TxOrigin::Relay(Some(_)) => {
+                g.orphanage.remove_wtxid(&tx.compute_wtxid());
+            }
+            TxOrigin::Relay(None) => {}
         }
     }
 
@@ -3034,6 +3054,7 @@ impl MempoolHub {
                     return self.finish_accept_err(us, parked);
                 }
                 self.note_if_accept_failure(tx, &e);
+                self.erase_pooled_orphans_of_resent_parent(tx, &e, origin);
                 if let Some(r) = self.admit_with_waiting_spender(tx, &e, utxo, origin) {
                     let us = t0.elapsed().as_micros() as u64;
                     self.meter_accept_wall(us, true);
@@ -3109,7 +3130,7 @@ impl MempoolHub {
             let mut g = self.lock_write();
             g.last_accept_stages = stages;
             let committed = Self::commit_rechecked(&mut g, tx, prep, utxo, defer_trim, &sample);
-            self.note_origin(origin, &committed.result);
+            self.note_committed(&mut g, tx, origin, &committed.result);
             stages = g.last_accept_stages;
             lock_us = lock_us.saturating_add(t_lock.elapsed().as_micros() as u64);
             committed
@@ -3235,23 +3256,55 @@ impl MempoolHub {
         utxo: &impl rbitcoin_mempool::UtxoProvider,
         origin: TxOrigin,
     ) -> Option<AcceptResult> {
-        let lifted = self.lift_waiting_spender(parent, e, origin)?;
+        let child = self.waiting_spender(parent, e, origin)?;
         let pid = parent.compute_txid();
         let admitted = self
-            .admit_1p1c(&lifted.tx, utxo, &BTreeSet::from([pid]), origin)
+            .admit_1p1c(&child, utxo, &BTreeSet::from([pid]), origin)
             .is_some();
-        self.settle_lifted(&lifted, pid, admitted);
+        if !admitted {
+            self.drop_rejected_orphan(&child);
+        }
         admitted.then(|| self.live_accept_result(&pid)).flatten()
     }
 
-    /// The one parked child that spends the dust output of a peer's parent
-    /// that failed only the minimum relay fee, lifted out of the orphanage.
-    fn lift_waiting_spender(
+    /// A peer's parent that failed on a different witness of its txid
+    /// already in the mempool: erase that peer's orphans of it whose txid is
+    /// pooled too. Neither can enter.
+    ///
+    /// Core erases them in `Find1P1CPackage`, which runs only when the
+    /// parent's wtxid is in the reconsiderable-rejects filter (a parent sent
+    /// again after a fee failure). This node has no per-parent-wtxid
+    /// reconsiderable filter (only failed pairs, by package hash), and its
+    /// extra-pool body is keyed by txid, so the trigger is the failure itself.
+    /// Only orphans whose txid is pooled are erased, so the wider trigger
+    /// erases nothing that could still enter.
+    fn erase_pooled_orphans_of_resent_parent(
         &self,
         parent: &Transaction,
         e: &AcceptError,
         origin: TxOrigin,
-    ) -> Option<rbitcoin_mempool::LiftedOrphan> {
+    ) {
+        let Some(peer) = origin.peer() else {
+            return;
+        };
+        if matches!(
+            e,
+            AcceptError::Policy("txn-same-nonwitness-data-in-mempool")
+        ) {
+            self.lock_write()
+                .erase_pooled_orphans(&parent.compute_txid(), peer);
+        }
+    }
+
+    /// The one parked child that spends the dust output of a peer's parent
+    /// that failed only the minimum relay fee. It stays parked until the
+    /// pair's relay admit erases it.
+    fn waiting_spender(
+        &self,
+        parent: &Transaction,
+        e: &AcceptError,
+        origin: TxOrigin,
+    ) -> Option<Transaction> {
         let fee_only = matches!(
             e,
             AcceptError::Policy("min relay fee") | AcceptError::Policy("mempool min fee")
@@ -3261,28 +3314,22 @@ impl MempoolHub {
             return None;
         }
         rbitcoin_consensus::policy::dust_vouts(parent).next()?;
-        self.lock_write().lift_dust_spender(parent, peer, |child| {
+        self.lock_read().dust_spender(parent, peer, |child| {
             self.try_recent_reject(&package_hash(parent, child))
         })
     }
 
-    /// Clear the lift of an admitted child or of one that failed hard, or
-    /// park it again under its peers.
-    fn settle_lifted(&self, lifted: &rbitcoin_mempool::LiftedOrphan, parent: Txid, admitted: bool) {
-        let child = lifted.tx.compute_txid();
-        if admitted {
-            self.forget_taken_orphan(child, lifted.taken_gen);
-            return;
+    /// A parked child whose pair failed hard (its wtxid is now a recent
+    /// reject) leaves the orphanage. Core erases a package member for any
+    /// result but missing inputs, a fee failure included. Here a child whose
+    /// pair only failed softly stays parked until its parent enters the
+    /// mempool or it expires, and the remembered pair key stops the same
+    /// pair being tried again before the next block.
+    fn drop_rejected_orphan(&self, child: &Transaction) {
+        let wtxid = child.compute_wtxid();
+        if self.try_recent_reject(&wtxid) {
+            let _ = self.orphan_write(|g| g.orphanage.remove_wtxid(&wtxid));
         }
-        if self.try_recent_reject(&lifted.tx.compute_wtxid()) {
-            self.forget_taken_orphan(child, lifted.taken_gen);
-            return;
-        }
-        let _ = self.lock_write().park_announced(
-            &lifted.tx,
-            BTreeSet::from([parent]),
-            &lifted.announcers,
-        );
     }
 
     /// Admit `parent` with the fee floor waived, then `child`, rolling the
@@ -3317,7 +3364,9 @@ impl MempoolHub {
         let sample_p = self.sample_chain_coins(parent, utxo);
         let parent_commit = {
             let mut g = self.lock_write();
-            Self::commit_rechecked(&mut g, parent, prep_p, utxo, true, &sample_p)
+            let committed = Self::commit_rechecked(&mut g, parent, prep_p, utxo, true, &sample_p);
+            self.note_committed(&mut g, parent, origin.pair_parent(), &committed.result);
+            committed
         };
         let (parent_res, prevouts_p) = match parent_commit.result {
             Ok(r) => (r, parent_commit.prevouts),
@@ -3350,7 +3399,7 @@ impl MempoolHub {
         let child_commit = {
             let mut g = self.lock_write();
             let committed = Self::commit_rechecked(&mut g, child, prep_c, utxo, true, &sample_c);
-            self.note_origin(origin, &committed.result);
+            self.note_committed(&mut g, child, origin, &committed.result);
             committed
         };
         self.meter_accept_stages(lock_us, stages);
@@ -3397,108 +3446,25 @@ impl MempoolHub {
         self.unindex_evicted(&gone);
     }
 
-    /// Roll the package back, then return members that were parked before it.
-    ///
-    /// A child whose parents are already in the mempool is admitted. One that
-    /// still misses a parent is parked under those parents, with the peers
-    /// who announced it.
+    /// Roll the package back. A parked member was never taken out, so
+    /// nothing is put back in the orphanage.
     #[doc(hidden)]
-    pub fn abandon_package(
-        &self,
-        accepted: &[AcceptResult],
-        lifted: &[rbitcoin_mempool::LiftedOrphan],
-    ) {
+    pub fn abandon_package(&self, accepted: &[AcceptResult]) {
         if !accepted.is_empty() {
             self.rollback_package_accepted(accepted);
         }
-        let ready = self.lifted_ready(lifted);
-        let utxo = self.utxo_provider();
-        for item in ready {
-            let id = item.tx.compute_txid();
-            // Every announcer is restored under the accept lock. A disconnect
-            // during the lift already edited the in-flight record.
-            let from = item
-                .announcers
-                .iter()
-                .copied()
-                .find(|&peer| self.tx_from_trusted(Some(peer)))
-                .or_else(|| item.announcers.first().copied());
-            // A put-back: it does not evict a child the rollback restored.
-            let _ = self.accept_with_utxo(
-                &item.tx,
-                &utxo,
-                TxOrigin::Relay(from),
-                AcceptPath::PutBack,
-                &item.announcers,
-            );
-            self.forget_taken_orphan(id, item.taken_gen);
+    }
+
+    /// [`Self::abandon_package`] that restores replaced conflicts with
+    /// scripts awaited. Each takes a store permit only around its coin read.
+    async fn abandon_package_async(self: &Arc<Self>, accepted: Vec<AcceptResult>) {
+        if accepted.is_empty() {
+            return;
         }
-    }
-
-    /// Parents that arrived while a member was lifted. Reads the coin DB.
-    fn lifted_ready(
-        &self,
-        lifted: &[rbitcoin_mempool::LiftedOrphan],
-    ) -> Vec<rbitcoin_mempool::LiftedOrphan> {
-        let utxo = self.utxo_provider();
-        let tip = self.chain_tip_ctx();
-        // Read the priority map before the mempool write lock. A child under
-        // the raw relay floor is still admissible when its delta clears it.
-        let deltas = self.prioritised_txs();
-        let trusted = {
-            let id = self.trusted_session.load(Ordering::Relaxed);
-            (id != u64::MAX).then_some(id)
-        };
-        let mut g = self.lock_write();
-        g.repark_lifted(
-            lifted,
-            &utxo,
-            tip,
-            &|id| deltas.get(id).copied().unwrap_or(0),
-            trusted,
-        )
-    }
-
-    /// [`Self::abandon_package`] whose re-admit awaits scripts. Restoring a
-    /// replaced conflict and reparking a lifted member each take a store
-    /// permit only around their coin reads.
-    async fn abandon_package_async(
-        self: &Arc<Self>,
-        accepted: Vec<AcceptResult>,
-        lifted: Vec<rbitcoin_mempool::LiftedOrphan>,
-    ) {
         let hub = Arc::clone(self);
-        let victims = crate::reactor::off_pool(move || {
-            if accepted.is_empty() {
-                Vec::new()
-            } else {
-                hub.unlink_package_accepted(&accepted)
-            }
-        })
-        .await;
+        let victims =
+            crate::reactor::off_pool(move || hub.unlink_package_accepted(&accepted)).await;
         self.restore_replaced_async(victims).await;
-        let hub = Arc::clone(self);
-        let ready = crate::reactor::off_pool_budgeted(move || hub.lifted_ready(&lifted)).await;
-        for item in ready {
-            let id = item.tx.compute_txid();
-            let from = item
-                .announcers
-                .iter()
-                .copied()
-                .find(|&peer| self.tx_from_trusted(Some(peer)))
-                .or_else(|| item.announcers.first().copied());
-            let gen = item.taken_gen;
-            let _ = self
-                .accept_with_utxo_async(
-                    item.tx,
-                    TxOrigin::Relay(from),
-                    AcceptPath::PutBack,
-                    item.announcers,
-                )
-                .await;
-            let hub = Arc::clone(self);
-            crate::reactor::off_pool(move || hub.forget_taken_orphan(id, gen)).await;
-        }
     }
 
     /// Drop the package members and return the conflicts they replaced.
@@ -3726,8 +3692,7 @@ impl MempoolHub {
     #[doc(hidden)]
     pub fn unindex_if_absent(&self, tx: &Transaction) {
         let txid = tx.compute_txid();
-        let parked = self.lock_read().orphanage.contains(&txid);
-        if !self.contains(&txid) && !parked {
+        if !self.contains(&txid) {
             self.unindex_txid(&txid);
         }
     }
@@ -3875,7 +3840,7 @@ impl MempoolHub {
                             })
                             .await;
                             for child in kids {
-                                let txid = child.tx.compute_txid();
+                                let wtxid = child.tx.compute_wtxid();
                                 let gen = child.taken_gen;
                                 let from = child
                                     .announcers
@@ -3892,7 +3857,7 @@ impl MempoolHub {
                                     .await;
                                 let hub = Arc::clone(self);
                                 crate::reactor::off_pool(move || {
-                                    hub.forget_taken_orphan(txid, gen)
+                                    hub.forget_taken_orphan(wtxid, gen)
                                 })
                                 .await;
                             }
@@ -3918,7 +3883,7 @@ impl MempoolHub {
         promote_note(parent);
         self.enqueue_noted_orphans(&mut queue);
         while let Some(child) = queue.pop_front() {
-            let txid = child.tx.compute_txid();
+            let wtxid = child.tx.compute_wtxid();
             let from = child
                 .announcers
                 .iter()
@@ -3932,8 +3897,8 @@ impl MempoolHub {
                 &child.announcers,
             );
             // Admitted or rejected without a repark. A repark already consumed
-            // this generation. A newer take of the same txid keeps its own.
-            self.forget_taken_orphan(txid, child.taken_gen);
+            // this generation. A newer take of the same wtxid keeps its own.
+            self.forget_taken_orphan(wtxid, child.taken_gen);
             self.enqueue_noted_orphans(&mut queue);
         }
     }
@@ -4238,15 +4203,16 @@ impl MempoolHub {
             .await;
         }
         let hub = Arc::clone(self);
-        let (tx, e, lifted) = crate::reactor::off_pool(move || {
+        let (tx, e, child) = crate::reactor::off_pool(move || {
             hub.note_if_accept_failure(&tx, &e);
-            let lifted = hub.lift_waiting_spender(&tx, &e, origin);
-            (tx, e, lifted)
+            hub.erase_pooled_orphans_of_resent_parent(&tx, &e, origin);
+            let child = hub.waiting_spender(&tx, &e, origin);
+            (tx, e, child)
         })
         .await;
-        if let Some(lifted) = lifted {
+        if let Some(child) = child {
             if let Some(r) = self
-                .admit_with_waiting_spender_work(&tx, lifted, origin)
+                .admit_with_waiting_spender_work(&tx, child, origin)
                 .await
             {
                 let hub = Arc::clone(self);
@@ -4271,17 +4237,19 @@ impl MempoolHub {
     async fn admit_with_waiting_spender_work(
         self: &Arc<Self>,
         parent: &Transaction,
-        lifted: rbitcoin_mempool::LiftedOrphan,
+        child: Transaction,
         origin: TxOrigin,
     ) -> Option<AcceptResult> {
         let pid = parent.compute_txid();
         let admitted = self
-            .admit_1p1c_work(&lifted.tx, &BTreeSet::from([pid]), origin)
+            .admit_1p1c_work(&child, &BTreeSet::from([pid]), origin)
             .await
             .is_some();
         let hub = Arc::clone(self);
         crate::reactor::off_pool(move || {
-            hub.settle_lifted(&lifted, pid, admitted);
+            if !admitted {
+                hub.drop_rejected_orphan(&child);
+            }
             admitted.then(|| hub.live_accept_result(&pid)).flatten()
         })
         .await
@@ -4404,7 +4372,9 @@ impl MempoolHub {
             utxo.note_spender(&child_note);
             let sample = hub.sample_chain_coins(&parent_c, &utxo);
             let mut g = hub.lock_write();
-            Self::commit_rechecked(&mut g, &parent_c, prep_p, &utxo, true, &sample)
+            let committed = Self::commit_rechecked(&mut g, &parent_c, prep_p, &utxo, true, &sample);
+            hub.note_committed(&mut g, &parent_c, origin.pair_parent(), &committed.result);
+            committed
         })
         .await;
         let (parent_res, prevouts_p) = match parent_commit.result {
@@ -4465,7 +4435,7 @@ impl MempoolHub {
             let sample = hub.sample_chain_coins(&child_c, &utxo);
             let mut g = hub.lock_write();
             let committed = Self::commit_rechecked(&mut g, &child_c, prep_c, &utxo, true, &sample);
-            hub.note_origin(origin, &committed.result);
+            hub.note_committed(&mut g, &child_c, origin, &committed.result);
             committed
         })
         .await;
@@ -4551,18 +4521,7 @@ impl MempoolHub {
         let mut lock_us = 0u64;
         let mut accepted: Vec<AcceptResult> = Vec::with_capacity(txs.len());
         let mut prevouts: Vec<Vec<TxOut>> = Vec::with_capacity(txs.len());
-        let mut lifted: Vec<rbitcoin_mempool::LiftedOrphan> = Vec::new();
         for tx in &txs {
-            let hub = Arc::clone(self);
-            let tx_l = tx.clone();
-            if let Some(parked) = crate::reactor::off_pool(move || {
-                let mut g = hub.lock_write();
-                g.lift_parked_member(&tx_l)
-            })
-            .await
-            {
-                lifted.push(parked);
-            }
             let hub = Arc::clone(self);
             let id = tx.compute_txid();
             let delta = crate::reactor::off_pool(move || hub.fee_delta(&id)).await;
@@ -4583,7 +4542,7 @@ impl MempoolHub {
                     let hub = Arc::clone(self);
                     let stages_f = stages;
                     let lock_f = lock_us;
-                    self.abandon_package_async(accepted, lifted).await;
+                    self.abandon_package_async(accepted).await;
                     return crate::reactor::off_pool(move || {
                         let us = t0.elapsed().as_micros() as u64;
                         hub.meter_accept_stages(lock_f, stages_f);
@@ -4602,7 +4561,7 @@ impl MempoolHub {
                 let mut g = hub.lock_write();
                 g.last_accept_stages = stages;
                 let committed = Self::commit_rechecked(&mut g, &tx_c, prep, &utxo, true, &sample);
-                hub.note_origin(TxOrigin::Local, &committed.result);
+                hub.note_committed(&mut g, &tx_c, TxOrigin::Local, &committed.result);
                 let stages = g.last_accept_stages;
                 (committed, stages, t_lock.elapsed().as_micros() as u64)
             })
@@ -4625,7 +4584,7 @@ impl MempoolHub {
                     self.restore_replaced_async(undone).await;
                     let hub = Arc::clone(self);
                     crate::reactor::off_pool(move || hub.publish_fee_floor()).await;
-                    self.abandon_package_async(accepted, lifted).await;
+                    self.abandon_package_async(accepted).await;
                     let hub = Arc::clone(self);
                     return crate::reactor::off_pool(move || {
                         let us = t0.elapsed().as_micros() as u64;
@@ -4637,15 +4596,15 @@ impl MempoolHub {
             }
         }
         let hub = Arc::clone(self);
-        let (indexed, accepted, lifted) = crate::reactor::off_pool(move || {
-            let indexed = hub
-                .index_accepted_package(&txs, &accepted, &prevouts, &lifted, stages, lock_us, t0);
-            (indexed, accepted, lifted)
+        let (indexed, accepted) = crate::reactor::off_pool(move || {
+            let indexed =
+                hub.index_accepted_package(&txs, &accepted, &prevouts, stages, lock_us, t0);
+            (indexed, accepted)
         })
         .await;
         match indexed {
             Err(e) => {
-                self.abandon_package_async(accepted, lifted).await;
+                self.abandon_package_async(accepted).await;
                 let hub = Arc::clone(self);
                 crate::reactor::off_pool(move || hub.publish_fee_floor()).await;
                 Err(e)
@@ -5070,17 +5029,9 @@ impl MempoolHub {
         let mut lock_us = 0u64;
         let mut accepted: Vec<AcceptResult> = Vec::with_capacity(txs.len());
         let mut prevouts: Vec<Vec<TxOut>> = Vec::with_capacity(txs.len());
-        // A member that is already parked has to leave the orphanage before
-        // prepare. Otherwise the parent just committed in this package is
-        // rolled back and the child stays parked.
-        let mut lifted: Vec<rbitcoin_mempool::LiftedOrphan> = Vec::new();
+        // A parked member stays parked, as Core's package admit leaves the
+        // orphanage alone.
         for tx in txs {
-            if let Some(parked) = {
-                let mut g = self.lock_write();
-                g.lift_parked_member(tx)
-            } {
-                lifted.push(parked);
-            }
             utxo.note_spender(tx);
             let delta = self.fee_delta(&tx.compute_txid());
             let spec = AdmitSpec {
@@ -5094,7 +5045,7 @@ impl MempoolHub {
             let prep = match self.admit_staged(tx, &utxo, spec, &mut stages, &mut lock_us) {
                 Ok(p) => p,
                 Err(e) => {
-                    self.abandon_package(&accepted, &lifted);
+                    self.abandon_package(&accepted);
                     let us = t0.elapsed().as_micros() as u64;
                     self.meter_accept_stages(lock_us, stages);
                     return Err(self.finish_accept_err(us, e).unwrap_err());
@@ -5106,7 +5057,7 @@ impl MempoolHub {
                 let mut g = self.lock_write();
                 g.last_accept_stages = stages;
                 let committed = Self::commit_rechecked(&mut g, tx, prep, &utxo, true, &sample);
-                self.note_origin(TxOrigin::Local, &committed.result);
+                self.note_committed(&mut g, tx, TxOrigin::Local, &committed.result);
                 stages = g.last_accept_stages;
                 committed
             };
@@ -5119,7 +5070,7 @@ impl MempoolHub {
                 Err(e) => {
                     self.unindex_evicted(&committed.failed_evict);
                     self.restore_replaced(&committed.undone);
-                    self.abandon_package(&accepted, &lifted);
+                    self.abandon_package(&accepted);
                     // The first member can evict and fail with nothing to roll
                     // back, so the rollback publish does not run.
                     self.publish_fee_floor();
@@ -5129,18 +5080,16 @@ impl MempoolHub {
                 }
             }
         }
-        self.finish_accepted_package(txs, accepted, prevouts, lifted, stages, lock_us, t0)
+        self.finish_accepted_package(txs, accepted, prevouts, stages, lock_us, t0)
     }
 
-    /// Trim and index. Does not promote and does not re-admit a lifted orphan.
+    /// Trim and index. Does not promote.
     /// `Err` means trim dropped a member; the caller rolls the package back.
-    #[allow(clippy::too_many_arguments)] // stage inputs stay unbundled
     fn index_accepted_package(
         &self,
         txs: &[Transaction],
         accepted: &[AcceptResult],
         prevouts: &[Vec<TxOut>],
-        lifted: &[rbitcoin_mempool::LiftedOrphan],
         stages: rbitcoin_mempool::AcceptStageUs,
         lock_us: u64,
         t0: Instant,
@@ -5152,11 +5101,6 @@ impl MempoolHub {
             return Err(self
                 .finish_accept_err(us, AcceptError::Policy("mempool full"))
                 .unwrap_err());
-        }
-        // The failure path forgets inside abandon. Success leaves the lifted
-        // txs in the mempool, so the in-flight rows would outlive the admit.
-        for item in lifted {
-            self.forget_taken_orphan(item.tx.compute_txid(), item.taken_gen);
         }
         let us = t0.elapsed().as_micros() as u64;
         self.meter_accept_stages(lock_us, stages);
@@ -5202,15 +5146,14 @@ impl MempoolHub {
         txs: &[Transaction],
         accepted: Vec<AcceptResult>,
         prevouts: Vec<Vec<TxOut>>,
-        lifted: Vec<rbitcoin_mempool::LiftedOrphan>,
         stages: rbitcoin_mempool::AcceptStageUs,
         lock_us: u64,
         t0: Instant,
     ) -> Result<Vec<AcceptResult>, AcceptError> {
-        match self.index_accepted_package(txs, &accepted, &prevouts, &lifted, stages, lock_us, t0) {
+        match self.index_accepted_package(txs, &accepted, &prevouts, stages, lock_us, t0) {
             Err(e) => {
                 // Trim dropped a member that had already replaced its conflicts.
-                self.abandon_package(&accepted, &lifted);
+                self.abandon_package(&accepted);
                 self.publish_fee_floor();
                 Err(e)
             }
@@ -5407,26 +5350,17 @@ impl MempoolHub {
         self.lock_read().orphanage.snapshot()
     }
 
-    pub fn add_orphan_announcer(&self, txid: &Txid, peer: u64) -> bool {
-        if let Some(r) = self.orphan_write(|g| g.orphanage.add_announcer(txid, peer)) {
+    pub fn add_orphan_announcer(&self, wtxid: &Wtxid, peer: u64) -> bool {
+        if let Some(r) = self.orphan_write(|g| g.orphanage.add_announcer(wtxid, peer)) {
             return r;
         }
         let _g = crate::reactor::BlockingRegion::enter();
-        self.orphan_write(|g| g.orphanage.add_announcer(txid, peer))
+        self.orphan_write(|g| g.orphanage.add_announcer(wtxid, peer))
             .unwrap_or(false)
     }
 
-    pub fn add_orphan_announcer_wtxid(&self, wtxid: &Wtxid, peer: u64) -> bool {
-        if let Some(r) = self.orphan_write(|g| g.orphanage.add_announcer_wtxid(wtxid, peer)) {
-            return r;
-        }
-        let _g = crate::reactor::BlockingRegion::enter();
-        self.orphan_write(|g| g.orphanage.add_announcer_wtxid(wtxid, peer))
-            .unwrap_or(false)
-    }
-
-    fn forget_taken_orphan(&self, txid: Txid, gen: u64) {
-        let _ = self.orphan_write(|g| g.orphanage.forget_taken_gen(&txid, gen));
+    fn forget_taken_orphan(&self, wtxid: Wtxid, gen: u64) {
+        let _ = self.orphan_write(|g| g.orphanage.forget_taken_gen(&wtxid, gen));
     }
 
     pub fn erase_orphans_for_peer(&self, peer: u64) {
@@ -5460,12 +5394,10 @@ impl MempoolHub {
             if g.graph.contains(txid) {
                 return true;
             }
-            if g.orphanage.contains(txid) {
-                if let Some(w) = g.orphanage.wtxid_of(txid) {
-                    if w.to_byte_array() == txid.to_byte_array() {
-                        return true;
-                    }
-                }
+            if g.orphanage
+                .contains_wtxid(&Wtxid::from_byte_array(txid.to_byte_array()))
+            {
+                return true;
             }
         }
         if self
@@ -5491,12 +5423,12 @@ impl MempoolHub {
         out
     }
 
-    pub fn try_orphan_missing(&self, txid: &Txid) -> Option<BTreeSet<Txid>> {
+    pub fn try_orphan_missing(&self, wtxid: &Wtxid) -> Option<BTreeSet<Txid>> {
         self.inner
             .try_read()
             .ok()?
             .orphanage
-            .missing_of(txid)
+            .missing_of(wtxid)
             .cloned()
     }
 
