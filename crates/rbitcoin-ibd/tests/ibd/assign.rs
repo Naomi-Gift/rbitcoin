@@ -2182,7 +2182,7 @@ fn stale_pending_expires_only_inside_the_tip_batch() {
     for ht in [1u32, 32, 33] {
         st.record_height(h(ht), ht);
         st.body.mark_pending(h(ht));
-        st.body.pending_since.insert(h(ht), old);
+        st.body.set_pending_since(h(ht), old);
     }
     for ht in [1u32, 32] {
         hub.query
@@ -2192,7 +2192,7 @@ fn stale_pending_expires_only_inside_the_tip_batch() {
     let low = h(0x100);
     st.hash_height.insert(low, 0);
     st.body.mark_pending(low);
-    st.body.pending_since.insert(low, old);
+    st.body.set_pending_since(low, old);
     assign_work_ordered(
         &mut st,
         &hub,
