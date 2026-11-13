@@ -343,3 +343,19 @@ fn hashhead_empty_insert_get_miss_flush_and_reopen_multi() {
     assert!(std::path::PathBuf::from(mlt).exists());
     cleanup_hh(&path);
 }
+
+#[test]
+fn multi_list_get_reads_create_and_next() {
+    let path = tmp_path();
+    let list = MultiList::create(&path).unwrap();
+    let create = Fk(0x0102_0304_0506_0708);
+    let a = list.append(create, Fk::NULL).unwrap();
+    let b = list.append(Fk(9), a).unwrap();
+    assert_eq!(list.get(a).unwrap(), (create, Fk::NULL));
+    assert_eq!(list.get(b).unwrap(), (Fk(9), a));
+    match list.get(Fk(99)) {
+        Err(StoreError::NotFound) => {}
+        other => panic!("missing multi row must be NotFound, got {other:?}"),
+    }
+    cleanup_hh(&path);
+}
