@@ -216,3 +216,38 @@ fn unknown_sigops_and_older_schema_records_decode() {
         ));
     }
 }
+
+#[test]
+fn decode_packed_prefix_keeps_fee_and_rejects_short() {
+    let tx = sample_tx(false);
+    let (txid, wtxid) = (tx.compute_txid(), tx.compute_wtxid());
+    let packed =
+        encode_packed_live(&tx, &txid, &wtxid, 99, 401, Some(3), 1_700_000_111, &[]).unwrap();
+    let got = decode_packed(&packed, true, true).unwrap();
+    assert_eq!(got.fee_sat, 99);
+    assert_eq!(got.weight, 401);
+    assert_eq!(got.sigop_cost, Some(3));
+    assert_eq!(got.accept_secs, 1_700_000_111);
+    assert_eq!(got.txid, txid);
+    assert_eq!(got.wtxid, wtxid);
+    assert_eq!(serialize(&got.tx), serialize(&tx));
+    let mut v3 = packed.clone();
+    v3.drain(ACCEPT_SECS_OFF..ACCEPT_SECS_OFF + 8);
+    let got = decode_packed(&v3, true, false).unwrap();
+    assert_eq!(got.fee_sat, 99);
+    assert_eq!(got.weight, 401);
+    assert_eq!(got.sigop_cost, Some(3));
+    assert_eq!(got.accept_secs, 0);
+    assert_eq!(got.txid, txid);
+    let mut v2 = v3;
+    v2.drain(SIGOP_COST_OFF..SIGOP_COST_OFF + 8);
+    let got = decode_packed(&v2, false, false).unwrap();
+    assert_eq!(got.fee_sat, 99);
+    assert_eq!(got.weight, 401);
+    assert_eq!(got.sigop_cost, None);
+    assert_eq!(got.txid, txid);
+    assert!(matches!(
+        decode_packed(&packed[..16], true, true),
+        Err(MempoolError::Corrupt("packed live short"))
+    ));
+}

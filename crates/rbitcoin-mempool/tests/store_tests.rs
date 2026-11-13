@@ -1078,6 +1078,50 @@ fn clear_dirty_keeps_a_second_interval_from_rewriting_meta() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[test]
+fn open_or_init_meta_reads_written_fields_and_rejects_bad_files() {
+    let dir = tmp_dir();
+    let path = dir.join("meta");
+    let mut buf = [0u8; META_LEN];
+    write_meta_bytes(&mut buf, 17, 8, 3);
+    fs::write(&path, buf).unwrap();
+    let (_file, gen, cap, live, schema) = match open_or_init_meta(&path) {
+        Ok(opened) => opened,
+        Err(err) => panic!("{err}"),
+    };
+    assert_eq!((gen, cap, live, schema), (17, 8, 3, MEM_SCHEMA));
+    write_meta_bytes(&mut buf, 1, 0, 0);
+    fs::write(&path, buf).unwrap();
+    match open_or_init_meta(&path) {
+        Err(MempoolError::Corrupt(m)) => assert!(m.contains("slot_cap zero"), "{m}"),
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("zero slot_cap opened"),
+    }
+    let mut junk = [0u8; META_LEN];
+    junk[0..4].copy_from_slice(b"BAD!");
+    fs::write(&path, junk).unwrap();
+    match open_or_init_meta(&path) {
+        Err(MempoolError::BadMagic) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("bad magic opened"),
+    }
+    fs::write(&path, b"rBMP").unwrap();
+    match open_or_init_meta(&path) {
+        Err(MempoolError::Io { .. }) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("short meta opened"),
+    }
+    let fresh = dir.join("missing-meta");
+    let (_file, gen, cap, live, schema) = match open_or_init_meta(&fresh) {
+        Ok(opened) => opened,
+        Err(err) => panic!("{err}"),
+    };
+    assert_eq!(
+        (gen, cap, live, schema),
+        (0, DEFAULT_SLOT_CAP, 0, MEM_SCHEMA)
+    );
+}
+
 /// Two new slot rows share one `pwrite` when they are adjacent. Separate
 /// writes leave the same bytes a reopen reads. The merge is the persist
 /// path for a burst of admits.

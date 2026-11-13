@@ -893,10 +893,15 @@ pub fn encode_posts_spill(map: &PostPackMap) -> Vec<u8> {
 
 #[doc(hidden)]
 pub fn fold_posts_spill_bytes(map: &mut PostPackMap, bytes: &[u8]) -> Result<(), StoreError> {
-    if bytes.len() < POSTS_SPILL_HDR || bytes[0..8] != POSTS_SPILL_MAGIC[..] {
+    if bytes.len() < POSTS_SPILL_HDR {
         return Err(refuse_posts_leftover());
     }
-    let n_keys = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
+    let mut hdr = [0u8; POSTS_SPILL_HDR];
+    hdr.copy_from_slice(&bytes[..POSTS_SPILL_HDR]);
+    if hdr[0..8] != POSTS_SPILL_MAGIC[..] {
+        return Err(refuse_posts_leftover());
+    }
+    let n_keys = le_u32!(hdr, 8) as usize;
     let mut i = POSTS_SPILL_HDR;
     let mut src = PostPackMap::default();
     for _ in 0..n_keys {

@@ -583,3 +583,38 @@ fn posts_spill_fallocate_padding_refuses() {
         other => panic!("fallocate padding must refuse, got {other:?}"),
     }
 }
+
+#[test]
+fn fold_posts_spill_bytes_reads_key_count_and_refuses_short() {
+    let mut map = PostPackMap::default();
+    let k = prefix_key(12);
+    insert_post_fk(&mut map, k, 4);
+    insert_post_fk(&mut map, k, 9);
+    let bytes = encode_posts_spill(&map);
+    let mut round = PostPackMap::default();
+    fold_posts_spill_bytes(&mut round, &bytes).unwrap();
+    assert_eq!(
+        round.map.get(&k).map(|v| v.as_slice()),
+        Some(&[4u64, 9][..])
+    );
+    match fold_posts_spill_bytes(&mut PostPackMap::default(), &bytes[..POSTS_SPILL_HDR]) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("posts spill truncated"), "{m}");
+        }
+        other => panic!("header without keys must truncate, got {other:?}"),
+    }
+    match fold_posts_spill_bytes(&mut PostPackMap::default(), &bytes[..POSTS_SPILL_HDR - 1]) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("wipe store/scripthash.unsorted"), "{m}");
+        }
+        other => panic!("short spill must refuse, got {other:?}"),
+    }
+    let mut bad = bytes.clone();
+    bad[0] = b'X';
+    match fold_posts_spill_bytes(&mut PostPackMap::default(), &bad) {
+        Err(StoreError::Corrupt(m)) => {
+            assert!(m.contains("wipe store/scripthash.unsorted"), "{m}");
+        }
+        other => panic!("bad magic must refuse, got {other:?}"),
+    }
+}
