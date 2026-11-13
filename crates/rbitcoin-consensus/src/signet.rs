@@ -242,32 +242,30 @@ pub fn read_signet_compact(rdr: &mut &[u8]) -> Result<u64, ConsensusError> {
     let (v, n) = match rdr[0] {
         tag @ 0..=252 => (u64::from(tag), 1usize),
         253 => {
-            if rdr.len() < 3 {
+            let Some(raw) = rdr.first_chunk::<3>() else {
                 return Err(ConsensusError::BadBlock("signet: compact size"));
-            }
-            let v = u16::from_le_bytes([rdr[1], rdr[2]]);
+            };
+            let v = rbitcoin_primitives::le_u16!(raw, 1);
             if v < 253 {
                 return Err(ConsensusError::BadBlock("signet: non-minimal compact size"));
             }
             (u64::from(v), 3)
         }
         254 => {
-            if rdr.len() < 5 {
+            let Some(raw) = rdr.first_chunk::<5>() else {
                 return Err(ConsensusError::BadBlock("signet: compact size"));
-            }
-            let v = u32::from_le_bytes([rdr[1], rdr[2], rdr[3], rdr[4]]);
+            };
+            let v = rbitcoin_primitives::le_u32!(raw, 1);
             if v <= u32::from(u16::MAX) {
                 return Err(ConsensusError::BadBlock("signet: non-minimal compact size"));
             }
             (u64::from(v), 5)
         }
         255 => {
-            if rdr.len() < 9 {
+            let Some(raw) = rdr.first_chunk::<9>() else {
                 return Err(ConsensusError::BadBlock("signet: compact size"));
-            }
-            let v = u64::from_le_bytes([
-                rdr[1], rdr[2], rdr[3], rdr[4], rdr[5], rdr[6], rdr[7], rdr[8],
-            ]);
+            };
+            let v = rbitcoin_primitives::le_u64!(raw, 1);
             if v <= u64::from(u32::MAX) {
                 return Err(ConsensusError::BadBlock("signet: non-minimal compact size"));
             }

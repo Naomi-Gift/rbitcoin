@@ -15,7 +15,8 @@ use crate::error::StoreError;
 use crate::header_table::block_header_hash;
 use crate::store::Store;
 use rbitcoin_primitives::{
-    merkle_root_from_txids, schema_file_openable, Fk, Height, SCHEMA_VERSION, STORE_MAGIC,
+    bytes, le_u16, le_u32, le_u64, merkle_root_from_txids, schema_file_openable, Fk, Height,
+    SCHEMA_VERSION, STORE_MAGIC,
 };
 use std::fs::OpenOptions;
 use std::io::{Read, Write};
@@ -117,24 +118,15 @@ impl TipSeal {
         if buf[0..4] != STORE_MAGIC {
             return Err(StoreError::BadMagic);
         }
-        let ver = u16::from_le_bytes([buf[4], buf[5]]);
+        let ver = le_u16!(buf, 4);
         if !schema_file_openable(ver) {
             return Err(StoreError::BadSchema(ver));
         }
         Ok(Some(Self {
-            tip_height: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
-            confirmed_len: u64::from_le_bytes([
-                buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
-            ]),
-            generation: u64::from_le_bytes([
-                buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27],
-            ]),
-            tip_hash: [
-                buf[28], buf[29], buf[30], buf[31], buf[32], buf[33], buf[34], buf[35], buf[36],
-                buf[37], buf[38], buf[39], buf[40], buf[41], buf[42], buf[43], buf[44], buf[45],
-                buf[46], buf[47], buf[48], buf[49], buf[50], buf[51], buf[52], buf[53], buf[54],
-                buf[55], buf[56], buf[57], buf[58], buf[59],
-            ],
+            tip_height: le_u32!(buf, 8),
+            confirmed_len: le_u64!(buf, 12),
+            generation: le_u64!(buf, 20),
+            tip_hash: bytes!(buf, 28, 32),
         }))
     }
 
