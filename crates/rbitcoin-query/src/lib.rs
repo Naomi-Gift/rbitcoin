@@ -602,13 +602,19 @@ pub struct Query {
 
 /// Best header path published by IBD header intake.
 ///
-/// `slots[i]` is the hash at `base + i`. A `None` slot is a hole in that
-/// range. Heights outside `[base, base + slots.len())` are not on the path.
+/// `slots[start + i]` is the hash at `base + i`. A `None` slot is a hole in
+/// that range. `start` is a dropped prefix left in place until it is at least
+/// as long as the live tail, so a load pack does not copy the span. Heights
+/// outside the live range are not on the path.
 #[derive(Default)]
 #[doc(hidden)]
 pub struct MilestonePath {
     base: u32,
+    /// First live index in `slots`.
+    start: usize,
     slots: Vec<Option<[u8; 32]>>,
+    /// Count of `Some` hashes in the live range.
+    live: usize,
     /// Work through `work_height` when `work_valid` (big-endian).
     pub work_through: [u8; 32],
     pub work_height: u32,
@@ -620,29 +626,43 @@ pub struct MilestonePath {
 
 impl MilestonePath {
     fn is_empty(&self) -> bool {
-        self.slots.is_empty()
+        self.live == 0
+    }
+
+    fn logical_len(&self) -> usize {
+        self.slots.len().saturating_sub(self.start)
     }
 
     fn slot(&self, height: u32) -> Option<&Option<[u8; 32]>> {
-        if self.slots.is_empty() || height < self.base {
+        let phys = self.phys(height)?;
+        self.slots.get(phys)
+    }
+
+    fn phys(&self, height: u32) -> Option<usize> {
+        if self.logical_len() == 0 || height < self.base {
             return None;
         }
-        self.slots.get((height - self.base) as usize)
+        let idx = (height - self.base) as usize;
+        if idx >= self.logical_len() {
+            return None;
+        }
+        Some(self.start + idx)
     }
 
     fn hash_at(&self, height: u32) -> Option<[u8; 32]> {
         self.slot(height).copied().flatten()
     }
 
-    /// A slot still in range wins. A hole there does not link. A dropped tip
-    /// links through `work_hash`.
+    /// A filled slot wins. An empty slot at this tip still links through
+    /// `work_hash`: a note below the retained base turns a dropped tip into
+    /// a hole, and that hole is not a different hash.
     fn links_work_tip(&self, height: u32, prev: [u8; 32]) -> bool {
         if self.work_height != height {
             return false;
         }
         match self.slot(height) {
-            Some(slot) => *slot == Some(prev),
-            None => self.work_hash == Some(prev),
+            Some(Some(hash)) => *hash == prev,
+            _ => self.work_hash == Some(prev),
         }
     }
 
@@ -667,74 +687,125 @@ impl MilestonePath {
     }
 
     fn note(&mut self, height: u32, hash: [u8; 32]) {
-        if self.slots.is_empty() {
+        if self.live == 0 {
+            self.wipe();
             self.base = height;
             self.slots.push(Some(hash));
+            self.live = 1;
             return;
         }
         if height < self.base {
-            let gap = (self.base - height) as usize;
-            let mut prefix = Vec::with_capacity(gap + self.slots.len());
-            prefix.push(Some(hash));
-            prefix.resize(gap, None);
-            prefix.append(&mut self.slots);
-            self.slots = prefix;
-            self.base = height;
+            self.note_below(height, hash);
             return;
         }
         let idx = (height - self.base) as usize;
-        if idx >= self.slots.len() {
-            self.slots.resize(idx + 1, None);
+        let phys = self.start + idx;
+        if phys >= self.slots.len() {
+            self.slots.resize(phys + 1, None);
         }
-        self.slots[idx] = Some(hash);
+        self.store(phys, hash);
+    }
+
+    /// Put `hash` at `height` and leave a hole up to the old base.
+    /// Reuse a cleared prefix when it covers that gap, so the live tail stays put.
+    fn note_below(&mut self, height: u32, hash: [u8; 32]) {
+        let gap = (self.base - height) as usize;
+        if self.start >= gap {
+            self.start -= gap;
+            self.base = height;
+            self.store(self.start, hash);
+            return;
+        }
+        let mut prefix = Vec::with_capacity(gap + self.logical_len());
+        prefix.push(Some(hash));
+        prefix.resize(gap, None);
+        prefix.extend_from_slice(&self.slots[self.start..]);
+        self.slots = prefix;
+        self.start = 0;
+        self.base = height;
+        self.live += 1;
+    }
+
+    fn store(&mut self, phys: usize, hash: [u8; 32]) {
+        if self.slots[phys].is_none() {
+            self.live += 1;
+        }
+        self.slots[phys] = Some(hash);
     }
 
     fn clear_above(&mut self, height: u32) {
-        if self.slots.is_empty() {
+        if self.live == 0 {
             return;
         }
         if height < self.base {
-            self.slots = Vec::new();
+            self.wipe();
             return;
         }
         let keep = (height - self.base) as usize + 1;
-        if keep < self.slots.len() {
-            self.slots.truncate(keep);
+        let end = self.start + keep;
+        if end < self.slots.len() {
+            self.forget_range(end, self.slots.len());
+            self.slots.truncate(end);
         }
-        self.clear_if_blank();
+        if self.live == 0 {
+            self.wipe();
+            return;
+        }
+        self.compact();
     }
 
     /// Drop every hash at or below `height`.
     ///
     /// Work stays. Its tip can be this height, so the slot can go while
-    /// `work_hash` still links the next header.
+    /// `work_hash` still links the next header. The dropped prefix stays in
+    /// place until it is at least as long as the live tail.
     fn drop_through(&mut self, height: u32) {
-        if self.slots.is_empty() || height < self.base {
+        if self.live == 0 || height < self.base {
             return;
         }
         let drop_n = ((height - self.base) as usize).saturating_add(1);
-        if drop_n >= self.slots.len() {
-            self.slots = Vec::new();
+        if drop_n >= self.logical_len() {
+            self.wipe();
             return;
         }
-        self.slots.drain(..drop_n);
+        let end = self.start + drop_n;
+        self.forget_range(self.start, end);
+        self.start = end;
         self.base = height.saturating_add(1);
-        if self.clear_if_blank() {
+        if self.live == 0 {
+            self.wipe();
             return;
         }
-        let live = self.slots.len();
-        if self.slots.capacity() > live.saturating_mul(2).max(64) {
+        self.compact();
+    }
+
+    fn forget_range(&mut self, from: usize, to: usize) {
+        for slot in &mut self.slots[from..to] {
+            if slot.take().is_some() {
+                self.live -= 1;
+            }
+        }
+    }
+
+    /// Copy the live tail once the dropped prefix is the larger part.
+    fn compact(&mut self) {
+        let live_len = self.logical_len();
+        if self.start == 0 || self.start < live_len {
+            return;
+        }
+        let tail = self.slots.split_off(self.start);
+        self.slots = tail;
+        self.start = 0;
+        if self.slots.capacity() > self.slots.len().saturating_mul(2).max(64) {
             self.slots.shrink_to_fit();
         }
     }
 
-    fn clear_if_blank(&mut self) -> bool {
-        if self.slots.iter().all(Option::is_none) {
-            self.slots = Vec::new();
-            true
-        } else {
-            false
-        }
+    fn wipe(&mut self) {
+        self.slots = Vec::new();
+        self.start = 0;
+        self.base = 0;
+        self.live = 0;
     }
 }
 

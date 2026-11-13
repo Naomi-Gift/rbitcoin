@@ -1662,6 +1662,81 @@ fn a_checkpoint_on_an_invalid_work_tip_still_links_after_the_drop() {
 }
 
 #[test]
+fn a_note_below_the_retained_base_still_links_the_dropped_tip() {
+    let (dir, q) = temp_query("ms-reopen-link");
+    let zero = bitcoin::Work::from_be_bytes([0; 32]);
+    let mut one_be = [0u8; 32];
+    one_be[31] = 1;
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    let through_five = one.to_be_bytes();
+    let through_six = (one + one).to_be_bytes();
+    let a5 = [0x05u8; 32];
+    let a10 = [0x0au8; 32];
+    q.note_milestone_header(5, a5, [0; 32], one, Some(zero));
+    q.note_milestone_header(10, a10, [0x99; 32], one, None);
+    q.drop_milestone_path_through(9);
+    assert_eq!(q.milestone_header_at(5), None);
+    assert_eq!(q.milestone_header_at(10), Some(a10));
+    q.note_milestone_header(4, [0x04; 32], [0; 32], one, None);
+    assert_eq!(
+        q.milestone_header_at(5),
+        None,
+        "reopening below the base leaves the dropped tip a hole"
+    );
+    assert_eq!(q.milestone_best_work_be(), Some(through_five));
+    q.note_milestone_header(6, [0x06; 32], a5, one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(through_six),
+        "a header that links to the dropped tip still adds its work"
+    );
+    q.note_milestone_header(7, [0x07; 32], [0x99; 32], one, None);
+    assert_eq!(q.milestone_best_work_be(), Some(through_six));
+    let _ = dir;
+}
+
+#[test]
+fn a_note_into_a_dropped_prefix_still_links_the_work_tip() {
+    let (dir, q) = temp_query("ms-prefix-reuse");
+    let zero = bitcoin::Work::from_be_bytes([0; 32]);
+    let mut one_be = [0u8; 32];
+    one_be[31] = 1;
+    let one = bitcoin::Work::from_be_bytes(one_be);
+    let through_six = (one + one).to_be_bytes();
+    let through_seven = (one + one + one).to_be_bytes();
+    let h5 = [0x05u8; 32];
+    let h6 = [0x06u8; 32];
+    q.note_milestone_header(5, h5, [0; 32], one, Some(zero));
+    q.note_milestone_header(6, h6, h5, one, None);
+    for height in 7..=12 {
+        q.note_milestone_header(height, [height as u8; 32], [0x99; 32], one, None);
+    }
+    assert_eq!(q.milestone_best_work_be(), Some(through_six));
+    q.drop_milestone_path_through(7);
+    assert_eq!(q.milestone_header_at(6), None);
+    assert_eq!(q.milestone_header_at(8), Some([8; 32]));
+    q.note_milestone_header(5, [0x15; 32], [0; 32], one, None);
+    assert_eq!(
+        q.milestone_header_at(6),
+        None,
+        "reopening the dropped prefix leaves the work tip a hole"
+    );
+    assert_eq!(q.milestone_header_at(7), None);
+    assert_eq!(q.milestone_header_at(5), Some([0x15; 32]));
+    assert_eq!(q.milestone_header_at(8), Some([8; 32]));
+    assert_eq!(q.milestone_best_work_be(), Some(through_six));
+    q.note_milestone_header(7, [0x17; 32], h6, one, None);
+    assert_eq!(
+        q.milestone_best_work_be(),
+        Some(through_seven),
+        "a header that links to the dropped tip still adds its work"
+    );
+    q.note_milestone_header(7, [0x27; 32], [0x99; 32], one, None);
+    assert_eq!(q.milestone_best_work_be(), Some(through_seven));
+    let _ = dir;
+}
+
+#[test]
 fn a_load_pack_drops_milestone_hashes_the_store_tip_passed() {
     let (dir, q) = temp_query("ms-load-pack");
     let (mut h0, _) = coinbase_block(0, Fk::NULL, None);
