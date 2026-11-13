@@ -45,10 +45,6 @@ fn size_snapshot_counts_packs_and_bytes() {
     assert_eq!(entries, 2);
     assert!(bytes > 0, "expected non-zero approx bytes");
     assert!(bytes < 4096, "bytes={bytes}");
-    rbitcoin_query::process_mem_stats::note(packs, entries, bytes);
-    let s = rbitcoin_query::process_mem_stats::load();
-    assert_eq!(s.inflight_layers, 2);
-    assert_eq!(s.inflight_pins, 2);
     let again = m.size_snapshot();
     assert_eq!(
         (packs, entries, bytes),

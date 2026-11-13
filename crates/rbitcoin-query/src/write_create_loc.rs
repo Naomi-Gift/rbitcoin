@@ -137,7 +137,7 @@ pub fn publish(ram: &WriteCreateLocRam) {
 }
 
 /// Drop this thread's loc window (Query open / test isolation). Does not publish
-/// zeros — `wloc=` atomics are process-wide like `iflight=`.
+/// zeros — `wloc=` atomics are process-wide.
 pub fn clear() {
     RAM.with(|c| {
         *c.borrow_mut() = WriteCreateLocRam::default();

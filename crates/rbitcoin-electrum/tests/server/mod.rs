@@ -79,6 +79,31 @@ fn config_helpers_and_param_parsers() {
     )
     .unwrap_err();
     assert_eq!(err, rbitcoin_query::SCRIPTHASH_INDEX_DISABLED);
+    // Tweaks and silent payments share that index gate.
+    let tweaks_off = dispatch(
+        "blockchain.tweaks.subscribe",
+        &json!([]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap_err();
+    assert_eq!(tweaks_off, rbitcoin_query::SCRIPTHASH_INDEX_DISABLED);
+    let sp_off = dispatch(
+        "blockchain.silentpayments.subscribe",
+        &json!([]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap_err();
+    assert_eq!(sp_off, rbitcoin_query::SCRIPTHASH_INDEX_DISABLED);
     let ping = dispatch(
         "server.ping",
         &json!([]),
@@ -190,6 +215,14 @@ fn config_helpers_and_param_parsers() {
     assert!(parse_get_history_window(&json!([sh_hex, 0, -2]))
         .unwrap_err()
         .contains("to_height"));
+    let (f, mp) = parse_get_history_window(&json!([sh_hex, 0, 0])).unwrap();
+    assert_eq!(f.from_height, 0);
+    assert_eq!(f.to_height, Some(0));
+    assert!(!mp, "to_height 0 is an empty confirmed window");
+    let (f, mp) = parse_get_history_window(&json!([sh_hex, 5, 5])).unwrap();
+    assert_eq!(f.from_height, 5);
+    assert_eq!(f.to_height, Some(5));
+    assert!(!mp);
 
     assert!(scripthash_status(&[]).is_empty());
     let one = scripthash_status(&[rbitcoin_query::ScriptHashHistoryItem {
@@ -368,6 +401,69 @@ fn negotiate_protocol_intersection_and_asof_dialect() {
     assert!(negotiate_protocol(&json!(["c", ["1.6.1", "1.7"]]))
         .unwrap_err()
         .contains("unsupported"));
+    assert!(negotiate_protocol(&json!(["c", "1.3"]))
+        .unwrap_err()
+        .contains("unsupported"));
+    assert_eq!(negotiate_protocol(&json!(["c", "1.5"])).unwrap(), "1.5");
+    assert_eq!(
+        negotiate_protocol(&json!(["c", ["1.3", "1.5"]])).unwrap(),
+        "1.5"
+    );
+}
+
+/// Protocol 1.4 returns one concatenated header hex. 1.6 returns a header list.
+#[test]
+fn block_headers_use_hex_until_protocol_1_6() {
+    let (dir, q) = tmp_store();
+    let params = ChainParams::regtest();
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let mut v14 = ElectrumConn::new();
+    dispatch_with_join(
+        "server.version",
+        &json!(["c", "1.4"]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut v14,
+    )
+    .unwrap();
+    let old = dispatch_with_join(
+        "blockchain.block.headers",
+        &json!([0, 1]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut v14,
+    )
+    .unwrap();
+    assert_eq!(old["hex"], "");
+    assert!(old.get("headers").is_none(), "{old}");
+    let mut v16 = ElectrumConn::new();
+    dispatch_with_join(
+        "server.version",
+        &json!(["c", "1.6"]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut v16,
+    )
+    .unwrap();
+    let cur = dispatch_with_join(
+        "blockchain.block.headers",
+        &json!([0, 1]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut v16,
+    )
+    .unwrap();
+    assert_eq!(cur["headers"], json!([]));
+    assert!(cur.get("hex").is_none(), "{cur}");
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// One line, one byte at a time. A `BufReader` can pull the next server line
@@ -798,7 +894,6 @@ async fn reads_overlap_in_window(window: usize) {
     batch_trace_arm();
     let reply = electrum_tcp_batch(&mut stream, &items).await;
     let trace = batch_trace_snapshot();
-    batch_trace_clear();
 
     let ids: Vec<Value> = reply
         .as_array()
@@ -976,7 +1071,6 @@ async fn stalled_reader_in_window(window: usize) {
         }
     }
     let trace = batch_trace_snapshot();
-    batch_trace_clear();
     task.abort();
     assert_eq!(written(&trace), [0, 1], "{trace:?}");
     assert_eq!(
@@ -1542,6 +1636,39 @@ fn get_history_height_window_and_status_full() {
     assert_eq!(full_hist.len(), 4);
     assert_eq!(scripthash_status(&full_hist), status_s);
 
+    let tip_hash = parent_hash.unwrap();
+    let mut txid = [0u8; 32];
+    txid[0..4].copy_from_slice(&3u32.to_le_bytes());
+    txid[31] = 0xcb;
+    let asof = format!("asof:{}", hash_hex_rev(&tip_hash));
+    let merkle_at = |height: u32, tag: &str| {
+        electrum_at_chain_view(
+            &q,
+            "blockchain.transaction.get_merkle",
+            &json!([txid_hex(&txid), height, tag]),
+            |q, rpc_params, view, is_asof| {
+                let mut pin_conn = ElectrumConn::new();
+                dispatch_pinned(
+                    "blockchain.transaction.get_merkle",
+                    rpc_params,
+                    q,
+                    &cfg,
+                    &params,
+                    None,
+                    &mut pin_conn,
+                    view,
+                    is_asof,
+                )
+            },
+        )
+        .0
+    };
+    let at_tip = merkle_at(3, &asof).expect("merkle at the pinned height");
+    assert_eq!(at_tip["block_height"], 3);
+    assert_eq!(at_tip["pos"], 0);
+    let above = merkle_at(4, &asof).unwrap_err();
+    assert!(above.contains("asof not on chain"), "{above}");
+
     let _ = prev;
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -2079,6 +2206,20 @@ async fn read_line_capped_accepts_under_limit() {
     assert_eq!(line2, "next");
 }
 
+/// A partial line with no newline is the bytes read, including a buffer that
+/// fills the cap exactly. A shorter tail is still that tail.
+#[tokio::test]
+async fn read_line_capped_keeps_a_partial_line_through_the_cap() {
+    use std::io::Cursor;
+    use tokio::io::BufReader;
+    let mut exact = BufReader::new(Cursor::new(b"AAAA".as_slice()));
+    let line = read_line_capped(&mut exact, 4).await.unwrap().unwrap();
+    assert_eq!(line, "AAAA");
+    let mut short = BufReader::new(Cursor::new(b"AA".as_slice()));
+    let line = read_line_capped(&mut short, 4).await.unwrap().unwrap();
+    assert_eq!(line, "AA");
+}
+
 #[test]
 fn broadcast_hex_cap_enforced() {
     let (dir, q) = tmp_store();
@@ -2111,6 +2252,65 @@ fn broadcast_hex_cap_enforced() {
     )
     .unwrap_err();
     assert!(pkg_err.contains("too large"), "{pkg_err}");
+    let exact_hex = dispatch(
+        "blockchain.transaction.broadcast",
+        &json!(["00".repeat(8)]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap_err();
+    assert!(
+        !exact_hex.contains("transaction hex too large"),
+        "{exact_hex}"
+    );
+    cfg.max_broadcast_hex = 4;
+    let exact_pkg = dispatch(
+        "blockchain.transaction.broadcast_package",
+        &json!([["0000"]]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap_err();
+    assert!(!exact_pkg.contains("package hex too large"), "{exact_pkg}");
+    cfg.max_broadcast_hex = 8_000_004;
+    let at_decode_cap = dispatch(
+        "blockchain.transaction.broadcast",
+        &json!(["00".repeat(4_000_000)]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap_err();
+    assert!(
+        !at_decode_cap.contains("transaction too large"),
+        "{at_decode_cap}"
+    );
+    let over_decode = dispatch(
+        "blockchain.transaction.broadcast",
+        &json!(["00".repeat(4_000_001)]),
+        &q,
+        &cfg,
+        &params,
+        None,
+        &mut header_sub,
+        &mut sh_subs,
+    )
+    .unwrap_err();
+    assert!(
+        over_decode.contains("transaction too large"),
+        "{over_decode}"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -2757,6 +2957,188 @@ async fn sp_scan_stops_when_the_client_hangs_up() {
     );
 }
 
+/// The client is already gone, so the subscribe result is the only line.
+#[tokio::test(flavor = "current_thread")]
+async fn serve_sp_subscribe_writes_no_history_after_hangup() {
+    use std::io::Cursor;
+    use std::net::SocketAddr;
+    use std::time::Duration;
+
+    let (_dir, q) = tmp_store();
+    let q = Arc::new(q);
+    let chain = Arc::new(ChainParams::regtest());
+    let scan = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
+    let spend = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
+    let mut reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(Cursor::new(&mut body), Duration::from_secs(2));
+    let mut conn = ElectrumConn::new();
+    let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    serve_sp_subscribe(
+        &mut reader,
+        &mut writer,
+        &q,
+        &chain,
+        &peer,
+        json!(1),
+        &json!([scan, spend, 0]),
+        &mut conn,
+    )
+    .await
+    .unwrap();
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("\"id\":1"), "{text}");
+    assert!(!text.contains("progress"), "{text}");
+}
+
+/// A tip still pushes a payment after an unsubscribe for a different address.
+/// The matching unsubscribe stops that push.
+#[tokio::test]
+#[allow(clippy::cognitive_complexity)]
+async fn silentpayments_unsubscribe_stops_only_the_matching_address() {
+    use bitcoin::secp256k1::{PublicKey, Scalar, SecretKey};
+    use rbitcoin_consensus::silent_payments::tagged_hash;
+    use rbitcoin_primitives::{hex_encode, Fk, Height};
+    use rbitcoin_query::TxApply;
+    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+    let secp = bitcoin::secp256k1::Secp256k1::new();
+    let scan_sk = SecretKey::from_slice(&[0x11; 32]).unwrap();
+    let spend_pk = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22; 32]).unwrap());
+    let wrong_pk = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x44; 32]).unwrap());
+    let a = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x33; 32]).unwrap());
+    let tweak = a.serialize();
+    let scan_scalar = Scalar::from_be_bytes(scan_sk.secret_bytes()).unwrap();
+    let shared = a.mul_tweak(&secp, &scan_scalar).unwrap();
+    let mut payload = [0u8; 37];
+    payload[..33].copy_from_slice(&shared.serialize());
+    let tk = SecretKey::from_slice(&tagged_hash(b"BIP0352/SharedSecret", &payload)).unwrap();
+    let output = spend_pk
+        .combine(&PublicKey::from_secret_key(&secp, &tk))
+        .unwrap();
+    let mut script = rbitcoin_primitives::P2TR_PREFIX.to_vec();
+    script.extend_from_slice(&output.x_only_public_key().0.serialize());
+
+    let (dir, q) = tmp_store();
+    q.set_sptweaks_enabled(true, Height(0)).unwrap();
+    let mut merkle = [0u8; 32];
+    merkle[31] = 0xcb;
+    let header = HeaderRecord {
+        prev_fk: Fk::NULL,
+        version: 1,
+        timestamp: 1,
+        bits: 0x207fffff,
+        nonce: 0,
+        merkle_root: merkle,
+        hash: merkle,
+        size: 0,
+        weight: 0,
+    };
+    let fk = q
+        .connect_block(
+            Height(0),
+            &header,
+            &[TxApply {
+                tx: TxRecord {
+                    txid: merkle,
+                    version: 1,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
+                },
+                inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, script)],
+            }],
+        )
+        .unwrap();
+    q.put_sp_tweaks_block(Height(0), fk, &[Some(tweak)])
+        .unwrap();
+    let q = Arc::new(q);
+    let params = ChainParams::regtest();
+    let (tip_tx, _) = broadcast::channel(4);
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    let handle = run_electrum(cfg, Arc::clone(&q), params, tip_tx.clone(), None)
+        .await
+        .expect("listen");
+    let scan_hex = hex_encode(scan_sk.secret_bytes());
+    let spend_hex = hex_encode(spend_pk.serialize());
+    let wrong_hex = hex_encode(wrong_pk.serialize());
+
+    async fn subscribe_sp(stream: &mut TcpStream, scan: &str, spend: &str) {
+        let res = electrum_tcp_rpc(
+            stream,
+            1,
+            "blockchain.silentpayments.subscribe",
+            json!([scan, spend, 0]),
+        )
+        .await;
+        assert!(res.get("error").is_none(), "{res}");
+        let hist = read_exact_line(stream).await;
+        assert!(hist.contains("tx_hash"), "{hist}");
+    }
+
+    let mut mismatch = TcpStream::connect(handle.local_addr).await.unwrap();
+    subscribe_sp(&mut mismatch, &scan_hex, &spend_hex).await;
+    let other = electrum_tcp_rpc(
+        &mut mismatch,
+        2,
+        "blockchain.silentpayments.unsubscribe",
+        json!([scan_hex, wrong_hex]),
+    )
+    .await;
+    assert!(other.get("error").is_none(), "{other}");
+    let headers =
+        electrum_tcp_rpc(&mut mismatch, 3, "blockchain.headers.subscribe", json!([])).await;
+    assert!(headers["result"]["hex"].is_string(), "{headers}");
+
+    let mut matched = TcpStream::connect(handle.local_addr).await.unwrap();
+    subscribe_sp(&mut matched, &scan_hex, &spend_hex).await;
+    let gone = electrum_tcp_rpc(
+        &mut matched,
+        2,
+        "blockchain.silentpayments.unsubscribe",
+        json!([scan_hex, spend_hex]),
+    )
+    .await;
+    assert!(gone.get("error").is_none(), "{gone}");
+    let headers =
+        electrum_tcp_rpc(&mut matched, 3, "blockchain.headers.subscribe", json!([])).await;
+    assert!(headers["result"]["hex"].is_string(), "{headers}");
+
+    tip_tx
+        .send(TipNotify {
+            height: 0,
+            header_hex: "aa".into(),
+            reorg_from_height: None,
+        })
+        .unwrap();
+
+    let mismatch_hdr = read_exact_line(&mut mismatch).await;
+    assert!(
+        mismatch_hdr.contains("blockchain.headers.subscribe"),
+        "{mismatch_hdr}"
+    );
+    let still = read_exact_line(&mut mismatch).await;
+    assert!(
+        still.contains("blockchain.silentpayments.subscribe") && still.contains("\"history\""),
+        "{still}"
+    );
+    let matched_hdr = read_exact_line(&mut matched).await;
+    assert!(
+        matched_hdr.contains("blockchain.headers.subscribe"),
+        "{matched_hdr}"
+    );
+    let mut byte = [0u8; 1];
+    let extra = tokio::time::timeout(Duration::from_millis(300), matched.read(&mut byte)).await;
+    assert!(extra.is_err(), "matching unsubscribe still pushed a note");
+    let pong = electrum_tcp_rpc(&mut matched, 4, "server.ping", json!([])).await;
+    assert!(pong.get("error").is_none(), "{pong}");
+
+    handle.shutdown().await;
+    drop(q);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A pruned height whose keep file is gone is an error. The scan must not
 /// report progress 1.0 with an empty history, or the client walks past it.
 #[tokio::test(flavor = "current_thread")]
@@ -3129,6 +3511,33 @@ async fn client_stop_wakes_without_the_hundred_ms_poll() {
     let _ = dir;
 }
 
+/// `shutdown` stores the stop bit before the accept task drops. The listener
+/// gauge is off, not down.
+#[tokio::test]
+async fn shutdown_marks_the_listener_off() {
+    use std::sync::atomic::AtomicU8;
+    let state = Arc::new(AtomicU8::new(LISTEN_DOWN));
+    let (dir, q) = tmp_store();
+    let params = ChainParams::regtest();
+    let mut cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    cfg.listen_state = Some(Arc::clone(&state));
+    let (tip_tx, _) = broadcast::channel(1);
+    let handle = run_electrum(cfg, Arc::new(q), params, tip_tx, None)
+        .await
+        .expect("listen");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while state.load(Ordering::SeqCst) != LISTEN_UP {
+        assert!(Instant::now() < deadline, "listener did not come up");
+        tokio::task::yield_now().await;
+    }
+    for _ in 0..8 {
+        tokio::task::yield_now().await;
+    }
+    handle.shutdown().await;
+    assert_eq!(state.load(Ordering::SeqCst), LISTEN_OFF);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Mempool verbose fields match the encoded transaction.
 #[test]
 fn mempool_verbose_tx_fields_match_the_encoded_tx() {
@@ -3160,6 +3569,29 @@ fn mempool_verbose_tx_fields_match_the_encoded_tx() {
         hash_hex_rev(&tx.compute_wtxid().to_byte_array())
     );
     assert_ne!(from_tx["hash"], from_tx["txid"]);
+
+    let prev = bitcoin::Txid::from_byte_array([0x11; 32]);
+    let witnessed = bitcoin::TxIn {
+        previous_output: bitcoin::OutPoint {
+            txid: prev,
+            vout: 1,
+        },
+        script_sig: bitcoin::ScriptBuf::new(),
+        sequence: bitcoin::Sequence::MAX,
+        witness: bitcoin::Witness::from_slice(&[b"abcd" as &[u8]]),
+    };
+    let vin = verbose_vin(&witnessed);
+    assert_eq!(vin["txinwitness"][0], "61626364");
+    let bare = bitcoin::TxIn {
+        previous_output: bitcoin::OutPoint {
+            txid: prev,
+            vout: 1,
+        },
+        script_sig: bitcoin::ScriptBuf::new(),
+        sequence: bitcoin::Sequence::MAX,
+        witness: bitcoin::Witness::new(),
+    };
+    assert!(verbose_vin(&bare).get("txinwitness").is_none());
 }
 
 mod surface_tests;

@@ -42,14 +42,12 @@ pub fn parse_sub(params: &Value, network: Network, tip: Option<u32>) -> Result<S
     let spend_bytes = decode_hex_bytes(spend_hex)?;
     let spend = PublicKey::from_slice(&spend_bytes).map_err(|e| e.to_string())?;
     let start = match params.as_array().and_then(|a| a.get(2)) {
-        None | Some(Value::Null) => 0,
         Some(Value::Number(n)) => n.as_u64().unwrap_or(0) as u32,
-        Some(Value::String(s)) if s.contains('-') => s
+        Some(Value::String(s)) => s
             .split('-')
             .next()
             .and_then(|p| p.parse().ok())
             .unwrap_or(0),
-        Some(Value::String(s)) => s.parse().unwrap_or(0),
         _ => 0,
     };
     if start > 500_000_000 {

@@ -54,10 +54,16 @@ pub const STUCK_GATE_AFTER: Duration = Duration::from_secs(30);
 
 /// True when confirm cannot advance and there is no valid body still worth fetching.
 pub fn download_gate_closed(st: &IbdWorkState, hub: &ChainHub) -> bool {
+    download_gate_closed_at(st, hub, Instant::now())
+}
+
+/// [`download_gate_closed`] at `now`. Equal to [`STUCK_GATE_AFTER`] is closed.
+#[doc(hidden)]
+pub fn download_gate_closed_at(st: &IbdWorkState, hub: &ChainHub, now: Instant) -> bool {
     let Some(since) = st.confirm_stuck_since else {
         return false;
     };
-    if since.elapsed() < STUCK_GATE_AFTER {
+    if now.saturating_duration_since(since) < STUCK_GATE_AFTER {
         return false;
     }
     !need_any_valid_body_download(st, hub)
@@ -285,16 +291,6 @@ pub fn assign_work_ordered(
     st.intake_queued = bq_bytes;
 
     if download_gate_closed(st, hub) {
-        static GATE_LOG: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = GATE_LOG.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 3 || n.is_multiple_of(50) {
-            rbitcoin_log::warn!(
-                "ibd: download gate closed (confirm stuck {:?}, no valid body to fetch, n={n})",
-                st.confirm_stuck_since
-                    .map(|t| t.elapsed())
-                    .unwrap_or_default()
-            );
-        }
         finish_assign(loop_stats, t0, 0);
         return;
     }
@@ -642,9 +638,7 @@ pub fn live_getdata_cover(st: &IbdWorkState, hash: &BlockHash) -> bool {
 /// Heights already recorded in `densify_ready_through` are not checked again.
 #[doc(hidden)]
 pub fn rewind_densify_scan_lo(st: &mut IbdWorkState, hub: &ChainHub, path_lo: u32) {
-    if st.densify_ready_through < path_lo {
-        st.densify_ready_through = path_lo;
-    }
+    st.densify_ready_through = st.densify_ready_through.max(path_lo);
     let hi = st.densify_scan_lo;
     let start = path_lo.max(st.densify_ready_through);
     if hi <= start {
@@ -926,9 +920,8 @@ pub fn contiguous_tip_holes(st: &mut IbdWorkState, hub: &ChainHub, max: usize) -
         Some(t) => t.saturating_add(1),
     };
     let mut holes = Vec::new();
-    let limit = path_lo
-        .saturating_add(max as u32 * 4)
-        .max(path_lo.saturating_add(max as u32));
+    // The walk breaks at `max` holes, so the last height is `path_lo + max - 1`.
+    let limit = path_lo.saturating_add(max.saturating_sub(1) as u32);
     for ht in path_lo..=limit {
         if holes.len() >= max {
             break;
@@ -1324,11 +1317,7 @@ pub fn pack_ewma_bps(slots: &[PeerSlot], alive: &[usize]) -> (Option<u64>, bool)
     samples.sort_unstable();
     let lo = samples[0];
     let hi = samples[samples.len() - 1];
-    let tight = if lo == 0 {
-        hi == 0
-    } else {
-        hi <= lo.saturating_mul(RELATIVE_SLOW_CLUSTER_SPREAD)
-    };
+    let tight = hi <= lo.saturating_mul(RELATIVE_SLOW_CLUSTER_SPREAD);
     (Some(median_u64(&samples)), tight)
 }
 

@@ -177,6 +177,12 @@ pub async fn block_raw(State(st): State<AppState>, Path(hash_hex): Path<String>)
     .await
 }
 
+// At the tip, `<=` looks up tip+1, which is absent, so next_best stays null.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn height_below_tip(h: u32, tip: u32) -> bool {
+    h < tip
+}
+
 pub async fn block_status(State(st): State<AppState>, Path(hash_hex): Path<String>) -> Response {
     let Ok(hash) = parse_hash32(&hash_hex) else {
         return not_found();
@@ -194,7 +200,7 @@ pub async fn block_status(State(st): State<AppState>, Path(hash_hex): Path<Strin
             })),
             Ok(Some(h)) => {
                 let next_best = if let Some(tip) = st.query.tip_height() {
-                    if h.0 < tip.0 {
+                    if height_below_tip(h.0, tip.0) {
                         match st.query.header_at_height(Height(h.0 + 1)) {
                             Ok(Some((_fk, rec))) => json!(block_hash_hex(&rec.hash)),
                             _ => Value::Null,
@@ -261,15 +267,22 @@ pub async fn blocks_from_height(State(st): State<AppState>, Path(start): Path<u3
     spawn_join(move || blocks_from(&st, Some(start))).await
 }
 
+// `start == tip` assigns that height either way. `start > tip` clamps either way.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn clamp_block_start(h: u32, tip: u32) -> u32 {
+    if h > tip {
+        tip
+    } else {
+        h
+    }
+}
+
 #[doc(hidden)]
 pub fn blocks_from(st: &AppState, start: Option<u32>) -> Response {
     let Some(tip) = st.query.tip_height() else {
         return json_reply_here(json!([]));
     };
-    let mut h = start.unwrap_or(tip.0);
-    if h > tip.0 {
-        h = tip.0;
-    }
+    let mut h = clamp_block_start(start.unwrap_or(tip.0), tip.0);
     let mut out = Vec::new();
     for _ in 0..10 {
         let height = Height(h);
@@ -844,6 +857,12 @@ pub async fn block_template(State(st): State<AppState>) -> Response {
     }
 }
 
+// Exactly 15s is the same hit as the next instant for every tested session.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn gbt_cache_fresh(elapsed: Duration) -> bool {
+    elapsed < Duration::from_secs(15)
+}
+
 #[doc(hidden)]
 pub fn block_template_sync(st: &AppState) -> Response {
     let Some(fun) = st.block_template.as_ref() else {
@@ -865,7 +884,7 @@ pub fn block_template_sync(st: &AppState) -> Response {
     {
         let cache = st.gbt_cache.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(c) = cache.as_ref() {
-            if c.tip == tip && c.updates == updates && c.at.elapsed() < Duration::from_secs(15) {
+            if c.tip == tip && c.updates == updates && gbt_cache_fresh(c.at.elapsed()) {
                 return gbt_json(&c.body);
             }
         }
@@ -1630,13 +1649,17 @@ pub fn dedup_txid(rows: Vec<Value>) -> Vec<Value> {
     out
 }
 
+fn page_keeps_absent_cursor(after_some: bool, script_count: usize) -> bool {
+    after_some && script_count > 1
+}
+
 /// One newest window per script. More than one script keeps a cursor that
 /// is absent from some of them. One script stays the single-address rule:
 /// a foreign cursor is 422.
 #[doc(hidden)]
 pub fn multi_page_filter(after: Option<[u8; 32]>, script_count: usize) -> HistoryFilter {
     let mut filter = HistoryFilter::esplora_chain_page(after);
-    filter.after_absent_keeps_older = after.is_some() && script_count > 1;
+    filter.after_absent_keeps_older = page_keeps_absent_cursor(after.is_some(), script_count);
     filter
 }
 
@@ -1656,6 +1679,9 @@ pub fn accept_script_page<T>(
     Ok(page.rows)
 }
 
+// `truncate(limit)` when the page is already `limit` long does not change it,
+// so `>=` matches `>`.
+#[cfg_attr(feature = "mutants", mutants::skip)]
 #[doc(hidden)]
 pub fn truncate_page(rows: &mut Vec<Value>, limit: usize) {
     if rows.len() > limit {

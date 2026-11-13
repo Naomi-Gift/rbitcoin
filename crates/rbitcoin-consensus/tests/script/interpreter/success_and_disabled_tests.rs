@@ -579,6 +579,19 @@ fn find_and_delete_pushdata_lengths() {
 
     // Truncated PUSHDATA2 stops before the missing length byte.
     assert_eq!(fad(&[0x4d, 0x01], &[0xff]), vec![0x4d]);
+    // Two-byte PUSHDATA1 keeps 0xab inside the push.
+    let hidden = vec![0x4c, 0x02, 0xab, 0x00];
+    assert_eq!(strip_op_codeseparator(&hidden).as_ref(), hidden.as_slice());
+    // PUSHDATA2 payload 0xab is data, not OP_CODESEPARATOR.
+    let hidden2 = vec![0x4d, 0x01, 0x00, 0xab, 0x51];
+    assert_eq!(
+        strip_op_codeseparator(&hidden2).as_ref(),
+        hidden2.as_slice()
+    );
+    // A truncated PUSHDATA1 at the last byte drops nothing, so the script is borrowed.
+    let end = strip_op_codeseparator(&[0x4c]);
+    assert!(matches!(end, std::borrow::Cow::Borrowed(_)));
+    assert_eq!(end.as_ref(), &[0x4c]);
     // Truncated PUSHDATA4 of four bytes: three length bytes are not enough.
     assert_eq!(fad(&[0x4e, 0x01, 0x00, 0x00], &[0xff]), vec![0x4e]);
 
@@ -669,6 +682,10 @@ fn tapscript_has_op_success_pushdata_scan() {
     ])));
     assert!(tapscript_has_op_success(Script::from_bytes(&[
         0x4c, 0x01, 0x00, 0x7e
+    ])));
+    // OP_SUCCESS as the PUSHDATA1 length is a length, not an opcode.
+    assert!(!tapscript_has_op_success(Script::from_bytes(&[
+        0x4c, 0x7e, 0x00
     ])));
     let _ = (leaf, leaf2, leaf3);
 }

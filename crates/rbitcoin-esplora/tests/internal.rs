@@ -139,6 +139,27 @@ async fn run_unix(
     (handle, sock)
 }
 
+/// `maxfeerate` rejects a fee over the cap, allows zero and 1 BTC/kvB, and
+/// rejects a negative rate.
+async fn maxfeerate_query_cases(sock: &std::path::Path, body: &[u8]) {
+    let (st, resp) = http_post_unix(sock, "/txs/test?maxfeerate=0.00000001", body).await;
+    assert_eq!(st, 200, "{resp}");
+    let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
+    assert_eq!(arr[0]["allowed"], false, "{resp}");
+    assert_eq!(arr[0]["reject-reason"], "max-fee-exceeded");
+    let (st, resp) = http_post_unix(sock, "/txs/test?maxfeerate=0", body).await;
+    assert_eq!(st, 200, "{resp}");
+    let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
+    assert_eq!(arr[0]["allowed"], true, "{resp}");
+    let (st, resp) = http_post_unix(sock, "/txs/test?maxfeerate=-1", body).await;
+    assert_eq!(st, 400, "{resp}");
+    assert!(resp.contains("Invalid maxfeerate"), "{resp}");
+    let (st, resp) = http_post_unix(sock, "/txs/test?maxfeerate=1", body).await;
+    assert_eq!(st, 200, "{resp}");
+    let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
+    assert_eq!(arr[0]["allowed"], true, "{resp}");
+}
+
 /// `/txs/test` dry-runs; `POST /tx` admits. `GET /broadcast` is gone.
 async fn test_then_broadcast(sock: &std::path::Path, pad: &Pad, txs: &[Transaction]) {
     use bitcoin::consensus::encode::serialize_hex;
@@ -156,11 +177,12 @@ async fn test_then_broadcast(sock: &std::path::Path, pad: &Pad, txs: &[Transacti
         !pad.hub.contains(&txs[0].compute_txid()),
         "test must not admit"
     );
-    let (st, resp) = http_post_unix(sock, "/txs/test?maxfeerate=0.00000001", &body).await;
+    maxfeerate_query_cases(sock, &body).await;
+    let edge: Vec<String> = (0..25).map(|_| hex.clone()).collect();
+    let edge_body = serde_json::to_vec(&edge).unwrap();
+    let (st, resp) = http_post_unix(sock, "/txs/test", &edge_body).await;
     assert_eq!(st, 200, "{resp}");
-    let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
-    assert_eq!(arr[0]["allowed"], false, "{resp}");
-    assert_eq!(arr[0]["reject-reason"], "max-fee-exceeded");
+    assert!(resp.contains("package-contains-duplicates"), "{resp}");
     let too: Vec<String> = (0..26).map(|_| hex.clone()).collect();
     let body = serde_json::to_vec(&too).unwrap();
     let (st, resp) = http_post_unix(sock, "/txs/test", &body).await;
@@ -190,6 +212,17 @@ async fn mempool_totals_and_txid_pages(sock: &std::path::Path, pad: &Pad) {
     assert_eq!(mem["count"].as_u64(), Some(3), "{body}");
     assert_eq!(mem["total_fee"].as_u64(), Some(expect_fee), "{body}");
     assert_eq!(mem["vsize"].as_u64(), Some(expect_vsize), "{body}");
+    let hist = pad.hub.fee_histogram();
+    let got = mem["fee_histogram"].as_array().expect("histogram");
+    assert_eq!(got.len(), hist.len(), "{body}");
+    assert!(!hist.is_empty(), "{body}");
+    for (row, (rate_kvb, vs)) in got.iter().zip(hist) {
+        let rate = row[0].as_f64().unwrap();
+        assert!(rate > 0.0, "{row}");
+        let expect = (rate_kvb as f64) / 1000.0;
+        assert!((rate - expect).abs() < 1e-9, "{row} vs {rate_kvb}");
+        assert_eq!(row[1].as_u64(), Some(vs), "{row}");
+    }
 
     let (st, p1) = http_get_unix(sock, "/mempool/txids/page?max_txs=1").await;
     assert_eq!(st, 200, "{p1}");
@@ -309,6 +342,14 @@ async fn outspends_by_txid_outpoint_and_query(sock: &std::path::Path, pad: &Pad)
     assert_eq!(arr.len(), 2);
     assert_eq!(arr[0][0]["spent"], true);
     assert_eq!(arr[1], json!([]));
+    let exactly: String = (0..50)
+        .map(|_| "aa".repeat(32))
+        .collect::<Vec<_>>()
+        .join(",");
+    let (st, resp) = http_get_unix(sock, &format!("/txs/outspends?txids={exactly}")).await;
+    assert_eq!(st, 200, "{resp}");
+    let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
+    assert_eq!(arr.len(), 50, "{resp}");
     let too_many = (0..51)
         .map(|_| "aa".repeat(32))
         .collect::<Vec<_>>()

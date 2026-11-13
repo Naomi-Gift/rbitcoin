@@ -49,7 +49,6 @@ impl LoadAheadState {
     pub fn apply_disconnect(&mut self, hub: &ChainHub) {
         if let Some(h) = hub.query.take_disconnect(&mut self.disconnect_gen_seen) {
             self.in_flight.drop_from_height(h);
-            self.publish_mem_stats();
         }
     }
 
@@ -74,7 +73,6 @@ impl LoadAheadState {
         let extra = self.retain.observe(accounted, inflight_bytes, would_drop);
         self.in_flight
             .prune_below_height(inflight_prune_height(hi, extra));
-        self.publish_mem_stats();
     }
 
     /// Advance create-fk HWM from published body; clear last_loaded once on tip.
@@ -88,13 +86,6 @@ impl LoadAheadState {
                 self.last_loaded = None;
             }
         }
-    }
-
-    /// Publish InFlight occupancy for `ibd: sizes`.
-    #[doc(hidden)]
-    pub fn publish_mem_stats(&self) {
-        let (layers, pins, if_bytes) = self.in_flight.size_snapshot();
-        rbitcoin_query::process_mem_stats::note(layers, pins, if_bytes);
     }
 
     #[doc(hidden)]
@@ -144,7 +135,6 @@ impl LoadAheadState {
             self.next_tx_start = last.saturating_add(1).max(1);
         }
         self.last_loaded = Some((last_height, last_hash));
-        self.publish_mem_stats();
     }
 
     #[doc(hidden)]
@@ -168,13 +158,11 @@ impl LoadAheadState {
         if let Some((h, hash)) = last {
             self.last_loaded = Some((h, hash));
         }
-        self.publish_mem_stats();
     }
 
     #[doc(hidden)]
     pub fn clear_all(&mut self, hub: &ChainHub) {
         self.in_flight.clear();
-        self.publish_mem_stats();
         self.last_loaded = None;
         self.next_tx_start = hub.query.tx_body_count().saturating_add(1).max(1);
     }
@@ -222,7 +210,7 @@ pub struct ConfirmFeed {
     /// [`Self::set_unproven_bounds`]. Offer compares this and skips `inner`
     /// when the triple is unchanged and no reservation has moved.
     lead_bounds: std::sync::Mutex<Option<InstalledLead>>,
-    /// A reservation was taken, released, or cleared since the last install.
+    /// A reservation was released or cleared since the last install.
     /// The next identical allowance still has to recompute the remainder.
     lead_bounds_dirty: AtomicBool,
 }
@@ -265,6 +253,13 @@ pub(crate) fn wait_feed_timeout<'a>(
     cv.wait_timeout(guard, Duration::from_millis(20))
         .unwrap_or_else(|err| err.into_inner())
         .0
+}
+
+/// A hold from [`ConfirmFeed::hold_for`] has not passed.
+/// The stamped millisecond itself is over: `<`, not `<=`.
+#[doc(hidden)]
+pub fn hold_active(now_ms: u64, until_ms: u64) -> bool {
+    now_ms < until_ms
 }
 
 impl ConfirmFeed {
@@ -353,7 +348,7 @@ impl ConfirmFeed {
     /// Install the next unproven lead. A repeat of the lifted lead does not
     /// lock the feed. `None` means no cap, so the skip runs only once both
     /// caps are already clear. The same height cap, match, and allowance
-    /// also skip, until a reservation is taken, released, or cleared.
+    /// also skip, until a reservation is released or cleared.
     pub fn install_unproven_bounds(
         &self,
         height_limit: Option<u32>,
@@ -396,8 +391,14 @@ impl ConfirmFeed {
         }
     }
 
-    fn unproven_lead_active(&self) -> bool {
+    /// Height cap, byte cap, or both. Lookup charges the lead only then.
+    pub fn unproven_lead_active(&self) -> bool {
         self.height_capped.load(Ordering::Acquire) || self.byte_capped.load(Ordering::Acquire)
+    }
+
+    /// Cap that was already on, or one that appeared while the queue was walked.
+    pub fn lead_charged_or_now(&self, charged: bool) -> bool {
+        charged || self.unproven_lead_active()
     }
 
     /// Lookup waits `for_` before it selects a body again.
@@ -408,7 +409,10 @@ impl ConfirmFeed {
 
     /// A hold from [`Self::hold_for`] has not passed.
     pub fn held(&self) -> bool {
-        super::peer_io::ibd_mono_ms() < self.hold_until_ms.load(Ordering::Acquire)
+        hold_active(
+            super::peer_io::ibd_mono_ms(),
+            self.hold_until_ms.load(Ordering::Acquire),
+        )
     }
 
     pub fn epoch(&self) -> u64 {
@@ -522,8 +526,10 @@ impl ConfirmFeed {
     /// Reservations above `confirmed_tip` go back to the byte remainder. A
     /// height at or below that tip stays reserved: its Accepted event may
     /// still be waiting, and refunding it lets the next lookup spend those
-    /// bytes again. Call this when the confirmed tip moved, not when only
-    /// the header walk did.
+    /// bytes again. The refund cannot raise the remainder above the installed
+    /// allowance minus the reservations still held. A charge whose reservation
+    /// was already released stays spent. Call this when the confirmed tip
+    /// moved, not when only the header walk did.
     pub fn clear(&self, confirmed_tip: u32) {
         let mut g = self.inner.lock().unwrap();
         g.ready.clear();
@@ -534,13 +540,28 @@ impl ConfirmFeed {
             .filter(|(&h, _)| h > confirmed_tip)
             .fold(0u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
         g.lead_reserved.retain(|&h, _| h <= confirmed_tip);
-        if let Some(left) = g.lead_bytes_left.as_mut() {
-            *left = left.saturating_add(refund);
-        }
-        if refund > 0 {
-            self.lead_bounds_dirty.store(true, Ordering::Release);
+        if let Some(current) = g.lead_bytes_left {
+            let pending = g
+                .lead_reserved
+                .values()
+                .fold(0u64, |acc, b| acc.saturating_add(*b));
+            let mut next = current.saturating_add(refund);
+            if let Some(allowance) = self
+                .lead_bounds
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|saved| saved.bytes_left)
+            {
+                let cap = allowance.saturating_sub(pending);
+                if next > cap {
+                    next = cap;
+                }
+            }
+            g.lead_bytes_left = Some(next);
         }
         drop(g);
+        self.lead_bounds_dirty.store(true, Ordering::Release);
         self.publish_cleared_plan();
     }
 
@@ -663,7 +684,6 @@ impl ConfirmRejectClass {
         match err {
             ConfirmError::Rules(e) => Self::from_consensus(e),
             ConfirmError::Store(StoreError::Cancelled(_)) => Self::Cancelled,
-            ConfirmError::Store(e) if e.is_uring_session_fault() => Self::EngineFault,
             ConfirmError::Store(StoreError::Io { .. }) => Self::EngineFault,
             ConfirmError::Store(StoreError::Corrupt(m)) => Self::from_err_str(m),
             ConfirmError::Store(_) => Self::EngineFault,
@@ -922,6 +942,36 @@ pub fn apply_write_reject(
     }
 }
 
+/// Stop when the feed is stopped or confirm is cancelled. Either flag ends the stage.
+/// Scripts keep publishing while this is false.
+#[doc(hidden)]
+pub fn confirm_stage_stopping(stopped: bool, cancelled: bool) -> bool {
+    stopped || cancelled
+}
+
+/// Drop a stale write unless a session fault already counted the connected blocks.
+#[doc(hidden)]
+pub fn drop_stale_write(skip_stale: bool, stale: bool) -> bool {
+    !skip_stale && stale
+}
+
+/// The write already connected: this hash is on the tip, or a spent-prevout
+/// batch whose every block is.
+#[doc(hidden)]
+pub fn write_already_committed(
+    skip_stale: bool,
+    tip_has_hash: bool,
+    spent_batch_connected: bool,
+) -> bool {
+    !skip_stale && (tip_has_hash || spent_batch_connected)
+}
+
+/// Lookup parks only when the wave did no work.
+#[doc(hidden)]
+pub fn lookup_should_wait(did_work: bool) -> bool {
+    !did_work
+}
+
 /// Let every batch below a rejected load wave finish scripts and write before
 /// load classes and rewinds. Core connects one block at a time, so the valid
 /// prefix is connected when it judges a bad block. The rewind's epoch bump
@@ -929,7 +979,9 @@ pub fn apply_write_reject(
 #[doc(hidden)]
 pub fn await_batches_below_reject(hub: &ChainHub, feed: &ConfirmFeed, first_h: u32) {
     let t_wait = Instant::now();
-    feed.wait_claims_below(first_h, || feed.stopped() || hub.query.confirm_cancelled());
+    feed.wait_claims_below(first_h, || {
+        confirm_stage_stopping(feed.stopped(), hub.query.confirm_cancelled())
+    });
     confirm_thr_stats::add_load_reject(hub.query.confirm_stats(), t_wait.elapsed());
 }
 
@@ -1070,6 +1122,8 @@ impl LookupFaultPolicy {
 #[doc(hidden)]
 pub static LOOKUP_WAVE_FAULTS: AtomicU64 = AtomicU64::new(0);
 
+/// Perf log samples this counter. No session branch reads it.
+#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn take_lookup_wave_faults() -> u64 {
     LOOKUP_WAVE_FAULTS.swap(0, Ordering::Relaxed)
 }
@@ -1138,12 +1192,6 @@ pub enum ConfirmEvent {
 
 thread_local! {
     static CONFIRM_PROGRESS_LAST: Cell<Option<Instant>> = const { Cell::new(None) };
-}
-
-#[cfg(debug_assertions)]
-#[doc(hidden)]
-pub fn clear_confirm_progress_clock() {
-    CONFIRM_PROGRESS_LAST.with(|cell| cell.set(None));
 }
 
 /// Publish operator snapshots when `now` is at least 5s after the last publish.
@@ -1546,17 +1594,16 @@ pub fn write_drain_max_parts(writeq_cap: usize) -> usize {
     writeq_cap.max(1)
 }
 
-/// BQ heights ≥ `path_lo` with resolve-complete and not load-inflight.
-pub fn confirm_ready_count(
-    query: &rbitcoin_query::Query,
+/// A queued body at or above the confirm cursor, resolve-complete, and not
+/// already in the load wave.
+#[doc(hidden)]
+pub fn confirm_row_is_ready(
+    height: u32,
+    resolve_complete: bool,
     path_lo: u32,
-    inflight: &std::collections::HashSet<u32>,
-) -> usize {
-    query
-        .block_queue_list_meta()
-        .into_iter()
-        .filter(|m| m.height >= path_lo && !inflight.contains(&m.height) && m.resolve_complete)
-        .count()
+    inflight: bool,
+) -> bool {
+    height >= path_lo && !inflight && resolve_complete
 }
 
 /// Live depths **and contents** of the bounded confirm pipeline queues.
@@ -1671,10 +1718,6 @@ impl ConfirmQueueDepths {
             self.load_to_scripts.load(Ordering::Relaxed),
             self.scripts_to_write.load(Ordering::Relaxed),
         )
-    }
-
-    pub fn load_depth(&self) -> usize {
-        self.lookup_to_load.load(Ordering::Relaxed)
     }
 
     /// Max scriptq and writeq depths since last call; resets those HWMs to 0.
@@ -1948,9 +1991,10 @@ pub fn parent_check_wait_slice() {
             false
         }
     });
-    if !advanced {
-        std::thread::sleep(Duration::from_millis(2));
+    if advanced {
+        return;
     }
+    std::thread::sleep(Duration::from_millis(2));
 }
 
 /// A fresh read of a lone block's parents after its load stamp missed one.
@@ -2090,19 +2134,10 @@ pub fn drain_script_ok_write_queue(
                         parts = parts.saturating_add(1);
                     }
                     Err(leftover) => {
-                        let polarity =
-                            batch.archive_plan.is_some() != leftover.archive_plan.is_some();
-                        if polarity {
-                            warn!(
-                                "ibd: write batch drain plan polarity after parts={parts} leftover_blks={}",
-                                leftover.len()
-                            );
-                        } else {
-                            warn!(
-                                "ibd: write batch drain gap after parts={parts} leftover_blks={}",
-                                leftover.len()
-                            );
-                        }
+                        warn!(
+                            "ibd: write batch drain stopped after parts={parts} leftover_blks={}",
+                            leftover.len()
+                        );
                         return (batch, parts, Some(leftover), None);
                     }
                 }
@@ -2339,11 +2374,10 @@ pub fn spawn_confirm_engine(
                 leftover = next_left;
                 pending_clear = clear;
                 confirm_thr_stats::add_write_recv_wait(&stats, t_recv.elapsed());
-                if feed_wb.stopped() || hub_wb.query.confirm_cancelled() {
+                if confirm_stage_stopping(feed_wb.stopped(), hub_wb.query.confirm_cancelled()) {
                     break;
                 }
                 publish_confirm_progress(&hub_wb.query);
-                let n = batch.len();
                 let first_h = batch.heights_hashes().first().map(|(h, _)| *h).unwrap_or(0);
                 let t0 = Instant::now();
                 let heights_hashes = batch.heights_hashes();
@@ -2409,36 +2443,15 @@ pub fn spawn_confirm_engine(
                         }
                         feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                         let deq_ns = t_deq.elapsed().as_nanos() as u64;
-                        if deq_ns > 0 {
-                            rbitcoin_query::note_confirm(&stats.write_dequeue_ns, deq_ns);
-                        }
+                        rbitcoin_query::note_confirm(&stats.write_dequeue_ns, deq_ns);
                         let elapsed = t0.elapsed();
                         confirm_thr_stats::add_write_work(&stats, elapsed);
-                        if elapsed.as_millis() > 2_000 {
-                            let p = stats.last_write_phases();
-                            let ms = rbitcoin_query::LastWritePhases::ms;
-                            info!(
-                                "ibd: confirm write slow batch={n} parts={parts} first={first_h} wall={:?} \
-                                 class_a={}ms ensure={}ms struct={}ms spent={}ms create_h={}ms \
-                                 bip68={}ms class_c={}ms spend_ann={}ms",
-                                elapsed,
-                                ms(p.class_a_ns),
-                                ms(p.ensure_ns),
-                                ms(p.structural_ns),
-                                ms(p.spent_ns),
-                                ms(p.create_h_ns),
-                                ms(p.bip68_ns),
-                                ms(p.class_c_ns),
-                                ms(p.spend_ann_ns),
-                            );
-                        }
                     }
                     Err((e, failed)) => {
                         confirm_thr_stats::add_write_work(&stats, t0.elapsed());
                         let mut err = e;
                         let msg = err.to_string();
-                        if err.is_cancelled() || feed_wb.stopped()
-                        {
+                        if confirm_stage_stopping(feed_wb.stopped(), err.is_cancelled()) {
                             info!("ibd: confirm write aborted: {msg}");
                             break;
                         }
@@ -2521,19 +2534,21 @@ pub fn spawn_confirm_engine(
                             }
                         }
                         let msg = err.to_string();
-                        if !skip_stale && write_batch_is_stale_plan(&hub_wb, &feed_wb, height) {
+                        if drop_stale_write(
+                            skip_stale,
+                            write_batch_is_stale_plan(&hub_wb, &feed_wb, height),
+                        ) {
                             debug!(
                                 "ibd: confirm write drop stale batch first={height} ({msg})"
                             );
                             feed_wb.finish(heights_hashes.iter().map(|(h, _)| *h));
                             continue;
                         }
-                        if !skip_stale
-                            && (hub_wb.has_block(&hash)
-                                || (msg.contains("prevout already spent")
-                                    && heights_hashes.iter().all(|(_, raw)| {
-                                        hub_wb.has_block(&BlockHash::from_byte_array(*raw))
-                                    })))
+                        let spent_connected = msg.contains("prevout already spent")
+                            && heights_hashes.iter().all(|(_, raw)| {
+                                hub_wb.has_block(&BlockHash::from_byte_array(*raw))
+                            });
+                        if write_already_committed(skip_stale, hub_wb.has_block(&hash), spent_connected)
                         {
                             debug!(
                                 "ibd: confirm write skip already-committed @{height} ({msg})"
@@ -2600,7 +2615,9 @@ pub fn spawn_confirm_engine(
     let scripts = std::thread::Builder::new()
         .name("ibd-confirm".into())
         .spawn(move || {
-            info!("ibd: confirm scripts on dedicated OS thread (publish waves; steal pool verifies)");
+            info!(
+                "ibd: confirm scripts on dedicated OS thread (publish waves; steal pool verifies)"
+            );
             let stats = hub_sc.query.confirm_stats_arc();
             rbitcoin_query::drive_script_waves_with(
                 &mat_rx,
@@ -2612,11 +2629,9 @@ pub fn spawn_confirm_engine(
                         batch.parent_count(),
                     );
                 },
-                |outcome, meta| {
-                    let stage_ns = confirm_thr_stats::stage_wall_ns(
-                        outcome.work_ns,
-                        outcome.index_done_ns,
-                    );
+                |outcome, _meta| {
+                    let stage_ns =
+                        confirm_thr_stats::stage_wall_ns(outcome.work_ns, outcome.index_done_ns);
                     loop_stats_sc
                         .confirm_ns
                         .fetch_add(stage_ns, Ordering::Relaxed);
@@ -2624,8 +2639,6 @@ pub fn spawn_confirm_engine(
                         &stats,
                         confirm_thr_stats::script_work_from_verify_ns(stage_ns),
                     );
-                    let script_ms = outcome.work_ns / 1_000_000;
-                    let mat_ms = meta.mat_ns / 1_000_000;
                     let wb = outcome.batch.len();
                     let ww = outcome.batch.approx_wire_bytes();
                     let parents = outcome.batch.parent_count();
@@ -2639,21 +2652,12 @@ pub fn spawn_confirm_engine(
                     }
                     confirm_thr_stats::add_script_send_wait(&stats, t_send.elapsed());
                     q_sc.note_write_send(wb, ww, parents);
-                    if script_ms > 2_000 || mat_ms > 2_000 {
-                        info!(
-                            "ibd: confirm scripts slow batch={} first={} load_ms={mat_ms} script_ms={script_ms} wall_ms={}",
-                            meta.n,
-                            meta.first_h,
-                            meta.t0.elapsed().as_millis()
-                        );
-                    }
-                    !feed_sc.stopped() && !hub_sc.query.confirm_cancelled()
+                    !confirm_stage_stopping(feed_sc.stopped(), hub_sc.query.confirm_cancelled())
                 },
                 |e, meta, dropped| {
                     confirm_thr_stats::add_script_work(&stats, Duration::ZERO);
                     let msg = e.to_string();
-                    if e.is_cancelled() || feed_sc.stopped()
-                    {
+                    if confirm_stage_stopping(feed_sc.stopped(), e.is_cancelled()) {
                         info!("ibd: confirm scripts aborted: {msg}");
                         return false;
                     }
@@ -2709,7 +2713,7 @@ pub fn spawn_confirm_engine(
                     );
                     true
                 },
-                || feed_sc.stopped() || hub_sc.query.confirm_cancelled(),
+                || confirm_stage_stopping(feed_sc.stopped(), hub_sc.query.confirm_cancelled()),
             );
             drop(write_tx);
             let _ = write_thr.join();
@@ -2735,7 +2739,7 @@ pub fn spawn_confirm_engine(
             let mut stamped_gen: Option<u32> = None;
             let stats = hub_load.query.confirm_stats_arc();
             loop {
-                if feed_load.stopped() || hub_load.query.confirm_cancelled() {
+                if confirm_stage_stopping(feed_load.stopped(), hub_load.query.confirm_cancelled()) {
                     break;
                 }
                 let t_hygiene = Instant::now();
@@ -2827,7 +2831,7 @@ pub fn spawn_confirm_engine(
                     continue;
                 }
                 let expect_h = batch[0].0;
-                if feed_load.stopped() || hub_load.query.confirm_cancelled() {
+                if confirm_stage_stopping(feed_load.stopped(), hub_load.query.confirm_cancelled()) {
                     let req: Vec<(u32, BlockHash)> =
                         batch.iter().map(|(h, ha, _)| (*h, *ha)).collect();
                     feed_load.requeue_wire(&req);
@@ -2887,8 +2891,7 @@ pub fn spawn_confirm_engine(
                     Ok(s) => s,
                     Err(e) => {
                         let msg = e.to_string();
-                        if e.is_cancelled() || feed_load.stopped()
-                        {
+                        if confirm_stage_stopping(feed_load.stopped(), e.is_cancelled()) {
                             drop(mat_tx);
                             rbitcoin_consensus::unpark_script_publisher();
                             let _ = scripts.join();
@@ -3004,7 +3007,6 @@ pub fn spawn_confirm_engine(
                     Vec::new(),
                     Vec::new(),
                 );
-                let plan_ns = stamped.work_ns;
                 let heights_hashes: Vec<(u32, BlockHash)> = wire_batch
                     .iter()
                     .map(|(h, ha, _)| (*h, *ha))
@@ -3041,7 +3043,7 @@ pub fn spawn_confirm_engine(
                 confirm_thr_stats::add_load_asm(&stats, Duration::from_nanos(asm_d));
                 drop(_live_guard);
 
-                if feed_load.stopped() || hub_load.query.confirm_cancelled() {
+                if confirm_stage_stopping(feed_load.stopped(), hub_load.query.confirm_cancelled()) {
                     drop(mat_tx);
                     rbitcoin_consensus::unpark_script_publisher();
                     let _ = scripts.join();
@@ -3050,7 +3052,6 @@ pub fn spawn_confirm_engine(
 
                 match mat_res {
                     Ok(outcome) => {
-                        let work_ms = outcome.work_ns / 1_000_000;
                         let prepared_n = outcome.batch.len();
                         let wire = outcome.batch.approx_wire_bytes();
                         let parents = outcome.batch.parent_count();
@@ -3067,18 +3068,6 @@ pub fn spawn_confirm_engine(
                         rbitcoin_consensus::unpark_script_publisher();
                         confirm_thr_stats::add_load_send_wait(&stats, t_send.elapsed());
                         queues_load.note_script_send(prepared_n, wire, parents);
-                        if work_ms > 2_000 {
-                            let pin = stats.last_pin_phases();
-                            info!(
-                                "ibd: confirm load slow batch={prepared_n} claim={} first={expect_h} \
-                                 work_ms={work_ms} plan_stamp_ms={} \
-                                 {} parents={}",
-                                heights_hashes.len(),
-                                plan_ns / 1_000_000,
-                                pin.format_slow_pin(),
-                                parents,
-                            );
-                        }
                     }
                     Err(e) => {
                         let msg = e.to_string();
@@ -3191,7 +3180,8 @@ pub fn spawn_confirm_engine(
                 } else {
                     tip.unwrap_or(0).saturating_add(1)
                 };
-                let remaining = load_queue_cap().saturating_sub(queues_lookup.load_depth());
+                let remaining = load_queue_cap()
+                    .saturating_sub(queues_lookup.lookup_to_load.load(Ordering::Relaxed));
                 if remaining == 0 {
                     let t_wait = Instant::now();
                     let g = feed.inner.lock().unwrap();
@@ -3244,7 +3234,7 @@ pub fn spawn_confirm_engine(
                 // A cap that appears during the queue walk still applies. No
                 // copied size means a byte charge stops instead of overspending.
                 // Both caps clear leaves the wave as the queue returned it.
-                let wave_h = if charge || feed.unproven_lead_active() {
+                let wave_h = if feed.lead_charged_or_now(charge) {
                     take_unproven_lead(&feed, charge.then_some(lens.as_slice()), wave_h)
                 } else {
                     wave_h
@@ -3411,7 +3401,7 @@ pub fn spawn_confirm_engine(
                     }
                     confirm_thr_stats::add_lookup_stamp(&stats, t_wave.elapsed());
                 }
-                if !did {
+                if lookup_should_wait(did) {
                     let t_wait = Instant::now();
                     let g = feed.inner.lock().unwrap();
                     if feed.stopped() {
@@ -3477,18 +3467,8 @@ pub fn offer_confirm_ready(
             }
         }
         if body.is_rejected(&hash) {
-            // Tip is frozen on a consensus-invalid tip+1. Densify must not
+            // Tip is frozen on a consensus-invalid block. Densify must not
             // keep fetching above this height (download gate).
-            if ht == expect {
-                static REJECT_STUCK: AtomicU32 = AtomicU32::new(0);
-                let n = REJECT_STUCK.fetch_add(1, Ordering::Relaxed) + 1;
-                if n <= 3 || n.is_multiple_of(100) {
-                    warn!(
-                        "ibd: confirm stuck: tip+1={ht} {hash} is consensus-invalid; \
-                         download gate closed until a valid heavier fork is planted (n={n})"
-                    );
-                }
-            }
             break;
         }
         if !super::progress::claim_ready(hub, body, ht, &hash) {
@@ -3541,13 +3521,10 @@ pub fn take_unproven_lead(
         out.push(ht);
     }
     if g.lead_bytes_left.is_some() {
-        let changed = g.lead_bytes_left != bytes_left || !reserved.is_empty();
+        // The remainder already matches the next install of the same allowance.
         g.lead_bytes_left = bytes_left;
         for (ht, wire) in reserved {
             g.lead_reserved.insert(ht, wire);
-        }
-        if changed {
-            feed.lead_bounds_dirty.store(true, Ordering::Release);
         }
     }
     out

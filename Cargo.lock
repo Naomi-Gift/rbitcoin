@@ -1049,6 +1049,7 @@ version = "0.9.99"
 dependencies = [
  "bitcoin",
  "libc",
+ "mutants",
  "rbitcoin-consensus",
  "rbitcoin-log",
  "rbitcoin-net",
@@ -1069,6 +1070,7 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
+ "mutants",
  "rbitcoin-consensus",
  "rbitcoin-electrum",
  "rbitcoin-log",
@@ -1089,6 +1091,7 @@ version = "0.9.99"
 dependencies = [
  "bitcoin",
  "libc",
+ "mutants",
  "rbitcoin-consensus",
  "rbitcoin-log",
  "rbitcoin-net",

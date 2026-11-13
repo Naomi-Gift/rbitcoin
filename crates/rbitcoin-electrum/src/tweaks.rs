@@ -94,7 +94,26 @@ pub fn height_map_json(
     cut_through: bool,
     min_dust: u64,
 ) -> Result<String, String> {
-    let tip = query.tip_height().map(|t| t.0);
+    height_map_json_with_tip(
+        query,
+        chain,
+        h,
+        query.tip_height().map(|t| t.0),
+        cut_through,
+        min_dust,
+    )
+}
+
+/// Same map as [`height_map_json`], using `tip` instead of a second read.
+#[doc(hidden)]
+pub fn height_map_json_with_tip(
+    query: &Query,
+    chain: &ChainParams,
+    h: u32,
+    tip: Option<u32>,
+    cut_through: bool,
+    min_dust: u64,
+) -> Result<String, String> {
     if tip.is_none_or(|t| h > t) || !chain.taproot_active_at(h) {
         return Ok(empty_height_json(h));
     }
@@ -475,7 +494,6 @@ fn push_quoted_u32(s: &mut String, n: u32) {
 
 fn push_hex(s: &mut String, data: &[u8]) {
     const HEX: &[u8; 16] = b"0123456789abcdef";
-    s.reserve(data.len() * 2);
     for &b in data {
         s.push(HEX[(b >> 4) as usize] as char);
         s.push(HEX[(b & 0xf) as usize] as char);

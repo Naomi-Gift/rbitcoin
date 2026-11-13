@@ -451,12 +451,13 @@ impl EsploraConfig {
     }
 
     pub fn with_listen(listen: EsploraListen, network: Network) -> Self {
+        let blindbit_max_inflight = crate::blindbit::default_max_inflight();
         Self {
             listen,
             limits: ServeLimits::for_public_proxy(),
             network,
             block_template: None,
-            blindbit_max_inflight: crate::blindbit::default_max_inflight(),
+            blindbit_max_inflight,
         }
     }
 }
@@ -927,7 +928,7 @@ impl AppState {
     }
 
     pub fn seed_bulk(&self, client: Option<&str>, bag: &mut HashMap<[u8; 32], Arc<ShJoinSlot>>) {
-        let Some(id) = client.filter(|s| !s.is_empty()) else {
+        let Some(id) = named_join_client(client) else {
             return;
         };
         let g = self.sh_join.lock().unwrap_or_else(|p| p.into_inner());
@@ -939,7 +940,7 @@ impl AppState {
     }
 
     pub fn promote_bulk(&self, client: Option<&str>, bag: HashMap<[u8; 32], Arc<ShJoinSlot>>) {
-        let Some(id) = client.filter(|s| !s.is_empty()) else {
+        let Some(id) = named_join_client(client) else {
             return;
         };
         let mut g = self.sh_join.lock().unwrap_or_else(|p| p.into_inner());
@@ -1102,6 +1103,11 @@ fn spawn_capped<L: CappedAccept>(
             }
         }
     })
+}
+
+#[doc(hidden)]
+pub fn named_join_client(client: Option<&str>) -> Option<&str> {
+    client.filter(|s| !s.is_empty())
 }
 
 /// Start Esplora **plain HTTP** on `config.listen`.
@@ -1333,9 +1339,7 @@ pub async fn run_esplora(
         #[cfg(unix)]
         EsploraListen::Unix(path) => {
             if let Some(parent) = path.parent() {
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
-                }
+                std::fs::create_dir_all(parent)?;
             }
             let _ = std::fs::remove_file(&path);
             let listener = bind_unix_mode(&path, 0o660)?;

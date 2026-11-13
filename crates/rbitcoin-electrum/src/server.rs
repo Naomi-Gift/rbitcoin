@@ -804,16 +804,12 @@ pub fn batch_trace_arm() {
     BATCH_TRACE_ON.with(|on| on.set(true));
 }
 
-/// Stop recording on this thread and drop what was recorded.
-#[cfg(debug_assertions)]
-pub fn batch_trace_clear() {
-    BATCH_TRACE_ON.with(|on| on.set(false));
-    BATCH_TRACE.with(|trace| trace.borrow_mut().clear());
-}
-
+/// Steps recorded on this thread, then stop. A debug build keeps nothing
+/// unless a test arms the trace again.
 #[cfg(debug_assertions)]
 pub fn batch_trace_snapshot() -> Vec<BatchStep> {
-    BATCH_TRACE.with(|trace| trace.borrow().clone())
+    BATCH_TRACE_ON.with(|on| on.set(false));
+    BATCH_TRACE.with(|trace| std::mem::take(&mut *trace.borrow_mut()))
 }
 
 /// The connection's fixed inputs to one request.
@@ -1635,7 +1631,7 @@ where
     let t0 = Instant::now();
     let Some(last) = last else {
         return serve_tweaks_empty_last(
-            writer, query, chain, peer, &id, params_v, req, t0, min_dust,
+            writer, query, chain, peer, &id, params_v, req, t0, min_dust, tip,
         )
         .await;
     };
@@ -1750,9 +1746,14 @@ pub async fn serve_tweaks_empty_last<W: AsyncWrite + Unpin>(
     req: crate::tweaks::TweakReq,
     t0: Instant,
     min_dust: u64,
+    tip: Option<u32>,
 ) -> Result<(), std::io::Error> {
     let first =
-        match crate::tweaks::height_map_json(query, chain, req.start, !req.historical, min_dust) {
+        // `tip` is the read that already put `start` past the chain. A later
+        // block must not build a map, so cut-through is not consulted.
+        match crate::tweaks::height_map_json_with_tip(
+            query, chain, req.start, tip, false, min_dust,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 tweaks_sub_err(
@@ -2055,13 +2056,19 @@ pub fn settled_restatus_notes(
 #[doc(hidden)]
 pub const TICK_SCAN_MAX_GAP: u32 = 32;
 
+// `seen == now` already returned, so `>=` matches `>`.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn tick_forward(b: u32, a: u32) -> bool {
+    b > a
+}
+
 #[doc(hidden)]
 pub fn tick_scan(seen: Option<u32>, now: Option<u32>) -> Option<Option<Vec<u32>>> {
     if seen == now {
         return None;
     }
     match (seen, now) {
-        (Some(a), Some(b)) if b > a => {
+        (Some(a), Some(b)) if tick_forward(b, a) => {
             let gap = b.saturating_sub(a);
             if gap > TICK_SCAN_MAX_GAP {
                 Some(None)
@@ -2071,6 +2078,12 @@ pub fn tick_scan(seen: Option<u32>, now: Option<u32>) -> Option<Option<Vec<u32>>
         }
         _ => Some(None),
     }
+}
+
+// A same-sized leftover is not pushed. The sweep runs only once the map is larger.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn last_sent_outgrew(last_sent: usize, subs: usize) -> bool {
+    last_sent > subs
 }
 
 /// Backstop sweep of last-sent statuses for hashes no longer subscribed.
@@ -2084,7 +2097,7 @@ pub fn drop_unsubscribed_status(
     last_sent: &mut HashMap<[u8; 32], String>,
     sh_subs: &HashSet<[u8; 32]>,
 ) {
-    if last_sent.len() > sh_subs.len() {
+    if last_sent_outgrew(last_sent.len(), sh_subs.len()) {
         last_sent.retain(|k, _| sh_subs.contains(k));
     }
 }
@@ -3086,8 +3099,8 @@ pub fn pick_dotted(cmin_s: &str, cmax_s: &str) -> Result<String, String> {
         protocol_tuple(cmax_s).ok_or_else(|| format!("unsupported protocol version {cmax_s}"))?;
     let smin = protocol_tuple(PROTOCOL_MIN).expect("PROTOCOL_MIN");
     let smax = protocol_tuple(PROTOCOL_MAX).expect("PROTOCOL_MAX");
-    let lo = if cmin < smin { smin } else { cmin };
-    let hi = if cmax < smax { cmax } else { smax };
+    let lo = std::cmp::max(cmin, smin);
+    let hi = std::cmp::min(cmax, smax);
     if hi < lo {
         return Err("unsupported protocol version".into());
     }

@@ -222,6 +222,10 @@ fn confirm_reject_class_matches_substring_table() {
             ConfirmRejectClass::Cascade,
         ),
         (
+            "corrupt record: plan not committed in order",
+            ConfirmRejectClass::Cascade,
+        ),
+        (
             "consensus: prevout already spent on best chain",
             ConfirmRejectClass::ConsensusInvalid,
         ),
@@ -230,6 +234,8 @@ fn confirm_reject_class_matches_substring_table() {
             ConfirmRejectClass::Cascade,
         ),
         ("confirm cancelled", ConfirmRejectClass::Cancelled),
+        ("bad transaction", ConfirmRejectClass::ConsensusInvalid),
+        ("missing prevout", ConfirmRejectClass::ConsensusInvalid),
         (
             "consensus: bad header: timestamp too far in future",
             ConfirmRejectClass::Cascade,

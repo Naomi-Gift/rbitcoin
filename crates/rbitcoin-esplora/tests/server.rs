@@ -1,6 +1,10 @@
+use axum::body::Bytes;
 use axum::extract::ConnectInfo;
+use axum::extract::Query as AxumQuery;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::middleware::{self};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Router;
 use bitcoin::Network;
@@ -181,6 +185,28 @@ async fn accepted_within(mut opened: Vec<TcpStream>, cap: usize) -> Vec<TcpStrea
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_listen_creates_a_missing_parent_dir() {
+    let (_dir, q) = temp_query("esplora-unix-parent");
+    // A store path is too long for `sockaddr_un`. The socket path stays short.
+    let short = std::path::PathBuf::from(format!("/tmp/rbtc-es-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&short);
+    std::fs::create_dir_all(&short).unwrap();
+    let sock = short.join("m").join("s.sock");
+    let cfg = EsploraConfig::with_listen(EsploraListen::Unix(sock.clone()), Network::Regtest);
+    let mut handle = run_esplora(cfg, Arc::new(q), None)
+        .await
+        .expect("nested socket parent is created");
+    assert!(sock.exists(), "bind did not create {}", sock.display());
+    handle.shutdown.store(true);
+    tokio::time::timeout(Duration::from_secs(2), &mut handle.task)
+        .await
+        .expect("esplora shutdown")
+        .expect("serve task");
+    let _ = std::fs::remove_dir_all(&short);
+}
+
 fn temp_query(label: &str) -> (rbitcoin_query::testutil::TempDir, Query) {
     rbitcoin_query::testutil::tiny_query_labeled(label)
 }
@@ -350,6 +376,19 @@ fn esplora_listen_parse_tcp_and_path() {
             EsploraListen::parse("./esplora.sock", 3000).unwrap(),
             EsploraListen::Unix(_)
         ));
+        // One path arm each: a leading dot, a slash, a `.sock` suffix.
+        assert!(matches!(
+            EsploraListen::parse(".hidden", 3000).unwrap(),
+            EsploraListen::Unix(_)
+        ));
+        assert!(matches!(
+            EsploraListen::parse("foo/bar", 3000).unwrap(),
+            EsploraListen::Unix(_)
+        ));
+        assert!(matches!(
+            EsploraListen::parse("esplora.sock", 3000).unwrap(),
+            EsploraListen::Unix(_)
+        ));
     }
     assert!(EsploraListen::parse("not-an-addr", 3000).is_err());
 }
@@ -375,6 +414,138 @@ fn join_idle_evicts_after_ttl() {
     sweep_clients(&mut map, now);
     assert!(!map.contains_key("stale"));
     assert!(map.contains_key("fresh"));
+}
+
+#[test]
+fn join_idle_at_the_ttl_is_gone_and_the_client_cap_keeps_256() {
+    let mut map = HashMap::new();
+    let now = Instant::now();
+    map.insert(
+        "edge".into(),
+        ClientJoins {
+            last_req: now.checked_sub(JOIN_IDLE).unwrap(),
+            ..ClientJoins::default()
+        },
+    );
+    map.insert(
+        "inside".into(),
+        ClientJoins {
+            last_req: now
+                .checked_sub(JOIN_IDLE - Duration::from_nanos(1))
+                .unwrap(),
+            ..ClientJoins::default()
+        },
+    );
+    sweep_clients(&mut map, now);
+    assert!(!map.contains_key("edge"));
+    assert!(map.contains_key("inside"));
+
+    let mut full = HashMap::new();
+    for i in 0..JOIN_MAX_CLIENTS {
+        full.insert(
+            format!("c{i}"),
+            ClientJoins {
+                last_req: now,
+                ..ClientJoins::default()
+            },
+        );
+    }
+    sweep_clients(&mut full, now);
+    assert_eq!(full.len(), JOIN_MAX_CLIENTS);
+
+    full.insert(
+        "oldest".into(),
+        ClientJoins {
+            last_req: now.checked_sub(Duration::from_secs(1)).unwrap(),
+            ..ClientJoins::default()
+        },
+    );
+    sweep_clients(&mut full, now);
+    assert_eq!(full.len(), JOIN_MAX_CLIENTS);
+    assert!(!full.contains_key("oldest"));
+}
+
+#[test]
+fn join_bulk_cap_is_16_mib_and_keeps_a_two_mib_slot() {
+    assert_eq!(JOIN_BULK_CAP, 16_777_216);
+    let two_mib = rbitcoin_query::ShJoinSlot::with_spender_fk_count((2 * 1024 * 1024 - 144) / 8);
+    assert!(two_mib.packed_bytes() > 1_048_576);
+    assert!(two_mib.packed_bytes() < JOIN_BULK_CAP);
+    let mut c = ClientJoins {
+        last_bulk: HashMap::from([([1u8; 32], two_mib)]),
+        ..ClientJoins::default()
+    };
+    cap_bulk(&mut c);
+    assert_eq!(c.last_bulk.len(), 1);
+}
+
+#[test]
+fn cap_bulk_keeps_the_cap_and_drops_one_byte_over() {
+    let exact = rbitcoin_query::ShJoinSlot::with_spender_fk_count((JOIN_BULK_CAP - 144) / 8);
+    assert_eq!(exact.packed_bytes(), JOIN_BULK_CAP);
+    let mut at = ClientJoins {
+        last_bulk: HashMap::from([([2u8; 32], Arc::clone(&exact))]),
+        ..ClientJoins::default()
+    };
+    cap_bulk(&mut at);
+    assert_eq!(at.last_bulk.len(), 1);
+
+    let over = rbitcoin_query::testutil::sh_join_slot_over_16mib();
+    let mut c = ClientJoins {
+        last_bulk: HashMap::from([([3u8; 32], over)]),
+        ..ClientJoins::default()
+    };
+    cap_bulk(&mut c);
+    assert!(c.last_bulk.is_empty());
+}
+
+#[test]
+fn retain_join_budget_keeps_a_last_sh_at_the_cap() {
+    let exact = rbitcoin_query::ShJoinSlot::with_spender_fk_count((JOIN_BULK_CAP - 144) / 8);
+    let mut c = ClientJoins {
+        last_sh: Some(([4u8; 32], exact, 1)),
+        ..ClientJoins::default()
+    };
+    retain_join_budget(&mut c);
+    assert!(c.last_sh.is_some());
+}
+
+#[test]
+fn named_join_client_drops_only_an_empty_id() {
+    assert_eq!(named_join_client(None), None);
+    assert_eq!(named_join_client(Some("")), None);
+    assert_eq!(named_join_client(Some("c1")), Some("c1"));
+}
+
+#[test]
+fn esplora_stop_load_follows_store() {
+    let stop = EsploraStop::new(false);
+    assert!(!stop.load());
+    stop.store(true);
+    assert!(stop.load());
+}
+
+#[test]
+fn blindbit_default_inflight_is_half_the_pool() {
+    let pool = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .max(4);
+    assert_eq!(rbitcoin_esplora::blindbit::default_max_inflight(), pool / 2);
+    assert!(rbitcoin_esplora::blindbit::default_max_inflight() >= 2);
+}
+
+#[test]
+fn esplora_perf_window_resets_and_totals_keep_the_note() {
+    const NOTE: u64 = 1_000_000_000;
+    let _ = sample_reset_perf();
+    let before = perf_totals();
+    METER.note(NOTE);
+    let window = sample_reset_perf();
+    let after = perf_totals();
+    assert!(window.0 >= 1 && window.1 >= NOTE && window.2 >= NOTE);
+    assert!(after.0 > before.0);
+    assert!(after.1 >= before.1.saturating_add(NOTE));
 }
 
 fn join_only_state(q: Arc<Query>, cache: Arc<Mutex<JoinCache>>) -> AppState {
@@ -770,6 +941,8 @@ async fn address_without_sh_index_is_503_disabled() {
     };
     let app = Router::new()
         .route("/address/{addr}/utxo", get(handlers::address_utxo))
+        .route("/addresses/txs", post(handlers::post_addresses_txs))
+        .route("/scripthashes/txs", post(handlers::post_scripthashes_txs))
         .route("/blocks/tip/height", get(tip_height))
         .layer(middleware::from_fn_with_state(
             state.clone(),
@@ -787,6 +960,12 @@ async fn address_without_sh_index_is_503_disabled() {
     assert_eq!(body, rbitcoin_query::SCRIPTHASH_INDEX_DISABLED);
     let (st, body) = http_get(addr, "/blocks/tip/height").await;
     assert_eq!(st, 200, "tip must work without SH: {body}");
+    let (st, body) = http_post(addr, "/addresses/txs", b"[]").await;
+    assert_eq!(st, 503, "{body}");
+    assert_eq!(body, rbitcoin_query::SCRIPTHASH_INDEX_DISABLED);
+    let (st, body) = http_post(addr, "/scripthashes/txs", b"[]").await;
+    assert_eq!(st, 503, "{body}");
+    assert_eq!(body, rbitcoin_query::SCRIPTHASH_INDEX_DISABLED);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -831,6 +1010,176 @@ async fn http_503_chain_view_moved_omits_tip_header() {
         header_value(&raw, HDR_CHAIN_TIP).is_none(),
         "503 must not stamp a fork tip"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn pin_or_reject_without_asof_on_an_empty_chain() {
+    let (dir, q) = temp_query("pin-empty");
+    match pin_or_reject(&q, rbitcoin_query::ChainViewKind::Tip, None) {
+        Ok(None) => {}
+        Ok(Some(_)) => panic!("empty chain pinned a view"),
+        Err(r) => panic!("status {}", r.status()),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn asof_of_a_moved_view_is_404() {
+    let (dir, q) = temp_query("asof-moved");
+    let (h0, t0) = coinbase(0, Fk::NULL, None);
+    let hash = h0.hash;
+    q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let state = AppState {
+        query: Arc::new(q),
+        network: Network::Regtest,
+        mempool: None,
+        max_body: 1024,
+        sh_join: Arc::new(Mutex::new(JoinCache::default())),
+        join_header_trusted: false,
+        block_template: None,
+        gbt_cache: Arc::new(Mutex::new(None)),
+    };
+    async fn pin_then_move(State(st): State<AppState>, AsOf(asof): AsOf) -> Response {
+        let view = match pin_or_reject(&st.query, rbitcoin_query::ChainViewKind::Tip, asof) {
+            Ok(v) => v,
+            Err(r) => return r,
+        };
+        st.query.disconnect_tip().unwrap();
+        maybe_attach_view("ok".into_response(), view)
+    }
+    let app = Router::new()
+        .route("/tx/{txid}/status", get(pin_then_move))
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            stamp_chain_view_mw,
+        ))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let (st, body) = http_get(
+        addr,
+        &format!("/tx/ab/status?asof={}", block_hash_hex(&hash)),
+    )
+    .await;
+    assert_eq!(st, 404, "{body}");
+    assert!(!body.contains("chain view moved"), "{body}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn body_at_max_is_not_413_and_300_slots_fit() {
+    // Body length against `max_body`, and the 300-element outs list. The routes call these checks.
+    let (dir, q) = temp_query("body-max");
+    let (h0, t0) = coinbase(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[t0]).unwrap();
+    let q = Arc::new(q);
+    let mp = dir.join("mp");
+    std::fs::create_dir_all(&mp).unwrap();
+    let hub = rbitcoin_net::MempoolHub::open(&mp, Arc::clone(&q)).unwrap();
+    let state = |max_body: usize, mempool: bool| AppState {
+        query: Arc::clone(&q),
+        network: Network::Regtest,
+        mempool: mempool.then(|| Arc::clone(&hub)),
+        max_body,
+        sh_join: Arc::new(Mutex::new(JoinCache::default())),
+        join_header_trusted: false,
+        block_template: None,
+        gbt_cache: Arc::new(Mutex::new(None)),
+    };
+    let at = Bytes::new();
+    let over = Bytes::from_static(b"x");
+    let codes = |name: &str, at_max: Response, too_big: Response| {
+        assert_ne!(at_max.status(), StatusCode::PAYLOAD_TOO_LARGE, "{name}");
+        assert_eq!(too_big.status(), StatusCode::PAYLOAD_TOO_LARGE, "{name}");
+    };
+    codes(
+        "post_block_height_outs",
+        handlers::post_block_height_outs(State(state(0, false)), AsOf(None), at.clone()).await,
+        handlers::post_block_height_outs(State(state(0, false)), AsOf(None), over.clone()).await,
+    );
+    codes(
+        "post_scripthashes_txs",
+        handlers::post_scripthashes_txs(
+            State(state(0, false)),
+            JoinClient(None),
+            AxumQuery(handlers::AfterTxidQuery::default()),
+            at.clone(),
+        )
+        .await,
+        handlers::post_scripthashes_txs(
+            State(state(0, false)),
+            JoinClient(None),
+            AxumQuery(handlers::AfterTxidQuery::default()),
+            over.clone(),
+        )
+        .await,
+    );
+    codes(
+        "post_txs_test",
+        handlers::post_txs_test(
+            State(state(0, false)),
+            AxumQuery(handlers::MaxFeeQuery::default()),
+            at.clone(),
+        )
+        .await,
+        handlers::post_txs_test(
+            State(state(0, false)),
+            AxumQuery(handlers::MaxFeeQuery::default()),
+            over.clone(),
+        )
+        .await,
+    );
+    codes(
+        "post_tx",
+        handlers::post_tx(State(state(0, true)), at.clone()).await,
+        handlers::post_tx(State(state(0, true)), over.clone()).await,
+    );
+    codes(
+        "post_tx_package",
+        handlers::post_tx_package(State(state(0, true)), at.clone()).await,
+        handlers::post_tx_package(State(state(0, true)), over.clone()).await,
+    );
+    #[cfg(unix)]
+    {
+        codes(
+            "post_internal_txs",
+            rbitcoin_esplora::internal::post_internal_txs(State(state(0, false)), at.clone()).await,
+            rbitcoin_esplora::internal::post_internal_txs(State(state(0, false)), over.clone())
+                .await,
+        );
+        codes(
+            "post_outspends_by_txid",
+            rbitcoin_esplora::internal::post_outspends_by_txid(State(state(0, false)), at.clone())
+                .await,
+            rbitcoin_esplora::internal::post_outspends_by_txid(
+                State(state(0, false)),
+                over.clone(),
+            )
+            .await,
+        );
+        codes(
+            "post_outspends_by_outpoint",
+            rbitcoin_esplora::internal::post_outspends_by_outpoint(
+                State(state(0, false)),
+                at.clone(),
+            )
+            .await,
+            rbitcoin_esplora::internal::post_outspends_by_outpoint(
+                State(state(0, false)),
+                over.clone(),
+            )
+            .await,
+        );
+    }
+    let slots = Bytes::from(serde_json::to_vec(&vec![[0u32, 0, 0]; 300]).unwrap());
+    let resp =
+        handlers::post_block_height_outs(State(state(slots.len(), false)), AsOf(None), slots).await;
+    assert_ne!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_ne!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

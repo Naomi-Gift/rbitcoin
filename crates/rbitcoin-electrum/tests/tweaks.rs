@@ -39,6 +39,7 @@ fn last_height_stops_at_tip() {
     assert_eq!(last_height(880_791, 81_427, Some(962_217)), Some(962_217));
     assert_eq!(last_height(10, 3, Some(11)), Some(11));
     assert_eq!(last_height(10, 1, Some(100)), Some(10));
+    assert_eq!(last_height(10, 1, Some(10)), Some(10));
     assert_eq!(last_height(50, 1, Some(10)), None);
     assert_eq!(last_height(0, 1, None), None);
 }
@@ -133,6 +134,10 @@ fn first_subscribe_wave_indexed_shares_batch_and_pre_taproot_is_empty() {
         assert_eq!(v["method"], "blockchain.tweaks.subscribe");
         assert!(v["params"][0][&h].as_object().unwrap().is_empty(), "{v}");
     }
+    // One indexed height, including a start that is also the last.
+    let same = load_thin_batch(&q, 2, 2, ThinTweakRangeLimits::default()).unwrap();
+    assert_eq!(same.len(), 1);
+    assert_eq!(same[0].0, 2);
     let thin1 = q.load_thin_tweaks(Height(1)).unwrap().expect("indexed");
     assert_eq!(
         encode_thin_height_json(1, &thin1, DEFAULT_TWEAKS_MIN_DUST),
@@ -350,6 +355,9 @@ fn height_map_cut_through_omits_spent_p2tr() {
     let live = height_map_json(&q, &chain, 1, true, DEFAULT_TWEAKS_MIN_DUST).unwrap();
     let live_v: Value = serde_json::from_str(&live).unwrap();
     assert_eq!(live_v["1"].as_object().unwrap().len(), 1);
+    let stale =
+        height_map_json_with_tip(&q, &chain, 1, Some(0), false, DEFAULT_TWEAKS_MIN_DUST).unwrap();
+    assert_eq!(stale, empty_height_json(1));
 
     let elig_fk = q.block_tx_fks(Height(1)).unwrap()[0];
     let mut spend2 = [0u8; 32];
@@ -401,6 +409,14 @@ fn height_map_cut_through_omits_spent_p2tr() {
     let hist = height_map_json(&q, &chain, 1, false, 0).unwrap();
     let hist_v: Value = serde_json::from_str(&hist).unwrap();
     assert_eq!(hist_v["1"].as_object().unwrap().len(), 1, "{hist}");
+
+    let cut_sub = subscribe(&q, &json!([1, 1, false]), &chain, 0).unwrap();
+    assert!(
+        cut_sub["1"].as_object().unwrap().is_empty(),
+        "subscribe cut-through omits the spent output: {cut_sub}"
+    );
+    let hist_sub = subscribe(&q, &json!([1, 1, true]), &chain, 0).unwrap();
+    assert_eq!(hist_sub["1"].as_object().unwrap().len(), 1, "{hist_sub}");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -549,6 +565,7 @@ fn pruned_height_map_does_not_walk_a_hole() {
 /// still in the keep window has to be in the subscribe result. An empty
 /// map would tell the client the height was already scanned.
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn unsealed_pruned_spend_is_not_an_empty_height() {
     use bitcoin::hashes::{hash160, Hash};
     use bitcoin::secp256k1::{PublicKey, Secp256k1, SecretKey};
@@ -595,7 +612,7 @@ fn unsealed_pruned_spend_is_not_an_empty_height() {
                     output_count: 1,
                 },
                 inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
-                outputs: vec![OutputRecord::unspent(50_0000_0000, p2wpkh)],
+                outputs: vec![OutputRecord::unspent(50_0000_0000, p2wpkh.clone())],
             }],
         )
         .unwrap();
@@ -616,31 +633,32 @@ fn unsealed_pruned_spend_is_not_an_empty_height() {
         size: 0,
         weight: 0,
     };
-    q.connect_block(
-        Height(1),
-        &h1,
-        &[TxApply {
-            tx: TxRecord {
-                txid: spend_txid,
-                version: 2,
-                locktime: 0,
-                input_count: 1,
-                output_count: 1,
-            },
-            inputs: vec![InputRecord {
-                prev_txid: genesis_txid,
-                parent: rbitcoin_store::InputParent::Prevout {
-                    create_fk: create0,
-                    vout: 0,
+    let fk1 = q
+        .connect_block(
+            Height(1),
+            &h1,
+            &[TxApply {
+                tx: TxRecord {
+                    txid: spend_txid,
+                    version: 2,
+                    locktime: 0,
+                    input_count: 1,
+                    output_count: 1,
                 },
-                sequence: u32::MAX,
-                script_sig: vec![],
-                witness: vec![vec![0u8; 64], ser.to_vec()],
+                inputs: vec![InputRecord {
+                    prev_txid: genesis_txid,
+                    parent: rbitcoin_store::InputParent::Prevout {
+                        create_fk: create0,
+                        vout: 0,
+                    },
+                    sequence: u32::MAX,
+                    script_sig: vec![],
+                    witness: vec![vec![0u8; 64], ser.to_vec()],
+                }],
+                outputs: vec![OutputRecord::unspent(49_0000_0000, p2tr)],
             }],
-            outputs: vec![OutputRecord::unspent(49_0000_0000, p2tr)],
-        }],
-    )
-    .unwrap();
+        )
+        .unwrap();
     assert_eq!(q.tweak_index_next(), Some(1), "height 1 is not sealed");
     q.set_prune_seqsigwit(true).unwrap();
     let chain = ChainParams::regtest();
@@ -670,6 +688,56 @@ fn unsealed_pruned_spend_is_not_an_empty_height() {
         "{}",
         wave.result_json
     );
+
+    let elig = q.block_tx_fks(Height(1)).unwrap()[0];
+    let mut spend2 = [0u8; 32];
+    spend2[0] = 0x22;
+    let hash2 = rbitcoin_store::block_header_hash(1, &h1.hash, &[0x22; 32], 3, 0x207fffff, 2);
+    let h2 = HeaderRecord {
+        prev_fk: fk1,
+        version: 1,
+        timestamp: 3,
+        bits: 0x207fffff,
+        nonce: 2,
+        merkle_root: [0x22; 32],
+        hash: hash2,
+        size: 0,
+        weight: 0,
+    };
+    q.connect_block(
+        Height(2),
+        &h2,
+        &[TxApply {
+            tx: TxRecord {
+                txid: spend2,
+                version: 2,
+                locktime: 0,
+                input_count: 1,
+                output_count: 1,
+            },
+            inputs: vec![InputRecord {
+                prev_txid: spend_txid,
+                parent: rbitcoin_store::InputParent::Prevout {
+                    create_fk: elig,
+                    vout: 0,
+                },
+                sequence: u32::MAX,
+                script_sig: vec![],
+                witness: vec![vec![0u8; 64]],
+            }],
+            outputs: vec![OutputRecord::unspent(48_0000_0000, p2wpkh)],
+        }],
+    )
+    .unwrap();
+    let spent = height_map_json(&q, &chain, 1, true, 0).unwrap();
+    let spent_v: Value = serde_json::from_str(&spent).unwrap();
+    assert!(
+        spent_v["1"].as_object().unwrap().is_empty(),
+        "cut-through drops a spent taproot output: {spent}"
+    );
+    let kept = height_map_json(&q, &chain, 1, false, 0).unwrap();
+    let kept_v: Value = serde_json::from_str(&kept).unwrap();
+    assert_eq!(kept_v["1"].as_object().unwrap().len(), 1, "{kept}");
     drop(q);
     let _ = std::fs::remove_dir_all(&dir);
 }
