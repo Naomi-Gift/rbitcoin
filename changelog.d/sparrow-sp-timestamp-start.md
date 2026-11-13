@@ -13,3 +13,11 @@ Fixed
   `[subscription, progress, history]` of the Frigate specification; they
   were an object. A block connected during the scan, or one whose tip event
   was missed, is scanned.
+- **Silent Payments subscriptions follow more of the Frigate
+  specification.** A connection keeps up to 16 addresses, each with its own
+  history scan and tip notes; it kept one, so a second wallet replaced the
+  first. A subscribe to an address the connection already has keeps the
+  earlier start. A `"FROM-TO"` start scans that closed range instead of
+  running to the tip. A reorg during a history scan scans the replaced
+  heights again. A start the node cannot read is the error of the
+  subscribe request.

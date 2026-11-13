@@ -24,12 +24,14 @@ way:
   then releases it. Scans waiting for a permit take turns.
 - The scan runs beside the session. It stops before its next chunk when
   the connection ends, when the client unsubscribes, or when a new
-  subscribe replaces it. A connection has one scan.
+  subscribe to the same address replaces it. A connection has at most
+  16 addresses, each with one scan.
 - The scan reads one chunk ahead of what the client has taken and no
   further.
 
-What is not bounded: a connected client may ask for the whole chain, and
-the node scans it for as long as that client stays connected. That is the
+What is not bounded: a connected client may ask for the whole chain, once
+per address, and the node scans it for as long as that client stays
+connected. That is the
 request a restoring wallet makes.
 
 The 065 regression `sp_scan_stops_when_the_client_hangs_up` is replaced by
@@ -41,4 +43,5 @@ The 065 regression `sp_scan_stops_when_the_client_hangs_up` is replaced by
 `timestamp_start_resolves_to_a_height`,
 `sp_scan_stops_when_the_session_drops_it`,
 `sp_unsubscribe_drops_a_running_scan`,
+`sp_subscriptions_are_capped_per_connection`,
 `sp_chunk_end_covers_one_height_and_stops_at_the_tip`.
