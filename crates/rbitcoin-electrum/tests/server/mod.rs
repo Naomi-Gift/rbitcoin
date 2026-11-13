@@ -3024,7 +3024,7 @@ async fn sp_scan_reaches_blocks_connected_after_the_subscribe() {
     .unwrap();
     // The subscribe read height 5 as the tip. The chain is at 10 by now.
     let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-    let scan = tokio::spawn(run_sp_scan(Arc::clone(&chain.q), params, sub, 5, tx));
+    let scan = tokio::spawn(run_sp_scan(Arc::clone(&chain.q), params, sub, 0, 5, tx));
     let mut steps = Vec::new();
     while let Some(step) = rx.recv().await {
         steps.push(step.unwrap());
@@ -3055,7 +3055,7 @@ async fn sp_scan_stops_when_the_session_drops_it() {
     )
     .unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-    let scan = tokio::spawn(run_sp_scan(Arc::clone(&chain.q), params, sub, last, tx));
+    let scan = tokio::spawn(run_sp_scan(Arc::clone(&chain.q), params, sub, 0, last, tx));
     let first = rx.recv().await.unwrap().unwrap();
     assert_eq!(first.through, SP_SCAN_CHUNK - 1);
     // The session ended, or an unsubscribe dropped the scan.
@@ -3353,6 +3353,86 @@ async fn sp_range_start_scans_only_the_range() {
         .map(|h| h["height"].as_u64().unwrap())
         .collect();
     assert_eq!(heights, vec![10], "heights 6 to 9 were not asked for");
+}
+
+/// A reorg while the history is scanned replaces heights the scan already
+/// read. The scan goes back to the first of them.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_reorg_restarts_a_running_scan_above_the_fork() {
+    use crate::silent_scan::SpChain;
+    use rbitcoin_electrum::silent_scan::SP_SCAN_CHUNK;
+
+    let last = SP_SCAN_CHUNK * 4 - 1;
+    let chain = SpChain::new("el-sp-reorg", last, &[20]);
+    let params = Arc::new(ChainParams::regtest());
+    let mut conn = ElectrumConn::new();
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    serve_sp_subscribe(
+        &mut writer,
+        &chain.q,
+        &params,
+        &"127.0.0.1:9".parse().unwrap(),
+        json!(1),
+        &chain.sub(json!(0)),
+        &mut conn,
+    )
+    .await
+    .unwrap();
+    let (address, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+    assert_eq!(
+        step.as_ref().unwrap().as_ref().unwrap().through,
+        SP_SCAN_CHUNK - 1
+    );
+    write_sp_scan_step(&mut writer, &chain.q, &params, &mut conn, &address, step)
+        .await
+        .unwrap();
+
+    // Heights 11 and up are replaced. The first chunk is sent already.
+    let reorg = TipNotify {
+        height: last,
+        header_hex: String::new(),
+        reorg_from_height: Some(10),
+    };
+    restart_sp_scans_after_reorg(&mut conn.sp_scans, &chain.q, &params, &reorg);
+    let (address, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+    let again = step.as_ref().unwrap().as_ref().unwrap();
+    assert_eq!(
+        again.through,
+        sp_chunk_end(11, last),
+        "the scan restarts at 11"
+    );
+    assert_eq!(again.hits.len(), 1, "height 20 is scanned again");
+    assert!(again.progress > 0.0 && again.progress < 1.0);
+    write_sp_scan_step(&mut writer, &chain.q, &params, &mut conn, &address, step)
+        .await
+        .unwrap();
+
+    // A fork above what was sent restarts at the first height not sent.
+    let shallow = TipNotify {
+        height: last,
+        header_hex: String::new(),
+        reorg_from_height: Some(last - 1),
+    };
+    let sent = again_through(&conn);
+    restart_sp_scans_after_reorg(&mut conn.sp_scans, &chain.q, &params, &shallow);
+    let (_, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+    assert_eq!(step.unwrap().unwrap().through, sp_chunk_end(sent, last));
+
+    // Not a reorg: the scan is left alone.
+    let plain = TipNotify {
+        height: last,
+        header_hex: String::new(),
+        reorg_from_height: None,
+    };
+    let before = again_through(&conn);
+    restart_sp_scans_after_reorg(&mut conn.sp_scans, &chain.q, &params, &plain);
+    assert_eq!(again_through(&conn), before);
+}
+
+/// First height the one running scan has not sent.
+fn again_through(conn: &ElectrumConn) -> u32 {
+    conn.sp_scans[0].next
 }
 
 /// An unsubscribe stops the history scan it names.

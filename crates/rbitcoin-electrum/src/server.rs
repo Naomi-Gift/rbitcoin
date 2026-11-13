@@ -538,6 +538,7 @@ where
                             )
                             .await?;
                         }
+                        restart_sp_scans_after_reorg(&mut conn.sp_scans, &query, &params, &t);
                         for live in conn.sp_subs.iter_mut() {
                             let from = live.next_unscanned(&t);
                             if from <= t.height {
@@ -1392,8 +1393,9 @@ where
     writer.line(rpc_result(&id, &result, None)).await?;
     let last = sub.end.unwrap_or(tip.unwrap_or(sub.start).max(sub.start));
     drop_sp_address(conn, &sub.address);
+    let from = sub.start;
     conn.sp_scans
-        .push(SpScanRun::start(query, chain, sub, last));
+        .push(SpScanRun::start(query, chain, sub, from, last));
     Ok(())
 }
 
@@ -1567,6 +1569,9 @@ pub struct SpScanRun {
     steps: tokio::sync::mpsc::Receiver<Result<SpScanStep, String>>,
     /// When the client last got a note of this scan.
     noted: Instant,
+    /// First height whose step the session has not taken.
+    #[doc(hidden)]
+    pub next: u32,
     task: JoinHandle<usize>,
 }
 
@@ -1577,10 +1582,13 @@ impl Drop for SpScanRun {
 }
 
 impl SpScanRun {
+    /// Scan `from..=last` for `sub`. `from` is `sub.start`, or above it
+    /// when a scan resumes.
     fn start(
         query: &Arc<Query>,
         chain: &Arc<ChainParams>,
         sub: crate::silent_scan::SpSub,
+        from: u32,
         last: u32,
     ) -> Self {
         // One step of slack: the scan reads the next chunk while the session
@@ -1590,6 +1598,7 @@ impl SpScanRun {
             Arc::clone(query),
             Arc::clone(chain),
             sub.clone(),
+            from,
             last,
             tx,
         ));
@@ -1597,6 +1606,7 @@ impl SpScanRun {
             sub,
             steps,
             noted: Instant::now(),
+            next: from,
             task,
         }
     }
@@ -1620,7 +1630,28 @@ pub async fn next_sp_scan_step(
     .await
 }
 
-/// Scan `sub.start..=last` in chunks, one step per chunk. A start with no
+/// A reorg replaced the heights above its fork, and a running scan may have
+/// read them. Each scan starts again at the first replaced height, or at
+/// the first height it has not sent when that is lower: a step still in
+/// flight is dropped with the old task.
+#[doc(hidden)]
+pub fn restart_sp_scans_after_reorg(
+    scans: &mut [SpScanRun],
+    query: &Arc<Query>,
+    chain: &Arc<ChainParams>,
+    tip: &TipNotify,
+) {
+    let Some(fork) = tip.reorg_from_height else {
+        return;
+    };
+    for run in scans.iter_mut() {
+        let from = run.next.min(fork.saturating_add(1)).max(run.sub.start);
+        let last = run.sub.end.unwrap_or(tip.height).max(from);
+        *run = SpScanRun::start(query, chain, run.sub.clone(), from, last);
+    }
+}
+
+/// Scan `from..=last` in chunks, one step per chunk. A start with no
 /// end goes on to the tip while it keeps moving. Stops when the receiver is gone. Returns the
 /// chunks scanned.
 #[doc(hidden)]
@@ -1628,12 +1659,12 @@ pub async fn run_sp_scan(
     query: Arc<Query>,
     chain: Arc<ChainParams>,
     sub: crate::silent_scan::SpSub,
+    mut from: u32,
     mut last: u32,
     steps: tokio::sync::mpsc::Sender<Result<SpScanStep, String>>,
 ) -> usize {
     use crate::silent_scan::SP_SCAN_PERMITS;
     static PERMITS: Semaphore = Semaphore::const_new(SP_SCAN_PERMITS);
-    let mut from = sub.start;
     let mut chunks = 0usize;
     loop {
         let end = sp_chunk_end(from, last);
@@ -1713,6 +1744,7 @@ pub async fn write_sp_scan_step<W: AsyncWrite + Unpin>(
             return writer.line(note).await;
         }
     };
+    run.next = step.through.saturating_add(1);
     let done = step.progress >= 1.0;
     if done || !step.hits.is_empty() || run.noted.elapsed() >= SP_PROGRESS_INTERVAL {
         writer
