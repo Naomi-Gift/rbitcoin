@@ -293,13 +293,15 @@ async fn outspends_by_txid_outpoint_and_query(sock: &std::path::Path, pad: &Pad)
     assert!(arr[0][0].get("vin").is_some(), "{resp}");
     assert_eq!(arr[1], json!([]));
     let op = format!("{spent}:0");
-    let body = serde_json::to_vec(&json!([op, "bad"])).unwrap();
+    let past = format!("{spent}:4294967295");
+    let body = serde_json::to_vec(&json!([op, "bad", past])).unwrap();
     let (st, resp) = http_post_unix(sock, "/internal/txs/outspends/by-outpoint", &body).await;
     assert_eq!(st, 200, "{resp}");
     let arr: Vec<Value> = serde_json::from_str(&resp).unwrap();
-    assert_eq!(arr.len(), 2);
+    assert_eq!(arr.len(), 3);
     assert_eq!(arr[0]["spent"], true);
     assert_eq!(arr[1]["spent"], false);
+    assert_eq!(arr[2], json!({"spent": false}), "vout past the outputs");
 
     let (st, resp) = http_get_unix(sock, &format!("/txs/outspends?txids={spent},{unknown}")).await;
     assert_eq!(st, 200, "{resp}");

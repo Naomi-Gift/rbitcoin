@@ -1311,7 +1311,7 @@ pub fn gettxout(ctx: &RpcContext, params: &RpcParams) -> Result<Value, Value> {
         .query
         .get_tx(fk)
         .map_err(|e| rpc_error(ERR_MISC, e.to_string()))?;
-    // Spender read treats a slot past `output_count` as corrupt. The vout is absent.
+    // A vout past `output_count` is absent; the output read below would fail.
     if n >= rec.output_count {
         return Ok(Value::Null);
     }

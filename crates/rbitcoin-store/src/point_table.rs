@@ -108,11 +108,21 @@ where
     if create_tx_fk.is_null() {
         return Ok(());
     }
-    let (multi, field, vin) = match txs.get_output_spender_meta(create_tx_fk, vout) {
-        Ok(m) => m,
-        Err(StoreError::NotFound) => return Ok(()),
-        Err(e) => return Err(e),
+    let Some(loc) = txs
+        .create_loc_range_batch(&[create_tx_fk])?
+        .into_iter()
+        .next()
+        .flatten()
+    else {
+        return Ok(());
     };
+    // Callers pass a request's vout. Past `n_out` there is no output, so no
+    // spender; the slot read would report it as corrupt.
+    if vout >= loc.n_out {
+        return Ok(());
+    }
+    let (off, len) = loc.spent;
+    let (multi, field, vin) = txs.get_output_spender_meta_at(off, len, vout)?;
     if field.is_null() {
         return Ok(());
     }

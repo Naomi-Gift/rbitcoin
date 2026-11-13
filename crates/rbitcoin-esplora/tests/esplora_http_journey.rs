@@ -363,6 +363,14 @@ async fn mempool_spend_outspends_and_hex(pad: &HttpPad, spend: &bitcoin::Transac
     assert_eq!(st, 200, "mempool-only create outspend: {body}");
     let os: Value = serde_json::from_str(&body).unwrap();
     assert_eq!(os["spent"], false, "{os}");
+    for path in [
+        format!("/tx/{cb0}/outspend/4294967295"),
+        format!("/tx/{txid_hex}/outspend/4294967295"),
+    ] {
+        let (st, body) = http_get(addr, &path).await;
+        assert_eq!(st, 200, "vout past the outputs: {path} {body}");
+        assert_eq!(body, r#"{"spent":false}"#, "{path}");
+    }
     let asof0 = block_hash_hex(&pad.hashes[0]);
     let (st, body) = http_get(addr, &format!("/tx/{cb0}/outspend/0?asof={asof0}")).await;
     assert_eq!(st, 200, "asof outspend: {body}");
