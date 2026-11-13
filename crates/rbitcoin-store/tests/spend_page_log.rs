@@ -1866,6 +1866,63 @@ fn hold_during_fold_leaves_the_commit() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A damaged commit must not open. An unaligned offset, an image longer
+/// than one page, or the same page named twice would make the fold write
+/// that image at that offset.
+#[test]
+fn reload_refuses_a_commit_record_that_cannot_be_one_page() {
+    fn plant(dir: &std::path::Path, recs: &[(u64, u64, u32)], file_len: usize) {
+        use rbitcoin_primitives::{SCHEMA_VERSION, STORE_MAGIC};
+        let n = recs.len();
+        let mut buf = vec![0u8; 28 + n * 24 + 4];
+        buf[0..4].copy_from_slice(&STORE_MAGIC);
+        buf[4..6].copy_from_slice(&SCHEMA_VERSION.to_le_bytes());
+        buf[8..12].copy_from_slice(&1u32.to_le_bytes());
+        buf[12..16].copy_from_slice(&1u32.to_le_bytes());
+        buf[16..24].copy_from_slice(&(file_len as u64).to_le_bytes());
+        buf[24..28].copy_from_slice(&(n as u32).to_le_bytes());
+        for (i, (page, log_off, image_len)) in recs.iter().enumerate() {
+            let at = 28 + i * 24;
+            buf[at..at + 8].copy_from_slice(&page.to_le_bytes());
+            buf[at + 8..at + 16].copy_from_slice(&log_off.to_le_bytes());
+            buf[at + 16..at + 20].copy_from_slice(&image_len.to_le_bytes());
+        }
+        std::fs::write(dir.join(SPEND_PAGES_COMMIT_NAME), &buf).unwrap();
+        std::fs::write(dir.join(SPEND_PAGES_NAME), vec![0u8; file_len]).unwrap();
+    }
+    let d = dir();
+    plant(&d, &[(8, 0, 8)], 8);
+    assert!(
+        matches!(SpendPageLog::load(&d), Err(StoreError::Corrupt(_))),
+        "an unaligned page offset must not open"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    plant(&d, &[(4096, 0, 8192)], 8192);
+    assert!(
+        matches!(SpendPageLog::load(&d), Err(StoreError::Corrupt(_))),
+        "an image longer than one page must not open"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    plant(&d, &[(4096, 0, 8), (4096, 8, 8)], 16);
+    assert!(
+        matches!(SpendPageLog::load(&d), Err(StoreError::Corrupt(_))),
+        "a page named twice must not open"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+
+    let d = dir();
+    plant(&d, &[(4096, 0, 8)], 8);
+    assert!(
+        SpendPageLog::load(&d).is_ok(),
+        "a short tail image is one page"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[test]
 fn reload_drops_pages_without_a_commit_and_serves_a_bad_magic() {
     let d = dir();

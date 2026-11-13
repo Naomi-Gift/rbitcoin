@@ -2,10 +2,12 @@ Fixed
 
 - **A torn historical spend page below `spend_durable` stays spent while `spend.pages.commit` exists.**
   Confirm records every published slot, including the short tail, in a directory
-  and does not write that `spent.body` slot. Schema stays 27. A binary from
-  before this log opens the datadir and reads `spent.body`, so a slot that is
-  not folded yet looks unspent. The spend checkpoint rewrites `spend.pages`
-  to the images still named before it advances the marker, and the next
+  and does not write that `spent.body` slot. Schema is 28. A schema-27
+  binary refuses the datadir, so it cannot write a spend under a live page
+  log. Open refuses a commit record whose offset is not a page boundary,
+  whose image is longer than one page, or that names a page twice. The spend
+  checkpoint writes a new generation file of every page still named and
+  renames it over `spend.pages` before it advances the marker, and the next
   checkpoint folds a generation the previous one left
   quiet. A retry of a failed compose writes the frozen pages and every note
   taken after that freeze into the replacement commit, including a newer slot

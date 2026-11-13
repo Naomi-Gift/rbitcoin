@@ -1441,7 +1441,21 @@ impl SpendPageLog {
         g.committed.clear();
         let mut kept_recs: Vec<(u64, u64, u32)> = Vec::new();
         let mut clipped = false;
+        let mut named_pages = HashSet::new();
         for rec in parsed.recs {
+            if rec.page_off % BODY_PAGE_SIZE != 0 {
+                return Err(StoreError::Corrupt(
+                    "spend page commit offset is not page aligned",
+                ));
+            }
+            if u64::from(rec.image_len) > BODY_PAGE_SIZE {
+                return Err(StoreError::Corrupt(
+                    "spend page commit image is longer than one page",
+                ));
+            }
+            if !named_pages.insert(rec.page_off) {
+                return Err(StoreError::Corrupt("spend page commit names a page twice"));
+            }
             if body_end.is_some_and(|end| rec.page_off >= end) {
                 clipped = true;
                 continue;

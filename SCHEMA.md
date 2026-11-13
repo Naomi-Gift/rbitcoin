@@ -1,7 +1,7 @@
 # On-disk schema (current)
 
-**Version:** `SCHEMA_VERSION = 27` (`rbitcoin_primitives`).  
-**Status:** 27 rewrites `meta` only. Historical spend slots, including the short tail page, live in `spend.pages` until fold. `--prune-seqsigwit` can leave `seqsigwit` at a header while creates remain. A 26 binary treats that empty locator as damage and truncates the chain, and it does not read the spend page log, so it refuses 27 `meta`. Opening any 22–26 datadir here, pruned or not, rewrites `meta` to 27 and syncs that directory before a witness cut. A 0.9.0 binary then refuses the directory. 26 is `header.body` 88 B (consensus fields only). Occupied 24/25
+**Version:** `SCHEMA_VERSION = 28` (`rbitcoin_primitives`).  
+**Status:** 28 rewrites `meta` only. A schema-27 binary does not read `spend.pages` and would hide spends it wrote into `spent.body` under a live log, so it refuses 28 `meta`. Historical spend slots, including the short tail page, live in `spend.pages` until fold. `--prune-seqsigwit` can leave `seqsigwit` at a header while creates remain. A 26 binary treats that empty locator as damage and truncates the chain. Opening any 22–27 datadir here, pruned or not, rewrites `meta` to 28 and syncs that directory. A 27 binary then refuses the directory. A 0.9.0 binary refuses it too. 26 is `header.body` 88 B (consensus fields only). Occupied 24/25
 rewrites each 96 B row down to 88 B (`header.body.grow` then rename), dropping
 the trailing `size:u32` + `weight:u32`. Block size and weight are summed from
 `txstat` for that header's create range. A 25 binary refuses 26 `meta`.
@@ -87,11 +87,12 @@ index refuses flat *.idx.meta; place files under store/{stem}.idx/ (meta + NNNNN
 index refuses Shared (file) scripthash.body; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)
 index refuses pack8 Paged (mode 10) scripthash heads; wipe store/scripthash* then restart (Class A kept; SH rematerializes with --sh-index)
 ```  
-Table file headers **22–27** remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
+Table file headers **22–28** remain `schema_file_openable`. A 22 binary refuses 23 `meta`.
 **22→23 open:** occupied Class A rewrites `create.loc.ovf` 12 B rows (`fk:u64` + two u16) to 16 B (`fk:u64` + two u32) and `store/meta` to 23. Empty 22 rewrites `meta`. A 22 binary refuses 23 `meta`. Spent vin stays u16 (stripped input ≥ ~41 B ⇒ ≲24k vins in a 1 MB block; widening would bump the 8 B spent slot).
-**23→24 open** (schema 24/25 binaries): rewrote `header.body` 88 B rows to 96 B. This binary does not expand. An 88 B body stays 88 B and `meta` rewrites to 27.
+**23→24 open** (schema 24/25 binaries): rewrote `header.body` 88 B rows to 96 B. This binary does not expand. An 88 B body stays 88 B and `meta` rewrites to 28.
 **24/25→26 open:** rewrite each 96 B `header.body` row to 88 B (drop trailing `size`/`weight`) via `header.body.grow` then rename; rewrite `meta` to 26. A body that is already 88 B is unchanged. A 25 binary refuses 26 `meta`. Crash with leftover `.grow` discards it and retries.
-**26→27 open:** rewrite `store/meta` to 27 and sync its directory. No table rewrite. Historical spend slots that are not yet in `spent.body` live in `spend.pages` until fold. A 26 binary refuses 27 `meta`. The sync lands before a witness stem cut, so a crash cannot leave schema 26 beside an empty witness locator.
+**27→28 open:** rewrite `store/meta` to 28 and sync its directory. No table rewrite. A 27 binary refuses 28 `meta`. That binary does not read `spend.pages`, so leaving it on 27 would let it write spends under a live log.
+**26→27 open** (schema 27 binaries): rewrote `store/meta` to 27. No table rewrite. Historical spend slots that are not yet in `spent.body` live in `spend.pages` until fold. A 26 binary refuses 27 `meta`. The sync lands before a witness stem cut, so a crash cannot leave schema 26 beside an empty witness locator. This binary continues from 27 to 28.
 **24→25 open:** rewrite `meta` to 25; create or zero-extend `txstat.body` to `create.loc` count. Do **not** rewrite `txout.body`. Unlink leftover `txfixed.body`. A 24 binary refuses 25 `meta`.
 **Endianness:** little-endian for all multi-byte integers.
 
@@ -102,7 +103,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 ## Schema 17 freeze
 
 Class A shape settled here at schema 17 and is still the live layout under
-the `SCHEMA_VERSION` at the top of this file (27). Schemas 18–27 already
+the `SCHEMA_VERSION` at the top of this file (28). Schemas 18–28 already
 shipped. Meta 22–27 is what this binary opens (rules above). Earlier
 layouts are history in
 [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md). A byte-incompatible change bumps
@@ -230,7 +231,7 @@ itself changed.
     seqsigwit.window/                # prune window: one {height}.bin per kept height. The only witness payload while seqsigwit.prune exists
     seqsigwit.reloc                  # optional: append-only files live under --datadir-cold/store
     spent.body                                              # sole-spender 8 B × n_out; leftover spent.off unlinked
-    spend.pages / spend.pages.commit                       # historical spend slots until fold (schema 27)
+    spend.pages / spend.pages.commit                       # historical spend slots until fold (schema 28)
     tx.body / tx.idx.*                              # schema ≤14 packed (refused if non-empty)
     txid.body                                       # dense create_fk-ordered txids (schema 13+)
     txstat.body / txstat.ovf / txstat.blk            # 8 B/create ULEB econ + per-header tails (schema 25)
@@ -289,7 +290,7 @@ and cuts it). `txout`, `txstat`, `input`, block filters, and tweaks are not prun
 | Offset | Size | Field |
 |--------|------|-------|
 | 0 | 4 | Magic `RBT1` |
-| 4 | 2 | Schema version (u16) — live **27** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **22–27** remain `schema_file_openable` |
+| 4 | 2 | Schema version (u16) — live **28** (`SCHEMA_VERSION`). Occupied files keep the version they were written; **22–28** remain `schema_file_openable` |
 | 6 | 2 | Table kind (u16) |
 | 8 | 8 | Logical length (bytes), including this header |
 
