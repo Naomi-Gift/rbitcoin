@@ -18,7 +18,7 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{broadcast, Notify, Semaphore};
 use tokio::task::JoinHandle;
 
@@ -84,6 +84,16 @@ pub const DEFAULT_MAX_REQUEST_BYTES: usize = DEFAULT_MAX_LINE_BYTES;
 /// shared touch set. A reorg or a tick gap > 32 restatuses every sub in full.
 /// Operators can raise it (`--electrum-max-subs`).
 pub const DEFAULT_MAX_SCRIPTHASH_SUBS: usize = 10_000;
+/// Default cap on `blockchain.silentpayments.subscribe` addresses per
+/// connection. Each address scans every new block with its own key, and
+/// each subscribe may scan the whole chain, so this is far below the
+/// scripthash cap. Frigate's default is 100. Operators can raise it
+/// (`--electrum-max-sp-subs`).
+pub const DEFAULT_MAX_SP_SUBS: usize = 16;
+/// Silent-payment history scans the process runs at once, across every
+/// connection. The per-connection cap alone leaves connections x addresses.
+/// A subscribe past this is refused until a scan ends. Not a knob.
+pub const DEFAULT_MAX_SP_SCANS: usize = 32;
 /// Idle read timeout — disconnect quiet clients (DoS of FD/tasks).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 /// Max raw tx hex chars for `transaction.broadcast` (~4 MiB wire → 8 MiB hex).
@@ -137,6 +147,15 @@ pub struct ElectrumConfig {
     pub limits: ServeLimits,
     /// Max `blockchain.scripthash.subscribe` entries per connection.
     pub max_scripthash_subs: usize,
+    /// Silent-payment addresses one connection may subscribe (>= 1).
+    pub max_sp_subs: usize,
+    /// One permit per running silent-payment history scan
+    /// ([`DEFAULT_MAX_SP_SCANS`]). Clones of the config share it, so it is
+    /// one bound for every listener.
+    pub sp_scan_slots: Arc<Semaphore>,
+    /// Heights one history scan step reads. Tests shorten it.
+    #[doc(hidden)]
+    pub sp_scan_chunk: u32,
     /// Max hex length accepted by `blockchain.transaction.broadcast`.
     pub max_broadcast_hex: usize,
     /// Omit served P2TR outs with `value <=` this (sats). `0` serves all.
@@ -170,6 +189,9 @@ impl ElectrumConfig {
             genesis_hash_hex: rbitcoin_primitives::display_hash_hex(genesis),
             limits: ServeLimits::for_public_proxy(),
             max_scripthash_subs: DEFAULT_MAX_SCRIPTHASH_SUBS,
+            max_sp_subs: DEFAULT_MAX_SP_SUBS,
+            sp_scan_slots: Arc::new(Semaphore::new(DEFAULT_MAX_SP_SCANS)),
+            sp_scan_chunk: crate::silent_scan::SP_SCAN_CHUNK,
             max_broadcast_hex: DEFAULT_MAX_BROADCAST_HEX,
             tweaks_min_dust: crate::tweaks::DEFAULT_TWEAKS_MIN_DUST,
             onion_tcp: Arc::new(OnceLock::new()),
@@ -459,9 +481,11 @@ pub struct ElectrumConn {
     pub sh_subs: HashSet<[u8; 32]>,
     pub sh_join: Option<Arc<ShJoinSlot>>,
     pub outpoint_subs: HashSet<([u8; 32], u32)>,
-    pub sp_sub: Option<crate::silent_scan::SpSub>,
-    /// One historical silent-payment scan at a time on this connection.
-    pub sp_scan_busy: bool,
+    /// Silent-payment subscriptions whose history has been sent.
+    pub sp_subs: Vec<SpLive>,
+    /// History scans of subscribes that have not reached the tip. An address
+    /// is in one of the two lists, once.
+    pub sp_scans: Vec<SpScanRun>,
 }
 
 impl ElectrumConn {
@@ -473,8 +497,8 @@ impl ElectrumConn {
             sh_subs: HashSet::new(),
             sh_join: None,
             outpoint_subs: HashSet::new(),
-            sp_sub: None,
-            sp_scan_busy: false,
+            sp_subs: Vec::new(),
+            sp_scans: Vec::new(),
         }
     }
 }
@@ -536,9 +560,8 @@ where
                             )
                             .await?;
                         }
-                        if let Some(sub) = conn.sp_sub.as_ref() {
-                            emit_sp_tip(&mut writer, &query, &params, sub, t.height).await?;
-                        }
+                        restart_sp_scans_after_reorg(&mut conn.sp_scans, &query, &params, &t);
+                        emit_sp_tips(&mut writer, &query, &params, &mut conn, &t).await?;
                         if !conn.sh_subs.is_empty() {
                             let heights = if t.reorg_from_height.is_some() {
                                 None
@@ -725,7 +748,6 @@ where
                             match stream {
                                 ElectrumStream::SilentPayments => {
                                     serve_sp_subscribe(
-                                        &mut reader,
                                         &mut writer,
                                         &query,
                                         &params,
@@ -733,6 +755,7 @@ where
                                         id,
                                         &params_v,
                                         &mut conn,
+                                        &config,
                                     )
                                     .await?
                                 }
@@ -758,6 +781,11 @@ where
                 };
                 writer.line(resp).await?;
                 let _ = &notify;
+            }
+            // Last: a scan with steps ready does not hold back a request.
+            (address, step) = next_sp_scan_step(&mut conn.sp_scans) => {
+                write_sp_scan_step(&mut writer, &query, &params, &mut conn, &address, step)
+                    .await?;
             }
         }
     }
@@ -1059,8 +1087,8 @@ fn read_conn(conn: &mut ElectrumConn, method: &str) -> ElectrumConn {
             None
         },
         outpoint_subs: HashSet::new(),
-        sp_sub: None,
-        sp_scan_busy: conn.sp_scan_busy,
+        sp_subs: Vec::new(),
+        sp_scans: Vec::new(),
     }
 }
 
@@ -1258,8 +1286,8 @@ async fn answer_one(
         sh_subs: std::mem::take(&mut conn.sh_subs),
         sh_join: conn.sh_join.take(),
         outpoint_subs: std::mem::take(&mut conn.outpoint_subs),
-        sp_sub: conn.sp_sub.clone(),
-        sp_scan_busy: conn.sp_scan_busy,
+        sp_subs: std::mem::take(&mut conn.sp_subs),
+        sp_scans: std::mem::take(&mut conn.sp_scans),
     };
     let (result, work, stamped, _ran) = spawn_dispatch(ctx, work, &asked)
         .await
@@ -1334,12 +1362,13 @@ fn finish_reply(
     }
 }
 
+/// Frigate subscribe: the result line, then the history scan started beside
+/// the session. Its notes follow from [`write_sp_scan_step`]. A subscribe
+/// to an address the connection already has replaces that subscription and
+/// scans again. `config` caps the addresses of the connection and the scans
+/// of the process.
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
-/// Tweaks stream: JSON-RPC result = first height, then one notify per
-/// following height, then `{"message":"done"}`. Honor `count` through tip.
-/// Answer `server.ping` while computing.
-pub async fn serve_sp_subscribe<R, W>(
-    reader: &mut R,
+pub async fn serve_sp_subscribe<W>(
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
     chain: &Arc<ChainParams>,
@@ -1347,13 +1376,14 @@ pub async fn serve_sp_subscribe<R, W>(
     id: Value,
     params_v: &Value,
     conn: &mut ElectrumConn,
+    config: &ElectrumConfig,
 ) -> Result<(), std::io::Error>
 where
-    R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    let max_subs = config.max_sp_subs;
     let tip = query.tip_height().map(|h| h.0);
-    let sub = match crate::silent_scan::parse_sub(params_v, chain.network, tip) {
+    let mut sub = match parse_sp_sub(params_v, query, chain).await {
         Ok(s) => s,
         Err(e) => {
             writer
@@ -1362,12 +1392,59 @@ where
             return Ok(());
         }
     };
-    if conn.sp_scan_busy {
+    // Frigate: a subscribe must not narrow the coverage the address has.
+    let held_range = sp_held_range(conn, &sub.address);
+    if let Some((start, end)) = held_range {
+        sub.start = sub.start.min(start);
+        // An open subscription stays open. Two ranges keep the later end.
+        sub.end = sub.end.zip(end).map(|(new, held)| new.max(held));
+    }
+    let held = conn.sp_subs.len() + conn.sp_scans.len();
+    if held_range.is_none() && held >= max_subs {
+        let message = format!("subscription limit reached ({max_subs}) for this connection");
         writer
-            .line(json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": "silent payment scan already running"}}))
+            .line(json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": message}}))
             .await?;
         return Ok(());
     }
+    // The reply is the one place an error reaches the client: a note has
+    // no error member. A start that cannot be read is refused here.
+    let (q, c, start) = (Arc::clone(query), Arc::clone(chain), sub.start);
+    let readable = budgeted_blocking(query, move || {
+        rbitcoin_query::tweaks_at_height(&q, &c, Height(start))
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()));
+    if let Err(message) = readable {
+        writer
+            .line(json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": message}}))
+            .await?;
+        return Ok(());
+    }
+    // One slot per running scan, process-wide. A scan this subscribe
+    // replaces hands its slot on.
+    let replaced = conn
+        .sp_scans
+        .iter()
+        .position(|run| run.sub.address == sub.address)
+        .map(|i| conn.sp_scans.remove(i));
+    let slot = match replaced {
+        Some(run) => run.slot,
+        None => {
+            match Arc::clone(&config.sp_scan_slots).try_acquire_owned() {
+                Ok(slot) => slot,
+                Err(_) => {
+                    let message = "silent payment scan limit reached, try again later";
+                    writer
+                    .line(json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": message}}))
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+    };
     let result = crate::silent_scan::subscribe_result(&sub);
     rbitcoin_log::api_call(
         "electrum",
@@ -1378,31 +1455,64 @@ where
         None,
     );
     writer.line(rpc_result(&id, &result, None)).await?;
-    conn.sp_scan_busy = true;
-    let last = tip.unwrap_or(sub.start);
-    let scanned = scan_sp_off_connection(reader, query, chain, &sub, last).await;
-    let hits = scanned.hits;
-    conn.sp_scan_busy = false;
-    if let Some(message) = scanned.error {
-        writer.line(sp_scan_error_note(&sub, message)).await?;
-        return Ok(());
-    }
-    // The client left before any chunk. A history line would write into a closed socket.
-    if scanned.chunks == 0 && sub.start <= last {
-        return Ok(());
-    }
-    let note = json!({
-        "jsonrpc": "2.0",
-        "method": "blockchain.silentpayments.subscribe",
-        "params": {
-            "subscription": result,
-            "progress": 1.0,
-            "history": hits,
-        }
-    });
-    writer.line(note).await?;
-    conn.sp_sub = Some(sub);
+    let last = sub.end.unwrap_or(tip.unwrap_or(sub.start).max(sub.start));
+    drop_sp_address(conn, &sub.address);
+    let from = sub.start;
+    conn.sp_scans.push(SpScanRun::start(
+        query,
+        chain,
+        sub,
+        from,
+        last,
+        config.sp_scan_chunk,
+        slot,
+    ));
     Ok(())
+}
+
+/// The start, and the end of a closed range, of the connection's
+/// subscription to `address`.
+fn sp_held_range(conn: &ElectrumConn, address: &str) -> Option<(u32, Option<u32>)> {
+    let live = conn.sp_subs.iter().map(|live| &live.sub);
+    let scanning = conn.sp_scans.iter().map(|run| &run.sub);
+    live.chain(scanning)
+        .find(|sub| sub.address == address)
+        .map(|sub| (sub.start, sub.end))
+}
+
+/// End the subscription to `address`, live or still scanning.
+fn drop_sp_address(conn: &mut ElectrumConn, address: &str) {
+    conn.sp_subs.retain(|live| live.sub.address != address);
+    conn.sp_scans.retain(|run| run.sub.address != address);
+}
+
+/// Parse against the confirmed chain: its tip, and its header times for a
+/// timestamp start.
+fn parse_sp_sub_on_chain(
+    params: &Value,
+    query: &Query,
+    chain: &ChainParams,
+) -> Result<crate::silent_scan::SpSub, String> {
+    let tip = query.tip_height().map(|h| h.0);
+    let block_time = |height: u32| match query.header_at_height(Height(height)) {
+        Ok(Some((_fk, header))) => Ok(header.timestamp),
+        Ok(None) => Err(format!("no header at height {height}")),
+        Err(e) => Err(e.to_string()),
+    };
+    crate::silent_scan::parse_sub(params, chain.network, tip, &block_time)
+}
+
+/// [`parse_sp_sub_on_chain`] off the connection task: a timestamp start
+/// reads headers.
+async fn parse_sp_sub(
+    params: &Value,
+    query: &Arc<Query>,
+    chain: &Arc<ChainParams>,
+) -> Result<crate::silent_scan::SpSub, String> {
+    let (p, q, c) = (params.clone(), Arc::clone(query), Arc::clone(chain));
+    budgeted_blocking(query, move || parse_sp_sub_on_chain(&p, &q, &c))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()))
 }
 
 #[doc(hidden)]
@@ -1412,50 +1522,75 @@ pub fn silentpayments_unsubscribe(
     chain: &ChainParams,
     params: &Value,
 ) -> Result<Value, String> {
-    let tip = query.tip_height().map(|h| h.0);
-    let sub = crate::silent_scan::parse_sub(params, chain.network, tip)?;
-    if conn
-        .sp_sub
-        .as_ref()
-        .is_some_and(|s| s.address == sub.address)
-    {
-        conn.sp_sub = None;
-    }
+    let sub = parse_sp_sub_on_chain(params, query, chain)?;
+    drop_sp_address(conn, &sub.address);
     Ok(json!(sub.address))
 }
 
+/// A tip event for every live silent-payment subscription: each scans the
+/// heights it has not seen. One whose heights cannot be read gets the error
+/// note and ends. Left live, it would count those heights as scanned.
+#[doc(hidden)]
+pub async fn emit_sp_tips<W: AsyncWrite + Unpin>(
+    writer: &mut ConnWrite<W>,
+    query: &Arc<Query>,
+    chain: &ChainParams,
+    conn: &mut ElectrumConn,
+    tip: &TipNotify,
+) -> Result<(), std::io::Error> {
+    let mut kept = Vec::with_capacity(conn.sp_subs.len());
+    for mut live in std::mem::take(&mut conn.sp_subs) {
+        let from = live.next_unscanned(tip);
+        if from <= tip.height
+            && !emit_sp_tip(writer, query, chain, &live.sub, from, tip.height).await?
+        {
+            continue;
+        }
+        // A reorg replaced what was above its tip, so the tip is the last
+        // height scanned. A late event for a lower height rewinds nothing.
+        live.through = match tip.reorg_from_height {
+            Some(_) => tip.height,
+            None => live.through.max(tip.height),
+        };
+        kept.push(live);
+    }
+    conn.sp_subs = kept;
+    Ok(())
+}
+
+/// Heights `from..=to` connected after the history: one note when any of
+/// them pays the subscription. `false` when a height could not be read; the
+/// error note is written.
 pub async fn emit_sp_tip<W: AsyncWrite + Unpin>(
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
     chain: &ChainParams,
     sub: &crate::silent_scan::SpSub,
-    height: u32,
-) -> Result<(), std::io::Error> {
+    from: u32,
+    to: u32,
+) -> Result<bool, std::io::Error> {
     let q = Arc::clone(query);
     let c = chain.clone();
     let piece = sub.clone();
     let outcome = budgeted_blocking(query, move || {
-        crate::silent_scan::scan_hits(&q, &c, &piece, height, height)
+        crate::silent_scan::scan_hits(&q, &c, &piece, from, to)
     })
     .await;
     let hits = match outcome {
         Ok(Ok(hits)) => hits,
-        Ok(Err(message)) => return writer.line(sp_scan_error_note(sub, message)).await,
-        Err(e) => return writer.line(sp_scan_error_note(sub, e.to_string())).await,
-    };
-    if hits.is_empty() {
-        return Ok(());
-    }
-    let note = json!({
-        "jsonrpc": "2.0",
-        "method": "blockchain.silentpayments.subscribe",
-        "params": {
-            "subscription": crate::silent_scan::subscribe_result(sub),
-            "progress": 1.0,
-            "history": hits,
+        Ok(Err(message)) => {
+            writer.line(sp_scan_error_note(sub, message)).await?;
+            return Ok(false);
         }
-    });
-    writer.line(note).await
+        Err(e) => {
+            writer.line(sp_scan_error_note(sub, e.to_string())).await?;
+            return Ok(false);
+        }
+    };
+    if !hits.is_empty() {
+        writer.line(sp_history_note(sub, 1.0, hits)).await?;
+    }
+    Ok(true)
 }
 
 /// Push the current status of each of `outpoints`.
@@ -1500,102 +1635,307 @@ pub fn redact_sp_params(params: &Value) -> String {
     serde_json::to_string(&v).unwrap_or_else(|_| "[]".into())
 }
 
+/// Last height of the scan chunk of `chunk` heights that starts at `from`,
+/// at most `last`.
 #[doc(hidden)]
-pub fn sp_scan_ranges(start: u32, last: u32) -> Vec<(u32, u32)> {
-    use crate::silent_scan::SP_SCAN_CHUNK;
-    if start > last {
-        return Vec::new();
-    }
-    let mut from = start;
-    let mut ranges = Vec::new();
-    loop {
-        let end = from
-            .saturating_add(SP_SCAN_CHUNK.saturating_sub(1))
-            .min(last);
-        ranges.push((from, end));
-        if end == last {
-            break;
+pub fn sp_chunk_end(from: u32, last: u32, chunk: u32) -> u32 {
+    from.saturating_add(chunk.saturating_sub(1)).min(last)
+}
+
+/// A subscription whose history is sent, and the last height scanned for it.
+pub struct SpLive {
+    pub sub: crate::silent_scan::SpSub,
+    pub through: u32,
+}
+
+impl SpLive {
+    /// First height a tip event still has to scan. Events can be missed or
+    /// arrive late, so this is the height after the last scan, not the
+    /// event's own. A reorg starts again above its fork.
+    fn next_unscanned(&self, tip: &TipNotify) -> u32 {
+        let next = self.through.saturating_add(1);
+        match tip.reorg_from_height {
+            Some(fork) => next.min(fork.saturating_add(1)),
+            None => next,
         }
-        from = end.saturating_add(1);
     }
-    ranges
 }
 
+/// One scanned chunk of a history scan.
 #[doc(hidden)]
-pub struct SpScan {
+pub struct SpScanStep {
     pub hits: Vec<Value>,
-    /// Chunks scanned before the client hung up.
-    pub chunks: usize,
-    /// A height could not be read. The scan did not finish.
-    pub error: Option<String>,
+    /// Last height scanned so far.
+    pub through: u32,
+    /// Share of the heights scanned. 1.0 only once `through` is the tip.
+    pub progress: f64,
 }
 
-/// One poll. `fill_buf` does not consume: an empty ready buffer is EOF,
-/// and pending means the client is still connected. A zero timeout can
-/// poll twice, so this does not use one.
-#[doc(hidden)]
-pub fn peer_hung_up<R: AsyncBufRead + Unpin>(reader: &mut R) -> bool {
-    let waker = std::task::Waker::noop();
-    let mut cx = std::task::Context::from_waker(waker);
-    let mut fut = std::pin::pin!(reader.fill_buf());
-    match std::future::Future::poll(fut.as_mut(), &mut cx) {
-        std::task::Poll::Ready(Ok(buf)) => buf.is_empty(),
-        std::task::Poll::Ready(Err(_)) => true,
-        std::task::Poll::Pending => false,
+/// A scan task that is aborted when its owner drops it.
+struct SpScanTask(JoinHandle<usize>);
+
+impl Drop for SpScanTask {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 
-pub async fn scan_sp_off_connection<R: AsyncBufRead + Unpin>(
-    reader: &mut R,
+/// A history scan running beside the session. Dropping it stops the scan
+/// before its next chunk and frees its slot.
+pub struct SpScanRun {
+    pub sub: crate::silent_scan::SpSub,
+    steps: tokio::sync::mpsc::Receiver<Result<SpScanStep, String>>,
+    /// When the client last got a note of this scan.
+    noted: Instant,
+    /// First height whose step the session has not taken.
+    #[doc(hidden)]
+    pub next: u32,
+    chunk: u32,
+    task: SpScanTask,
+    /// This scan's share of [`ElectrumConfig::sp_scan_slots`].
+    slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl SpScanRun {
+    /// Scan `from..=last` for `sub`, `chunk` heights a step.
+    #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
+    fn start(
+        query: &Arc<Query>,
+        chain: &Arc<ChainParams>,
+        sub: crate::silent_scan::SpSub,
+        from: u32,
+        last: u32,
+        chunk: u32,
+        slot: tokio::sync::OwnedSemaphorePermit,
+    ) -> Self {
+        let (steps, task) = Self::spawn(query, chain, &sub, from, last, chunk);
+        Self {
+            sub,
+            steps,
+            noted: Instant::now(),
+            next: from,
+            chunk,
+            task,
+            slot,
+        }
+    }
+
+    /// Scan again from `from`, in the same slot. The old task is aborted
+    /// and a step it had queued is dropped.
+    fn restart(&mut self, query: &Arc<Query>, chain: &Arc<ChainParams>, from: u32, last: u32) {
+        let (steps, task) = Self::spawn(query, chain, &self.sub, from, last, self.chunk);
+        self.steps = steps;
+        self.task = task;
+        self.next = from;
+    }
+
+    fn spawn(
+        query: &Arc<Query>,
+        chain: &Arc<ChainParams>,
+        sub: &crate::silent_scan::SpSub,
+        from: u32,
+        last: u32,
+        chunk: u32,
+    ) -> (
+        tokio::sync::mpsc::Receiver<Result<SpScanStep, String>>,
+        SpScanTask,
+    ) {
+        // One step of slack: the scan reads the next chunk while the session
+        // writes this one, and no further ahead of a slow client.
+        let (tx, steps) = tokio::sync::mpsc::channel(1);
+        let task = tokio::spawn(run_sp_scan(
+            Arc::clone(query),
+            Arc::clone(chain),
+            sub.clone(),
+            from,
+            last,
+            chunk,
+            tx,
+        ));
+        (steps, SpScanTask(task))
+    }
+}
+
+/// The address of the first scan with a step ready, and that step: a chunk,
+/// the scan error, or `None` when the scan task died. Pending while no scan
+/// has one. Cancel safe: a step stays queued until this returns it.
+#[doc(hidden)]
+pub async fn next_sp_scan_step(
+    scans: &mut [SpScanRun],
+) -> (String, Option<Result<SpScanStep, String>>) {
+    std::future::poll_fn(|cx| {
+        for run in scans.iter_mut() {
+            if let std::task::Poll::Ready(step) = run.steps.poll_recv(cx) {
+                return std::task::Poll::Ready((run.sub.address.clone(), step));
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
+/// A reorg replaced the heights above its fork, and a running scan may have
+/// read them. Each scan starts again at the first replaced height, or at
+/// the first height it has not sent when that is lower: a step still in
+/// flight is dropped with the old task.
+#[doc(hidden)]
+pub fn restart_sp_scans_after_reorg(
+    scans: &mut [SpScanRun],
     query: &Arc<Query>,
     chain: &Arc<ChainParams>,
-    sub: &crate::silent_scan::SpSub,
-    last: u32,
-) -> SpScan {
+    tip: &TipNotify,
+) {
+    let Some(fork) = tip.reorg_from_height else {
+        return;
+    };
+    for run in scans.iter_mut() {
+        let from = run.next.min(fork.saturating_add(1)).max(run.sub.start);
+        // A range that ended above the new tip ends at the tip: the heights
+        // above it are gone.
+        let last = run
+            .sub
+            .end
+            .map_or(tip.height, |end| end.min(tip.height))
+            .max(from);
+        run.restart(query, chain, from, last);
+    }
+}
+
+/// Scan `from..=last`, `chunk` heights a step. A start with no end goes on
+/// to the tip while it keeps moving. Stops when the receiver is gone.
+/// Returns the chunks scanned.
+#[doc(hidden)]
+pub async fn run_sp_scan(
+    query: Arc<Query>,
+    chain: Arc<ChainParams>,
+    sub: crate::silent_scan::SpSub,
+    mut from: u32,
+    mut last: u32,
+    chunk: u32,
+    steps: tokio::sync::mpsc::Sender<Result<SpScanStep, String>>,
+) -> usize {
     use crate::silent_scan::SP_SCAN_PERMITS;
-    static PERMITS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(SP_SCAN_PERMITS);
-    let mut hits = Vec::new();
+    static PERMITS: Semaphore = Semaphore::const_new(SP_SCAN_PERMITS);
     let mut chunks = 0usize;
-    for (from, end) in sp_scan_ranges(sub.start, last) {
-        if peer_hung_up(reader) {
-            break;
-        }
-        let Ok(permit) = PERMITS.acquire().await else {
-            break;
+    loop {
+        let end = sp_chunk_end(from, last, chunk);
+        let permit = tokio::select! {
+            permit = PERMITS.acquire() => permit,
+            _ = steps.closed() => return chunks,
         };
-        let q = Arc::clone(query);
-        let c = Arc::clone(chain);
-        let piece = sub.clone();
-        let outcome = budgeted_blocking(query, move || {
+        let Ok(permit) = permit else {
+            return chunks;
+        };
+        let (q, c, piece) = (Arc::clone(&query), Arc::clone(&chain), sub.clone());
+        let outcome = budgeted_blocking(&query, move || {
             let _sp = permit;
             crate::silent_scan::scan_hits(&q, &c, &piece, from, end)
         })
-        .await;
-        let chunk = match outcome {
-            Ok(Ok(hits)) => hits,
-            Ok(Err(message)) => {
-                return SpScan {
-                    hits,
-                    chunks,
-                    error: Some(message),
-                };
-            }
-            Err(e) => {
-                return SpScan {
-                    hits,
-                    chunks,
-                    error: Some(e.to_string()),
-                };
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()));
+        let hits = match outcome {
+            Ok(hits) => hits,
+            Err(message) => {
+                let _ = steps.send(Err(message)).await;
+                return chunks;
             }
         };
-        hits.extend(chunk);
         chunks += 1;
+        if end == last && sub.end.is_none() {
+            // Blocks connected since `last` was read are history too.
+            last = query.tip_height().map_or(last, |tip| tip.0.max(last));
+        }
+        let progress = if end == last {
+            1.0
+        } else {
+            f64::from(end - sub.start + 1) / (f64::from(last - sub.start) + 1.0)
+        };
+        let step = SpScanStep {
+            hits,
+            through: end,
+            progress,
+        };
+        if steps.send(Ok(step)).await.is_err() || end == last {
+            return chunks;
+        }
+        from = end + 1;
     }
-    SpScan {
-        hits,
-        chunks,
-        error: None,
+}
+
+/// Frigate asks for a note with an empty history at regular intervals.
+const SP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Write one step of the history scan for `address`. The step at the tip
+/// makes the subscription live.
+#[doc(hidden)]
+pub async fn write_sp_scan_step<W: AsyncWrite + Unpin>(
+    writer: &mut ConnWrite<W>,
+    query: &Arc<Query>,
+    chain: &ChainParams,
+    conn: &mut ElectrumConn,
+    address: &str,
+    step: Option<Result<SpScanStep, String>>,
+) -> Result<(), std::io::Error> {
+    let Some(run) = conn
+        .sp_scans
+        .iter_mut()
+        .find(|run| run.sub.address == address)
+    else {
+        return Ok(());
+    };
+    let step = match step {
+        Some(Ok(step)) => step,
+        failed => {
+            let message = match failed {
+                Some(Err(message)) => message,
+                _ => "silent payment scan stopped".to_string(),
+            };
+            let note = sp_scan_error_note(&run.sub, message);
+            drop_sp_address(conn, address);
+            return writer.line(note).await;
+        }
+    };
+    run.next = step.through.saturating_add(1);
+    let done = step.progress >= 1.0;
+    if done || !step.hits.is_empty() || run.noted.elapsed() >= SP_PROGRESS_INTERVAL {
+        writer
+            .line(sp_history_note(&run.sub, step.progress, step.hits))
+            .await?;
+        run.noted = Instant::now();
     }
+    if !done {
+        return Ok(());
+    }
+    let mut live = SpLive {
+        sub: run.sub.clone(),
+        through: step.through,
+    };
+    drop_sp_address(conn, address);
+    let tip = query.tip_height().map_or(live.through, |tip| tip.0);
+    // A block whose tip event came before this step had no subscription.
+    // Read what connected since, up to the end of a closed range: a scan
+    // that a reorg cut short ends below it. The heights above a range were
+    // not asked for.
+    let wanted = live.sub.end.map_or(tip, |end| end.min(tip));
+    if wanted > live.through
+        && !emit_sp_tip(writer, query, chain, &live.sub, live.through + 1, wanted).await?
+    {
+        return Ok(());
+    }
+    // Also down: a step that finished above the chain tip scanned heights
+    // a reorg removed, and the blocks that connect there are not scanned yet.
+    live.through = tip;
+    conn.sp_subs.push(live);
+    Ok(())
+}
+
+/// Frigate notification: positional `[subscription, progress, history]`.
+fn sp_history_note(sub: &crate::silent_scan::SpSub, progress: f64, history: Vec<Value>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "method": "blockchain.silentpayments.subscribe",
+        "params": [crate::silent_scan::subscribe_result(sub), progress, history],
+    })
 }
 
 fn sp_scan_error_note(sub: &crate::silent_scan::SpSub, message: String) -> Value {
@@ -2371,8 +2711,8 @@ pub fn dispatch(
         sh_subs: std::mem::take(sh_subs),
         sh_join: None,
         outpoint_subs: HashSet::new(),
-        sp_sub: None,
-        sp_scan_busy: false,
+        sp_subs: Vec::new(),
+        sp_scans: Vec::new(),
     };
     let r = dispatch_with_join(method, params, query, config, chain, mempool, &mut conn);
     *header_sub = conn.header_sub;
@@ -2917,8 +3257,7 @@ pub fn dispatch_pinned(
             Ok(json!(conn.outpoint_subs.remove(&(txid, vout))))
         }
         "blockchain.silentpayments.subscribe" => {
-            let tip = query.tip_height().map(|h| h.0);
-            let sub = crate::silent_scan::parse_sub(params, chain.network, tip)?;
+            let sub = parse_sp_sub_on_chain(params, query, chain)?;
             Ok(crate::silent_scan::subscribe_result(&sub))
         }
         "blockchain.silentpayments.unsubscribe" => {

@@ -613,6 +613,33 @@ fn sv2_tp_idle_timeout_argv_default_off() {
 }
 
 #[test]
+fn electrum_max_sp_subs_cli_conf_and_bounds() {
+    assert_eq!(
+        ready_config(["rbitcoin-node"]).electrum_max_sp_subs,
+        rbitcoin_electrum::DEFAULT_MAX_SP_SUBS
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--electrum-max-sp-subs", "100"]).electrum_max_sp_subs,
+        100
+    );
+    assert_eq!(
+        ready_config(["rbitcoin-node", "--electrum-max-sp-subs=2"]).electrum_max_sp_subs,
+        2
+    );
+    let mut c = NodeConfig::default();
+    c.apply_kv("electrum_max_sp_subs", "40").unwrap();
+    assert_eq!(c.electrum_max_sp_subs, 40);
+    let zero = c.apply_kv("electrum_max_sp_subs", "0").unwrap_err();
+    assert!(format!("{zero}").contains(">= 1"), "{zero}");
+    let bad = c.apply_kv("electrum_max_sp_subs", "nope").unwrap_err();
+    assert!(format!("{bad}").contains("electrum_max_sp_subs"), "{bad}");
+    assert_eq!(
+        c.electrum_max_sp_subs, 40,
+        "a refused value changes nothing"
+    );
+}
+
+#[test]
 fn electrum_max_subs_cli_conf_and_bounds() {
     assert_eq!(
         ready_config(["rbitcoin-node"]).electrum_max_subs,

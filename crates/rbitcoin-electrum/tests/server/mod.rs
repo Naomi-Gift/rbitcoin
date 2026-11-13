@@ -16,6 +16,8 @@ use rbitcoin_query::testutil::FixtureChain;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
+use crate::silent_scan::no_times;
+
 fn tmp_store() -> (rbitcoin_query::testutil::TempDir, Query) {
     rbitcoin_query::testutil::tiny_query_labeled("electrum")
 }
@@ -2881,198 +2883,780 @@ fn dispatch_param_type_edges_and_subscribe_cap() {
 }
 
 #[test]
-fn sp_scan_ranges_cover_one_height_and_the_next_chunk() {
-    // A span past one chunk must fail a broken stop before a one-height call can spin.
-    assert_eq!(
-        rbitcoin_electrum::server::sp_scan_ranges(0, rbitcoin_electrum::silent_scan::SP_SCAN_CHUNK),
-        vec![
-            (0, rbitcoin_electrum::silent_scan::SP_SCAN_CHUNK - 1),
-            (
-                rbitcoin_electrum::silent_scan::SP_SCAN_CHUNK,
-                rbitcoin_electrum::silent_scan::SP_SCAN_CHUNK
-            )
-        ]
+fn sp_chunk_end_covers_one_height_and_stops_at_the_tip() {
+    use rbitcoin_electrum::silent_scan::SP_SCAN_CHUNK;
+    let chunk = SP_SCAN_CHUNK;
+    assert_eq!(sp_chunk_end(0, chunk, chunk), chunk - 1);
+    assert_eq!(sp_chunk_end(chunk, chunk, chunk), chunk);
+    assert_eq!(sp_chunk_end(4, 4, chunk), 4);
+    assert_eq!(sp_chunk_end(0, 1, chunk), 1);
+    assert_eq!(sp_chunk_end(u32::MAX - 1, u32::MAX, chunk), u32::MAX);
+    assert_eq!(sp_chunk_end(8, 100, 4), 11);
+    assert_eq!(sp_chunk_end(8, 100, 1), 8);
+}
+
+/// One line from the server side of a duplex, as JSON.
+async fn sp_next_line<R: tokio::io::AsyncBufRead + Unpin>(reader: &mut R) -> Value {
+    let mut line = String::new();
+    let n = tokio::time::timeout(Duration::from_secs(20), reader.read_line(&mut line))
+        .await
+        .expect("a line within the deadline")
+        .expect("read");
+    assert_ne!(n, 0, "the server closed the connection");
+    serde_json::from_str(&line).expect("json line")
+}
+
+/// Notes of one scan through the first `progress` 1.0. Returns every history
+/// entry and the progress values in order.
+async fn sp_read_history<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    subscription: &Value,
+) -> (Vec<Value>, Vec<f64>) {
+    let mut history = Vec::new();
+    let mut progress = Vec::new();
+    loop {
+        let note = sp_next_line(reader).await;
+        assert_eq!(
+            note["method"], "blockchain.silentpayments.subscribe",
+            "{note}"
+        );
+        let params = note["params"]
+            .as_array()
+            .unwrap_or_else(|| panic!("Frigate notes carry positional params: {note}"));
+        assert_eq!(params.len(), 3, "{note}");
+        assert_eq!(
+            &params[0], subscription,
+            "the note names the subscribe result"
+        );
+        let p = params[1].as_f64().expect("progress");
+        history.extend(params[2].as_array().expect("history").iter().cloned());
+        progress.push(p);
+        if p >= 1.0 {
+            return (history, progress);
+        }
+    }
+}
+
+struct SpSession {
+    client: tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    send: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    tip_tx: broadcast::Sender<TipNotify>,
+    _task: tokio::task::JoinHandle<Result<(), std::io::Error>>,
+}
+
+/// The listener configuration of the silent-payment tests.
+fn sp_cfg() -> ElectrumConfig {
+    ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &ChainParams::regtest())
+}
+
+/// [`sp_cfg`] with history scan steps of four heights, for short chains.
+fn sp_cfg_short_steps() -> ElectrumConfig {
+    let mut cfg = sp_cfg();
+    cfg.sp_scan_chunk = 4;
+    cfg
+}
+
+fn sp_session(q: &Arc<Query>) -> SpSession {
+    let params = ChainParams::regtest();
+    let cfg = sp_cfg();
+    let (client, server) = tokio::io::duplex(1 << 16);
+    let (tip_tx, tip_rx) = broadcast::channel(8);
+    let task = tokio::spawn(handle_client(
+        server,
+        "127.0.0.1:9".parse().unwrap(),
+        Arc::clone(q),
+        Arc::new(cfg),
+        Arc::new(params),
+        tip_rx,
+        None,
+        ElectrumStop::new(false),
+    ));
+    let (read, send) = tokio::io::split(client);
+    SpSession {
+        client: BufReader::new(read),
+        send,
+        tip_tx,
+        _task: task,
+    }
+}
+
+/// Sparrow's shape: the start is the wallet birthday in seconds, and the
+/// payment is far more than one scan chunk below the tip. The scan runs
+/// beside the session, so a request sent with the subscribe is answered
+/// before the history instead of after it.
+#[tokio::test]
+async fn sp_timestamp_start_finds_a_payment_older_than_one_chunk() {
+    use crate::silent_scan::{SpChain, SP_CHAIN_T0};
+    use rbitcoin_electrum::silent_scan::SP_SCAN_CHUNK;
+
+    // The older payment is more than 256 blocks below the tip.
+    let last = SP_SCAN_CHUNK + 30;
+    let chain = SpChain::new("el-sp-old", last, &[10, last - 1]);
+    let mut s = sp_session(&chain.q);
+    // Two hours after block 10 is twelve blocks later.
+    let birthday = SP_CHAIN_T0 + (10 + 12) * 600;
+    let lines = format!(
+        "{}\n{}\n",
+        json!({"jsonrpc":"2.0","id":1,"method":"blockchain.silentpayments.subscribe","params":chain.sub(json!(birthday))}),
+        json!({"jsonrpc":"2.0","id":2,"method":"server.ping","params":[]}),
     );
+    s.send.write_all(lines.as_bytes()).await.unwrap();
+
+    let reply = sp_next_line(&mut s.client).await;
+    assert_eq!(reply["id"], 1, "{reply}");
+    assert!(reply.get("error").is_none(), "{reply}");
+    assert_eq!(reply["result"]["start_height"], 10, "{reply}");
+    assert_eq!(reply["result"]["labels"], json!([0]), "{reply}");
+    let pong = sp_next_line(&mut s.client).await;
+    assert_eq!(
+        pong["id"], 2,
+        "a request must not wait for the history: {pong}"
+    );
+
+    let (history, progress) = sp_read_history(&mut s.client, &reply["result"]).await;
+    let heights: Vec<u64> = history
+        .iter()
+        .map(|h| h["height"].as_u64().unwrap())
+        .collect();
+    assert_eq!(heights, vec![10, u64::from(last) - 1], "{history:?}");
+    assert_eq!(history[0]["tx_hash"].as_str().unwrap().len(), 64);
+    assert_eq!(history[0]["tweak_key"].as_str().unwrap().len(), 66);
     assert!(
-        rbitcoin_electrum::server::sp_scan_ranges(5, 4).is_empty(),
-        "a start past the tip scans nothing"
+        progress.len() >= 2,
+        "history arrives in parts: {progress:?}"
     );
-    assert_eq!(
-        rbitcoin_electrum::server::sp_scan_ranges(4, 4),
-        vec![(4, 4)]
-    );
-    assert_eq!(
-        rbitcoin_electrum::server::sp_scan_ranges(0, 1),
-        vec![(0, 1)]
+    let (done, parts) = progress.split_last().unwrap();
+    assert_eq!(*done, 1.0);
+    assert!(
+        parts.iter().all(|p| *p > 0.0 && *p < 1.0) && parts.is_sorted(),
+        "{progress:?}"
     );
 }
 
-#[tokio::test(flavor = "current_thread")]
-async fn sp_scan_stops_when_the_client_hangs_up() {
-    use std::pin::Pin;
-    use std::task::{Context, Poll};
-    use tokio::io::{AsyncBufRead, AsyncRead, ReadBuf};
+/// A block connected while the history is scanned is part of the history.
+/// Its tip event reached a session that had no live subscription yet.
+#[tokio::test]
+async fn sp_scan_reaches_blocks_connected_after_the_subscribe() {
+    use crate::silent_scan::SpChain;
 
-    struct HangUp {
-        polls: std::cell::Cell<usize>,
-    }
-    impl AsyncRead for HangUp {
-        fn poll_read(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            _buf: &mut ReadBuf<'_>,
-        ) -> Poll<std::io::Result<()>> {
-            Poll::Pending
-        }
-    }
-    impl AsyncBufRead for HangUp {
-        fn poll_fill_buf(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-        ) -> Poll<std::io::Result<&[u8]>> {
-            let n = self.polls.get();
-            self.polls.set(n + 1);
-            if n == 0 {
-                Poll::Pending
-            } else {
-                Poll::Ready(Ok(&[]))
-            }
-        }
-        fn consume(self: Pin<&mut Self>, _amt: usize) {}
-    }
-
-    let (_dir, q) = tmp_store();
-    let q = std::sync::Arc::new(q);
-    let chain = std::sync::Arc::new(ChainParams::regtest());
-    let scan = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
-    let spend = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
+    let chain = SpChain::new("el-sp-grow", 10, &[8]);
+    let params = Arc::new(ChainParams::regtest());
     let sub = rbitcoin_electrum::silent_scan::parse_sub(
-        &json!([scan, spend, 0]),
+        &chain.sub(json!(0)),
         bitcoin::Network::Regtest,
-        Some(rbitcoin_electrum::silent_scan::SP_SCAN_CHUNK),
+        Some(5),
+        &no_times,
     )
     .unwrap();
-    let last = rbitcoin_electrum::silent_scan::SP_SCAN_CHUNK;
-    let ranges = rbitcoin_electrum::server::sp_scan_ranges(sub.start, last);
-    assert_eq!(ranges.len(), 2, "the fixture spans two chunks");
-    let mut reader = HangUp {
-        polls: std::cell::Cell::new(0),
-    };
-    let scanned =
-        rbitcoin_electrum::server::scan_sp_off_connection(&mut reader, &q, &chain, &sub, last)
-            .await;
-    assert_eq!(
-        scanned.chunks, 1,
-        "a hang-up before the next chunk stops the scan"
-    );
+    // The subscribe read height 5 as the tip. The chain is at 10 by now.
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let scan = tokio::spawn(run_sp_scan(
+        Arc::clone(&chain.q),
+        params,
+        sub,
+        0,
+        5,
+        rbitcoin_electrum::silent_scan::SP_SCAN_CHUNK,
+        tx,
+    ));
+    let mut steps = Vec::new();
+    while let Some(step) = rx.recv().await {
+        steps.push(step.unwrap());
+    }
+    assert_eq!(scan.await.unwrap(), 2, "one chunk to 5, one to the tip");
+    assert_eq!(steps[0].through, 5);
+    assert!(steps[0].progress < 1.0, "height 5 is not the tip");
+    assert!(steps[0].hits.is_empty());
+    assert_eq!(steps[1].through, 10);
+    assert_eq!(steps[1].progress, 1.0);
+    assert_eq!(steps[1].hits.len(), 1);
+    assert_eq!(steps[1].hits[0]["height"], 8);
 }
 
-/// The client is already gone, so the subscribe result is the only line.
-#[tokio::test(flavor = "current_thread")]
-async fn serve_sp_subscribe_writes_no_history_after_hangup() {
-    use std::io::Cursor;
-    use std::net::SocketAddr;
-    use std::time::Duration;
+/// Wait until nothing but `held` references the store: the scan task and
+/// its blocking read are gone.
+async fn sp_scan_task_gone(q: &Arc<Query>, held: usize) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Arc::strong_count(q) > held {
+        assert!(Instant::now() < deadline, "the scan task is still running");
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
 
-    let (_dir, q) = tmp_store();
-    let q = Arc::new(q);
-    let chain = Arc::new(ChainParams::regtest());
-    let scan = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
-    let spend = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
-    let mut reader = BufReader::new(Cursor::new(Vec::<u8>::new()));
-    let mut body = Vec::new();
-    let mut writer = ConnWrite::new(Cursor::new(&mut body), Duration::from_secs(2));
+/// A session that ends drops its scans: the task stops and its slot frees.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_scan_stops_when_the_session_drops_it() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-drop", 15, &[]);
+    let params = Arc::new(ChainParams::regtest());
+    let cfg = sp_cfg_short_steps();
+    let slots = cfg.sp_scan_slots.available_permits();
+    let held = Arc::strong_count(&chain.q);
     let mut conn = ElectrumConn::new();
-    let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
     serve_sp_subscribe(
-        &mut reader,
         &mut writer,
-        &q,
-        &chain,
-        &peer,
+        &chain.q,
+        &params,
+        &"127.0.0.1:9".parse().unwrap(),
         json!(1),
-        &json!([scan, spend, 0]),
+        &chain.sub(json!(0)),
         &mut conn,
+        &cfg,
     )
     .await
     .unwrap();
-    let text = String::from_utf8(body).unwrap();
-    assert!(text.contains("\"id\":1"), "{text}");
-    assert!(!text.contains("progress"), "{text}");
+    assert_eq!(cfg.sp_scan_slots.available_permits(), slots - 1);
+    assert!(Arc::strong_count(&chain.q) > held, "the scan task runs");
+    let (_, first) = next_sp_scan_step(&mut conn.sp_scans).await;
+    let first = first.unwrap().unwrap();
+    assert_eq!(first.through, 3, "one step of four heights");
+    assert!(first.progress < 1.0);
+
+    // The session ends with three steps of the scan left.
+    drop(conn);
+    assert_eq!(cfg.sp_scan_slots.available_permits(), slots);
+    sp_scan_task_gone(&chain.q, held).await;
+}
+
+/// History scans are capped across connections. A subscribe past the cap is
+/// refused in its reply, and a scan that ends frees its slot.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_scans_are_capped_across_connections() {
+    use crate::silent_scan::SpChain;
+
+    assert_eq!(
+        sp_cfg().sp_scan_slots.available_permits(),
+        DEFAULT_MAX_SP_SCANS
+    );
+    let chain = SpChain::new("el-sp-slots", 15, &[]);
+    let params = Arc::new(ChainParams::regtest());
+    let mut cfg = sp_cfg_short_steps();
+    cfg.sp_scan_slots = Arc::new(tokio::sync::Semaphore::new(2));
+    let peer = "127.0.0.1:9".parse().unwrap();
+    let subscribe = async |conn: &mut ElectrumConn, wallet: u8| -> Value {
+        let mut body = Vec::new();
+        let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+        serve_sp_subscribe(
+            &mut writer,
+            &chain.q,
+            &params,
+            &peer,
+            json!(1),
+            &chain.sub_for(wallet, json!(0)),
+            conn,
+            &cfg,
+        )
+        .await
+        .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    };
+    let (mut one, mut two) = (ElectrumConn::new(), ElectrumConn::new());
+    assert!(subscribe(&mut one, 0).await.get("error").is_none());
+    assert!(subscribe(&mut two, 1).await.get("error").is_none());
+    // Both slots are held, by two connections.
+    for conn in [&mut one, &mut two] {
+        let refused = subscribe(conn, 2).await;
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("scan limit"),
+            "{refused}"
+        );
+    }
+    assert_eq!(one.sp_scans.len() + two.sp_scans.len(), 2);
+    // Subscribing again replaces a scan in its own slot.
+    assert!(subscribe(&mut one, 0).await.get("error").is_none());
+    assert_eq!(one.sp_scans.len(), 1);
+    assert_eq!(cfg.sp_scan_slots.available_permits(), 0);
+
+    // A scan that reaches the tip frees its slot. The subscription stays.
+    while !two.sp_scans.is_empty() {
+        let mut sink = Vec::new();
+        let mut writer = ConnWrite::new(std::io::Cursor::new(&mut sink), Duration::from_secs(2));
+        let (address, step) = next_sp_scan_step(&mut two.sp_scans).await;
+        write_sp_scan_step(&mut writer, &chain.q, &params, &mut two, &address, step)
+            .await
+            .unwrap();
+    }
+    assert_eq!(two.sp_subs.len(), 1);
+    assert_eq!(cfg.sp_scan_slots.available_permits(), 1);
+    assert!(subscribe(&mut two, 2).await.get("error").is_none());
+
+    // So does an unsubscribe.
+    silentpayments_unsubscribe(&mut one, &chain.q, &params, &chain.sub_for(0, json!(0))).unwrap();
+    assert_eq!(cfg.sp_scan_slots.available_permits(), 1);
+}
+
+/// Tip events are a hint. A session that missed one, or got it before the
+/// history finished, still scans every height once.
+#[tokio::test]
+async fn sp_tip_note_covers_every_height_since_the_last_scan() {
+    use crate::silent_scan::SpChain;
+
+    let mut chain = SpChain::new("el-sp-tip", 3, &[]);
+    let mut s = sp_session(&chain.q);
+    let line = format!(
+        "{}\n",
+        json!({"jsonrpc":"2.0","id":1,"method":"blockchain.silentpayments.subscribe","params":chain.sub(json!(0))}),
+    );
+    s.send.write_all(line.as_bytes()).await.unwrap();
+    let reply = sp_next_line(&mut s.client).await;
+    let (history, _) = sp_read_history(&mut s.client, &reply["result"]).await;
+    assert!(history.is_empty(), "{history:?}");
+
+    // Heights 4 and 5 connect. Only the event for 5 arrives.
+    chain.extend(5, &[4]);
+    let tip = |height: u32| TipNotify {
+        height,
+        header_hex: String::new(),
+        reorg_from_height: None,
+    };
+    s.tip_tx.send(tip(5)).unwrap();
+    let (history, progress) = sp_read_history(&mut s.client, &reply["result"]).await;
+    assert_eq!(progress, vec![1.0]);
+    assert_eq!(history.len(), 1, "{history:?}");
+    assert_eq!(history[0]["height"], 4);
+
+    // A late event for a height already scanned sends nothing.
+    s.tip_tx.send(tip(4)).unwrap();
+    let ping = format!(
+        "{}\n",
+        json!({"jsonrpc":"2.0","id":7,"method":"server.ping","params":[]})
+    );
+    s.send.write_all(ping.as_bytes()).await.unwrap();
+    let pong = sp_next_line(&mut s.client).await;
+    assert_eq!(pong["id"], 7, "height 4 was sent once already: {pong}");
+
+    // A reorg replaces height 5 with a paying block's branch: rescan it.
+    s.tip_tx
+        .send(TipNotify {
+            height: 5,
+            header_hex: String::new(),
+            reorg_from_height: Some(3),
+        })
+        .unwrap();
+    let (history, _) = sp_read_history(&mut s.client, &reply["result"]).await;
+    assert_eq!(history.len(), 1, "{history:?}");
+    assert_eq!(history[0]["height"], 4);
+}
+
+/// Notes until every subscription in `subs` has reached progress 1.0.
+/// History by address.
+async fn sp_read_all_done<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    subs: &[&Value],
+) -> HashMap<String, Vec<Value>> {
+    let mut history: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut done = HashSet::new();
+    while done.len() < subs.len() {
+        let note = sp_next_line(reader).await;
+        let params = note["params"].as_array().expect("positional params");
+        assert!(
+            subs.contains(&&params[0]),
+            "the note names a subscribe result: {note}"
+        );
+        let address = params[0]["address"].as_str().unwrap().to_string();
+        history
+            .entry(address.clone())
+            .or_default()
+            .extend(params[2].as_array().unwrap().iter().cloned());
+        if params[1].as_f64().unwrap() >= 1.0 {
+            done.insert(address);
+        }
+    }
+    history
+}
+
+fn sp_subscribe_line(id: u32, params: Value) -> String {
+    format!(
+        "{}\n",
+        json!({"jsonrpc":"2.0","id":id,"method":"blockchain.silentpayments.subscribe","params":params})
+    )
+}
+
+/// Sparrow opens several wallets on one connection. Each address keeps its
+/// own history scan and its own tip notes.
+#[tokio::test]
+async fn sp_two_addresses_share_a_connection() {
+    use crate::silent_scan::SpChain;
+
+    let mut chain = SpChain::new("el-sp-two", 0, &[]);
+    chain.extend_paying(3, &[(1, 0), (2, 1)]);
+    let mut s = sp_session(&chain.q);
+    let lines = format!(
+        "{}{}",
+        sp_subscribe_line(1, chain.sub_for(0, json!(0))),
+        sp_subscribe_line(2, chain.sub_for(1, json!(0))),
+    );
+    s.send.write_all(lines.as_bytes()).await.unwrap();
+    let first = sp_next_line(&mut s.client).await;
+    let second = sp_next_line(&mut s.client).await;
+    assert_eq!((&first["id"], &second["id"]), (&json!(1), &json!(2)));
+    let (a, b) = (&first["result"], &second["result"]);
+    assert_ne!(a["address"], b["address"]);
+    let history = sp_read_all_done(&mut s.client, &[a, b]).await;
+    let heights = |sub: &Value, history: &HashMap<String, Vec<Value>>| -> Vec<u64> {
+        history[sub["address"].as_str().unwrap()]
+            .iter()
+            .map(|h| h["height"].as_u64().unwrap())
+            .collect()
+    };
+    assert_eq!(heights(a, &history), vec![1]);
+    assert_eq!(heights(b, &history), vec![2]);
+
+    // Both are live: one block pays each.
+    chain.extend_paying(5, &[(4, 1), (5, 0)]);
+    s.tip_tx
+        .send(TipNotify {
+            height: 5,
+            header_hex: String::new(),
+            reorg_from_height: None,
+        })
+        .unwrap();
+    let history = sp_read_all_done(&mut s.client, &[a, b]).await;
+    assert_eq!(heights(a, &history), vec![5]);
+    assert_eq!(heights(b, &history), vec![4]);
+
+    // An unsubscribe ends one and leaves the other.
+    let unsub = format!(
+        "{}\n",
+        json!({"jsonrpc":"2.0","id":3,"method":"blockchain.silentpayments.unsubscribe","params":chain.sub_for(0, json!(0))})
+    );
+    s.send.write_all(unsub.as_bytes()).await.unwrap();
+    let gone = sp_next_line(&mut s.client).await;
+    assert_eq!(gone["result"], a["address"], "{gone}");
+    chain.extend_paying(7, &[(6, 0), (7, 1)]);
+    s.tip_tx
+        .send(TipNotify {
+            height: 7,
+            header_hex: String::new(),
+            reorg_from_height: None,
+        })
+        .unwrap();
+    let history = sp_read_all_done(&mut s.client, &[b]).await;
+    assert_eq!(heights(b, &history), vec![7]);
+}
+
+/// A connection's subscriptions are capped by the listener's configuration.
+/// Subscribing again to an address it already has is not counted.
+#[tokio::test]
+async fn sp_subscriptions_are_capped_per_connection() {
+    use crate::silent_scan::SpChain;
+
+    let params = Arc::new(ChainParams::regtest());
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    assert_eq!(cfg.max_sp_subs, DEFAULT_MAX_SP_SUBS);
+    assert_eq!(DEFAULT_MAX_SP_SUBS, 16);
+
+    let chain = SpChain::new("el-sp-cap", 1, &[]);
+    let mut conn = ElectrumConn::new();
+    let peer = "127.0.0.1:9".parse().unwrap();
+    let subscribe = async |conn: &mut ElectrumConn, wallet: u8, max_subs: usize| -> Value {
+        let mut cfg = cfg.clone();
+        cfg.max_sp_subs = max_subs;
+        let mut body = Vec::new();
+        let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+        serve_sp_subscribe(
+            &mut writer,
+            &chain.q,
+            &params,
+            &peer,
+            json!(1),
+            &chain.sub_for(wallet, json!(0)),
+            conn,
+            &cfg,
+        )
+        .await
+        .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    };
+    for wallet in 0..3 {
+        let reply = subscribe(&mut conn, wallet, 3).await;
+        assert!(reply.get("error").is_none(), "{reply}");
+    }
+    assert_eq!(conn.sp_scans.len(), 3);
+    let over = subscribe(&mut conn, 3, 3).await;
+    assert!(
+        over["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("subscription limit reached (3)"),
+        "{over}"
+    );
+    assert_eq!(conn.sp_scans.len(), 3);
+    let again = subscribe(&mut conn, 0, 3).await;
+    assert!(again.get("error").is_none(), "{again}");
+    assert_eq!(conn.sp_scans.len(), 3);
+    // A higher cap on the listener admits the address.
+    let raised = subscribe(&mut conn, 3, 4).await;
+    assert!(raised.get("error").is_none(), "{raised}");
+    assert_eq!(conn.sp_scans.len(), 4);
+}
+
+/// Frigate: a subscribe to an address the connection has must not narrow
+/// its coverage. The earlier start stays and is the one returned.
+#[tokio::test]
+async fn sp_resubscribe_keeps_the_earlier_start() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-widen", 9, &[]);
+    let params = Arc::new(ChainParams::regtest());
+    let mut conn = ElectrumConn::new();
+    let peer = "127.0.0.1:9".parse().unwrap();
+    let subscribe = async |conn: &mut ElectrumConn, wallet: u8, start: u32| -> Value {
+        let mut body = Vec::new();
+        let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+        serve_sp_subscribe(
+            &mut writer,
+            &chain.q,
+            &params,
+            &peer,
+            json!(1),
+            &chain.sub_for(wallet, json!(start)),
+            conn,
+            &sp_cfg(),
+        )
+        .await
+        .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    };
+    let first = subscribe(&mut conn, 0, 4).await;
+    assert_eq!(first["result"]["start_height"], 4);
+    // Still scanning: a later start keeps 4.
+    let later = subscribe(&mut conn, 0, 7).await;
+    assert_eq!(later["result"]["start_height"], 4, "{later}");
+    assert_eq!(conn.sp_scans[0].sub.start, 4);
+    // Another address is not bound by it.
+    let other = subscribe(&mut conn, 1, 7).await;
+    assert_eq!(other["result"]["start_height"], 7, "{other}");
+    // An earlier start widens.
+    let wider = subscribe(&mut conn, 0, 2).await;
+    assert_eq!(wider["result"]["start_height"], 2, "{wider}");
+
+    // Live: the history is sent, and a later start still keeps 2.
+    while conn.sp_subs.len() < 2 {
+        let mut sink = Vec::new();
+        let mut writer = ConnWrite::new(std::io::Cursor::new(&mut sink), Duration::from_secs(2));
+        let (address, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+        write_sp_scan_step(&mut writer, &chain.q, &params, &mut conn, &address, step)
+            .await
+            .unwrap();
+    }
+    let live = subscribe(&mut conn, 0, 9).await;
+    assert_eq!(live["result"]["start_height"], 2, "{live}");
+}
+
+/// `"FROM-TO"` scans that range and no further. The subscription is then
+/// live for blocks connected after it.
+#[tokio::test]
+async fn sp_range_start_scans_only_the_range() {
+    use crate::silent_scan::SpChain;
+
+    let mut chain = SpChain::new("el-sp-range", 9, &[2, 5, 8]);
+    let mut s = sp_session(&chain.q);
+    s.send
+        .write_all(sp_subscribe_line(1, chain.sub(json!("1-5"))).as_bytes())
+        .await
+        .unwrap();
+    let reply = sp_next_line(&mut s.client).await;
+    assert_eq!(reply["result"]["start_height"], 1, "{reply}");
+    let (history, _) = sp_read_history(&mut s.client, &reply["result"]).await;
+    let heights: Vec<u64> = history
+        .iter()
+        .map(|h| h["height"].as_u64().unwrap())
+        .collect();
+    assert_eq!(heights, vec![2, 5], "height 8 is past the range");
+
+    chain.extend(10, &[10]);
+    s.tip_tx
+        .send(TipNotify {
+            height: 10,
+            header_hex: String::new(),
+            reorg_from_height: None,
+        })
+        .unwrap();
+    let (history, _) = sp_read_history(&mut s.client, &reply["result"]).await;
+    let heights: Vec<u64> = history
+        .iter()
+        .map(|h| h["height"].as_u64().unwrap())
+        .collect();
+    assert_eq!(heights, vec![10], "heights 6 to 9 were not asked for");
+}
+
+/// A reorg while the history is scanned replaces heights the scan already
+/// read. The scan goes back to the first of them.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_reorg_restarts_a_running_scan_above_the_fork() {
+    use crate::silent_scan::SpChain;
+
+    let last = 15;
+    let chain = SpChain::new("el-sp-reorg", last, &[3]);
+    let params = Arc::new(ChainParams::regtest());
+    let cfg = sp_cfg_short_steps();
+    let mut conn = ElectrumConn::new();
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    serve_sp_subscribe(
+        &mut writer,
+        &chain.q,
+        &params,
+        &"127.0.0.1:9".parse().unwrap(),
+        json!(1),
+        &chain.sub(json!(0)),
+        &mut conn,
+        &cfg,
+    )
+    .await
+    .unwrap();
+    let (address, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+    assert_eq!(step.as_ref().unwrap().as_ref().unwrap().through, 3);
+    write_sp_scan_step(&mut writer, &chain.q, &params, &mut conn, &address, step)
+        .await
+        .unwrap();
+
+    // Heights 2 and up are replaced. The first step, through 3, is sent.
+    let reorg = TipNotify {
+        height: last,
+        header_hex: String::new(),
+        reorg_from_height: Some(1),
+    };
+    restart_sp_scans_after_reorg(&mut conn.sp_scans, &chain.q, &params, &reorg);
+    let (address, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+    let again = step.as_ref().unwrap().as_ref().unwrap();
+    assert_eq!(again.through, 5, "the scan restarts at 2");
+    assert_eq!(again.hits.len(), 1, "height 3 is scanned again");
+    assert!(again.progress > 0.0 && again.progress < 1.0);
+    write_sp_scan_step(&mut writer, &chain.q, &params, &mut conn, &address, step)
+        .await
+        .unwrap();
+
+    // A fork above what was sent restarts at the first height not sent.
+    let shallow = TipNotify {
+        height: last,
+        header_hex: String::new(),
+        reorg_from_height: Some(last - 1),
+    };
+    let sent = again_through(&conn);
+    restart_sp_scans_after_reorg(&mut conn.sp_scans, &chain.q, &params, &shallow);
+    let (_, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+    assert_eq!(step.unwrap().unwrap().through, sp_chunk_end(sent, last, 4));
+
+    // Not a reorg: the scan is left alone.
+    let plain = TipNotify {
+        height: last,
+        header_hex: String::new(),
+        reorg_from_height: None,
+    };
+    let before = again_through(&conn);
+    restart_sp_scans_after_reorg(&mut conn.sp_scans, &chain.q, &params, &plain);
+    assert_eq!(again_through(&conn), before);
+}
+
+/// First height the one running scan has not sent.
+fn again_through(conn: &ElectrumConn) -> u32 {
+    conn.sp_scans[0].next
+}
+
+/// The end of a range is coverage too: a re-subscribe keeps the later end,
+/// and an open subscription stays open.
+#[tokio::test]
+async fn sp_resubscribe_keeps_the_later_end() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-end", 9, &[]);
+    let params = Arc::new(ChainParams::regtest());
+    let mut conn = ElectrumConn::new();
+    let peer = "127.0.0.1:9".parse().unwrap();
+    let subscribe = async |conn: &mut ElectrumConn, wallet: u8, start: Value| {
+        let mut body = Vec::new();
+        let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+        serve_sp_subscribe(
+            &mut writer,
+            &chain.q,
+            &params,
+            &peer,
+            json!(1),
+            &chain.sub_for(wallet, start),
+            conn,
+            &sp_cfg(),
+        )
+        .await
+        .unwrap();
+    };
+    let held = |conn: &ElectrumConn, wallet: usize| {
+        let sub = &conn.sp_scans[wallet].sub;
+        (sub.start, sub.end)
+    };
+    // Open, then a range: still open.
+    subscribe(&mut conn, 0, json!(2)).await;
+    subscribe(&mut conn, 0, json!("5-7")).await;
+    assert_eq!(held(&conn, 0), (2, None));
+    // Two ranges: the earlier start and the later end.
+    subscribe(&mut conn, 1, json!("4-6")).await;
+    subscribe(&mut conn, 1, json!("1-3")).await;
+    assert_eq!(held(&conn, 1), (1, Some(6)));
+    subscribe(&mut conn, 1, json!("5-8")).await;
+    assert_eq!(held(&conn, 1), (1, Some(8)));
+    // A range, then open: open.
+    subscribe(&mut conn, 1, json!(9)).await;
+    assert_eq!(held(&conn, 1), (1, None));
+}
+
+/// An unsubscribe stops the history scan it names.
+#[tokio::test]
+async fn sp_unsubscribe_drops_a_running_scan() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-unsub", 3, &[]);
+    let params = Arc::new(ChainParams::regtest());
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    let mut conn = ElectrumConn::new();
+    serve_sp_subscribe(
+        &mut writer,
+        &chain.q,
+        &params,
+        &"127.0.0.1:9".parse().unwrap(),
+        json!(1),
+        &chain.sub(json!(0)),
+        &mut conn,
+        &sp_cfg(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(conn.sp_scans.len(), 1, "the subscribe starts a scan");
+    let other = json!([
+        "1f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c",
+        chain.spend_hex
+    ]);
+    silentpayments_unsubscribe(&mut conn, &chain.q, &params, &other).unwrap();
+    assert_eq!(conn.sp_scans.len(), 1, "another key leaves the scan");
+    let keys = json!([chain.scan_hex, chain.spend_hex]);
+    silentpayments_unsubscribe(&mut conn, &chain.q, &params, &keys).unwrap();
+    assert!(conn.sp_scans.is_empty(), "the unsubscribe names this scan");
 }
 
 /// A tip still pushes a payment after an unsubscribe for a different address.
 /// The matching unsubscribe stops that push.
 #[tokio::test]
-#[allow(clippy::cognitive_complexity)]
 async fn silentpayments_unsubscribe_stops_only_the_matching_address() {
-    use bitcoin::secp256k1::{PublicKey, Scalar, SecretKey};
-    use rbitcoin_consensus::silent_payments::tagged_hash;
-    use rbitcoin_primitives::{hex_encode, Fk, Height};
-    use rbitcoin_query::TxApply;
-    use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+    use crate::silent_scan::SpChain;
 
-    let secp = bitcoin::secp256k1::Secp256k1::new();
-    let scan_sk = SecretKey::from_slice(&[0x11; 32]).unwrap();
-    let spend_pk = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22; 32]).unwrap());
-    let wrong_pk = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x44; 32]).unwrap());
-    let a = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x33; 32]).unwrap());
-    let tweak = a.serialize();
-    let scan_scalar = Scalar::from_be_bytes(scan_sk.secret_bytes()).unwrap();
-    let shared = a.mul_tweak(&secp, &scan_scalar).unwrap();
-    let mut payload = [0u8; 37];
-    payload[..33].copy_from_slice(&shared.serialize());
-    let tk = SecretKey::from_slice(&tagged_hash(b"BIP0352/SharedSecret", &payload)).unwrap();
-    let output = spend_pk
-        .combine(&PublicKey::from_secret_key(&secp, &tk))
-        .unwrap();
-    let mut script = rbitcoin_primitives::P2TR_PREFIX.to_vec();
-    script.extend_from_slice(&output.x_only_public_key().0.serialize());
-
-    let (dir, q) = tmp_store();
-    q.set_sptweaks_enabled(true, Height(0)).unwrap();
-    let mut merkle = [0u8; 32];
-    merkle[31] = 0xcb;
-    let header = HeaderRecord {
-        prev_fk: Fk::NULL,
-        version: 1,
-        timestamp: 1,
-        bits: 0x207fffff,
-        nonce: 0,
-        merkle_root: merkle,
-        hash: merkle,
-        size: 0,
-        weight: 0,
-    };
-    let fk = q
-        .connect_block(
-            Height(0),
-            &header,
-            &[TxApply {
-                tx: TxRecord {
-                    txid: merkle,
-                    version: 1,
-                    locktime: 0,
-                    input_count: 1,
-                    output_count: 1,
-                },
-                inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
-                outputs: vec![OutputRecord::unspent(50_0000_0000, script)],
-            }],
-        )
-        .unwrap();
-    q.put_sp_tweaks_block(Height(0), fk, &[Some(tweak)])
-        .unwrap();
-    let q = Arc::new(q);
+    let mut chain = SpChain::new("el-sp-unsub-tip", 0, &[0]);
     let params = ChainParams::regtest();
     let (tip_tx, _) = broadcast::channel(4);
     let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
-    let handle = run_electrum(cfg, Arc::clone(&q), params, tip_tx.clone(), None)
+    let handle = run_electrum(cfg, Arc::clone(&chain.q), params, tip_tx.clone(), None)
         .await
         .expect("listen");
-    let scan_hex = hex_encode(scan_sk.secret_bytes());
-    let spend_hex = hex_encode(spend_pk.serialize());
-    let wrong_hex = hex_encode(wrong_pk.serialize());
+    let scan_hex = chain.scan_hex.clone();
+    let spend_hex = chain.spend_hex.clone();
+    // Another spend key: a different address under the same scan key.
+    let wrong_hex = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
 
     async fn subscribe_sp(stream: &mut TcpStream, scan: &str, spend: &str) {
         let res = electrum_tcp_rpc(
@@ -3115,9 +3699,11 @@ async fn silentpayments_unsubscribe_stops_only_the_matching_address() {
         electrum_tcp_rpc(&mut matched, 3, "blockchain.headers.subscribe", json!([])).await;
     assert!(headers["result"]["hex"].is_string(), "{headers}");
 
+    // A block that pays the address connects.
+    chain.extend(1, &[1]);
     tip_tx
         .send(TipNotify {
-            height: 0,
+            height: 1,
             header_hex: "aa".into(),
             reorg_from_height: None,
         })
@@ -3130,7 +3716,7 @@ async fn silentpayments_unsubscribe_stops_only_the_matching_address() {
     );
     let still = read_exact_line(&mut mismatch).await;
     assert!(
-        still.contains("blockchain.silentpayments.subscribe") && still.contains("\"history\""),
+        still.contains("blockchain.silentpayments.subscribe") && still.contains("tx_hash"),
         "{still}"
     );
     let matched_hdr = read_exact_line(&mut matched).await;
@@ -3145,67 +3731,82 @@ async fn silentpayments_unsubscribe_stops_only_the_matching_address() {
     assert!(pong.get("error").is_none(), "{pong}");
 
     handle.shutdown().await;
-    drop(q);
-    let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A pruned height whose keep file is gone is an error. The scan must not
-/// report progress 1.0 with an empty history, or the client walks past it.
-#[tokio::test(flavor = "current_thread")]
-async fn pruned_scan_miss_is_not_an_empty_history() {
+/// Two pruned blocks with no sealed tweak rows: each height reads from its
+/// keep file. The file of height 1 is gone.
+fn sp_pruned_chain_missing_height_1() -> (rbitcoin_query::testutil::TempDir, Arc<Query>) {
     use rbitcoin_query::TxApply;
     use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
-    use std::io::Cursor;
-    use std::net::SocketAddr;
-    use std::time::Duration;
 
     let (dir, q) = tmp_store();
     q.set_sptweaks_enabled(true, Height(0)).unwrap();
     q.set_prune_seqsigwit(true).unwrap();
     let mut script = vec![0x51, 0x20];
     script.extend_from_slice(&[0x11; 32]);
-    let merkle = [0x44; 32];
-    let header = HeaderRecord {
-        prev_fk: Fk::NULL,
-        version: 1,
-        timestamp: 1,
-        bits: 0x207fffff,
-        nonce: 0,
-        merkle_root: merkle,
-        hash: merkle,
-        size: 0,
-        weight: 0,
-    };
-    q.connect_block(
-        Height(0),
-        &header,
-        &[TxApply {
-            tx: TxRecord {
-                txid: merkle,
-                version: 1,
-                locktime: 0,
-                input_count: 1,
-                output_count: 1,
-            },
-            inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
-            outputs: vec![OutputRecord::unspent(50_0000_0000, script)],
-        }],
-    )
-    .unwrap();
-    std::fs::remove_file(q.store().path().join("seqsigwit.window/0.bin")).unwrap();
+    let mut prev = (Fk::NULL, None::<[u8; 32]>);
+    for h in 0..2u32 {
+        let mut merkle = [0x44; 32];
+        merkle[0] = h as u8;
+        let hash = match prev.1 {
+            None => merkle,
+            Some(parent) => {
+                rbitcoin_store::block_header_hash(1, &parent, &merkle, 1, 0x207fffff, 0)
+            }
+        };
+        let header = HeaderRecord {
+            prev_fk: prev.0,
+            version: 1,
+            timestamp: 1,
+            bits: 0x207fffff,
+            nonce: 0,
+            merkle_root: merkle,
+            hash,
+            size: 0,
+            weight: 0,
+        };
+        let fk = q
+            .connect_block(
+                Height(h),
+                &header,
+                &[TxApply {
+                    tx: TxRecord {
+                        txid: merkle,
+                        version: 1,
+                        locktime: 0,
+                        input_count: 1,
+                        output_count: 1,
+                    },
+                    inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                    outputs: vec![OutputRecord::unspent(50_0000_0000, script.clone())],
+                }],
+            )
+            .unwrap();
+        prev = (fk, Some(hash));
+    }
+    std::fs::remove_file(q.store().path().join("seqsigwit.window/1.bin")).unwrap();
     q.clear_seqsigwit_ram_window();
-    let q = Arc::new(q);
+    (dir, Arc::new(q))
+}
+
+const SP_MISS_SCAN: &str = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
+const SP_MISS_SPEND: &str = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
+
+/// A pruned height whose keep file is gone is an error. The scan must not
+/// report progress 1.0 with an empty history, or the client walks past it.
+#[tokio::test(flavor = "current_thread")]
+async fn pruned_scan_miss_is_not_an_empty_history() {
+    use std::io::Cursor;
+    use std::net::SocketAddr;
+
+    let (dir, q) = sp_pruned_chain_missing_height_1();
     let chain = Arc::new(ChainParams::regtest());
-    let scan = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
-    let spend = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
-    let params = json!([scan, spend, 0]);
-    let mut reader = BufReader::new(Cursor::new(b"\n".to_vec()));
+    let params = json!([SP_MISS_SCAN, SP_MISS_SPEND, 0]);
     let mut body = Vec::new();
     let mut writer = ConnWrite::new(Cursor::new(&mut body), Duration::from_secs(2));
     let mut conn = ElectrumConn::new();
     let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
     serve_sp_subscribe(
-        &mut reader,
         &mut writer,
         &q,
         &chain,
@@ -3213,39 +3814,397 @@ async fn pruned_scan_miss_is_not_an_empty_history() {
         json!(1),
         &params,
         &mut conn,
+        &sp_cfg(),
     )
     .await
     .unwrap();
+    assert_eq!(conn.sp_scans.len(), 1, "height 0 reads, so the scan starts");
+    let (address, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+    write_sp_scan_step(&mut writer, &q, &chain, &mut conn, &address, step)
+        .await
+        .unwrap();
+    assert!(conn.sp_scans.is_empty(), "a failed scan is over");
     let text = String::from_utf8(body).unwrap();
     assert!(
         text.contains("window miss"),
         "a keep-file miss has to be an error, got {text}"
     );
     assert!(
-        !text.contains("\"progress\":1.0") && !text.contains("\"progress\": 1.0"),
+        !text.contains("1.0"),
         "the miss must not finish the scan, got {text}"
     );
     assert!(
-        conn.sp_sub.is_none(),
+        conn.sp_subs.is_empty(),
         "a failed scan is not a live subscription"
     );
-    let sub =
-        rbitcoin_electrum::silent_scan::parse_sub(&params, bitcoin::Network::Regtest, Some(0))
-            .unwrap();
+    let sub = rbitcoin_electrum::silent_scan::parse_sub(
+        &params,
+        bitcoin::Network::Regtest,
+        Some(1),
+        &no_times,
+    )
+    .unwrap();
     let mut tip_body = Vec::new();
     let mut tip_writer = ConnWrite::new(Cursor::new(&mut tip_body), Duration::from_secs(2));
-    emit_sp_tip(&mut tip_writer, &q, &chain, &sub, 0)
+    let read = emit_sp_tip(&mut tip_writer, &q, &chain, &sub, 1, 1)
         .await
         .unwrap();
+    assert!(!read, "the miss is reported to the caller");
     let tip_text = String::from_utf8(tip_body).unwrap();
     assert!(
         tip_text.contains("window miss"),
         "a tip note must not hide the miss, got {tip_text}"
     );
     assert!(
-        !tip_text.contains("progress"),
+        !tip_text.contains("1.0"),
         "a tip miss must not report the height scanned, got {tip_text}"
     );
+    drop(q);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A live subscription whose new heights cannot be read ends, as a failed
+/// history scan does. Left live, it would mark those heights scanned.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_tip_miss_ends_the_subscription() {
+    use std::io::Cursor;
+
+    let (dir, q) = sp_pruned_chain_missing_height_1();
+    let chain = Arc::new(ChainParams::regtest());
+    let sub = |start: Value| {
+        rbitcoin_electrum::silent_scan::parse_sub(
+            &json!([SP_MISS_SCAN, SP_MISS_SPEND, start]),
+            bitcoin::Network::Regtest,
+            Some(1),
+            &no_times,
+        )
+        .unwrap()
+    };
+    let tip = TipNotify {
+        height: 1,
+        header_hex: String::new(),
+        reorg_from_height: None,
+    };
+
+    // A tip event: height 1 has no keep file.
+    let mut conn = ElectrumConn::new();
+    conn.sp_subs.push(SpLive {
+        sub: sub(json!(0)),
+        through: 0,
+    });
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(Cursor::new(&mut body), Duration::from_secs(2));
+    emit_sp_tips(&mut writer, &q, &chain, &mut conn, &tip)
+        .await
+        .unwrap();
+    assert!(conn.sp_subs.is_empty(), "the subscription ended");
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("window miss"), "{text}");
+
+    // A height already scanned is not read again, and the subscription stays.
+    let mut conn = ElectrumConn::new();
+    conn.sp_subs.push(SpLive {
+        sub: sub(json!(0)),
+        through: 1,
+    });
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(Cursor::new(&mut body), Duration::from_secs(2));
+    emit_sp_tips(&mut writer, &q, &chain, &mut conn, &tip)
+        .await
+        .unwrap();
+    assert_eq!(conn.sp_subs.len(), 1);
+    assert_eq!(conn.sp_subs[0].through, 1);
+    assert!(body.is_empty());
+
+    // The catch-up after a history scan: the scan ended at 0, the tip is 1.
+    let mut conn = ElectrumConn::new();
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(Cursor::new(&mut body), Duration::from_secs(2));
+    serve_sp_subscribe(
+        &mut writer,
+        &q,
+        &chain,
+        &"127.0.0.1:9".parse().unwrap(),
+        json!(1),
+        &json!([SP_MISS_SCAN, SP_MISS_SPEND, "0-0"]),
+        &mut conn,
+        &sp_cfg(),
+    )
+    .await
+    .unwrap();
+    conn.sp_scans[0].sub.end = None;
+    let address = conn.sp_scans[0].sub.address.clone();
+    let at_zero = SpScanStep {
+        hits: Vec::new(),
+        through: 0,
+        progress: 1.0,
+    };
+    write_sp_scan_step(
+        &mut writer,
+        &q,
+        &chain,
+        &mut conn,
+        &address,
+        Some(Ok(at_zero)),
+    )
+    .await
+    .unwrap();
+    assert!(conn.sp_scans.is_empty());
+    assert!(conn.sp_subs.is_empty(), "height 1 was not read");
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("window miss"), "{text}");
+    drop(q);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A reorg may leave the tip below the last height scanned. The heights
+/// above the new tip are replaced, so the blocks that connect there later
+/// are scanned.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_reorg_to_a_lower_tip_rewinds_the_scan() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-lower", 10, &[9]);
+    let params = ChainParams::regtest();
+    let sub = rbitcoin_electrum::silent_scan::parse_sub(
+        &chain.sub(json!(0)),
+        bitcoin::Network::Regtest,
+        Some(10),
+        &no_times,
+    )
+    .unwrap();
+    let mut conn = ElectrumConn::new();
+    conn.sp_subs.push(SpLive { sub, through: 10 });
+    let tip = |height: u32, reorg_from_height: Option<u32>| TipNotify {
+        height,
+        header_hex: String::new(),
+        reorg_from_height,
+    };
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+
+    // A late event for a lower height is not a reorg: nothing rewinds.
+    emit_sp_tips(&mut writer, &chain.q, &params, &mut conn, &tip(5, None))
+        .await
+        .unwrap();
+    assert_eq!(conn.sp_subs[0].through, 10);
+
+    // The chain forks at 6 and its new tip is 8.
+    emit_sp_tips(&mut writer, &chain.q, &params, &mut conn, &tip(8, Some(6)))
+        .await
+        .unwrap();
+    assert_eq!(conn.sp_subs[0].through, 8, "heights 9 and 10 are gone");
+
+    // Blocks connect at 9 and 10 again. Height 9 pays.
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    emit_sp_tips(&mut writer, &chain.q, &params, &mut conn, &tip(10, None))
+        .await
+        .unwrap();
+    assert_eq!(conn.sp_subs[0].through, 10);
+    let note: Value = serde_json::from_slice(&body).expect("a note for height 9");
+    assert_eq!(note["params"][2][0]["height"], 9, "{note}");
+}
+
+/// A reorg may leave the tip below the end of a closed range that is still
+/// being scanned. The scan ends at the new tip, and the subscription does
+/// not count the heights above it as scanned.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_reorg_below_a_range_end_stops_the_scan_at_the_tip() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-range-reorg", 15, &[]);
+    let params = Arc::new(ChainParams::regtest());
+    let cfg = sp_cfg_short_steps();
+    let mut conn = ElectrumConn::new();
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    serve_sp_subscribe(
+        &mut writer,
+        &chain.q,
+        &params,
+        &"127.0.0.1:9".parse().unwrap(),
+        json!(1),
+        &chain.sub(json!("0-15")),
+        &mut conn,
+        &cfg,
+    )
+    .await
+    .unwrap();
+    // The chain forks at 4 and its new tip is 9, below the range end.
+    let reorg = TipNotify {
+        height: 9,
+        header_hex: String::new(),
+        reorg_from_height: Some(4),
+    };
+    restart_sp_scans_after_reorg(&mut conn.sp_scans, &chain.q, &params, &reorg);
+    let last = loop {
+        let (_, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+        let step = step.unwrap().unwrap();
+        assert!(step.through <= 9, "scanned {} past the tip", step.through);
+        if step.progress >= 1.0 {
+            break step.through;
+        }
+    };
+    assert_eq!(last, 9, "the scan ends at the new tip");
+
+    // A finished step above the chain tip leaves the subscription at the tip.
+    let address = conn.sp_scans[0].sub.address.clone();
+    let past_tip = SpScanStep {
+        hits: Vec::new(),
+        through: 20,
+        progress: 1.0,
+    };
+    write_sp_scan_step(
+        &mut writer,
+        &chain.q,
+        &params,
+        &mut conn,
+        &address,
+        Some(Ok(past_tip)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(conn.sp_subs[0].through, 15, "the chain tip is 15");
+}
+
+/// A range scan cut short by a reorg ends at the new tip. A block that
+/// connects inside the range before that scan finishes had no live
+/// subscription to notify, so the finishing step reads it.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_range_scan_reads_a_block_connected_inside_the_range() {
+    use crate::silent_scan::SpChain;
+
+    let mut chain = SpChain::new("el-sp-range-grow", 9, &[]);
+    let params = Arc::new(ChainParams::regtest());
+    let cfg = sp_cfg_short_steps();
+    let mut conn = ElectrumConn::new();
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    serve_sp_subscribe(
+        &mut writer,
+        &chain.q,
+        &params,
+        &"127.0.0.1:9".parse().unwrap(),
+        json!(1),
+        &chain.sub(json!("0-9")),
+        &mut conn,
+        &cfg,
+    )
+    .await
+    .unwrap();
+    // The range ran to 15 before a reorg left the tip at 9.
+    conn.sp_scans[0].sub.end = Some(15);
+    let reorg = TipNotify {
+        height: 9,
+        header_hex: String::new(),
+        reorg_from_height: Some(4),
+    };
+    restart_sp_scans_after_reorg(&mut conn.sp_scans, &chain.q, &params, &reorg);
+    let (address, done) = loop {
+        let (address, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+        if step.as_ref().unwrap().as_ref().unwrap().progress >= 1.0 {
+            break (address, step);
+        }
+        write_sp_scan_step(&mut writer, &chain.q, &params, &mut conn, &address, step)
+            .await
+            .unwrap();
+    };
+    assert_eq!(done.as_ref().unwrap().as_ref().unwrap().through, 9);
+
+    // Heights 10 to 12 connect before the session takes the last step. 11
+    // pays, and it is inside the range.
+    chain.extend(12, &[11]);
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    write_sp_scan_step(&mut writer, &chain.q, &params, &mut conn, &address, done)
+        .await
+        .unwrap();
+    assert_eq!(conn.sp_subs[0].through, 12);
+    let text = String::from_utf8(body).unwrap();
+    let heights: Vec<u64> = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .flat_map(|note| note["params"][2].as_array().cloned().unwrap_or_default())
+        .map(|entry| entry["height"].as_u64().unwrap())
+        .collect();
+    assert_eq!(heights, vec![11], "{text}");
+}
+
+/// Past the end of a range nothing is read: the client did not ask for it.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_range_scan_does_not_read_past_its_end() {
+    use crate::silent_scan::SpChain;
+
+    let mut chain = SpChain::new("el-sp-range-end", 9, &[]);
+    let params = Arc::new(ChainParams::regtest());
+    let cfg = sp_cfg_short_steps();
+    let mut conn = ElectrumConn::new();
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    serve_sp_subscribe(
+        &mut writer,
+        &chain.q,
+        &params,
+        &"127.0.0.1:9".parse().unwrap(),
+        json!(1),
+        &chain.sub(json!("0-9")),
+        &mut conn,
+        &cfg,
+    )
+    .await
+    .unwrap();
+    chain.extend(12, &[11]);
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    while !conn.sp_scans.is_empty() {
+        let (address, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+        write_sp_scan_step(&mut writer, &chain.q, &params, &mut conn, &address, step)
+            .await
+            .unwrap();
+    }
+    assert_eq!(conn.sp_subs[0].through, 12);
+    let text = String::from_utf8(body).unwrap();
+    assert!(
+        !text.contains("tx_hash"),
+        "height 11 is past the range: {text}"
+    );
+}
+
+/// A start the node cannot read is refused in the reply to the subscribe.
+/// A JSON-RPC notification has no error member for it.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_subscribe_refuses_a_start_it_cannot_read() {
+    use std::io::Cursor;
+
+    let (dir, q) = sp_pruned_chain_missing_height_1();
+    let chain = Arc::new(ChainParams::regtest());
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(Cursor::new(&mut body), Duration::from_secs(2));
+    let mut conn = ElectrumConn::new();
+    serve_sp_subscribe(
+        &mut writer,
+        &q,
+        &chain,
+        &"127.0.0.1:9".parse().unwrap(),
+        json!(7),
+        &json!([SP_MISS_SCAN, SP_MISS_SPEND, 1]),
+        &mut conn,
+        &sp_cfg(),
+    )
+    .await
+    .unwrap();
+    let reply: Value = serde_json::from_slice(&body).expect("one reply line");
+    assert_eq!(reply["id"], 7, "{reply}");
+    assert!(reply.get("result").is_none(), "{reply}");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("window miss"),
+        "{reply}"
+    );
+    assert!(conn.sp_scans.is_empty(), "no scan starts: {reply}");
     drop(q);
     let _ = std::fs::remove_dir_all(&dir);
 }

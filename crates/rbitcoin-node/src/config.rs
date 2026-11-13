@@ -464,6 +464,9 @@ pub struct NodeConfig {
     /// Max `blockchain.scripthash.subscribe` entries per Electrum connection
     /// (>= 1). Default [`rbitcoin_electrum::DEFAULT_MAX_SCRIPTHASH_SUBS`].
     pub electrum_max_subs: usize,
+    /// Max `blockchain.silentpayments.subscribe` addresses per Electrum
+    /// connection (>= 1). Default [`rbitcoin_electrum::DEFAULT_MAX_SP_SUBS`].
+    pub electrum_max_sp_subs: usize,
     /// Max Esplora requests in flight across the whole listener (>= 1).
     /// Default [`rbitcoin_electrum::DEFAULT_MAX_CONNECTIONS`].
     pub esplora_max_inflight: usize,
@@ -624,6 +627,7 @@ impl Default for NodeConfig {
             max_sh_creates: rbitcoin_query::DEFAULT_MAX_SH_CREATES,
             heavy_sh_creates: rbitcoin_query::DEFAULT_HEAVY_SH_CREATES,
             electrum_max_subs: rbitcoin_electrum::DEFAULT_MAX_SCRIPTHASH_SUBS,
+            electrum_max_sp_subs: rbitcoin_electrum::DEFAULT_MAX_SP_SUBS,
             esplora_max_inflight: rbitcoin_electrum::DEFAULT_MAX_CONNECTIONS,
             store_read_budget: None,
             esplora_block_template: false,
@@ -1599,6 +1603,17 @@ impl NodeConfig {
                     ));
                 }
                 self.electrum_max_subs = n;
+            }
+            "electrum_max_sp_subs" => {
+                let n: usize = val
+                    .parse()
+                    .map_err(|e| NodeError::Config(format!("conf electrum_max_sp_subs: {e}")))?;
+                if n == 0 {
+                    return Err(NodeError::Config(
+                        "conf electrum_max_sp_subs must be >= 1".into(),
+                    ));
+                }
+                self.electrum_max_sp_subs = n;
             }
             "store_read_budget" => {
                 let n: i64 = val
