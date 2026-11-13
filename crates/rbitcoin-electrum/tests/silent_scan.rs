@@ -487,14 +487,21 @@ fn timestamp_start_reports_a_header_that_cannot_be_read() {
     assert!(err.contains("unexpected header read"), "{err}");
 }
 
-/// A synthetic chain with silent payments to one synthetic key pair. Block
+/// One synthetic receiver on an [`SpChain`].
+struct SpWallet {
+    scan_hex: String,
+    spend_hex: String,
+    paid_script: Vec<u8>,
+}
+
+/// A synthetic chain with silent payments to synthetic key pairs. Block
 /// `h` carries the time `SP_CHAIN_T0 + h * 600`.
 pub struct SpChain {
     _dir: rbitcoin_query::testutil::TempDir,
     pub q: std::sync::Arc<rbitcoin_query::Query>,
     pub scan_hex: String,
     pub spend_hex: String,
-    paid_script: Vec<u8>,
+    wallets: Vec<SpWallet>,
     tweak: [u8; 33],
     tip_fk: rbitcoin_primitives::Fk,
     tip_hash: Option<[u8; 32]>,
@@ -502,38 +509,52 @@ pub struct SpChain {
 }
 
 pub const SP_CHAIN_T0: u32 = 1_600_000_000;
+/// Receivers an [`SpChain`] can pay. Wallet 0 is the default.
+pub const SP_CHAIN_WALLETS: u8 = 20;
 
 impl SpChain {
-    /// Heights `0..=last`. Each height in `paid` has one payment.
+    /// Heights `0..=last`. Each height in `paid` has one payment to wallet 0.
     pub fn new(label: &str, last: u32, paid: &[u32]) -> Self {
         use bitcoin::secp256k1::{PublicKey, Scalar, SecretKey};
         use rbitcoin_consensus::silent_payments::tagged_hash;
         use rbitcoin_primitives::{hex_encode, Fk, Height};
 
         let secp = Secp256k1::new();
-        let scan_sk = SecretKey::from_slice(&[0x11; 32]).unwrap();
-        let spend_pk =
-            PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22; 32]).unwrap());
-        let a = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x33; 32]).unwrap());
-        let scan_scalar = Scalar::from_be_bytes(scan_sk.secret_bytes()).unwrap();
-        let shared = a.mul_tweak(&secp, &scan_scalar).unwrap();
-        let mut payload = [0u8; 37];
-        payload[..33].copy_from_slice(&shared.serialize());
-        let tk = SecretKey::from_slice(&tagged_hash(b"BIP0352/SharedSecret", &payload)).unwrap();
-        let output = spend_pk
-            .combine(&PublicKey::from_secret_key(&secp, &tk))
-            .unwrap();
-        let mut paid_script = rbitcoin_primitives::P2TR_PREFIX.to_vec();
-        paid_script.extend_from_slice(&output.x_only_public_key().0.serialize());
+        let a = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x77; 32]).unwrap());
+        let wallets: Vec<SpWallet> = (0..SP_CHAIN_WALLETS)
+            .map(|w| {
+                let scan_sk = SecretKey::from_slice(&[0x11 + w; 32]).unwrap();
+                let spend_pk = PublicKey::from_secret_key(
+                    &secp,
+                    &SecretKey::from_slice(&[0x41 + w; 32]).unwrap(),
+                );
+                let scan_scalar = Scalar::from_be_bytes(scan_sk.secret_bytes()).unwrap();
+                let shared = a.mul_tweak(&secp, &scan_scalar).unwrap();
+                let mut payload = [0u8; 37];
+                payload[..33].copy_from_slice(&shared.serialize());
+                let tk =
+                    SecretKey::from_slice(&tagged_hash(b"BIP0352/SharedSecret", &payload)).unwrap();
+                let output = spend_pk
+                    .combine(&PublicKey::from_secret_key(&secp, &tk))
+                    .unwrap();
+                let mut paid_script = rbitcoin_primitives::P2TR_PREFIX.to_vec();
+                paid_script.extend_from_slice(&output.x_only_public_key().0.serialize());
+                SpWallet {
+                    scan_hex: hex_encode(scan_sk.secret_bytes()),
+                    spend_hex: hex_encode(spend_pk.serialize()),
+                    paid_script,
+                }
+            })
+            .collect();
 
         let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled(label);
         q.set_sptweaks_enabled(true, Height(0)).unwrap();
         let mut chain = Self {
             _dir: dir,
             q: std::sync::Arc::new(q),
-            scan_hex: hex_encode(scan_sk.secret_bytes()),
-            spend_hex: hex_encode(spend_pk.serialize()),
-            paid_script,
+            scan_hex: wallets[0].scan_hex.clone(),
+            spend_hex: wallets[0].spend_hex.clone(),
+            wallets,
             tweak: a.serialize(),
             tip_fk: Fk::NULL,
             tip_hash: None,
@@ -543,8 +564,14 @@ impl SpChain {
         chain
     }
 
-    /// Connect heights through `last`. Each height in `paid` has one payment.
+    /// Connect heights through `last`. Each height in `paid` pays wallet 0.
     pub fn extend(&mut self, last: u32, paid: &[u32]) {
+        let paid: Vec<(u32, u8)> = paid.iter().map(|h| (*h, 0)).collect();
+        self.extend_paying(last, &paid);
+    }
+
+    /// Connect heights through `last`. `(height, wallet)` is one payment.
+    pub fn extend_paying(&mut self, last: u32, paid: &[(u32, u8)]) {
         use rbitcoin_primitives::Height;
         use rbitcoin_query::testutil::FixtureChain;
         use rbitcoin_query::TxApply;
@@ -573,11 +600,10 @@ impl SpChain {
                 size: 0,
                 weight: 0,
             };
-            let pays = paid.contains(&h);
-            let script = if pays {
-                self.paid_script.clone()
-            } else {
-                vec![rbitcoin_primitives::OP_TRUE]
+            let payee = paid.iter().find(|(height, _)| *height == h).map(|p| p.1);
+            let script = match payee {
+                Some(w) => self.wallets[usize::from(w)].paid_script.clone(),
+                None => vec![rbitcoin_primitives::OP_TRUE],
             };
             self.tip_fk = self
                 .q
@@ -598,14 +624,19 @@ impl SpChain {
                 )
                 .unwrap();
             self.q
-                .put_sp_tweaks_block(Height(h), self.tip_fk, &[pays.then_some(self.tweak)])
+                .put_sp_tweaks_block(Height(h), self.tip_fk, &[payee.map(|_| self.tweak)])
                 .unwrap();
         }
         self.next = last + 1;
     }
 
     pub fn sub(&self, start: serde_json::Value) -> serde_json::Value {
-        json!([self.scan_hex, self.spend_hex, start])
+        self.sub_for(0, start)
+    }
+
+    pub fn sub_for(&self, wallet: u8, start: serde_json::Value) -> serde_json::Value {
+        let w = &self.wallets[usize::from(wallet)];
+        json!([w.scan_hex, w.spend_hex, start])
     }
 }
 

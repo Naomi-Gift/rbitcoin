@@ -3120,6 +3120,151 @@ async fn sp_tip_note_covers_every_height_since_the_last_scan() {
     assert_eq!(history[0]["height"], 4);
 }
 
+/// Notes until every subscription in `subs` has reached progress 1.0.
+/// History by address.
+async fn sp_read_all_done<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    subs: &[&Value],
+) -> HashMap<String, Vec<Value>> {
+    let mut history: HashMap<String, Vec<Value>> = HashMap::new();
+    let mut done = HashSet::new();
+    while done.len() < subs.len() {
+        let note = sp_next_line(reader).await;
+        let params = note["params"].as_array().expect("positional params");
+        assert!(
+            subs.contains(&&params[0]),
+            "the note names a subscribe result: {note}"
+        );
+        let address = params[0]["address"].as_str().unwrap().to_string();
+        history
+            .entry(address.clone())
+            .or_default()
+            .extend(params[2].as_array().unwrap().iter().cloned());
+        if params[1].as_f64().unwrap() >= 1.0 {
+            done.insert(address);
+        }
+    }
+    history
+}
+
+fn sp_subscribe_line(id: u32, params: Value) -> String {
+    format!(
+        "{}\n",
+        json!({"jsonrpc":"2.0","id":id,"method":"blockchain.silentpayments.subscribe","params":params})
+    )
+}
+
+/// Sparrow opens several wallets on one connection. Each address keeps its
+/// own history scan and its own tip notes.
+#[tokio::test]
+async fn sp_two_addresses_share_a_connection() {
+    use crate::silent_scan::SpChain;
+
+    let mut chain = SpChain::new("el-sp-two", 0, &[]);
+    chain.extend_paying(3, &[(1, 0), (2, 1)]);
+    let mut s = sp_session(&chain.q);
+    let lines = format!(
+        "{}{}",
+        sp_subscribe_line(1, chain.sub_for(0, json!(0))),
+        sp_subscribe_line(2, chain.sub_for(1, json!(0))),
+    );
+    s.send.write_all(lines.as_bytes()).await.unwrap();
+    let first = sp_next_line(&mut s.client).await;
+    let second = sp_next_line(&mut s.client).await;
+    assert_eq!((&first["id"], &second["id"]), (&json!(1), &json!(2)));
+    let (a, b) = (&first["result"], &second["result"]);
+    assert_ne!(a["address"], b["address"]);
+    let history = sp_read_all_done(&mut s.client, &[a, b]).await;
+    let heights = |sub: &Value, history: &HashMap<String, Vec<Value>>| -> Vec<u64> {
+        history[sub["address"].as_str().unwrap()]
+            .iter()
+            .map(|h| h["height"].as_u64().unwrap())
+            .collect()
+    };
+    assert_eq!(heights(a, &history), vec![1]);
+    assert_eq!(heights(b, &history), vec![2]);
+
+    // Both are live: one block pays each.
+    chain.extend_paying(5, &[(4, 1), (5, 0)]);
+    s.tip_tx
+        .send(TipNotify {
+            height: 5,
+            header_hex: String::new(),
+            reorg_from_height: None,
+        })
+        .unwrap();
+    let history = sp_read_all_done(&mut s.client, &[a, b]).await;
+    assert_eq!(heights(a, &history), vec![5]);
+    assert_eq!(heights(b, &history), vec![4]);
+
+    // An unsubscribe ends one and leaves the other.
+    let unsub = format!(
+        "{}\n",
+        json!({"jsonrpc":"2.0","id":3,"method":"blockchain.silentpayments.unsubscribe","params":chain.sub_for(0, json!(0))})
+    );
+    s.send.write_all(unsub.as_bytes()).await.unwrap();
+    let gone = sp_next_line(&mut s.client).await;
+    assert_eq!(gone["result"], a["address"], "{gone}");
+    chain.extend_paying(7, &[(6, 0), (7, 1)]);
+    s.tip_tx
+        .send(TipNotify {
+            height: 7,
+            header_hex: String::new(),
+            reorg_from_height: None,
+        })
+        .unwrap();
+    let history = sp_read_all_done(&mut s.client, &[b]).await;
+    assert_eq!(heights(b, &history), vec![7]);
+}
+
+/// A connection's subscriptions are capped. Subscribing again to an address
+/// it already has is not counted.
+#[tokio::test]
+async fn sp_subscriptions_are_capped_per_connection() {
+    use crate::silent_scan::{SpChain, SP_CHAIN_WALLETS};
+    use rbitcoin_electrum::silent_scan::SP_MAX_SUBS;
+
+    assert!(usize::from(SP_CHAIN_WALLETS) > SP_MAX_SUBS);
+    let chain = SpChain::new("el-sp-cap", 1, &[]);
+    let params = Arc::new(ChainParams::regtest());
+    let mut conn = ElectrumConn::new();
+    let peer = "127.0.0.1:9".parse().unwrap();
+    let subscribe = async |conn: &mut ElectrumConn, wallet: u8| -> Value {
+        let mut body = Vec::new();
+        let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+        serve_sp_subscribe(
+            &mut writer,
+            &chain.q,
+            &params,
+            &peer,
+            json!(1),
+            &chain.sub_for(wallet, json!(0)),
+            conn,
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        serde_json::from_slice(&body).unwrap()
+    };
+    for wallet in 0..SP_MAX_SUBS {
+        let reply = subscribe(&mut conn, wallet as u8).await;
+        assert!(reply.get("error").is_none(), "{reply}");
+    }
+    assert_eq!(conn.sp_scans.len(), SP_MAX_SUBS);
+    let over = subscribe(&mut conn, SP_MAX_SUBS as u8).await;
+    assert!(
+        over["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("subscription limit"),
+        "{over}"
+    );
+    assert_eq!(conn.sp_scans.len(), SP_MAX_SUBS);
+    let again = subscribe(&mut conn, 0).await;
+    assert!(again.get("error").is_none(), "{again}");
+    assert_eq!(conn.sp_scans.len(), SP_MAX_SUBS);
+}
+
 /// An unsubscribe stops the history scan it names.
 #[tokio::test]
 async fn sp_unsubscribe_drops_a_running_scan() {
@@ -3141,16 +3286,16 @@ async fn sp_unsubscribe_drops_a_running_scan() {
     )
     .await
     .unwrap();
-    assert!(conn.sp_scan.is_some(), "the subscribe starts a scan");
+    assert_eq!(conn.sp_scans.len(), 1, "the subscribe starts a scan");
     let other = json!([
         "1f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c",
         chain.spend_hex
     ]);
     silentpayments_unsubscribe(&mut conn, &chain.q, &params, &other).unwrap();
-    assert!(conn.sp_scan.is_some(), "another key leaves the scan");
+    assert_eq!(conn.sp_scans.len(), 1, "another key leaves the scan");
     let keys = json!([chain.scan_hex, chain.spend_hex]);
     silentpayments_unsubscribe(&mut conn, &chain.q, &params, &keys).unwrap();
-    assert!(conn.sp_scan.is_none(), "the unsubscribe names this scan");
+    assert!(conn.sp_scans.is_empty(), "the unsubscribe names this scan");
 }
 
 /// A tip still pushes a payment after an unsubscribe for a different address.
@@ -3303,11 +3448,11 @@ async fn pruned_scan_miss_is_not_an_empty_history() {
     serve_sp_subscribe(&mut writer, &q, &chain, &peer, json!(1), &params, &mut conn)
         .await
         .unwrap();
-    let step = conn.sp_scan.as_mut().expect("a scan").next_step().await;
-    write_sp_scan_step(&mut writer, &q, &chain, &mut conn, step)
+    let (address, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+    write_sp_scan_step(&mut writer, &q, &chain, &mut conn, &address, step)
         .await
         .unwrap();
-    assert!(conn.sp_scan.is_none(), "a failed scan is over");
+    assert!(conn.sp_scans.is_empty(), "a failed scan is over");
     let text = String::from_utf8(body).unwrap();
     assert!(
         text.contains("window miss"),
@@ -3318,7 +3463,7 @@ async fn pruned_scan_miss_is_not_an_empty_history() {
         "the miss must not finish the scan, got {text}"
     );
     assert!(
-        conn.sp_sub.is_none(),
+        conn.sp_subs.is_empty(),
         "a failed scan is not a live subscription"
     );
     let sub = rbitcoin_electrum::silent_scan::parse_sub(

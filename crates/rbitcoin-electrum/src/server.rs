@@ -459,10 +459,11 @@ pub struct ElectrumConn {
     pub sh_subs: HashSet<[u8; 32]>,
     pub sh_join: Option<Arc<ShJoinSlot>>,
     pub outpoint_subs: HashSet<([u8; 32], u32)>,
-    /// The silent-payment subscription whose history has been sent.
-    pub sp_sub: Option<SpLive>,
-    /// The history scan of a subscribe, until it reaches the tip.
-    pub sp_scan: Option<SpScanRun>,
+    /// Silent-payment subscriptions whose history has been sent.
+    pub sp_subs: Vec<SpLive>,
+    /// History scans of subscribes that have not reached the tip. An address
+    /// is in one of the two lists, once.
+    pub sp_scans: Vec<SpScanRun>,
 }
 
 impl ElectrumConn {
@@ -474,8 +475,8 @@ impl ElectrumConn {
             sh_subs: HashSet::new(),
             sh_join: None,
             outpoint_subs: HashSet::new(),
-            sp_sub: None,
-            sp_scan: None,
+            sp_subs: Vec::new(),
+            sp_scans: Vec::new(),
         }
     }
 }
@@ -537,7 +538,7 @@ where
                             )
                             .await?;
                         }
-                        if let Some(live) = conn.sp_sub.as_mut() {
+                        for live in conn.sp_subs.iter_mut() {
                             let from = live.next_unscanned(&t);
                             if from <= t.height {
                                 emit_sp_tip(&mut writer, &query, &params, &live.sub, from, t.height)
@@ -759,13 +760,9 @@ where
                 let _ = &notify;
             }
             // Last: a scan with steps ready does not hold back a request.
-            step = async {
-                match conn.sp_scan.as_mut() {
-                    Some(run) => run.next_step().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                write_sp_scan_step(&mut writer, &query, &params, &mut conn, step).await?;
+            (address, step) = next_sp_scan_step(&mut conn.sp_scans) => {
+                write_sp_scan_step(&mut writer, &query, &params, &mut conn, &address, step)
+                    .await?;
             }
         }
     }
@@ -1067,8 +1064,8 @@ fn read_conn(conn: &mut ElectrumConn, method: &str) -> ElectrumConn {
             None
         },
         outpoint_subs: HashSet::new(),
-        sp_sub: None,
-        sp_scan: None,
+        sp_subs: Vec::new(),
+        sp_scans: Vec::new(),
     }
 }
 
@@ -1266,8 +1263,8 @@ async fn answer_one(
         sh_subs: std::mem::take(&mut conn.sh_subs),
         sh_join: conn.sh_join.take(),
         outpoint_subs: std::mem::take(&mut conn.outpoint_subs),
-        sp_sub: conn.sp_sub.take(),
-        sp_scan: conn.sp_scan.take(),
+        sp_subs: std::mem::take(&mut conn.sp_subs),
+        sp_scans: std::mem::take(&mut conn.sp_scans),
     };
     let (result, work, stamped, _ran) = spawn_dispatch(ctx, work, &asked)
         .await
@@ -1344,7 +1341,8 @@ fn finish_reply(
 
 /// Frigate subscribe: the result line, then the history scan started beside
 /// the session. Its notes follow from [`write_sp_scan_step`]. A subscribe
-/// while a scan runs replaces that scan.
+/// to an address the connection already has replaces that subscription and
+/// scans again.
 pub async fn serve_sp_subscribe<W>(
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
@@ -1367,6 +1365,17 @@ where
             return Ok(());
         }
     };
+    let held = conn.sp_subs.len() + conn.sp_scans.len();
+    if !sp_subscribed(conn, &sub.address) && held >= crate::silent_scan::SP_MAX_SUBS {
+        let message = format!(
+            "subscription limit reached ({}) for this connection",
+            crate::silent_scan::SP_MAX_SUBS
+        );
+        writer
+            .line(json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": message}}))
+            .await?;
+        return Ok(());
+    }
     let result = crate::silent_scan::subscribe_result(&sub);
     rbitcoin_log::api_call(
         "electrum",
@@ -1378,8 +1387,21 @@ where
     );
     writer.line(rpc_result(&id, &result, None)).await?;
     let last = tip.unwrap_or(sub.start).max(sub.start);
-    conn.sp_scan = Some(SpScanRun::start(query, chain, sub, last));
+    drop_sp_address(conn, &sub.address);
+    conn.sp_scans
+        .push(SpScanRun::start(query, chain, sub, last));
     Ok(())
+}
+
+fn sp_subscribed(conn: &ElectrumConn, address: &str) -> bool {
+    conn.sp_subs.iter().any(|live| live.sub.address == address)
+        || conn.sp_scans.iter().any(|run| run.sub.address == address)
+}
+
+/// End the subscription to `address`, live or still scanning.
+fn drop_sp_address(conn: &mut ElectrumConn, address: &str) {
+    conn.sp_subs.retain(|live| live.sub.address != address);
+    conn.sp_scans.retain(|run| run.sub.address != address);
 }
 
 /// Parse against the confirmed chain: its tip, and its header times for a
@@ -1419,20 +1441,7 @@ pub fn silentpayments_unsubscribe(
     params: &Value,
 ) -> Result<Value, String> {
     let sub = parse_sp_sub_on_chain(params, query, chain)?;
-    if conn
-        .sp_sub
-        .as_ref()
-        .is_some_and(|live| live.sub.address == sub.address)
-    {
-        conn.sp_sub = None;
-    }
-    if conn
-        .sp_scan
-        .as_ref()
-        .is_some_and(|run| run.sub.address == sub.address)
-    {
-        conn.sp_scan = None;
-    }
+    drop_sp_address(conn, &sub.address);
     Ok(json!(sub.address))
 }
 
@@ -1583,13 +1592,24 @@ impl SpScanRun {
             task,
         }
     }
+}
 
-    /// The next chunk or the scan error. `None` when the scan task died.
-    /// Cancel safe: a step stays queued until this returns it.
-    #[doc(hidden)]
-    pub async fn next_step(&mut self) -> Option<Result<SpScanStep, String>> {
-        self.steps.recv().await
-    }
+/// The address of the first scan with a step ready, and that step: a chunk,
+/// the scan error, or `None` when the scan task died. Pending while no scan
+/// has one. Cancel safe: a step stays queued until this returns it.
+#[doc(hidden)]
+pub async fn next_sp_scan_step(
+    scans: &mut [SpScanRun],
+) -> (String, Option<Result<SpScanStep, String>>) {
+    std::future::poll_fn(|cx| {
+        for run in scans.iter_mut() {
+            if let std::task::Poll::Ready(step) = run.steps.poll_recv(cx) {
+                return std::task::Poll::Ready((run.sub.address.clone(), step));
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
 }
 
 /// Scan `sub.start..=last` in chunks, then on to the tip while it keeps
@@ -1655,7 +1675,7 @@ pub async fn run_sp_scan(
 /// Frigate asks for a note with an empty history at regular intervals.
 const SP_PROGRESS_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Write one step of the connection's history scan. The step at the tip
+/// Write one step of the history scan for `address`. The step at the tip
 /// makes the subscription live.
 #[doc(hidden)]
 pub async fn write_sp_scan_step<W: AsyncWrite + Unpin>(
@@ -1663,9 +1683,14 @@ pub async fn write_sp_scan_step<W: AsyncWrite + Unpin>(
     query: &Arc<Query>,
     chain: &ChainParams,
     conn: &mut ElectrumConn,
+    address: &str,
     step: Option<Result<SpScanStep, String>>,
 ) -> Result<(), std::io::Error> {
-    let Some(run) = conn.sp_scan.as_mut() else {
+    let Some(run) = conn
+        .sp_scans
+        .iter_mut()
+        .find(|run| run.sub.address == address)
+    else {
         return Ok(());
     };
     let step = match step {
@@ -1676,7 +1701,7 @@ pub async fn write_sp_scan_step<W: AsyncWrite + Unpin>(
                 _ => "silent payment scan stopped".to_string(),
             };
             let note = sp_scan_error_note(&run.sub, message);
-            conn.sp_scan = None;
+            drop_sp_address(conn, address);
             return writer.line(note).await;
         }
     };
@@ -1694,14 +1719,14 @@ pub async fn write_sp_scan_step<W: AsyncWrite + Unpin>(
         sub: run.sub.clone(),
         through: step.through,
     };
-    conn.sp_scan = None;
+    drop_sp_address(conn, address);
     // A block whose tip event came before this step had no subscription.
     let tip = query.tip_height().map_or(live.through, |tip| tip.0);
     if tip > live.through {
         emit_sp_tip(writer, query, chain, &live.sub, live.through + 1, tip).await?;
         live.through = tip;
     }
-    conn.sp_sub = Some(live);
+    conn.sp_subs.push(live);
     Ok(())
 }
 
@@ -2487,8 +2512,8 @@ pub fn dispatch(
         sh_subs: std::mem::take(sh_subs),
         sh_join: None,
         outpoint_subs: HashSet::new(),
-        sp_sub: None,
-        sp_scan: None,
+        sp_subs: Vec::new(),
+        sp_scans: Vec::new(),
     };
     let r = dispatch_with_join(method, params, query, config, chain, mempool, &mut conn);
     *header_sub = conn.header_sub;

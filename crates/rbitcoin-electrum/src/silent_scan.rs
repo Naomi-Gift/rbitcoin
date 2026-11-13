@@ -20,6 +20,9 @@ pub const SP_START_TIME_THRESHOLD: u32 = 500_000_000;
 /// Bitcoin Core's `TIMESTAMP_WINDOW`: how far a block's time may trail the
 /// clock that mined it. A timestamp start scans from this much earlier.
 pub const SP_TIMESTAMP_WINDOW: u32 = 2 * 60 * 60;
+/// Silent-payment addresses one connection may subscribe. Each scans every
+/// new block. Not a knob.
+pub const SP_MAX_SUBS: usize = 16;
 /// Heights held under one scan permit before the next chunk.
 pub const SP_SCAN_CHUNK: u32 = 256;
 /// Process-wide historical scans. Not a knob.
