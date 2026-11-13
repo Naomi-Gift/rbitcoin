@@ -1784,7 +1784,13 @@ pub fn restart_sp_scans_after_reorg(
     };
     for run in scans.iter_mut() {
         let from = run.next.min(fork.saturating_add(1)).max(run.sub.start);
-        let last = run.sub.end.unwrap_or(tip.height).max(from);
+        // A range that ended above the new tip ends at the tip: the heights
+        // above it are gone.
+        let last = run
+            .sub
+            .end
+            .map_or(tip.height, |end| end.min(tip.height))
+            .max(from);
         run.restart(query, chain, from, last);
     }
 }
@@ -1908,8 +1914,10 @@ pub async fn write_sp_scan_step<W: AsyncWrite + Unpin>(
         {
             return Ok(());
         }
-        live.through = tip;
     }
+    // Also down: a step that finished above the chain tip scanned heights
+    // a reorg removed, and the blocks that connect there are not scanned yet.
+    live.through = tip;
     conn.sp_subs.push(live);
     Ok(())
 }

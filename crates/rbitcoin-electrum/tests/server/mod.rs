@@ -3996,6 +3996,68 @@ async fn sp_reorg_to_a_lower_tip_rewinds_the_scan() {
     assert_eq!(note["params"][2][0]["height"], 9, "{note}");
 }
 
+/// A reorg may leave the tip below the end of a closed range that is still
+/// being scanned. The scan ends at the new tip, and the subscription does
+/// not count the heights above it as scanned.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_reorg_below_a_range_end_stops_the_scan_at_the_tip() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-range-reorg", 15, &[]);
+    let params = Arc::new(ChainParams::regtest());
+    let cfg = sp_cfg_short_steps();
+    let mut conn = ElectrumConn::new();
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    serve_sp_subscribe(
+        &mut writer,
+        &chain.q,
+        &params,
+        &"127.0.0.1:9".parse().unwrap(),
+        json!(1),
+        &chain.sub(json!("0-15")),
+        &mut conn,
+        &cfg,
+    )
+    .await
+    .unwrap();
+    // The chain forks at 4 and its new tip is 9, below the range end.
+    let reorg = TipNotify {
+        height: 9,
+        header_hex: String::new(),
+        reorg_from_height: Some(4),
+    };
+    restart_sp_scans_after_reorg(&mut conn.sp_scans, &chain.q, &params, &reorg);
+    let last = loop {
+        let (_, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+        let step = step.unwrap().unwrap();
+        assert!(step.through <= 9, "scanned {} past the tip", step.through);
+        if step.progress >= 1.0 {
+            break step.through;
+        }
+    };
+    assert_eq!(last, 9, "the scan ends at the new tip");
+
+    // A finished step above the chain tip leaves the subscription at the tip.
+    let address = conn.sp_scans[0].sub.address.clone();
+    let past_tip = SpScanStep {
+        hits: Vec::new(),
+        through: 20,
+        progress: 1.0,
+    };
+    write_sp_scan_step(
+        &mut writer,
+        &chain.q,
+        &params,
+        &mut conn,
+        &address,
+        Some(Ok(past_tip)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(conn.sp_subs[0].through, 15, "the chain tip is 15");
+}
+
 /// A start the node cannot read is refused in the reply to the subscribe.
 /// A JSON-RPC notification has no error member for it.
 #[tokio::test(flavor = "current_thread")]
