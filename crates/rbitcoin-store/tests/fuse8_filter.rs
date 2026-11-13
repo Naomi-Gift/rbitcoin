@@ -250,14 +250,8 @@ fn decode_body_rejects_fingerprint_len_below_hash_geometry() {
 
 #[test]
 fn fuse_key_from_mixed_xors_quarters() {
-    let mut m = [0u8; 32];
-    m[0] = 1;
-    m[8] = 2;
-    m[16] = 4;
-    m[24] = 8;
-    let k = fuse_key_from_mixed(&m);
-    assert_eq!(k, 1u64 ^ 2u64 ^ 4u64 ^ 8u64); // LE quarters xor
-                                              // All-zero → zero.
+    let m: [u8; 32] = std::array::from_fn(|i| (i as u8).wrapping_mul(3).wrapping_add(1));
+    assert_eq!(fuse_key_from_mixed(&m), 2_314_885_668_798_488_672);
     assert_eq!(fuse_key_from_mixed(&[0u8; 32]), 0);
 }
 

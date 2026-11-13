@@ -101,14 +101,16 @@ pub fn open_file(path: &Path) -> Result<SealedFuse8, StoreError> {
     let mut map = ReadonlyMap::map_path(path)?;
     let geo = {
         let bytes = map.as_file_bytes();
-        if bytes.len() < 16 {
+        let Some(head) = bytes.first_chunk::<16>() else {
+            return Err(StoreError::Corrupt("tx.head fuse magic"));
+        };
+        if &head[0..4] != MAGIC {
             return Err(StoreError::Corrupt("tx.head fuse magic"));
         }
-        if &bytes[0..4] != MAGIC {
-            return Err(StoreError::Corrupt("tx.head fuse magic"));
-        }
-        let ver = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let len = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let ver = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+        let len = u64::from_le_bytes([
+            head[8], head[9], head[10], head[11], head[12], head[13], head[14], head[15],
+        ]);
         let Some(end) = 16u64.checked_add(len) else {
             return Err(StoreError::Corrupt("fuse8 v2 body unreadable"));
         };

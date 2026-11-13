@@ -159,6 +159,24 @@ fn poison_prev_edge_shrinks_tip() {
 }
 
 #[test]
+fn tip_seal_roundtrip_keeps_each_field() {
+    let dir = tmp();
+    let seal = TipSeal {
+        tip_height: 0x0403_0201,
+        tip_hash: std::array::from_fn(|i| i as u8),
+        confirmed_len: 0x0807_0605_0403_0201,
+        generation: 0x100f_0e0d_0c0b_0a09,
+    };
+    seal.store(&dir).unwrap();
+    let back = TipSeal::load(&dir).unwrap().expect("seal");
+    assert_eq!(back.tip_height, seal.tip_height);
+    assert_eq!(back.tip_hash, seal.tip_hash);
+    assert_eq!(back.confirmed_len, seal.confirmed_len);
+    assert_eq!(back.generation, seal.generation);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn tip_seal_clamps_unsealed_extension() {
     let dir = tmp();
     let s = Store::create_tiny(&dir).unwrap();

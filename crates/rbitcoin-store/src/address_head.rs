@@ -553,7 +553,9 @@ pub fn decode_layout_ext(ext: &[u8; 16]) -> Result<(HeadLayout, u64), StoreError
         ));
     }
     let bits = u32::from(ext[6]);
-    let generation = u64::from_le_bytes(ext[8..16].try_into().unwrap());
+    let generation = u64::from_le_bytes([
+        ext[8], ext[9], ext[10], ext[11], ext[12], ext[13], ext[14], ext[15],
+    ]);
     Ok((HeadLayout::new(bits)?, generation))
 }
 

@@ -421,9 +421,15 @@ fn ensure_same_hash_twice_is_idempotent() {
 #[test]
 fn header_record_roundtrip_is_88_bytes() {
     let rec = HeaderRecord {
+        prev_fk: Fk(0x0807_0605_0403_0201),
+        version: 0x0403_0201,
+        timestamp: 0x0807_0605,
+        bits: 0x0c0b_0a09,
+        nonce: 0x100f_0e0d,
+        merkle_root: std::array::from_fn(|i| i as u8),
+        hash: std::array::from_fn(|i| (i as u8).wrapping_add(32)),
         size: 285,
         weight: 1140,
-        ..sample([1u8; 32])
     };
     let enc = rec.encode();
     assert_eq!(enc.len(), HEADER_RECORD_LEN);
