@@ -377,3 +377,61 @@ fn height_index_survives_promote_and_dequeue() {
     assert_eq!(q.id_for_height(12), Some(3));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A height sits in the window that starts at the lowest queued height.
+/// Dropping that lowest height moves the window up, and a later body below
+/// the new low does not revive the dropped id.
+#[test]
+fn height_lookup_is_a_window_from_the_lowest() {
+    let mut q = BlockQueue::empty();
+    q.enqueue(10, [1u8; 32], 1, b"a").unwrap();
+    q.enqueue(12, [2u8; 32], 1, b"b").unwrap();
+    assert_eq!(q.height_to_id.lowest(), Some(10));
+    assert_eq!(q.height_to_id.get(11), None);
+    assert_eq!(q.min_height(), Some(10));
+    assert_eq!(q.max_height(), Some(12));
+    assert_eq!(q.dequeue_height(10).unwrap(), 1);
+    assert_eq!(q.height_to_id.lowest(), Some(12));
+    assert_eq!(q.height_to_id.get(10), None);
+    assert_eq!(q.min_height(), Some(12));
+    let id = q.enqueue(8, [3u8; 32], 1, b"c").unwrap();
+    assert_eq!(q.height_to_id.lowest(), Some(8));
+    assert_eq!(q.height_to_id.get(9), None);
+    assert_eq!(q.height_to_id.get(10), None);
+    assert_eq!(q.height_to_id.get(11), None);
+    assert_eq!(q.id_for_height(8), Some(id));
+    assert!(q.contains_height(12));
+    assert_eq!(q.heights(), vec![8, 12]);
+
+    let mut q = BlockQueue::empty();
+    q.enqueue(10, [1u8; 32], 1, b"a").unwrap();
+    q.enqueue(11, [2u8; 32], 1, b"b").unwrap();
+    q.enqueue(12, [3u8; 32], 1, b"c").unwrap();
+    assert_eq!(q.dequeue_height(10).unwrap(), 1);
+    assert_eq!(q.height_to_id.lowest(), Some(11));
+    assert_eq!(q.height_to_id.get(10), None);
+    let again = q.enqueue(10, [4u8; 32], 1, b"d").unwrap();
+    assert_eq!(q.id_for_height(10), Some(again));
+    assert!(q.contains_height(11));
+    assert!(q.contains_height(12));
+    assert_eq!(q.heights(), vec![10, 11, 12]);
+}
+
+/// One queued hash keeps its height without a side list. A second height is
+/// the list, and dropping back to one height removes that list.
+#[test]
+fn one_queued_hash_keeps_its_height_inline() {
+    let mut q = BlockQueue::empty();
+    let hash = [4u8; 32];
+    q.enqueue(4, hash, 1, b"a").unwrap();
+    assert!(q.by_hash.get(&hash).unwrap().is_inline());
+    assert_eq!(q.heights_for_hash(&hash), vec![4]);
+    q.enqueue(7, hash, 1, b"b").unwrap();
+    assert!(!q.by_hash.get(&hash).unwrap().is_inline());
+    assert_eq!(q.heights_for_hash(&hash), vec![4, 7]);
+    assert_eq!(q.dequeue_height(4).unwrap(), 1);
+    assert!(q.by_hash.get(&hash).unwrap().is_inline());
+    assert_eq!(q.heights_for_hash(&hash), vec![7]);
+    assert_eq!(q.dequeue_height(7).unwrap(), 1);
+    assert!(!q.has_hash(&hash));
+}
