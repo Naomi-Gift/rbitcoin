@@ -2244,7 +2244,7 @@ fn header_timeout_retire_is_not_a_solo_or_racing_tip() {
         None,
     );
     assert!(
-        st.inflight[&h(1)].peers.contains(&0) && !st.inflight[&h(1)].retired.contains(&0),
+        st.inflight[&h(1)].is_racing(0) && !st.inflight[&h(1)].is_retired(0),
         "one alive peer keeps the frontier hole"
     );
 
@@ -2267,7 +2267,7 @@ fn header_timeout_retire_is_not_a_solo_or_racing_tip() {
         Some(5.0),
     );
     assert!(
-        st.inflight[&h(1)].peers.contains(&0),
+        st.inflight[&h(1)].is_racing(0),
         "a racing tip does not retire the timeout owner first"
     );
     let _ = std::fs::remove_dir_all(dir);
@@ -2322,7 +2322,7 @@ fn assign_counts_each_getdata_and_rotates_reorg_peers() {
     st.body.mark_missing(b);
     assign_work_ordered(&mut st, &hub, &cfg, &stats, AssignDepth::Critical, None);
     assert_eq!(stats.assign_issued.load(Ordering::Relaxed), 2);
-    assert!(st.inflight[&a].peers.contains(&0) && st.inflight[&b].peers.contains(&1));
+    assert!(st.inflight[&a].is_racing(0) && st.inflight[&b].is_racing(1));
     let _ = std::fs::remove_dir_all(dir);
 }
 
@@ -2491,8 +2491,7 @@ fn dead_hung_owner_stays_and_sole_streamer_is_kept() {
     st.slots[0].alive = false;
     let req = st.inflight.get_mut(&h(40)).unwrap();
     req.started_at = Instant::now() - Duration::from_secs(31);
-    req.asked_at
-        .insert(0, Instant::now() - Duration::from_secs(31));
+    req.set_asked_at(0, Instant::now() - Duration::from_secs(31));
     seed_ewma(&mut st.slots[1], 5_000_000);
     let mut caps = HashMap::new();
     caps.insert(0, 16);
@@ -2502,7 +2501,7 @@ fn dead_hung_owner_stays_and_sole_streamer_is_kept() {
         0,
         "a dead owner is not hung densify"
     );
-    assert!(st.inflight[&h(40)].peers.contains(&0));
+    assert!(st.inflight[&h(40)].is_racing(0));
 
     let hash = h(8);
     let mut owner = dummy_slot(0);
@@ -2512,7 +2511,7 @@ fn dead_hung_owner_stays_and_sole_streamer_is_kept() {
     let mut req = state::InflightReq::new(0);
     let ago = Instant::now() - Duration::from_secs(31);
     req.started_at = ago;
-    req.asked_at.insert(0, ago);
+    req.set_asked_at(0, ago);
     assert_eq!(
         tip_hole_owner_to_drop(&req, &hash, &[owner], 16, 1024),
         None,
@@ -2536,8 +2535,7 @@ fn cover_keeps_later_holes_and_skips_dead_retired() {
     plant_tip_hole(&mut st, next, 2);
     let mut req = state::InflightReq::new(0);
     req.retire_peer(0);
-    req.asked_at
-        .insert(0, Instant::now() - Duration::from_secs(31));
+    req.set_asked_at(0, Instant::now() - Duration::from_secs(31));
     st.inflight.insert(hole, req);
     st.slots[0].in_flight.insert(hole);
     assert_eq!(
@@ -2546,7 +2544,7 @@ fn cover_keeps_later_holes_and_skips_dead_retired() {
         "no alive peer means no re-ask"
     );
     assert!(
-        st.inflight[&hole].peers.is_empty(),
+        st.inflight[&hole].is_empty(),
         "the retired owner stays retired"
     );
 
@@ -2556,7 +2554,7 @@ fn cover_keeps_later_holes_and_skips_dead_retired() {
         0,
         "a dead retired owner is not re-asked"
     );
-    assert!(!st.inflight[&hole].peers.contains(&0));
+    assert!(!st.inflight[&hole].is_racing(0));
 
     st.slots[0].alive = true;
     st.inflight.remove(&hole);
