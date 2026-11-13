@@ -697,7 +697,13 @@ where
                 }
                 let req: Value = match parse_electrum_request_line(&line) {
                     Some(v) => v,
-                    None => continue,
+                    None => {
+                        writer.line(json!({
+                            "jsonrpc":"2.0","id":null,
+                            "error":{"code":-32700,"message":"parse error"}
+                        })).await?;
+                        continue;
+                    }
                 };
                 let ctx = RequestCtx {
                     peer,

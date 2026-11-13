@@ -1247,7 +1247,17 @@ async fn accept_client_ping_and_shutdown() {
     );
 
     stream.write_all(b"\n").await.unwrap();
-    stream.write_all(b"{not json\n").await.unwrap();
+    stream
+        .write_all(b"{\"id\":2,\"method\":\"server.ping\",}\n")
+        .await
+        .unwrap();
+    let bad: Value = serde_json::from_str(&read_exact_line(&mut stream).await).unwrap();
+    assert_eq!(
+        bad,
+        json!({"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}})
+    );
+    let pong = electrum_tcp_rpc(&mut stream, 2, "server.ping", json!([])).await;
+    assert_eq!(pong, json!({"jsonrpc":"2.0","id":2,"result":null}));
     let v = electrum_tcp_rpc(&mut stream, 2, "server.version", json!([])).await;
     assert_eq!(v["id"], 2);
     let ver = v["result"].as_array().expect("version array");
