@@ -3442,6 +3442,51 @@ fn again_through(conn: &ElectrumConn) -> u32 {
     conn.sp_scans[0].next
 }
 
+/// The end of a range is coverage too: a re-subscribe keeps the later end,
+/// and an open subscription stays open.
+#[tokio::test]
+async fn sp_resubscribe_keeps_the_later_end() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-end", 9, &[]);
+    let params = Arc::new(ChainParams::regtest());
+    let mut conn = ElectrumConn::new();
+    let peer = "127.0.0.1:9".parse().unwrap();
+    let subscribe = async |conn: &mut ElectrumConn, wallet: u8, start: Value| {
+        let mut body = Vec::new();
+        let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+        serve_sp_subscribe(
+            &mut writer,
+            &chain.q,
+            &params,
+            &peer,
+            json!(1),
+            &chain.sub_for(wallet, start),
+            conn,
+            DEFAULT_MAX_SP_SUBS,
+        )
+        .await
+        .unwrap();
+    };
+    let held = |conn: &ElectrumConn, wallet: usize| {
+        let sub = &conn.sp_scans[wallet].sub;
+        (sub.start, sub.end)
+    };
+    // Open, then a range: still open.
+    subscribe(&mut conn, 0, json!(2)).await;
+    subscribe(&mut conn, 0, json!("5-7")).await;
+    assert_eq!(held(&conn, 0), (2, None));
+    // Two ranges: the earlier start and the later end.
+    subscribe(&mut conn, 1, json!("4-6")).await;
+    subscribe(&mut conn, 1, json!("1-3")).await;
+    assert_eq!(held(&conn, 1), (1, Some(6)));
+    subscribe(&mut conn, 1, json!("5-8")).await;
+    assert_eq!(held(&conn, 1), (1, Some(8)));
+    // A range, then open: open.
+    subscribe(&mut conn, 1, json!(9)).await;
+    assert_eq!(held(&conn, 1), (1, None));
+}
+
 /// An unsubscribe stops the history scan it names.
 #[tokio::test]
 async fn sp_unsubscribe_drops_a_running_scan() {

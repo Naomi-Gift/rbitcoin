@@ -1372,11 +1372,14 @@ where
         }
     };
     // Frigate: a subscribe must not narrow the coverage the address has.
-    if let Some(held_start) = sp_start(conn, &sub.address) {
-        sub.start = sub.start.min(held_start);
+    let held_range = sp_held_range(conn, &sub.address);
+    if let Some((start, end)) = held_range {
+        sub.start = sub.start.min(start);
+        // An open subscription stays open. Two ranges keep the later end.
+        sub.end = sub.end.zip(end).map(|(new, held)| new.max(held));
     }
     let held = conn.sp_subs.len() + conn.sp_scans.len();
-    if sp_start(conn, &sub.address).is_none() && held >= max_subs {
+    if held_range.is_none() && held >= max_subs {
         let message = format!("subscription limit reached ({max_subs}) for this connection");
         writer
             .line(json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": message}}))
@@ -1417,13 +1420,14 @@ where
     Ok(())
 }
 
-/// The start height of the connection's subscription to `address`.
-fn sp_start(conn: &ElectrumConn, address: &str) -> Option<u32> {
+/// The start, and the end of a closed range, of the connection's
+/// subscription to `address`.
+fn sp_held_range(conn: &ElectrumConn, address: &str) -> Option<(u32, Option<u32>)> {
     let live = conn.sp_subs.iter().map(|live| &live.sub);
     let scanning = conn.sp_scans.iter().map(|run| &run.sub);
     live.chain(scanning)
         .find(|sub| sub.address == address)
-        .map(|sub| sub.start)
+        .map(|sub| (sub.start, sub.end))
 }
 
 /// End the subscription to `address`, live or still scanning.
