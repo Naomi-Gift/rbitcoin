@@ -1390,21 +1390,14 @@ pub async fn block_header(State(st): State<AppState>, Path(hash_hex): Path<Strin
     let Ok(hash) = parse_hash32(&hash_hex) else {
         return not_found();
     };
-    match st.query.get_header_by_hash(&hash) {
-        Ok(Some((fk, rec))) => {
-            match st.query.store().header_txs.get_range(fk) {
-                Ok(None) => return not_found(),
-                Err(e) => return store_err(e),
-                Ok(Some(_)) => {}
-            }
-            match st.query.wire_header_from_record(&rec) {
-                Ok(hdr) => match encode_header_hex(&hdr) {
-                    Ok(hex) => plain_ok(hex),
-                    Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
-                },
-                Err(e) => store_err(e),
-            }
-        }
+    match st.query.connected_block_header(&hash) {
+        Ok(Some((_, rec))) => match st.query.wire_header_from_record(&rec) {
+            Ok(hdr) => match encode_header_hex(&hdr) {
+                Ok(hex) => plain_ok(hex),
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+            },
+            Err(e) => store_err(e),
+        },
         Ok(None) => not_found(),
         Err(e) => store_err(e),
     }

@@ -16,6 +16,12 @@ info:
     optional `0x` or `0X` prefix. A malformed hash in a path or in `?asof=`
     returns **404** `Not Found`.
 
+    ## Stored block reads
+    Hash-addressed block routes admit active blocks and blocks disconnected
+    during the current process. Header-only and never-connected bodies are 404.
+    Restart forgets disconnected membership: reopened stale blocks are 404
+    until reconnected and disconnected again. This does not relax `?asof=`.
+
     ## Chain-view headers
     Pinned responses carry `X-Bitcoin-Chain-Tip` (block hash) and
     `X-Bitcoin-Chain-Tip-Height`. Both are CORS-exposed. Block, tx, and header
@@ -135,8 +141,8 @@ paths:
   /block/{hash}:
     get:
       tags: [blocks]
-      summary: Block summary (active or archived stale block)
-      description: Height resolution walks at most 10,000 headers to an active ancestor or genesis; beyond that, 404. Median time uses this branch.
+      summary: Block summary (active or disconnected by this process)
+      description: Height resolution walks at most 10,000 headers to an active ancestor or genesis; beyond that, 404. Median time uses this branch. Stale summaries require complete txstat rows; unstamped stale summaries are 404 without witness reconstruction.
       parameters: [{ $ref: "#/components/parameters/BlockHash" }]
       responses:
         "200":
@@ -150,7 +156,7 @@ paths:
     get:
       tags: [blocks]
       summary: 80-byte block header as hex
-      description: A stored header without an archived body is 404.
+      description: Requires an active block or a body disconnected during this process.
       parameters: [{ $ref: "#/components/parameters/BlockHash" }]
       responses:
         "200": { $ref: "#/components/responses/PlainHex" }
@@ -159,7 +165,7 @@ paths:
     get:
       tags: [blocks]
       summary: Whether the block is on the best chain
-      description: Stored stale blocks retain their original height and have null next_best. A stored header without an archived body is 404. Height resolution is limited to 10,000 headers; beyond that, 404.
+      description: Blocks disconnected during this process retain their original height and have null next_best. A stored header without an archived body is 404. Height resolution is limited to 10,000 headers; beyond that, 404.
       parameters: [{ $ref: "#/components/parameters/BlockHash" }]
       responses:
         "200":
@@ -221,7 +227,8 @@ paths:
         Not in Blockstream Esplora API.md. One array row per tx in block order,
         coinbase first (fee 0). Same 404s as `/txids`; this static segment wins
         over `/txs/{start_index}`. No `--sh-index`. A pruned block whose
-        `txstat` rows predate schema 25 is 404 `pruned`.
+        `txstat` rows predate schema 25 is 404 `pruned` on the active chain.
+        An unstamped stale block is 404 without reconstruction.
       parameters: [{ $ref: "#/components/parameters/BlockHash" }]
       responses:
         "200":

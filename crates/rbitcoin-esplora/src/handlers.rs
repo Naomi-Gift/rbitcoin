@@ -79,7 +79,7 @@ fn stored_header_median_time(
 
 fn stored_block_tx_span(query: &Query, hash: &[u8; 32]) -> Result<(Fk, u32), StoreError> {
     let (header_fk, _) = query
-        .get_header_by_hash(hash)?
+        .connected_block_header(hash)?
         .ok_or(StoreError::NotFound)?;
     query
         .store()
@@ -94,14 +94,14 @@ pub fn block_summary_json(
     hash: &[u8; 32],
 ) -> Result<Value, rbitcoin_query::QueryError> {
     let (header_fk, rec) = query
-        .get_header_by_hash(hash)?
+        .connected_block_header(hash)?
         .ok_or(StoreError::NotFound)?;
     let (_, tx_count) = query
         .store()
         .header_txs
         .get_range(header_fk)?
         .ok_or(StoreError::NotFound)?;
-    let best_height = query.confirmed_height_of_hash(hash)?;
+    let best_height = query.published_height_of_hash(hash);
     let height = match best_height {
         Some(h) => h,
         None => stored_header_height(query, &rec)?,
@@ -111,9 +111,11 @@ pub fn block_summary_json(
     } else {
         query.store().get_header(rec.prev_fk)?.hash
     };
-    let (size, weight) = query
-        .block_size_weight(header_fk)?
-        .ok_or(rbitcoin_store::StoreError::NotFound)?;
+    let size_weight = match best_height {
+        Some(_) => query.block_size_weight(header_fk)?,
+        None => query.stamped_block_size_weight(header_fk)?,
+    };
+    let (size, weight) = size_weight.ok_or(StoreError::NotFound)?;
     let difficulty =
         Target::from_compact(CompactTarget::from_consensus(rec.bits)).difficulty_float();
     let mediantime = match best_height {
@@ -196,18 +198,25 @@ pub async fn block_raw(State(st): State<AppState>, Path(hash_hex): Path<String>)
         return not_found();
     };
     let q = std::sync::Arc::clone(&st.query);
-    spawn_join(move || match q.reconstruct_archived_block(&hash) {
-        Ok(Some(block)) => {
-            let raw = serialize(&block);
-            (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/octet-stream")],
-                raw,
-            )
-                .into_response()
+    spawn_join(move || {
+        match q.connected_block_header(&hash) {
+            Ok(Some(_)) => {}
+            Ok(None) => return not_found(),
+            Err(e) => return store_err(e),
         }
-        Ok(None) => not_found(),
-        Err(e) => store_err(e),
+        match q.reconstruct_archived_block(&hash) {
+            Ok(Some(block)) => {
+                let raw = serialize(&block);
+                (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/octet-stream")],
+                    raw,
+                )
+                    .into_response()
+            }
+            Ok(None) => not_found(),
+            Err(e) => store_err(e),
+        }
     })
     .await
 }
@@ -218,18 +227,13 @@ pub async fn block_status(State(st): State<AppState>, Path(hash_hex): Path<Strin
     };
     let q = std::sync::Arc::clone(&st.query);
     spawn_join(move || {
-        let (header_fk, rec) = match q.get_header_by_hash(&hash) {
+        let (_, rec) = match q.connected_block_header(&hash) {
             Ok(Some(header)) => header,
             Ok(None) => return not_found(),
             Err(e) => return store_err(e),
         };
-        match q.store().header_txs.get_range(header_fk) {
-            Ok(None) => return not_found(),
-            Err(e) => return store_err(e),
-            Ok(Some(_)) => {}
-        }
-        match q.confirmed_height_of_hash(&hash) {
-            Ok(None) => match stored_header_height(&q, &rec) {
+        match q.published_height_of_hash(&hash) {
+            None => match stored_header_height(&q, &rec) {
                 Ok(h) => json_reply_here(json!({
                     "in_best_chain": false,
                     "height": h.0,
@@ -237,7 +241,7 @@ pub async fn block_status(State(st): State<AppState>, Path(hash_hex): Path<Strin
                 })),
                 Err(e) => store_err(e),
             },
-            Ok(Some(h)) => {
+            Some(h) => {
                 let next_best = if let Some(tip) = st.query.tip_height() {
                     if h.0 < tip.0 {
                         match st.query.header_at_height(Height(h.0 + 1)) {
@@ -256,7 +260,6 @@ pub async fn block_status(State(st): State<AppState>, Path(hash_hex): Path<Strin
                     "next_best": next_best,
                 }))
             }
-            Err(e) => store_err(e),
         }
     })
     .await
@@ -344,16 +347,11 @@ pub async fn block_txids(State(st): State<AppState>, Path(hash_hex): Path<String
         let Ok(hash) = parse_hash32(&hash_hex) else {
             return not_found();
         };
-        let header_fk = match st.query.get_header_by_hash(&hash) {
+        let header_fk = match st.query.connected_block_header(&hash) {
             Ok(Some((fk, _))) => fk,
             Ok(None) => return not_found(),
             Err(e) => return store_err(e),
         };
-        match st.query.store().header_txs.get_range(header_fk) {
-            Ok(None) => return not_found(),
-            Err(e) => return store_err(e),
-            Ok(Some(_)) => {}
-        }
         match st.query.header_txids(header_fk) {
             Ok(ids) => json_reply_here(ids.iter().map(block_hash_hex).collect::<Vec<_>>()),
             Err(e) => store_err(e),

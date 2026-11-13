@@ -748,7 +748,7 @@ async fn pin_esplora_block_json_raw_status(
 }
 
 #[allow(clippy::cognitive_complexity)] // One invalidate/reconsider HTTP session across block routes.
-async fn pin_esplora_stale_block(rpc: SocketAddr, http: SocketAddr) {
+async fn pin_esplora_stale_block(rpc: SocketAddr, http: SocketAddr) -> String {
     let mined = jsonrpc(rpc, "generate", json!([2])).await;
     let hashes = mined["result"].as_array().expect("mined hashes");
     let first = hashes[0].as_str().unwrap();
@@ -832,6 +832,9 @@ async fn pin_esplora_stale_block(rpc: SocketAddr, http: SocketAddr) {
             true
         );
     }
+    let invalidated = jsonrpc(rpc, "invalidateblock", json!([first])).await;
+    assert!(invalidated["error"].is_null(), "{invalidated}");
+    tip.to_owned()
 }
 
 async fn pin_esplora_txid_raw_hex_merkleblock(
@@ -2764,7 +2767,7 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
     };
     assert!(history, "fee history missing connected height {tip}");
 
-    pin_esplora_stale_block(rpc_addr, esplora_addr).await;
+    let stale_hash = pin_esplora_stale_block(rpc_addr, esplora_addr).await;
 
     let _ = jsonrpc(rpc_addr, "stop", json!([])).await;
     let stopped = tokio::time::timeout(Duration::from_secs(15), node).await;
@@ -2774,6 +2777,51 @@ async fn esplora_broadcast_visible_in_rpc_and_electrum() {
         Ok(Err(e)) => panic!("run_p2p join: {e}"),
         Err(_) => panic!("run_p2p did not exit after stop"),
     }
+
+    let reopened = Arc::new(Query::open_or_create_tiny(td.store_path()).unwrap());
+    let stale_bytes = bitcoin::BlockHash::from_str(&stale_hash)
+        .unwrap()
+        .to_byte_array();
+    assert!(
+        reopened
+            .reconstruct_archived_block(&stale_bytes)
+            .unwrap()
+            .is_some(),
+        "restart retains the stale block's archived body"
+    );
+    let (_, active) = reopened
+        .header_at_height(reopened.tip_height().unwrap())
+        .unwrap()
+        .unwrap();
+    let active_hash = bitcoin::BlockHash::from_byte_array(active.hash).to_string();
+    let cfg = rbitcoin_esplora::EsploraConfig::with_network(
+        "127.0.0.1:0".parse().unwrap(),
+        bitcoin::Network::Regtest,
+    );
+    let listener = rbitcoin_esplora::run_esplora(cfg, reopened, None)
+        .await
+        .expect("reopen Esplora");
+    for suffix in [
+        "",
+        "/status",
+        "/header",
+        "/raw",
+        "/txids",
+        "/txid/0",
+        "/txs",
+        "/txs/0",
+        "/txs/summary",
+    ] {
+        let (code, _) =
+            http_get_raw(listener.local_addr, &format!("/block/{stale_hash}{suffix}")).await;
+        assert_eq!(
+            code, 404,
+            "stale membership is forgotten on restart: {suffix}"
+        );
+    }
+    let (code, body) = http_get(listener.local_addr, &format!("/block/{active_hash}")).await;
+    assert_eq!(code, 200, "active block after restart: {body}");
+    listener.shutdown().await;
 }
 
 /// Nothing listens here. A pinned `--connect` at genesis still enters tip mode.
