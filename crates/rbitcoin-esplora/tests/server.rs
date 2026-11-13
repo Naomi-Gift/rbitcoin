@@ -1226,6 +1226,24 @@ async fn block_txs_summary_rows_and_misses() {
         assert_eq!(st, want, "{path}: {body}");
     }
 
+    let parent_fk = q.header_at_height(Height(3)).unwrap().unwrap().0;
+    let (header_only, _) = coinbase(4, parent_fk, Some(h3.hash));
+    q.put_header(&header_only).unwrap();
+    let header_only_hex = block_hash_hex(&header_only.hash);
+    for suffix in [
+        "",
+        "/status",
+        "/header",
+        "/raw",
+        "/txids",
+        "/txid/0",
+        "/txs",
+        "/txs/summary",
+    ] {
+        let (st, _, _) = http_get_raw(addr, &format!("/block/{header_only_hex}{suffix}")).await;
+        assert_eq!(st, 404, "header without an archived body: {suffix}");
+    }
+
     q.disconnect_tip().unwrap();
     let (mut alt, alt_cb) = coinbase(3, prev, parent_hash);
     alt.nonce += 1;

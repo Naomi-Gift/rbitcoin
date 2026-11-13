@@ -42,14 +42,14 @@ pub const MEMPOOL_TX_PAGE: usize = 50;
 pub type JoinBag = HashMap<[u8; 32], Arc<ShJoinSlot>>;
 
 /// Original height of a stored header. O(stale branch depth), capped at
-/// 10,000 headers; active membership uses the query's height index.
+/// 10,000 headers. Callers refresh the active height index once before this walk.
 fn stored_header_height(
     query: &Query,
     rec: &rbitcoin_store::HeaderRecord,
 ) -> Result<Height, StoreError> {
     let mut rec = rec.clone();
     for depth in 0..10_000u32 {
-        if let Some(height) = query.confirmed_height_of_hash(&rec.hash)? {
+        if let Some(height) = query.published_height_of_hash(&rec.hash) {
             return Ok(Height(height.0 + depth));
         }
         if rec.prev_fk.is_null() {
@@ -96,6 +96,11 @@ pub fn block_summary_json(
     let (header_fk, rec) = query
         .get_header_by_hash(hash)?
         .ok_or(StoreError::NotFound)?;
+    let (_, tx_count) = query
+        .store()
+        .header_txs
+        .get_range(header_fk)?
+        .ok_or(StoreError::NotFound)?;
     let best_height = query.confirmed_height_of_hash(hash)?;
     let height = match best_height {
         Some(h) => h,
@@ -106,12 +111,6 @@ pub fn block_summary_json(
     } else {
         query.store().get_header(rec.prev_fk)?.hash
     };
-    let tx_count = query
-        .store()
-        .header_txs
-        .get_range(header_fk)?
-        .map(|(_, n)| n)
-        .unwrap_or(0);
     let (size, weight) = query
         .block_size_weight(header_fk)?
         .ok_or(rbitcoin_store::StoreError::NotFound)?;
@@ -219,11 +218,16 @@ pub async fn block_status(State(st): State<AppState>, Path(hash_hex): Path<Strin
     };
     let q = std::sync::Arc::clone(&st.query);
     spawn_join(move || {
-        let rec = match q.get_header_by_hash(&hash) {
-            Ok(Some((_, rec))) => rec,
+        let (header_fk, rec) = match q.get_header_by_hash(&hash) {
+            Ok(Some(header)) => header,
             Ok(None) => return not_found(),
             Err(e) => return store_err(e),
         };
+        match q.store().header_txs.get_range(header_fk) {
+            Ok(None) => return not_found(),
+            Err(e) => return store_err(e),
+            Ok(Some(_)) => {}
+        }
         match q.confirmed_height_of_hash(&hash) {
             Ok(None) => match stored_header_height(&q, &rec) {
                 Ok(h) => json_reply_here(json!({
