@@ -2296,11 +2296,13 @@ impl Store {
     /// annotated until its write finishes, so the checkpoint must not publish
     /// the old snapshot over it. The generation bump is what the in-flight
     /// checkpoint observes, including when this datadir has no marker file yet.
+    /// A failed commit patch still lowers both. The tip is already durable,
+    /// and the patch error is returned after that.
     pub fn clamp_spend_durable(&self) -> Result<(), StoreError> {
         use std::sync::atomic::Ordering;
         self.spend_reorg_gen.fetch_add(1, Ordering::AcqRel);
         let tip_now = self.confirmed.tip_height().map(|h| h.0).unwrap_or(0);
-        self.txs.hold_spend_fold_above(tip_now)?;
+        let hold = self.txs.hold_spend_fold_above(tip_now);
         let _ = self
             .spend_snapshot
             .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
@@ -2310,6 +2312,15 @@ impl Store {
                     .map_or(0, |h| cur.min(u64::from(h.0) + 1));
                 (low != cur).then_some(low)
             });
+        self.clamp_spend_marker()?;
+        hold
+    }
+
+    /// Write the spend marker down to the confirmed tip.
+    ///
+    /// No marker file means nothing has been device-flushed. Heights already
+    /// at the tip are left as they are.
+    fn clamp_spend_marker(&self) -> Result<(), StoreError> {
         let _g = self.spend_marker.lock().unwrap_or_else(|e| e.into_inner());
         let Some(marker) = crate::spend_durable::SpendDurable::load(self.path())? else {
             return Ok(());
