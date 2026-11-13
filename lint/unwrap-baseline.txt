@@ -1,6 +1,4 @@
-crates/rbitcoin-consensus/src/script/p2tr.rs	2
 crates/rbitcoin-log/src/api_log.rs	2
-crates/rbitcoin-mempool/src/graph.rs	1
 crates/rbitcoin-net/src/chain.rs	1
 crates/rbitcoin-net/src/tx_relay.rs	3
 crates/rbitcoin-primitives/src/scriptnum.rs	1
@@ -16,6 +14,5 @@ crates/rbitcoin-store/src/idx_body_pipeline.rs	2
 crates/rbitcoin-store/src/scripthash.rs	1
 crates/rbitcoin-store/src/scripthash_head.rs	1
 crates/rbitcoin-store/src/scripthash_slabs.rs	1
-crates/rbitcoin-store/src/segmented_head.rs	1
 crates/rbitcoin-store/src/spend_annotate_uring.rs	4
 crates/rbitcoin-store/src/txid_body.rs	4

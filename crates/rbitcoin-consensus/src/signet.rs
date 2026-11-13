@@ -255,7 +255,7 @@ pub fn read_signet_compact(rdr: &mut &[u8]) -> Result<u64, ConsensusError> {
             if rdr.len() < 5 {
                 return Err(ConsensusError::BadBlock("signet: compact size"));
             }
-            let v = u32::from_le_bytes(rdr[1..5].try_into().expect("4 bytes"));
+            let v = u32::from_le_bytes([rdr[1], rdr[2], rdr[3], rdr[4]]);
             if v <= u32::from(u16::MAX) {
                 return Err(ConsensusError::BadBlock("signet: non-minimal compact size"));
             }
@@ -265,7 +265,9 @@ pub fn read_signet_compact(rdr: &mut &[u8]) -> Result<u64, ConsensusError> {
             if rdr.len() < 9 {
                 return Err(ConsensusError::BadBlock("signet: compact size"));
             }
-            let v = u64::from_le_bytes(rdr[1..9].try_into().expect("8 bytes"));
+            let v = u64::from_le_bytes([
+                rdr[1], rdr[2], rdr[3], rdr[4], rdr[5], rdr[6], rdr[7], rdr[8],
+            ]);
             if v <= u64::from(u32::MAX) {
                 return Err(ConsensusError::BadBlock("signet: non-minimal compact size"));
             }
