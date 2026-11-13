@@ -3034,28 +3034,7 @@ pub fn outpoint_status(
     mempool: Option<&MempoolHub>,
     params: &Value,
 ) -> Result<Value, String> {
-    use bitcoin::hashes::Hash;
     let (txid, vout) = param_outpoint(params)?;
-    let unspent = json!({
-        "txid": txid_hex(&txid),
-        "vout": vout,
-        "spent": false,
-    });
-    let op = bitcoin::OutPoint {
-        txid: bitcoin::Txid::from_byte_array(txid),
-        vout,
-    };
-    // The spender read treats a slot past `output_count` as corrupt. That
-    // vout has no spender, as in electrs.
-    let nout = match query.get_tx_by_txid(&txid).map_err(|e| e.to_string())? {
-        Some((_, rec)) => Some(rec.output_count),
-        None => mempool
-            .and_then(|mp| mp.get_tx(&op.txid))
-            .map(|tx| tx.output.len() as u32),
-    };
-    if nout.is_some_and(|n| vout >= n) {
-        return Ok(unspent);
-    }
     if query
         .is_outpoint_spent(&txid, vout)
         .map_err(|e| e.to_string())?
@@ -3067,16 +3046,27 @@ pub fn outpoint_status(
             "height": query.tip_height().map(|h| h.0).unwrap_or(0),
         }));
     }
-    if let Some(spend) = mempool.and_then(|mp| mp.spending_txid(&op)) {
-        return Ok(json!({
-            "txid": txid_hex(&txid),
-            "vout": vout,
-            "spent": true,
-            "height": 0,
-            "spending_txid": format!("{spend}"),
-        }));
+    if let Some(mp) = mempool {
+        use bitcoin::hashes::Hash;
+        let op = bitcoin::OutPoint {
+            txid: bitcoin::Txid::from_byte_array(txid),
+            vout,
+        };
+        if let Some(spend) = mp.spending_txid(&op) {
+            return Ok(json!({
+                "txid": txid_hex(&txid),
+                "vout": vout,
+                "spent": true,
+                "height": 0,
+                "spending_txid": format!("{spend}"),
+            }));
+        }
     }
-    Ok(unspent)
+    Ok(json!({
+        "txid": txid_hex(&txid),
+        "vout": vout,
+        "spent": false,
+    }))
 }
 
 #[doc(hidden)]
