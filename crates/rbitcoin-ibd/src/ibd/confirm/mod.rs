@@ -523,30 +523,42 @@ impl ConfirmFeed {
     /// batch (not in `ready`/`inflight`) will drop it. `claimed_epoch` is kept
     /// so those in-channel batches can see they are stale.
     ///
-    /// Reservations above `confirmed_tip` are dropped. A height at or below
-    /// that tip stays reserved: its Accepted event may still be waiting, and
-    /// refunding it lets the next lookup spend those bytes again. The byte
-    /// remainder becomes the installed allowance minus the reservations still
-    /// held, so a refund cannot pass a cap that already clamped to zero.
-    /// Call this when the confirmed tip moved, not when only the header walk did.
+    /// Reservations above `confirmed_tip` go back to the byte remainder. A
+    /// height at or below that tip stays reserved: its Accepted event may
+    /// still be waiting, and refunding it lets the next lookup spend those
+    /// bytes again. The refund cannot raise the remainder above the installed
+    /// allowance minus the reservations still held. A charge whose reservation
+    /// was already released stays spent. Call this when the confirmed tip
+    /// moved, not when only the header walk did.
     pub fn clear(&self, confirmed_tip: u32) {
         let mut g = self.inner.lock().unwrap();
         g.ready.clear();
         g.inflight.clear();
+        let refund = g
+            .lead_reserved
+            .iter()
+            .filter(|(&h, _)| h > confirmed_tip)
+            .fold(0u64, |acc, (_, bytes)| acc.saturating_add(*bytes));
         g.lead_reserved.retain(|&h, _| h <= confirmed_tip);
-        if g.lead_bytes_left.is_some() {
+        if let Some(current) = g.lead_bytes_left {
             let pending = g
                 .lead_reserved
                 .values()
                 .fold(0u64, |acc, b| acc.saturating_add(*b));
-            let allowance = self
+            let mut next = current.saturating_add(refund);
+            if let Some(allowance) = self
                 .lead_bounds
                 .lock()
                 .unwrap()
                 .as_ref()
                 .and_then(|saved| saved.bytes_left)
-                .unwrap_or(0);
-            g.lead_bytes_left = Some(allowance.saturating_sub(pending));
+            {
+                let cap = allowance.saturating_sub(pending);
+                if next > cap {
+                    next = cap;
+                }
+            }
+            g.lead_bytes_left = Some(next);
         }
         drop(g);
         self.lead_bounds_dirty.store(true, Ordering::Release);
