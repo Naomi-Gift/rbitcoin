@@ -1347,17 +1347,14 @@ pub async fn ibd_cancellable(
                 };
                 let ready_n = hub
                     .query
-                    .block_queue_list_meta()
-                    .into_iter()
-                    .filter(|m| {
+                    .block_queue_count_rows(|height, resolve_complete| {
                         confirm::confirm_row_is_ready(
-                            m.height,
-                            m.resolve_complete,
+                            height,
+                            resolve_complete,
                             path_lo,
-                            inflight_h.contains(&m.height),
+                            inflight_h.contains(&height),
                         )
-                    })
-                    .count();
+                    });
                 let (bq_bytes, bq_count) = hub.query.block_queue_stats();
 
                 tip_rate_tracker.push(now, prog.tip);
