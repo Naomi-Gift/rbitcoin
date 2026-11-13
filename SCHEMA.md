@@ -23,7 +23,7 @@ divisible by 10 is Corrupt; zero is `e=0`, mantissa 0). Meta older than 22
 is one refuse, empty or occupied: `schema before 22 refuses this datadir;
 wipe datadir and redo IBD`. That is the last time `tx.body`, `txout.body`,
 or `inwit.body` / `seqsigwit.body` had to be deleted rather than rewritten.
-`schema_file_openable` is 22 through 27. A 23 binary refuses 24 `meta`. A 26 binary refuses 27 `meta`.
+`schema_file_openable` is 22 through 28. A 23 binary refuses 24 `meta`. A 26 binary refuses 27 `meta`. A 27 binary refuses 28 `meta`.
 
 Operator copy-paste (which dirs to wipe; kill-9 is not a migrate):
 [`docs/operator/storage.md`](./docs/operator/storage.md#schema-upgrade).
@@ -92,7 +92,7 @@ Table file headers **22–28** remain `schema_file_openable`. A 22 binary refuse
 **23→24 open** (schema 24/25 binaries): rewrote `header.body` 88 B rows to 96 B. This binary does not expand. An 88 B body stays 88 B and `meta` rewrites to 28.
 **24/25→26 open:** rewrite each 96 B `header.body` row to 88 B (drop trailing `size`/`weight`) via `header.body.grow` then rename; rewrite `meta` to 26. A body that is already 88 B is unchanged. A 25 binary refuses 26 `meta`. Crash with leftover `.grow` discards it and retries.
 **27→28 open:** rewrite `store/meta` to 28 and sync its directory. No table rewrite. A 27 binary refuses 28 `meta`. That binary does not read `spend.pages`, so leaving it on 27 would let it write spends under a live log.
-**26→27 open** (schema 27 binaries): rewrote `store/meta` to 27. No table rewrite. Historical spend slots that are not yet in `spent.body` live in `spend.pages` until fold. A 26 binary refuses 27 `meta`. The sync lands before a witness stem cut, so a crash cannot leave schema 26 beside an empty witness locator. This binary continues from 27 to 28.
+**26→27 open** (schema 27 binaries): rewrote `store/meta` to 27. No table rewrite. A 26 binary refuses 27 `meta`. The sync lands before a witness stem cut, so a crash cannot leave schema 26 beside an empty witness locator. This binary continues from 27 to 28.
 **24→25 open:** rewrite `meta` to 25; create or zero-extend `txstat.body` to `create.loc` count. Do **not** rewrite `txout.body`. Unlink leftover `txfixed.body`. A 24 binary refuses 25 `meta`.
 **Endianness:** little-endian for all multi-byte integers.
 
@@ -104,7 +104,7 @@ Older versions and migration notes live in [`SCHEMA_HISTORY.md`](./SCHEMA_HISTOR
 
 Class A shape settled here at schema 17 and is still the live layout under
 the `SCHEMA_VERSION` at the top of this file (28). Schemas 18–28 already
-shipped. Meta 22–27 is what this binary opens (rules above). Earlier
+shipped. Meta 22–28 is what this binary opens (rules above). Earlier
 layouts are history in
 [`SCHEMA_HISTORY.md`](./SCHEMA_HISTORY.md). A byte-incompatible change bumps
 from that live constant
@@ -611,7 +611,7 @@ the new `meta` or an unknown kind). See [Schema 17 freeze](#schema-17-freeze).
 Best-chain spentness also requires `is_confirmed_strong(spender)` (annotations may outlive reorgs).
 A Class A append fills the slot for a spend in the same write. When the write holds more than one spender of a vout (a double spend that write rejects), it names the first in chain order, the lowest fk. A rejected write keeps that append for the retry.
 
-`spend.pages` and `spend.pages.commit` name historical spend slots that are not yet folded onto `spent.body`, including the short tail page. Schema stays 27. A binary from before this log opens the datadir, ignores `spend.pages`, and reads `spent.body`, so a slot that is not folded yet looks unspent. A missing commit means no unsealed historical page. A commit that names bytes whose image file is missing or shorter than the committed length refuses open. That file is `spend.pages.{generation}` when a crash left it beside the new commit, and `spend.pages` otherwise. An empty claim with no pages file opens. `spend.pages` holds the page images. `spend.pages.commit` names the snapshot height, generation, committed byte length, and the page list. Four little-endian bytes after those records are the confirmed tip frozen with the snapshot. A commit that ends on the page list uses the snapshot height as that tip. A record past that length refuses open. A slot past a short image is not in the log. The checkpoint rewrites `spend.pages` to the images still named and syncs the commit before `spend_durable` advances. Fold copies a quiet generation onto `spent.body` after a later checkpoint, starting at byte 16 on the first page so the file header stays put, and skips a page confirm has re-dirtied. It deletes both files only once nothing committed, open, frozen, or pending remains. The body copy does not hold the utxo view. The directory drop does.
+`spend.pages` and `spend.pages.commit` name historical spend slots that are not yet folded onto `spent.body`, including the short tail page. Schema is 28. A schema-27 binary refuses 28 `meta`, so it never reads `spent.body` while this log is live. A missing commit means no unsealed historical page. A commit that names bytes whose image file is missing or shorter than the committed length refuses open. That file is `spend.pages.{generation}` when a crash left it beside the new commit, and `spend.pages` otherwise. An empty claim with no pages file opens. `spend.pages` holds the page images. `spend.pages.commit` names the snapshot height, generation, committed byte length, and the page list. Four little-endian bytes after those records are the confirmed tip frozen with the snapshot. A commit that ends on the page list uses the snapshot height as that tip. A record past that length refuses open. A slot past a short image is not in the log. The checkpoint rewrites `spend.pages` to the images still named and syncs the commit before `spend_durable` advances. Fold copies a quiet generation onto `spent.body` after a later checkpoint, starting at byte 16 on the first page so the file header stays put, and skips a page confirm has re-dirtied. It deletes both files only once nothing committed, open, frozen, or pending remains. The body copy does not hold the utxo view. The directory drop does.
 
 ### Multi-spender overflow (`spent.ovf`)
 

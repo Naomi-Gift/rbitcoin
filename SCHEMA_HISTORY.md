@@ -14,7 +14,7 @@ Versions below are listed **newest → oldest** after the summary table.
 | Version | Headline change | Still in current tree as… |
 |--------:|-----------------|---------------------------|
 | **28** | `meta` only. A 27 binary does not read `spend.pages` and would hide spends it wrote into `spent.body` under a live log, so it refuses 28 `meta`. Open rewrites 22–27 `meta` to 28. | **Current** |
-| **27** | `meta` only, plus `spend.pages` until fold. A pruned witness stem can be a header while creates remain. A 26 binary would truncate that chain and does not read the spend log, so it refuses 27 `meta`. A 27 binary rewrote 22–26 `meta` to 27. | Prior |
+| **27** | `meta` only. A pruned witness stem can be a header while creates remain. A 26 binary would truncate that chain, so it refuses 27 `meta`. Open rewrites 22–26 `meta` to 27, pruned or not. | Prior |
 | **26** | `header.body` 88 B. Occupied 24/25 strips trailing `size`/`weight`. Block size and weight come from `txstat`. | Prior |
 | **25** | `txstat.body` three ULEBs (`fee_sat`/`base`/`wit_extra`); `n_in` and parent edges on `input.*`. `seqsigwit` is the old `inwit` stem. Occupied 24 zero-extends `txstat`; no `txout` rewrite. | Prior |
 | **24** | `header.body` 96 B (`size`/`weight` u32). Occupied 23 rewrites 88 B rows. Extent last-page reserved = create count. | Prior |
@@ -42,9 +42,13 @@ Versions below are listed **newest → oldest** after the summary table.
 
 ---
 
-## v27 (`spend.pages` until fold)
+## v28 (`spend.pages` until fold)
 
-Historical spend slots, including a short tail page, are appended to `spend.pages` and named by `spend.pages.commit` before `spend_durable` advances. Fold copies a quiet generation onto `spent.body` afterwards, starting at byte 16 on page 0. A 26 binary does not read the log, so it refuses 27 `meta`. Opening 22–26 rewrites `meta` only.
+Historical spend slots, including a short tail page, are appended to `spend.pages` and named by `spend.pages.commit` before `spend_durable` advances. Fold copies a quiet generation onto `spent.body` afterwards, starting at byte 16 on page 0. A 27 binary does not read the log, so it refuses 28 `meta`. Opening 22–27 rewrites `meta` only.
+
+## v27 (witness stem)
+
+`meta` only. A pruned witness stem can be a header while creates remain. A 26 binary would truncate that chain, so it refuses 27 `meta`. A 27 binary rewrote 22–26 `meta` to 27.
 
 ## v25 (`txstat.body` 8 B/create, `input.*`, `seqsigwit`)
 
