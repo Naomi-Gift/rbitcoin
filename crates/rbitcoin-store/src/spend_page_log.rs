@@ -97,6 +97,7 @@ type KeptPage = (u64, PageSlots);
 /// Condvar `rbtc-spend-sync` waits on. The flag is the thread's stop bit.
 pub type SpendSyncWake = Arc<(Mutex<bool>, Condvar)>;
 
+#[derive(Clone)]
 struct OpenPage {
     slots: Vec<(u16, [u8; SLOT])>,
     /// Bit `rel` is set when `slots` names that slot.
@@ -451,8 +452,12 @@ impl SpendPageLog {
             while end < order.len() && order[end].0 == page_off {
                 end += 1;
             }
+            let later = g.later.get(&page_off);
+            let open = g.open.get(&page_off);
+            let frozen = g.frozen.get(&page_off);
+            let image = g.committed.get(&page_off).map(|page| page.image.as_ref());
             for &(_, rel, i) in &order[start..end] {
-                if let Some(meta) = noted_slot(&g, page_off, rel) {
+                if let Some(meta) = noted_from(later, open, frozen, image, rel) {
                     out[i] = Some(meta);
                 }
             }
@@ -1119,7 +1124,7 @@ impl SpendPageLog {
         let mut pages: SnapshotPages = g
             .frozen
             .iter()
-            .map(|(off, page)| (*off, open_page(page.slots.clone(), page.base.clone())))
+            .map(|(off, page)| (*off, page.clone()))
             .collect();
         fold_open_into_snapshot(&mut pages, &g.open, &g.committed);
         merge_later(&mut g, reset_edges);
@@ -1644,7 +1649,7 @@ fn fold_open_into_snapshot(
             pages[i].1.reindex();
         } else {
             index.insert(*off, pages.len());
-            pages.push((*off, open_page(noted.slots.clone(), noted.base.clone())));
+            pages.push((*off, noted.clone()));
         }
     }
     for (off, page) in pages.iter_mut() {
@@ -1975,16 +1980,28 @@ fn page_hit(page: Option<&OpenPage>, rel: u16) -> Option<[u8; SLOT]> {
     page?.hit(rel)
 }
 
+fn noted_from(
+    later: Option<&OpenPage>,
+    open: Option<&OpenPage>,
+    frozen: Option<&OpenPage>,
+    image: Option<&[u8]>,
+    rel: u16,
+) -> Option<[u8; SLOT]> {
+    page_hit(later, rel)
+        .or_else(|| page_hit(open, rel))
+        .or_else(|| page_hit(frozen, rel))
+        .or_else(|| image.and_then(|image| slot_in_image(image, rel)))
+}
+
 /// Directory bytes for one slot. `None` means `spent.body` still holds it.
 fn noted_slot(g: &Inner, page_off: u64, rel: u16) -> Option<[u8; SLOT]> {
-    page_hit(g.later.get(&page_off), rel)
-        .or_else(|| page_hit(g.open.get(&page_off), rel))
-        .or_else(|| page_hit(g.frozen.get(&page_off), rel))
-        .or_else(|| {
-            g.committed
-                .get(&page_off)
-                .and_then(|page| slot_in_image(&page.image, rel))
-        })
+    noted_from(
+        g.later.get(&page_off),
+        g.open.get(&page_off),
+        g.frozen.get(&page_off),
+        g.committed.get(&page_off).map(|page| page.image.as_ref()),
+        rel,
+    )
 }
 
 /// `None` when `rel` sits past the stored image. The body still holds it.

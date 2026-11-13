@@ -1035,6 +1035,18 @@ pub fn meta_prefetch_slice_matches(planned: &[u64], at: usize, abs_offs: &[u64])
     end <= planned.len() && planned[at..end] == *abs_offs
 }
 
+fn structural_meta_row(
+    prefetch: &[Option<(rbitcoin_primitives::Fk, u8, u32)>],
+    read: Option<&[Option<(rbitcoin_primitives::Fk, u8, u32)>]>,
+    at: usize,
+    i: usize,
+) -> Option<(rbitcoin_primitives::Fk, u8, u32)> {
+    match read {
+        Some(rows) => rows[i],
+        None => prefetch[at + i],
+    }
+}
+
 #[doc(hidden)]
 pub fn structural_load_durable_spent(
     query: &Query,
@@ -1056,7 +1068,7 @@ pub fn structural_load_durable_spent(
     if scratch.abs_offs.is_empty() {
         return Ok((0, 0));
     }
-    let metas = if let Some(at) = scratch.meta_at {
+    let (prefetch_at, read) = if let Some(at) = scratch.meta_at {
         let end = at.saturating_add(scratch.abs_offs.len());
         if end > scratch.meta_prefetch.len()
             || !meta_prefetch_slice_matches(&scratch.meta_offs, at, &scratch.abs_offs)
@@ -1065,9 +1077,8 @@ pub fn structural_load_durable_spent(
                 "invariant: structural meta prefetch short",
             )));
         }
-        let metas = scratch.meta_prefetch[at..end].to_vec();
         scratch.meta_at = Some(end);
-        metas
+        (at, None)
     } else {
         let meta_backend = rbitcoin_store::spend_meta_backend();
         let t_meta = Instant::now();
@@ -1082,15 +1093,17 @@ pub fn structural_load_durable_spent(
             scratch.abs_offs.len() as u64,
         );
         let _ = meta_backend;
-        metas
+        (0, Some(metas))
     };
-    if metas.len() != scratch.disk_jobs.len() {
+    let n = scratch.disk_jobs.len();
+    if read.as_ref().is_some_and(|rows| rows.len() != n) {
         return Err(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
             "invariant: structural meta batch length",
         )));
     }
     let t_strong = Instant::now();
-    for row in &metas {
+    for i in 0..n {
+        let row = structural_meta_row(&scratch.meta_prefetch, read.as_deref(), prefetch_at, i);
         let Some((field, _, _)) = row else {
             continue;
         };
@@ -1099,7 +1112,7 @@ pub fn structural_load_durable_spent(
         }
         if let Some(fid) = field.get() {
             if scratch.field_seen.insert(fid) {
-                scratch.field_fks.push(*field);
+                scratch.field_fks.push(field);
             }
         }
     }
@@ -1113,15 +1126,12 @@ pub fn structural_load_durable_spent(
         }
     }
     let jobs = std::mem::take(&mut scratch.disk_jobs);
-    let applied = jobs
-        .iter()
-        .copied()
-        .zip(metas)
-        .try_fold(0u64, |acc, (job, meta)| {
-            let (id, vout, abs, sfk, vin) = job;
-            let ns = structural_apply_one_meta(query, meta, id, vout, abs, sfk, vin, tip, scratch)?;
-            Ok::<u64, ConfirmError>(acc.saturating_add(ns))
-        });
+    let applied = (0..n).try_fold(0u64, |acc, i| {
+        let meta = structural_meta_row(&scratch.meta_prefetch, read.as_deref(), prefetch_at, i);
+        let (id, vout, abs, sfk, vin) = jobs[i];
+        let ns = structural_apply_one_meta(query, meta, id, vout, abs, sfk, vin, tip, scratch)?;
+        Ok::<u64, ConfirmError>(acc.saturating_add(ns))
+    });
     scratch.disk_jobs = jobs;
     let multi_list_ns = applied?;
     let spent_strong_ns = t_strong
