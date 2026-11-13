@@ -18,6 +18,7 @@
 //! window). This type **always** accepts already-requested payloads (OOM aside).
 
 use crate::error::StoreError;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -413,10 +414,10 @@ impl BlockQueue {
 
     #[doc(hidden)]
     pub fn remember_hash(&mut self, hash: [u8; 32], height: u32) {
-        match self.by_hash.get_mut(&hash) {
-            Some(heights) => heights.push_new(height),
-            None => {
-                self.by_hash.insert(hash, QueuedHeights::One(height));
+        match self.by_hash.entry(hash) {
+            Entry::Occupied(mut slot) => slot.get_mut().push_new(height),
+            Entry::Vacant(slot) => {
+                slot.insert(QueuedHeights::One(height));
             }
         }
     }
