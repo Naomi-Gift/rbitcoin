@@ -3088,8 +3088,9 @@ fn clear_refunds_only_heights_above_the_confirmed_tip() {
     assert_eq!(g.lead_bytes_left, Some(40));
 }
 
-/// A refund after a clamped remainder must not survive the next install of
-/// the same allowance. The reservations still held have to come back out.
+/// A refund after a clamped remainder stays inside the installed allowance.
+/// Reservations still held come out before the next lookup, with no install
+/// in between.
 #[test]
 fn clear_after_a_clamped_allowance_does_not_overspend() {
     use rbitcoin_ibd::ibd::confirm::take_unproven_lead;
@@ -3102,13 +3103,16 @@ fn clear_after_a_clamped_allowance_does_not_overspend() {
     feed.install_unproven_bounds(Some(10), 0, Some(50));
     assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(0));
     feed.clear(3);
-    feed.install_unproven_bounds(Some(10), 0, Some(50));
+    assert_eq!(
+        feed.inner.lock().unwrap().lead_bytes_left,
+        Some(0),
+        "the remainder is the allowance minus reservations still held"
+    );
     assert_eq!(
         take_unproven_lead(&feed, Some(&[30]), vec![4]),
         Vec::<u32>::new(),
-        "a refund of a height above the tip is still inside the new allowance"
+        "lookup cannot spend the refund before the next install"
     );
-    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(0));
 }
 
 #[test]

@@ -2080,18 +2080,18 @@ pub fn tick_scan(seen: Option<u32>, now: Option<u32>) -> Option<Option<Vec<u32>>
     }
 }
 
-/// Backstop sweep of last-sent statuses for hashes no longer subscribed.
-///
-/// `scripthash.unsubscribe` already removes its entry exactly (post-dispatch),
-/// so this only catches leftovers and only runs when `last_sent` outgrows the
-/// sub set. Sweeping unconditionally on every push made each notification
-/// O(subs), so a block touching many subs of a large wallet went quadratic.
 // A same-sized leftover is not pushed. The sweep runs only once the map is larger.
 #[cfg_attr(feature = "mutants", mutants::skip)]
 fn last_sent_outgrew(last_sent: usize, subs: usize) -> bool {
     last_sent > subs
 }
 
+/// Backstop sweep of last-sent statuses for hashes no longer subscribed.
+///
+/// `scripthash.unsubscribe` already removes its entry exactly (post-dispatch),
+/// so this only catches leftovers and only runs when `last_sent` outgrows the
+/// sub set. Sweeping unconditionally on every push made each notification
+/// O(subs), so a block touching many subs of a large wallet went quadratic.
 #[doc(hidden)]
 pub fn drop_unsubscribed_status(
     last_sent: &mut HashMap<[u8; 32], String>,

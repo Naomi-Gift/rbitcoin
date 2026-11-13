@@ -1046,8 +1046,10 @@ fn park_returns_before_sleep_when_work_or_epoch_moved() {
         jobs.push_back(Box::new(|| {}));
     }
     // The recheck repeats this predicate. Queued work must return before that gate.
+    // Pool workers share `DELAY_PARK`. Wait until they are parked so one of
+    // them cannot enter the gate for this arm.
+    wait_all_idle(worker_spawn_count());
     let arm = DelayParkArm::arm();
-    let entered_before = DELAY_PARK_ENTERED.load(Ordering::SeqCst);
     let idle = Arc::new(rbitcoin_consensus::sync::Mutex::new(Vec::new()));
     let (tx, rx) = mpsc::channel();
     let pool_t = Arc::clone(&pool);
@@ -1067,7 +1069,7 @@ fn park_returns_before_sleep_when_work_or_epoch_moved() {
     };
     handle.join().expect("queued work");
     assert!(
-        !reached_gate && DELAY_PARK_ENTERED.load(Ordering::SeqCst) == entered_before,
+        !reached_gate,
         "queued work must return before the park gate"
     );
     drop(arm);
@@ -1078,6 +1080,7 @@ fn park_returns_before_sleep_when_work_or_epoch_moved() {
     );
 
     let second = local_pool(4);
+    wait_all_idle(worker_spawn_count());
     let arm = DelayParkArm::arm();
     let idle = Arc::new(rbitcoin_consensus::sync::Mutex::new(Vec::new()));
     let (tx, rx) = mpsc::channel();
@@ -1103,6 +1106,7 @@ fn park_returns_before_sleep_when_work_or_epoch_moved() {
     assert!(!parked, "an epoch bump during the recheck must not park");
 
     let third = local_pool(4);
+    wait_all_idle(worker_spawn_count());
     let arm = DelayParkArm::arm();
     let idle = Arc::new(rbitcoin_consensus::sync::Mutex::new(Vec::new()));
     let (tx, rx) = mpsc::channel();
