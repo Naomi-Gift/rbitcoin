@@ -577,12 +577,6 @@ pub fn drop_redial_slot(
     blocked.contains(&addr) || live.into_iter().any(|have| have == addr)
 }
 
-/// One accepted redial slot. Zero stays zero only when none connect.
-#[doc(hidden)]
-pub fn accept_one_redial(n: usize) -> usize {
-    n + 1
-}
-
 /// `dark_empty_after` treats any live slot as not fully dark.
 #[doc(hidden)]
 pub fn peer_slot_alive(alive_now: usize) -> bool {
@@ -1229,7 +1223,7 @@ pub async fn ibd_cancellable(
                             s.id, s.addr, s.peer_height
                         );
                         st.slots.push(s);
-                        n = accept_one_redial(n);
+                        n += 1;
                     }
                     let alive_now = st.slots.iter().filter(|s| s.alive).count();
                     dark_redial_empty =
@@ -1346,7 +1340,24 @@ pub async fn ibd_cancellable(
 
                 let peers_n = st.slots.iter().filter(|s| s.alive).count();
                 let (_load_q, script_q, write_q) = confirm_queues.snap();
-                let ready_n = 0;
+                let path_lo = published.tip.map(|t| t.saturating_add(1)).unwrap_or(0);
+                let inflight_h = {
+                    let g = confirm_feed.inner.lock().unwrap();
+                    g.inflight.clone()
+                };
+                let ready_n = hub
+                    .query
+                    .block_queue_list_meta()
+                    .into_iter()
+                    .filter(|m| {
+                        confirm::confirm_row_is_ready(
+                            m.height,
+                            m.resolve_complete,
+                            path_lo,
+                            inflight_h.contains(&m.height),
+                        )
+                    })
+                    .count();
                 let (bq_bytes, bq_count) = hub.query.block_queue_stats();
 
                 tip_rate_tracker.push(now, prog.tip);

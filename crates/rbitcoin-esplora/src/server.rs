@@ -1125,14 +1125,6 @@ fn named_join_client(client: Option<&str>) -> Option<&str> {
     client.filter(|s| !s.is_empty())
 }
 
-// A bare `name.sock` has an empty parent. `create_dir_all("")` fails the listen.
-// The suite cannot chdir.
-#[cfg(unix)]
-#[cfg_attr(feature = "mutants", mutants::skip)]
-fn unix_parent_needs_dir(parent: &std::path::Path) -> bool {
-    !parent.as_os_str().is_empty()
-}
-
 /// Start Esplora **plain HTTP** on `config.listen`.
 ///
 /// TLS is external (reverse proxy). App [`ServeLimits`] always apply
@@ -1362,7 +1354,8 @@ pub async fn run_esplora(
         #[cfg(unix)]
         EsploraListen::Unix(path) => {
             if let Some(parent) = path.parent() {
-                if unix_parent_needs_dir(parent) {
+                // `create_dir_all("")` fails. A bare `name.sock` has an empty parent.
+                if !parent.as_os_str().is_empty() {
                     std::fs::create_dir_all(parent)?;
                 }
             }

@@ -741,8 +741,8 @@ fn try_nested_matching_hash_enters_witness_verify() {
         ScriptCheckJob::with_txid(txid, prevouts, tx, flags)
     };
     let mut cache = SighashCache::new(&*job2.tx);
-    // Policy flags are off, so this is the typed P2WPKH path. The interpreter
-    // reports EQUALVERIFY instead of the pubkey-hash error.
+    // Policy flags are off and the witness has two items, so this is the
+    // typed P2WPKH path.
     let err = try_nested(
         &job2,
         &mut cache,

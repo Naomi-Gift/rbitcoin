@@ -94,7 +94,26 @@ pub fn height_map_json(
     cut_through: bool,
     min_dust: u64,
 ) -> Result<String, String> {
-    let tip = query.tip_height().map(|t| t.0);
+    height_map_json_with_tip(
+        query,
+        chain,
+        h,
+        query.tip_height().map(|t| t.0),
+        cut_through,
+        min_dust,
+    )
+}
+
+/// Same map as [`height_map_json`], using `tip` instead of a second read.
+#[doc(hidden)]
+pub fn height_map_json_with_tip(
+    query: &Query,
+    chain: &ChainParams,
+    h: u32,
+    tip: Option<u32>,
+    cut_through: bool,
+    min_dust: u64,
+) -> Result<String, String> {
     if tip.is_none_or(|t| h > t) || !chain.taproot_active_at(h) {
         return Ok(empty_height_json(h));
     }

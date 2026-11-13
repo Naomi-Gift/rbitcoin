@@ -185,6 +185,28 @@ async fn accepted_within(mut opened: Vec<TcpStream>, cap: usize) -> Vec<TcpStrea
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unix_listen_creates_a_missing_parent_dir() {
+    let (_dir, q) = temp_query("esplora-unix-parent");
+    // A store path is too long for `sockaddr_un`. The socket path stays short.
+    let short = std::path::PathBuf::from(format!("/tmp/rbtc-es-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&short);
+    std::fs::create_dir_all(&short).unwrap();
+    let sock = short.join("m").join("s.sock");
+    let cfg = EsploraConfig::with_listen(EsploraListen::Unix(sock.clone()), Network::Regtest);
+    let mut handle = run_esplora(cfg, Arc::new(q), None)
+        .await
+        .expect("nested socket parent is created");
+    assert!(sock.exists(), "bind did not create {}", sock.display());
+    handle.shutdown.store(true);
+    tokio::time::timeout(Duration::from_secs(2), &mut handle.task)
+        .await
+        .expect("esplora shutdown")
+        .expect("serve task");
+    let _ = std::fs::remove_dir_all(&short);
+}
+
 fn temp_query(label: &str) -> (rbitcoin_query::testutil::TempDir, Query) {
     rbitcoin_query::testutil::tiny_query_labeled(label)
 }

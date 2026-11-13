@@ -11,6 +11,15 @@ use rbitcoin_ibd::ibd::confirm::{
 };
 
 #[test]
+fn confirm_row_is_ready_needs_every_arm() {
+    use rbitcoin_ibd::ibd::confirm::confirm_row_is_ready;
+    assert!(confirm_row_is_ready(5, true, 5, false));
+    assert!(!confirm_row_is_ready(4, true, 5, false));
+    assert!(!confirm_row_is_ready(5, true, 5, true));
+    assert!(!confirm_row_is_ready(5, false, 5, false));
+}
+
+#[test]
 fn missing_reject_parent_is_not_consensus_invalid() {
     use bitcoin::hashes::Hash;
 
@@ -3077,6 +3086,29 @@ fn clear_refunds_only_heights_above_the_confirmed_tip() {
     );
     assert!(!g.lead_reserved.contains_key(&5));
     assert_eq!(g.lead_bytes_left, Some(40));
+}
+
+/// A refund after a clamped remainder must not survive the next install of
+/// the same allowance. The reservations still held have to come back out.
+#[test]
+fn clear_after_a_clamped_allowance_does_not_overspend() {
+    use rbitcoin_ibd::ibd::confirm::take_unproven_lead;
+    let feed = ConfirmFeed::new();
+    feed.set_unproven_bounds(Some(10), 0, Some(100));
+    assert_eq!(
+        take_unproven_lead(&feed, Some(&[30, 30, 30]), vec![2, 3, 5]),
+        vec![2, 3, 5]
+    );
+    feed.install_unproven_bounds(Some(10), 0, Some(50));
+    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(0));
+    feed.clear(3);
+    feed.install_unproven_bounds(Some(10), 0, Some(50));
+    assert_eq!(
+        take_unproven_lead(&feed, Some(&[30]), vec![4]),
+        Vec::<u32>::new(),
+        "a refund of a height above the tip is still inside the new allowance"
+    );
+    assert_eq!(feed.inner.lock().unwrap().lead_bytes_left, Some(0));
 }
 
 #[test]

@@ -78,7 +78,8 @@ pub fn decode_tx(bytes: &[u8], try_no_witness: bool, try_witness: bool) -> Optio
 
 /// Core `CheckTxScriptsSanity`: every output script, and every input script
 /// of a non-coinbase, passes [`has_valid_ops`].
-fn scripts_parse(tx: &Transaction) -> bool {
+#[doc(hidden)]
+pub fn scripts_parse(tx: &Transaction) -> bool {
     let inputs = tx
         .input
         .iter()
@@ -109,44 +110,4 @@ pub fn decode_block(mut d: &[u8]) -> Result<Block, Error> {
         txdata.push(decode_tx_with_witness(&mut d)?);
     }
     Ok(Block { header, txdata })
-}
-
-#[cfg(test)]
-mod tests {
-    use bitcoin::absolute::LockTime;
-    use bitcoin::hashes::Hash;
-    use bitcoin::script::ScriptBuf;
-    use bitcoin::{Amount, OutPoint, Sequence, Transaction, TxIn, TxOut, Witness};
-
-    fn tx(coinbase: bool, script_sig: Vec<u8>) -> Transaction {
-        Transaction {
-            version: bitcoin::transaction::Version::ONE,
-            lock_time: LockTime::ZERO,
-            input: vec![TxIn {
-                previous_output: if coinbase {
-                    OutPoint::null()
-                } else {
-                    OutPoint {
-                        txid: bitcoin::Txid::from_byte_array([2; 32]),
-                        vout: 0,
-                    }
-                },
-                script_sig: ScriptBuf::from_bytes(script_sig),
-                sequence: Sequence::MAX,
-                witness: Witness::new(),
-            }],
-            output: vec![TxOut {
-                value: Amount::from_sat(1),
-                script_pubkey: ScriptBuf::from_bytes(vec![0x51]),
-            }],
-        }
-    }
-
-    #[test]
-    fn coinbase_script_sig_is_not_a_script_parse() {
-        // Truncated PUSHDATA1. A non-coinbase input fails; a coinbase input is exempt.
-        let bad = vec![0x4c];
-        assert!(!super::scripts_parse(&tx(false, bad.clone())));
-        assert!(super::scripts_parse(&tx(true, bad)));
-    }
 }

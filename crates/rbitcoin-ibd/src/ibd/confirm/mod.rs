@@ -542,6 +542,9 @@ impl ConfirmFeed {
             *left = left.saturating_add(refund);
         }
         drop(g);
+        // A clamped remainder stays 0 until this bit forces the next install
+        // to subtract the reservations that are still held.
+        self.lead_bounds_dirty.store(true, Ordering::Release);
         self.publish_cleared_plan();
     }
 
@@ -1577,6 +1580,18 @@ pub fn write_queue_cap() -> usize {
 #[inline]
 pub fn write_drain_max_parts(writeq_cap: usize) -> usize {
     writeq_cap.max(1)
+}
+
+/// A queued body at or above the confirm cursor, resolve-complete, and not
+/// already in the load wave.
+#[doc(hidden)]
+pub fn confirm_row_is_ready(
+    height: u32,
+    resolve_complete: bool,
+    path_lo: u32,
+    inflight: bool,
+) -> bool {
+    height >= path_lo && !inflight && resolve_complete
 }
 
 /// Live depths **and contents** of the bounded confirm pipeline queues.

@@ -1649,9 +1649,6 @@ pub fn dedup_txid(rows: Vec<Value>) -> Vec<Value> {
     out
 }
 
-// One script with a foreign cursor is 422 either way. A multi-script page
-// must keep the cursor so the other scripts can page.
-#[cfg_attr(feature = "mutants", mutants::skip)]
 fn page_keeps_absent_cursor(after_some: bool, script_count: usize) -> bool {
     after_some && script_count > 1
 }

@@ -355,6 +355,9 @@ fn height_map_cut_through_omits_spent_p2tr() {
     let live = height_map_json(&q, &chain, 1, true, DEFAULT_TWEAKS_MIN_DUST).unwrap();
     let live_v: Value = serde_json::from_str(&live).unwrap();
     assert_eq!(live_v["1"].as_object().unwrap().len(), 1);
+    let stale =
+        height_map_json_with_tip(&q, &chain, 1, Some(0), false, DEFAULT_TWEAKS_MIN_DUST).unwrap();
+    assert_eq!(stale, empty_height_json(1));
 
     let elig_fk = q.block_tx_fks(Height(1)).unwrap()[0];
     let mut spend2 = [0u8; 32];

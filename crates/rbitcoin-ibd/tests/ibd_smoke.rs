@@ -581,12 +581,6 @@ fn drop_redial_drops_a_blocked_or_live_addr() {
 }
 
 #[test]
-fn accept_one_redial_counts_the_slot() {
-    use rbitcoin_ibd::ibd::accept_one_redial;
-    assert_eq!(accept_one_redial(0), 1);
-}
-
-#[test]
 fn a_live_slot_is_not_dark() {
     use rbitcoin_ibd::ibd::peer_slot_alive;
     assert!(!peer_slot_alive(0));

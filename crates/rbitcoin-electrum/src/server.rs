@@ -1635,7 +1635,7 @@ where
     let t0 = Instant::now();
     let Some(last) = last else {
         return serve_tweaks_empty_last(
-            writer, query, chain, peer, &id, params_v, req, t0, min_dust,
+            writer, query, chain, peer, &id, params_v, req, t0, min_dust, tip,
         )
         .await;
     };
@@ -1750,10 +1750,14 @@ pub async fn serve_tweaks_empty_last<W: AsyncWrite + Unpin>(
     req: crate::tweaks::TweakReq,
     t0: Instant,
     min_dust: u64,
+    tip: Option<u32>,
 ) -> Result<(), std::io::Error> {
     let first =
-        // Past the tip the map is empty before cut-through reads this flag.
-        match crate::tweaks::height_map_json(query, chain, req.start, false, min_dust) {
+        // `tip` is the read that already put `start` past the chain. A later
+        // block must not build a map, so cut-through is not consulted.
+        match crate::tweaks::height_map_json_with_tip(
+            query, chain, req.start, tip, false, min_dust,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 tweaks_sub_err(
