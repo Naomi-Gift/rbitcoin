@@ -1666,6 +1666,17 @@ async fn electrum_leftover_mempool_does_not_double_count() {
     )
     .await;
     assert_eq!(conf["result"]["spent"], true, "{conf}");
+    let past = rpc(
+        &mut stream,
+        90,
+        "blockchain.outpoint.get_status",
+        json!([cb1, u32::MAX]),
+    )
+    .await;
+    assert_eq!(
+        past["result"]["spent"], false,
+        "vout past the outputs: {past}"
+    );
     assert_eq!(
         conf["result"]["height"].as_u64(),
         Some(102),

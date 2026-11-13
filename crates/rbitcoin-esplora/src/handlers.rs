@@ -700,15 +700,27 @@ pub async fn tx_outspend(
         let Ok(txid) = parse_hash32(&txid_hex) else {
             return not_found();
         };
-        let in_class_a = match st.query.tx_fk_by_txid(&txid) {
-            Ok(v) => v.is_some(),
+        let fk = match st.query.tx_fk_by_txid(&txid) {
+            Ok(v) => v,
             Err(e) => return store_err(e),
         };
-        let tid = Txid::from_byte_array(txid);
-        let in_mempool = st.mempool.as_ref().is_some_and(|m| m.contains(&tid));
-        if !in_class_a && (asof.is_some() || !in_mempool) {
-            return not_found();
-        }
+        // The spender read treats a slot past `output_count` as corrupt. That
+        // vout has no spender, as in electrs.
+        let nout = if let Some(fk) = fk {
+            match st.query.get_tx(fk) {
+                Ok(rec) => rec.output_count,
+                Err(e) => return store_err(e),
+            }
+        } else {
+            if asof.is_some() {
+                return not_found();
+            }
+            let tid = Txid::from_byte_array(txid);
+            let Some(tx) = st.mempool.as_ref().and_then(|m| m.get_tx(&tid)) else {
+                return not_found();
+            };
+            tx.output.len() as u32
+        };
         let view = match pin_or_reject(&st.query, ChainViewKind::Tip, asof) {
             Ok(v) => v,
             Err(r) => return r,
@@ -718,6 +730,9 @@ pub async fn tx_outspend(
         } else {
             None
         };
+        if vout >= nout {
+            return maybe_attach_view(json_reply_here(json!({ "spent": false })), view);
+        }
         match outspend_json(&st.query, mp, &txid, vout, view.as_ref()) {
             Ok(v) => maybe_attach_view(json_reply_here(v), view),
             Err(e) => store_err(e),
