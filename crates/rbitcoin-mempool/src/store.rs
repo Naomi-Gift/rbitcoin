@@ -30,6 +30,7 @@ use crate::packed::{
 use bitcoin::consensus::encode::deserialize;
 use bitcoin::hashes::Hash;
 use bitcoin::{Transaction, Txid, Wtxid};
+use rbitcoin_primitives::{le_u32, le_u64};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -1112,9 +1113,9 @@ pub fn open_or_init_meta(path: &Path) -> Result<(File, u64, u32, u32, u16), Memp
             return Err(MempoolError::BadMagic);
         }
         let schema = accepted_schema(u16::from_le_bytes([buf[4], buf[5]]))?;
-        let generation = u64::from_le_bytes(buf[8..16].try_into().unwrap());
-        let slot_cap = u32::from_le_bytes(buf[16..20].try_into().unwrap());
-        let live_count = u32::from_le_bytes(buf[20..24].try_into().unwrap());
+        let generation = le_u64!(buf, 8);
+        let slot_cap = le_u32!(buf, 16);
+        let live_count = le_u32!(buf, 20);
         if slot_cap == 0 {
             return Err(MempoolError::Corrupt("slot_cap zero"));
         }

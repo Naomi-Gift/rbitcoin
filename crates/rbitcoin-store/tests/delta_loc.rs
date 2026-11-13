@@ -374,3 +374,27 @@ fn pack_u16_seqsigwit_overflow_at_512kib() {
     assert_eq!(d, 0);
     assert_eq!(ovf, Some(65536));
 }
+
+#[test]
+fn range_batch_returns_appended_spans() {
+    let dir = TempDir::labeled("delta-range-typed").unwrap();
+    let loc = DeltaLoc::create(dir.path(), "seqsigwit").unwrap();
+    let fat = 65536 * IDX_STRIDE;
+    let mut starts = Vec::new();
+    let mut lens = Vec::new();
+    let mut cursor = FILE_HEADER_LEN as u64;
+    for len in [8u64, 16, fat] {
+        starts.push(cursor);
+        lens.push(len);
+        cursor = cursor.saturating_add(len);
+    }
+    loc.append(&starts, &lens).unwrap();
+    let rows = loc
+        .range_batch(&[Fk(1), Fk(3), Fk(2), Fk(0), Fk(9)])
+        .unwrap();
+    assert_eq!(rows[0], Some((starts[0], lens[0])));
+    assert_eq!(rows[1], Some((starts[2], lens[2])));
+    assert_eq!(rows[2], Some((starts[1], lens[1])));
+    assert_eq!(rows[3], None);
+    assert_eq!(rows[4], None);
+}

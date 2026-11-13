@@ -624,14 +624,14 @@ impl DeltaLoc {
         let mut out = vec![None; plan.out_len];
         for win in &plan.windows {
             let (buf, n) = (&win.buf, win.n);
+            let (rows, _) = buf.as_chunks::<2>();
             let mut ps = vec![0u64; n + 1];
             ps[0] = win.win_start;
-            let any_ovf =
-                (0..n).any(|i| u16::from_le_bytes(buf[i * 2..i * 2 + 2].try_into().unwrap()) == 0);
+            let any_ovf = rows.iter().any(|row| le_u16!(row, 0) == 0);
             if any_ovf {
                 let ovf = self.ovf_rows.read().unwrap_or_else(|e| e.into_inner());
-                for i in 0..n {
-                    let disk = u16::from_le_bytes(buf[i * 2..i * 2 + 2].try_into().unwrap());
+                for (i, row) in rows.iter().enumerate() {
+                    let disk = le_u16!(row, 0);
                     let strides = if disk == 0 {
                         ovf_lookup_strides(&ovf, win.win_first + i as u64, self.missing)?
                     } else {
@@ -640,8 +640,8 @@ impl DeltaLoc {
                     ps[i + 1] = ps[i].saturating_add(u64::from(strides).saturating_mul(IDX_STRIDE));
                 }
             } else {
-                for i in 0..n {
-                    let disk = u16::from_le_bytes(buf[i * 2..i * 2 + 2].try_into().unwrap());
+                for (i, row) in rows.iter().enumerate() {
+                    let disk = le_u16!(row, 0);
                     ps[i + 1] = ps[i].saturating_add(u64::from(disk).saturating_mul(IDX_STRIDE));
                 }
             }

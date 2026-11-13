@@ -152,3 +152,19 @@ fn get_many_page_grouped_matches_serial_and_caps_pages() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn get_range_typed_rows_and_past_count() {
+    let dir = tmp();
+    let t = TxidBody::create(&dir).unwrap();
+    let a = [0x31u8; 32];
+    let b = [0x32u8; 32];
+    let c = [0x33u8; 32];
+    t.append_batch(0, &[a, b, c]).unwrap();
+    assert_eq!(t.get_range(1, 3).unwrap(), vec![a, b, c]);
+    assert_eq!(t.get_range(2, 2).unwrap(), vec![b]);
+    assert!(t.get_range(3, 1).unwrap().is_empty());
+    assert!(matches!(t.get_range(1, 4), Err(StoreError::NotFound)));
+    assert!(matches!(t.get_range(0, 1), Err(StoreError::NotFound)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
