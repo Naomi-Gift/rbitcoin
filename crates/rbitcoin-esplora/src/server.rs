@@ -165,13 +165,18 @@ pub fn json_reply_here(v: impl Serialize) -> Response {
     json_reply_shared(Arc::new(v))
 }
 
+/// A JSON body the handler already encoded.
+#[doc(hidden)]
+pub fn json_bytes_reply(body: Vec<u8>) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
 /// Light bodies encode here. A heavy body moves the `Arc` into the response
 /// so [`ensure_json`] can hand it to `rbtc-scripts-*` without cloning.
 #[doc(hidden)]
 pub fn json_reply_shared(v: Arc<Value>) -> Response {
     if !rbitcoin_electrum::json_is_cpu_heavy(&v) {
-        let bytes = serde_json::to_vec(v.as_ref()).unwrap_or_else(|_| b"{}".to_vec());
-        return ([(header::CONTENT_TYPE, "application/json")], bytes).into_response();
+        return json_bytes_reply(serde_json::to_vec(v.as_ref()).unwrap_or_else(|_| b"{}".to_vec()));
     }
     let mut resp = Response::builder()
         .header(header::CONTENT_TYPE, "application/json")
