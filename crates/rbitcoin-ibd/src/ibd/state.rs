@@ -63,7 +63,7 @@ struct Holder {
 /// at the cap. The holders share one list.
 #[derive(Debug, Clone)]
 pub struct InflightReq {
-    /// Racing owners, then retired holders. A peer is in the list once.
+    /// First-ask order. A peer is in the list once.
     holders: Vec<Holder>,
     /// When this hash first entered global inflight (stale tip-hole re-get).
     pub started_at: Instant,
@@ -103,7 +103,7 @@ impl InflightReq {
         self.slot(peer).is_some_and(|h| h.retired)
     }
 
-    /// Racing owners, in the order they were added.
+    /// Racing owners, in first-ask order.
     pub fn racing(&self) -> impl Iterator<Item = usize> + '_ {
         self.holders.iter().filter(|h| !h.retired).map(|h| h.peer)
     }
@@ -114,7 +114,7 @@ impl InflightReq {
         self.racing().collect()
     }
 
-    /// Retired holders, in the order they were added.
+    /// Retired holders, in first-ask order.
     pub fn retired_ids(&self) -> impl Iterator<Item = usize> + '_ {
         self.holders.iter().filter(|h| h.retired).map(|h| h.peer)
     }
@@ -168,6 +168,13 @@ impl InflightReq {
     /// When racing or retired owner `peer` was asked.
     pub fn owner_asked_at(&self, peer: usize) -> Option<Instant> {
         self.slot(peer).map(|h| h.asked_at)
+    }
+
+    /// Ask time of a peer that already holds this getdata.
+    pub(crate) fn holder_asked_at(&self, peer: usize) -> Instant {
+        self.slot(peer)
+            .map(|h| h.asked_at)
+            .expect("peer holds this getdata")
     }
 
     /// Test seam: age an existing holder's ask.

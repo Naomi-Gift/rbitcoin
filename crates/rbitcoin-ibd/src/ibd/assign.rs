@@ -969,7 +969,7 @@ pub fn pre_hole_should_extra_racer(st: &IbdWorkState, hash: BlockHash, alive: &[
     }
     let now = Instant::now();
     let aged = req.racing().all(|pid| {
-        let since = req.owner_asked_at(pid).unwrap_or(req.started_at);
+        let since = req.holder_asked_at(pid);
         now.duration_since(since) >= TIP_HOLE_RX_STALE
     });
     if aged {
@@ -1143,9 +1143,7 @@ pub fn fifo_blocked_owner_to_drop(
             if !hole_owner_fifo_blocked(slot) {
                 return false;
             }
-            let held_long = req
-                .owner_asked_at(id)
-                .is_some_and(|t| now.duration_since(t) >= TIP_HOLE_FIFO_MIN_HOLD);
+            let held_long = now.duration_since(req.holder_asked_at(id)) >= TIP_HOLE_FIFO_MIN_HOLD;
             // free wait <= owner wait / FASTER, cross-multiplied as in tip_hole_drain_cmp.
             let free_wait = (free_q as u128 + 1)
                 .saturating_mul(TIP_HOLE_FIFO_FASTER)
@@ -1191,10 +1189,7 @@ pub fn tip_hole_owner_to_drop(
     if let Some(id) = fifo_blocked_owner_to_drop(req, hash, slots, per_peer, estimate) {
         return Some(id);
     }
-    let solo_since = owners
-        .first()
-        .and_then(|&pid| req.owner_asked_at(pid))
-        .unwrap_or(req.started_at);
+    let solo_since = req.holder_asked_at(owners[0]);
     let now_ms = ibd_mono_ms();
     let mut recent = Vec::new();
     let mut stale = Vec::new();
@@ -1263,7 +1258,7 @@ fn reask_aged_retired_owner(st: &mut IbdWorkState, hash: BlockHash) -> bool {
     let Some(pid) = st.inflight.get(&hash).and_then(|req| {
         req.retired_ids()
             .filter_map(|pid| {
-                let asked = req.owner_asked_at(pid)?;
+                let asked = req.holder_asked_at(pid);
                 (now.duration_since(asked) >= TIP_HOLE_RX_STALE).then_some((pid, asked))
             })
             .min_by_key(|(_, asked)| *asked)
@@ -1352,7 +1347,7 @@ pub fn steal_hung_densify(
                 return None;
             }
             let pid = req.racing().next()?;
-            Some((*h, ht, pid, req.owner_asked_at(pid)?))
+            Some((*h, ht, pid, req.holder_asked_at(pid)))
         })
         .collect();
     let hung: Vec<BlockHash> = candidates
