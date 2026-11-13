@@ -4058,6 +4058,109 @@ async fn sp_reorg_below_a_range_end_stops_the_scan_at_the_tip() {
     assert_eq!(conn.sp_subs[0].through, 15, "the chain tip is 15");
 }
 
+/// A range scan cut short by a reorg ends at the new tip. A block that
+/// connects inside the range before that scan finishes had no live
+/// subscription to notify, so the finishing step reads it.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_range_scan_reads_a_block_connected_inside_the_range() {
+    use crate::silent_scan::SpChain;
+
+    let mut chain = SpChain::new("el-sp-range-grow", 9, &[]);
+    let params = Arc::new(ChainParams::regtest());
+    let cfg = sp_cfg_short_steps();
+    let mut conn = ElectrumConn::new();
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    serve_sp_subscribe(
+        &mut writer,
+        &chain.q,
+        &params,
+        &"127.0.0.1:9".parse().unwrap(),
+        json!(1),
+        &chain.sub(json!("0-9")),
+        &mut conn,
+        &cfg,
+    )
+    .await
+    .unwrap();
+    // The range ran to 15 before a reorg left the tip at 9.
+    conn.sp_scans[0].sub.end = Some(15);
+    let reorg = TipNotify {
+        height: 9,
+        header_hex: String::new(),
+        reorg_from_height: Some(4),
+    };
+    restart_sp_scans_after_reorg(&mut conn.sp_scans, &chain.q, &params, &reorg);
+    let (address, done) = loop {
+        let (address, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+        if step.as_ref().unwrap().as_ref().unwrap().progress >= 1.0 {
+            break (address, step);
+        }
+        write_sp_scan_step(&mut writer, &chain.q, &params, &mut conn, &address, step)
+            .await
+            .unwrap();
+    };
+    assert_eq!(done.as_ref().unwrap().as_ref().unwrap().through, 9);
+
+    // Heights 10 to 12 connect before the session takes the last step. 11
+    // pays, and it is inside the range.
+    chain.extend(12, &[11]);
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    write_sp_scan_step(&mut writer, &chain.q, &params, &mut conn, &address, done)
+        .await
+        .unwrap();
+    assert_eq!(conn.sp_subs[0].through, 12);
+    let text = String::from_utf8(body).unwrap();
+    let heights: Vec<u64> = text
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .flat_map(|note| note["params"][2].as_array().cloned().unwrap_or_default())
+        .map(|entry| entry["height"].as_u64().unwrap())
+        .collect();
+    assert_eq!(heights, vec![11], "{text}");
+}
+
+/// Past the end of a range nothing is read: the client did not ask for it.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_range_scan_does_not_read_past_its_end() {
+    use crate::silent_scan::SpChain;
+
+    let mut chain = SpChain::new("el-sp-range-end", 9, &[]);
+    let params = Arc::new(ChainParams::regtest());
+    let cfg = sp_cfg_short_steps();
+    let mut conn = ElectrumConn::new();
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    serve_sp_subscribe(
+        &mut writer,
+        &chain.q,
+        &params,
+        &"127.0.0.1:9".parse().unwrap(),
+        json!(1),
+        &chain.sub(json!("0-9")),
+        &mut conn,
+        &cfg,
+    )
+    .await
+    .unwrap();
+    chain.extend(12, &[11]);
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    while !conn.sp_scans.is_empty() {
+        let (address, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+        write_sp_scan_step(&mut writer, &chain.q, &params, &mut conn, &address, step)
+            .await
+            .unwrap();
+    }
+    assert_eq!(conn.sp_subs[0].through, 12);
+    let text = String::from_utf8(body).unwrap();
+    assert!(
+        !text.contains("tx_hash"),
+        "height 11 is past the range: {text}"
+    );
+}
+
 /// A start the node cannot read is refused in the reply to the subscribe.
 /// A JSON-RPC notification has no error member for it.
 #[tokio::test(flavor = "current_thread")]

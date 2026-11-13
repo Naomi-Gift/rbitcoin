@@ -1906,14 +1906,15 @@ pub async fn write_sp_scan_step<W: AsyncWrite + Unpin>(
     };
     drop_sp_address(conn, address);
     let tip = query.tip_height().map_or(live.through, |tip| tip.0);
-    if tip > live.through {
-        // A block whose tip event came before this step had no subscription.
-        // A closed range did not ask for the heights above it.
-        if live.sub.end.is_none()
-            && !emit_sp_tip(writer, query, chain, &live.sub, live.through + 1, tip).await?
-        {
-            return Ok(());
-        }
+    // A block whose tip event came before this step had no subscription.
+    // Read what connected since, up to the end of a closed range: a scan
+    // that a reorg cut short ends below it. The heights above a range were
+    // not asked for.
+    let wanted = live.sub.end.map_or(tip, |end| end.min(tip));
+    if wanted > live.through
+        && !emit_sp_tip(writer, query, chain, &live.sub, live.through + 1, wanted).await?
+    {
+        return Ok(());
     }
     // Also down: a step that finished above the chain tip scanned heights
     // a reorg removed, and the blocks that connect there are not scanned yet.
