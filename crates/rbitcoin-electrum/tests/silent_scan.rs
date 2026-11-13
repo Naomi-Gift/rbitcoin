@@ -3,6 +3,11 @@ use bitcoin::Network;
 use rbitcoin_electrum::silent_scan::*;
 use serde_json::json;
 
+/// For a start that is a height: no header is read.
+pub fn no_times(height: u32) -> Result<u32, String> {
+    Err(format!("unexpected header read at {height}"))
+}
+
 // Official cryptographic outputs cannot be mined into a fresh test chain:
 // their tweak commits to the fixture's input outpoints and keys.
 #[test]
@@ -39,12 +44,14 @@ fn official_vectors_labeled_receiving() {
                 &json!([given["key_material"]["scan_priv_key"], spend]),
                 Network::Regtest,
                 Some(0),
+                &no_times,
             )
             .unwrap();
             let sub = parse_sub(
                 &json!([given["key_material"]["scan_priv_key"], spend, 0, labels]),
                 Network::Regtest,
                 Some(0),
+                &no_times,
             )
             .unwrap();
             let max_labels_sub = parse_sub(
@@ -56,6 +63,7 @@ fn official_vectors_labeled_receiving() {
                 ]),
                 Network::Regtest,
                 Some(0),
+                &no_times,
             )
             .unwrap();
             let tweak = hex_decode(rec["expected"]["tweak"].as_str().unwrap())
@@ -121,7 +129,7 @@ fn official_vectors_labeled_receiving() {
 
 #[test]
 fn parse_sub_indexes_a_non_string_param() {
-    match parse_sub(&json!([1, "02"]), Network::Regtest, Some(0)) {
+    match parse_sub(&json!([1, "02"]), Network::Regtest, Some(0), &no_times) {
         Err(err) => assert_eq!(err, "param 0 expected string"),
         Ok(_) => panic!("a non-string scan key must fail"),
     }
@@ -129,7 +137,12 @@ fn parse_sub_indexes_a_non_string_param() {
 
 #[test]
 fn parse_sub_rejects_short_scan_key() {
-    let err = match parse_sub(&json!(["00", "02".repeat(33)]), Network::Regtest, Some(0)) {
+    let err = match parse_sub(
+        &json!(["00", "02".repeat(33)]),
+        Network::Regtest,
+        Some(0),
+        &no_times,
+    ) {
         Err(e) => e,
         Ok(_) => panic!("expected error"),
     };
@@ -145,6 +158,7 @@ fn parse_sub_labels_start_and_networks() {
         &json!([scan, spend, "12-20", [0, 1, 1]]),
         Network::Bitcoin,
         Some(100),
+        &no_times,
     )
     .unwrap();
     assert_eq!(sub.start, 12);
@@ -154,42 +168,60 @@ fn parse_sub_labels_start_and_networks() {
         sub.address,
         "sp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc9pkqwv"
     );
-    let tsp = parse_sub(&json!([scan, spend]), Network::Signet, Some(3)).unwrap();
+    let tsp = parse_sub(&json!([scan, spend]), Network::Signet, Some(3), &no_times).unwrap();
     assert!(tsp.address.starts_with("tsp1"), "{}", tsp.address);
-    let t4 = parse_sub(&json!([scan, spend]), Network::Testnet4, Some(3)).unwrap();
+    let t4 = parse_sub(&json!([scan, spend]), Network::Testnet4, Some(3), &no_times).unwrap();
     assert!(t4.address.starts_with("tsp"), "{}", t4.address);
-    let tn = parse_sub(&json!([scan, spend]), Network::Testnet, Some(3)).unwrap();
+    let tn = parse_sub(&json!([scan, spend]), Network::Testnet, Some(3), &no_times).unwrap();
     assert!(tn.address.starts_with("tsp"), "{}", tn.address);
-    let no_tip = parse_sub(&json!([scan, spend, 50]), Network::Regtest, None).unwrap();
+    let no_tip = parse_sub(&json!([scan, spend, 50]), Network::Regtest, None, &no_times).unwrap();
     // Regtest is a test network: the same payload under `tsp`.
     assert_eq!(
         no_tip.address,
         "tsp1qqgste7k9hx0qftg6qmwlkqtwuy6cycyavzmzj85c6qdfhjdpdjtdgqjuexzk6murw56suy3e0rd2cgqvycxttddwsvgxe2usfpxumr70xc3wk4yh"
     );
     assert_eq!(no_tip.start, 50);
-    let null_start = parse_sub(&json!([scan, spend, null]), Network::Regtest, Some(3)).unwrap();
+    let null_start = parse_sub(
+        &json!([scan, spend, null]),
+        Network::Regtest,
+        Some(3),
+        &no_times,
+    )
+    .unwrap();
     assert_eq!(null_start.start, 0);
-    let bounded = parse_sub(&json!([scan, spend, 0]), Network::Regtest, Some(1_000)).unwrap();
-    assert_eq!(bounded.start, 1_000 - SP_HISTORY_WINDOW);
-    let wide = parse_sub(&json!([scan, spend, 1]), Network::Regtest, Some(10_000)).unwrap();
-    assert_eq!(wide.start, 10_000 - SP_HISTORY_WINDOW);
-    assert!(10_000 - wide.start <= SP_HISTORY_WINDOW);
-    let bad_spend = match parse_sub(&json!([scan, "02"]), Network::Regtest, Some(0)) {
+    // The requested history is honored: no start is moved toward the tip.
+    let genesis = parse_sub(
+        &json!([scan, spend, 0]),
+        Network::Regtest,
+        Some(1_000),
+        &no_times,
+    )
+    .unwrap();
+    assert_eq!(genesis.start, 0);
+    let unset = parse_sub(
+        &json!([scan, spend]),
+        Network::Regtest,
+        Some(1_000),
+        &no_times,
+    )
+    .unwrap();
+    assert_eq!(unset.start, 0);
+    let old = parse_sub(
+        &json!([scan, spend, 1]),
+        Network::Regtest,
+        Some(10_000),
+        &no_times,
+    )
+    .unwrap();
+    assert_eq!(old.start, 1);
+    assert_eq!(subscribe_result(&old)["start_height"], 1);
+    let bad_spend = match parse_sub(&json!([scan, "02"]), Network::Regtest, Some(0), &no_times) {
         Err(e) => e,
         Ok(_) => panic!("spend"),
     };
     assert!(!bad_spend.is_empty(), "{bad_spend}");
-    let ts = match parse_sub(
-        &json!([scan, spend, 600_000_000]),
-        Network::Regtest,
-        Some(0),
-    ) {
-        Err(e) => e,
-        Ok(_) => panic!("timestamp"),
-    };
-    assert!(ts.contains("timestamp"), "{ts}");
     let many = json!([scan, spend, 0, [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]]);
-    let too = match parse_sub(&many, Network::Regtest, Some(0)) {
+    let too = match parse_sub(&many, Network::Regtest, Some(0), &no_times) {
         Err(e) => e,
         Ok(_) => panic!("labels"),
     };
@@ -200,20 +232,34 @@ fn parse_sub_labels_start_and_networks() {
         &json!([scan, spend, "12", ["x", 2]]),
         Network::Regtest,
         Some(20),
+        &no_times,
     )
     .unwrap();
     assert_eq!(plain.start, 12);
     assert_eq!(plain.labels, vec![0, 2]);
-    let clamp = parse_sub(&json!([scan, spend, 100]), Network::Regtest, Some(3)).unwrap();
+    let clamp = parse_sub(
+        &json!([scan, spend, 100]),
+        Network::Regtest,
+        Some(3),
+        &no_times,
+    )
+    .unwrap();
     assert_eq!(clamp.start, 3);
     let at_cap = parse_sub(
         &json!([scan, spend, 500_000_000]),
         Network::Regtest,
         Some(3),
+        &no_times,
     )
     .unwrap();
     assert_eq!(at_cap.start, 3);
-    let bool_start = parse_sub(&json!([scan, spend, true]), Network::Regtest, Some(0)).unwrap();
+    let bool_start = parse_sub(
+        &json!([scan, spend, true]),
+        Network::Regtest,
+        Some(0),
+        &no_times,
+    )
+    .unwrap();
     assert_eq!(bool_start.start, 0);
 }
 
@@ -221,7 +267,13 @@ fn parse_sub_labels_start_and_networks() {
 fn tx_matches_bip352_simple_send() {
     let scan = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
     let spend = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
-    let sub = parse_sub(&json!([scan, spend, 0, [0, 1]]), Network::Regtest, Some(0)).unwrap();
+    let sub = parse_sub(
+        &json!([scan, spend, 0, [0, 1]]),
+        Network::Regtest,
+        Some(0),
+        &no_times,
+    )
+    .unwrap();
     let tweak = rbitcoin_primitives::hex_decode(
         "024ac253c216532e961988e2a8ce266a447c894c781e52ef6cee902361db960004",
     )
@@ -332,6 +384,7 @@ fn pruned_scan_returns_a_sealed_payment() {
         ]),
         Network::Regtest,
         Some(0),
+        &no_times,
     )
     .unwrap();
     let hits = scan_hits(&q, &chain, &sub, 0, 0).unwrap();
@@ -339,4 +392,97 @@ fn pruned_scan_returns_a_sealed_payment() {
     assert_eq!(hits[0]["height"], 0);
     drop(q);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+const SYNTH_SCAN: &str = "0f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
+const SYNTH_SPEND: &str = "025cc9856d6f8375350e123978daac200c260cb5b5ae83106cab90484dcd8fcf36";
+
+/// Sparrow sends the wallet birthday as seconds since the epoch. The start
+/// is the last block at least two hours older than that, as Bitcoin Core's
+/// rescan picks it.
+#[test]
+fn timestamp_start_resolves_to_a_height() {
+    const T0: u32 = 1_600_000_000;
+    let time_at = |h: u32| Ok::<u32, String>(T0 + h * 600);
+    let start_for = |start: serde_json::Value| {
+        parse_sub(
+            &json!([SYNTH_SCAN, SYNTH_SPEND, start]),
+            Network::Regtest,
+            Some(1_000),
+            &time_at,
+        )
+        .unwrap()
+        .start
+    };
+    // Block 500 carries the birthday. Two hours is twelve blocks.
+    assert_eq!(start_for(json!(T0 + 500 * 600)), 488);
+    // One second short of block 488's window keeps block 487.
+    assert_eq!(start_for(json!(T0 + 500 * 600 - 1)), 487);
+    assert_eq!(start_for(json!((T0 + 500 * 600).to_string())), 488);
+    let sub = parse_sub(
+        &json!([SYNTH_SCAN, SYNTH_SPEND, T0 + 500 * 600]),
+        Network::Regtest,
+        Some(1_000),
+        &time_at,
+    )
+    .unwrap();
+    assert_eq!(subscribe_result(&sub)["start_height"], 488);
+    // Older than genesis scans everything. Newer than the tip scans the tip.
+    assert_eq!(start_for(json!(500_000_001)), 0);
+    assert_eq!(start_for(json!(T0 + 1_000 * 600 + 7_200)), 1_000);
+    assert_eq!(start_for(json!(u64::from(u32::MAX) + 5)), 1_000);
+    // The nLockTime boundary itself is still a height.
+    let at_boundary = parse_sub(
+        &json!([SYNTH_SCAN, SYNTH_SPEND, 500_000_000]),
+        Network::Regtest,
+        Some(1_000),
+        &no_times,
+    )
+    .unwrap();
+    assert_eq!(at_boundary.start, 1_000);
+    // No chain yet: nothing to resolve against.
+    let empty = parse_sub(
+        &json!([SYNTH_SCAN, SYNTH_SPEND, T0]),
+        Network::Regtest,
+        None,
+        &no_times,
+    )
+    .unwrap();
+    assert_eq!(empty.start, 0);
+}
+
+/// Header times are not sorted. A block mined after the birthday may carry
+/// an earlier time, inside the two hour window.
+#[test]
+fn timestamp_start_covers_a_block_with_an_early_time() {
+    const T0: u32 = 1_600_000_000;
+    let birthday = T0 + 500 * 600;
+    // Block 500 is mined at the birthday with a clock 90 minutes slow.
+    let time_at = |h: u32| {
+        let t = T0 + h * 600;
+        Ok::<u32, String>(if h == 500 { t - 5_400 } else { t })
+    };
+    let sub = parse_sub(
+        &json!([SYNTH_SCAN, SYNTH_SPEND, birthday]),
+        Network::Regtest,
+        Some(1_000),
+        &time_at,
+    )
+    .unwrap();
+    assert!(sub.start <= 500, "start {} skips block 500", sub.start);
+    assert!(sub.start >= 480, "start {} is before the window", sub.start);
+}
+
+#[test]
+fn timestamp_start_reports_a_header_that_cannot_be_read() {
+    let err = match parse_sub(
+        &json!([SYNTH_SCAN, SYNTH_SPEND, 1_600_000_000]),
+        Network::Regtest,
+        Some(10),
+        &no_times,
+    ) {
+        Err(e) => e,
+        Ok(sub) => panic!("resolved to {}", sub.start),
+    };
+    assert!(err.contains("unexpected header read"), "{err}");
 }

@@ -16,6 +16,8 @@ use rbitcoin_query::testutil::FixtureChain;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
+use crate::silent_scan::no_times;
+
 fn tmp_store() -> (rbitcoin_query::testutil::TempDir, Query) {
     rbitcoin_query::testutil::tiny_query_labeled("electrum")
 }
@@ -2940,6 +2942,7 @@ async fn sp_scan_stops_when_the_client_hangs_up() {
         &json!([scan, spend, 0]),
         bitcoin::Network::Regtest,
         Some(rbitcoin_electrum::silent_scan::SP_SCAN_CHUNK),
+        &no_times,
     )
     .unwrap();
     let last = rbitcoin_electrum::silent_scan::SP_SCAN_CHUNK;
@@ -3219,9 +3222,13 @@ async fn pruned_scan_miss_is_not_an_empty_history() {
         conn.sp_sub.is_none(),
         "a failed scan is not a live subscription"
     );
-    let sub =
-        rbitcoin_electrum::silent_scan::parse_sub(&params, bitcoin::Network::Regtest, Some(0))
-            .unwrap();
+    let sub = rbitcoin_electrum::silent_scan::parse_sub(
+        &params,
+        bitcoin::Network::Regtest,
+        Some(0),
+        &no_times,
+    )
+    .unwrap();
     let mut tip_body = Vec::new();
     let mut tip_writer = ConnWrite::new(Cursor::new(&mut tip_body), Duration::from_secs(2));
     emit_sp_tip(&mut tip_writer, &q, &chain, &sub, 0)

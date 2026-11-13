@@ -15,8 +15,11 @@ pub fn decode_hex_bytes(s: &str) -> Result<Vec<u8>, String> {
     crate::server::decode_hex_bytes(s)
 }
 
-/// Heights scanned when the client omits a start or passes 0.
-pub const SP_HISTORY_WINDOW: u32 = 256;
+/// Frigate, as nLockTime: a start above this is seconds since the epoch.
+pub const SP_START_TIME_THRESHOLD: u32 = 500_000_000;
+/// Bitcoin Core's `TIMESTAMP_WINDOW`: how far a block's time may trail the
+/// clock that mined it. A timestamp start scans from this much earlier.
+pub const SP_TIMESTAMP_WINDOW: u32 = 2 * 60 * 60;
 /// Heights held under one scan permit before the next chunk.
 pub const SP_SCAN_CHUNK: u32 = 256;
 /// Process-wide historical scans. Not a knob.
@@ -31,7 +34,14 @@ pub struct SpSub {
     pub address: String,
 }
 
-pub fn parse_sub(params: &Value, network: Network, tip: Option<u32>) -> Result<SpSub, String> {
+/// Parse a subscribe or unsubscribe. `block_time` is the header time at a
+/// confirmed height, read only when the start is a timestamp.
+pub fn parse_sub(
+    params: &Value,
+    network: Network,
+    tip: Option<u32>,
+    block_time: &dyn Fn(u32) -> Result<u32, String>,
+) -> Result<SpSub, String> {
     let scan_hex = param_str(params, 0)?;
     let spend_hex = param_str(params, 1)?;
     let scan_bytes = decode_hex_bytes(scan_hex)?;
@@ -42,7 +52,7 @@ pub fn parse_sub(params: &Value, network: Network, tip: Option<u32>) -> Result<S
     let spend_bytes = decode_hex_bytes(spend_hex)?;
     let spend = PublicKey::from_slice(&spend_bytes).map_err(|e| e.to_string())?;
     let start = match params.as_array().and_then(|a| a.get(2)) {
-        Some(Value::Number(n)) => n.as_u64().unwrap_or(0) as u32,
+        Some(Value::Number(n)) => n.as_u64().unwrap_or(0),
         Some(Value::String(s)) => s
             .split('-')
             .next()
@@ -50,9 +60,14 @@ pub fn parse_sub(params: &Value, network: Network, tip: Option<u32>) -> Result<S
             .unwrap_or(0),
         _ => 0,
     };
-    if start > 500_000_000 {
-        return Err("timestamp start not supported".into());
-    }
+    // Past the last second a header can carry is past every block.
+    let start = u32::try_from(start).unwrap_or(u32::MAX);
+    let start = match tip {
+        Some(tip) if start > SP_START_TIME_THRESHOLD => height_before_time(start, tip, block_time)?,
+        Some(tip) => start.min(tip),
+        None if start > SP_START_TIME_THRESHOLD => 0,
+        None => start,
+    };
     let mut labels = vec![0u32];
     if let Some(arr) = params
         .as_array()
@@ -77,12 +92,6 @@ pub fn parse_sub(params: &Value, network: Network, tip: Option<u32>) -> Result<S
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| format!("invalid silent payment label key: {e}"))?;
     spend_keys.insert(0, spend);
-    let start = start.min(tip.unwrap_or(start));
-    // Any start, including a nonzero one, stays inside the recent window.
-    let start = match tip {
-        Some(tip_h) => start.max(tip_h.saturating_sub(SP_HISTORY_WINDOW)),
-        None => start,
-    };
     let address = encode_sp_address(network, &scan, &spend);
     Ok(SpSub {
         scan,
@@ -91,6 +100,31 @@ pub fn parse_sub(params: &Value, network: Network, tip: Option<u32>) -> Result<S
         spend_keys,
         address,
     })
+}
+
+/// The height a timestamp start scans from: the last block whose header
+/// time is at least [`SP_TIMESTAMP_WINDOW`] before `time`, or genesis when
+/// there is none. Header times are not sorted, so the search lands within
+/// their disorder, and the window is what covers it.
+pub fn height_before_time(
+    time: u32,
+    tip: u32,
+    block_time: &dyn Fn(u32) -> Result<u32, String>,
+) -> Result<u32, String> {
+    let target = time.saturating_sub(SP_TIMESTAMP_WINDOW);
+    let (mut low, mut high, mut best) = (0u32, tip, 0u32);
+    while low <= high {
+        let mid = low + (high - low) / 2;
+        if block_time(mid)? <= target {
+            best = mid;
+            low = mid + 1;
+        } else if mid == 0 {
+            break;
+        } else {
+            high = mid - 1;
+        }
+    }
+    Ok(best)
 }
 
 pub fn subscribe_result(sub: &SpSub) -> Value {

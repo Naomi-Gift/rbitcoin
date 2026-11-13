@@ -1347,7 +1347,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let tip = query.tip_height().map(|h| h.0);
-    let sub = match crate::silent_scan::parse_sub(params_v, chain.network, tip) {
+    let sub = match parse_sp_sub(params_v, query, chain).await {
         Ok(s) => s,
         Err(e) => {
             writer
@@ -1399,6 +1399,35 @@ where
     Ok(())
 }
 
+/// Parse against the confirmed chain: its tip, and its header times for a
+/// timestamp start.
+fn parse_sp_sub_on_chain(
+    params: &Value,
+    query: &Query,
+    chain: &ChainParams,
+) -> Result<crate::silent_scan::SpSub, String> {
+    let tip = query.tip_height().map(|h| h.0);
+    let block_time = |height: u32| match query.header_at_height(Height(height)) {
+        Ok(Some((_fk, header))) => Ok(header.timestamp),
+        Ok(None) => Err(format!("no header at height {height}")),
+        Err(e) => Err(e.to_string()),
+    };
+    crate::silent_scan::parse_sub(params, chain.network, tip, &block_time)
+}
+
+/// [`parse_sp_sub_on_chain`] off the connection task: a timestamp start
+/// reads headers.
+async fn parse_sp_sub(
+    params: &Value,
+    query: &Arc<Query>,
+    chain: &Arc<ChainParams>,
+) -> Result<crate::silent_scan::SpSub, String> {
+    let (p, q, c) = (params.clone(), Arc::clone(query), Arc::clone(chain));
+    budgeted_blocking(query, move || parse_sp_sub_on_chain(&p, &q, &c))
+        .await
+        .unwrap_or_else(|e| Err(e.to_string()))
+}
+
 #[doc(hidden)]
 pub fn silentpayments_unsubscribe(
     conn: &mut ElectrumConn,
@@ -1406,8 +1435,7 @@ pub fn silentpayments_unsubscribe(
     chain: &ChainParams,
     params: &Value,
 ) -> Result<Value, String> {
-    let tip = query.tip_height().map(|h| h.0);
-    let sub = crate::silent_scan::parse_sub(params, chain.network, tip)?;
+    let sub = parse_sp_sub_on_chain(params, query, chain)?;
     if conn
         .sp_sub
         .as_ref()
@@ -2911,8 +2939,7 @@ pub fn dispatch_pinned(
             Ok(json!(conn.outpoint_subs.remove(&(txid, vout))))
         }
         "blockchain.silentpayments.subscribe" => {
-            let tip = query.tip_height().map(|h| h.0);
-            let sub = crate::silent_scan::parse_sub(params, chain.network, tip)?;
+            let sub = parse_sp_sub_on_chain(params, query, chain)?;
             Ok(crate::silent_scan::subscribe_result(&sub))
         }
         "blockchain.silentpayments.unsubscribe" => {
