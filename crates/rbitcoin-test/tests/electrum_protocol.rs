@@ -181,7 +181,21 @@ async fn pin_silentpayments_1_6(stream: &mut TcpStream) {
         Some("blockchain.silentpayments.subscribe"),
         "{note}"
     );
-    assert!(note["params"]["history"].as_array().is_some(), "{note}");
+    // Frigate: positional `[subscription, progress, history]`.
+    assert_eq!(note["params"][0], sp["result"], "{note}");
+    assert_eq!(note["params"][1], 1.0, "{note}");
+    assert!(note["params"][2].as_array().is_some(), "{note}");
+    // Sparrow sends the wallet birthday. Older than genesis is the whole chain.
+    let dated = rpc(
+        stream,
+        57,
+        "blockchain.silentpayments.subscribe",
+        json!([SP_SCAN, SP_SPEND, 600_000_000]),
+    )
+    .await;
+    assert_eq!(dated["result"]["start_height"], 0, "{dated}");
+    let dated_note = read_notify(stream, "silentpayments dated history").await;
+    assert_eq!(dated_note["params"][0], dated["result"], "{dated_note}");
     const OTHER_SCAN: &str = "1f694e068028a717f8af6b9411f9a133dd3565258714cc226594b34db90c1f2c";
     let mismatch = rpc(
         stream,

@@ -486,3 +486,137 @@ fn timestamp_start_reports_a_header_that_cannot_be_read() {
     };
     assert!(err.contains("unexpected header read"), "{err}");
 }
+
+/// A synthetic chain with silent payments to one synthetic key pair. Block
+/// `h` carries the time `SP_CHAIN_T0 + h * 600`.
+pub struct SpChain {
+    _dir: rbitcoin_query::testutil::TempDir,
+    pub q: std::sync::Arc<rbitcoin_query::Query>,
+    pub scan_hex: String,
+    pub spend_hex: String,
+    paid_script: Vec<u8>,
+    tweak: [u8; 33],
+    tip_fk: rbitcoin_primitives::Fk,
+    tip_hash: Option<[u8; 32]>,
+    next: u32,
+}
+
+pub const SP_CHAIN_T0: u32 = 1_600_000_000;
+
+impl SpChain {
+    /// Heights `0..=last`. Each height in `paid` has one payment.
+    pub fn new(label: &str, last: u32, paid: &[u32]) -> Self {
+        use bitcoin::secp256k1::{PublicKey, Scalar, SecretKey};
+        use rbitcoin_consensus::silent_payments::tagged_hash;
+        use rbitcoin_primitives::{hex_encode, Fk, Height};
+
+        let secp = Secp256k1::new();
+        let scan_sk = SecretKey::from_slice(&[0x11; 32]).unwrap();
+        let spend_pk =
+            PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x22; 32]).unwrap());
+        let a = PublicKey::from_secret_key(&secp, &SecretKey::from_slice(&[0x33; 32]).unwrap());
+        let scan_scalar = Scalar::from_be_bytes(scan_sk.secret_bytes()).unwrap();
+        let shared = a.mul_tweak(&secp, &scan_scalar).unwrap();
+        let mut payload = [0u8; 37];
+        payload[..33].copy_from_slice(&shared.serialize());
+        let tk = SecretKey::from_slice(&tagged_hash(b"BIP0352/SharedSecret", &payload)).unwrap();
+        let output = spend_pk
+            .combine(&PublicKey::from_secret_key(&secp, &tk))
+            .unwrap();
+        let mut paid_script = rbitcoin_primitives::P2TR_PREFIX.to_vec();
+        paid_script.extend_from_slice(&output.x_only_public_key().0.serialize());
+
+        let (dir, q) = rbitcoin_query::testutil::tiny_query_labeled(label);
+        q.set_sptweaks_enabled(true, Height(0)).unwrap();
+        let mut chain = Self {
+            _dir: dir,
+            q: std::sync::Arc::new(q),
+            scan_hex: hex_encode(scan_sk.secret_bytes()),
+            spend_hex: hex_encode(spend_pk.serialize()),
+            paid_script,
+            tweak: a.serialize(),
+            tip_fk: Fk::NULL,
+            tip_hash: None,
+            next: 0,
+        };
+        chain.extend(last, paid);
+        chain
+    }
+
+    /// Connect heights through `last`. Each height in `paid` has one payment.
+    pub fn extend(&mut self, last: u32, paid: &[u32]) {
+        use rbitcoin_primitives::Height;
+        use rbitcoin_query::testutil::FixtureChain;
+        use rbitcoin_query::TxApply;
+        use rbitcoin_store::{HeaderRecord, InputRecord, OutputRecord, TxRecord};
+
+        for h in self.next..=last {
+            let mut merkle = [0u8; 32];
+            merkle[..4].copy_from_slice(&h.to_le_bytes());
+            merkle[31] = 0xcb;
+            let timestamp = SP_CHAIN_T0 + h * 600;
+            let hash = match self.tip_hash {
+                None => merkle,
+                Some(parent) => {
+                    rbitcoin_store::block_header_hash(1, &parent, &merkle, timestamp, 0x207fffff, 0)
+                }
+            };
+            self.tip_hash = Some(hash);
+            let header = HeaderRecord {
+                prev_fk: self.tip_fk,
+                version: 1,
+                timestamp,
+                bits: 0x207fffff,
+                nonce: 0,
+                merkle_root: merkle,
+                hash,
+                size: 0,
+                weight: 0,
+            };
+            let pays = paid.contains(&h);
+            let script = if pays {
+                self.paid_script.clone()
+            } else {
+                vec![rbitcoin_primitives::OP_TRUE]
+            };
+            self.tip_fk = self
+                .q
+                .connect_block(
+                    Height(h),
+                    &header,
+                    &[TxApply {
+                        tx: TxRecord {
+                            txid: merkle,
+                            version: 1,
+                            locktime: 0,
+                            input_count: 1,
+                            output_count: 1,
+                        },
+                        inputs: vec![InputRecord::coinbase(u32::MAX, vec![0x00], vec![])],
+                        outputs: vec![OutputRecord::unspent(50_0000_0000, script)],
+                    }],
+                )
+                .unwrap();
+            self.q
+                .put_sp_tweaks_block(Height(h), self.tip_fk, &[pays.then_some(self.tweak)])
+                .unwrap();
+        }
+        self.next = last + 1;
+    }
+
+    pub fn sub(&self, start: serde_json::Value) -> serde_json::Value {
+        json!([self.scan_hex, self.spend_hex, start])
+    }
+}
+
+/// The fixture itself: a payment far below the tip is found by a direct scan.
+#[test]
+fn sp_chain_fixture_pays_the_synthetic_keys() {
+    let chain = SpChain::new("el-sp-fixture", 300, &[7]);
+    let params = rbitcoin_consensus::ChainParams::regtest();
+    let sub = parse_sub(&chain.sub(json!(0)), Network::Regtest, Some(300), &no_times).unwrap();
+    assert_eq!(sub.start, 0);
+    let hits = scan_hits(&chain.q, &params, &sub, 0, 300).unwrap();
+    assert_eq!(hits.len(), 1, "{hits:?}");
+    assert_eq!(hits[0]["height"], 7);
+}
