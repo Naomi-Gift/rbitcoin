@@ -548,14 +548,7 @@ where
                             .await?;
                         }
                         restart_sp_scans_after_reorg(&mut conn.sp_scans, &query, &params, &t);
-                        for live in conn.sp_subs.iter_mut() {
-                            let from = live.next_unscanned(&t);
-                            if from <= t.height {
-                                emit_sp_tip(&mut writer, &query, &params, &live.sub, from, t.height)
-                                    .await?;
-                            }
-                            live.through = t.height;
-                        }
+                        emit_sp_tips(&mut writer, &query, &params, &mut conn, &t).await?;
                         if !conn.sh_subs.is_empty() {
                             let heights = if t.reorg_from_height.is_some() {
                                 None
@@ -1480,8 +1473,35 @@ pub fn silentpayments_unsubscribe(
     Ok(json!(sub.address))
 }
 
+/// A tip event for every live silent-payment subscription: each scans the
+/// heights it has not seen. One whose heights cannot be read gets the error
+/// note and ends. Left live, it would count those heights as scanned.
+#[doc(hidden)]
+pub async fn emit_sp_tips<W: AsyncWrite + Unpin>(
+    writer: &mut ConnWrite<W>,
+    query: &Arc<Query>,
+    chain: &ChainParams,
+    conn: &mut ElectrumConn,
+    tip: &TipNotify,
+) -> Result<(), std::io::Error> {
+    let mut kept = Vec::with_capacity(conn.sp_subs.len());
+    for mut live in std::mem::take(&mut conn.sp_subs) {
+        let from = live.next_unscanned(tip);
+        if from <= tip.height
+            && !emit_sp_tip(writer, query, chain, &live.sub, from, tip.height).await?
+        {
+            continue;
+        }
+        live.through = live.through.max(tip.height);
+        kept.push(live);
+    }
+    conn.sp_subs = kept;
+    Ok(())
+}
+
 /// Heights `from..=to` connected after the history: one note when any of
-/// them pays the subscription.
+/// them pays the subscription. `false` when a height could not be read; the
+/// error note is written.
 pub async fn emit_sp_tip<W: AsyncWrite + Unpin>(
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
@@ -1489,7 +1509,7 @@ pub async fn emit_sp_tip<W: AsyncWrite + Unpin>(
     sub: &crate::silent_scan::SpSub,
     from: u32,
     to: u32,
-) -> Result<(), std::io::Error> {
+) -> Result<bool, std::io::Error> {
     let q = Arc::clone(query);
     let c = chain.clone();
     let piece = sub.clone();
@@ -1499,13 +1519,19 @@ pub async fn emit_sp_tip<W: AsyncWrite + Unpin>(
     .await;
     let hits = match outcome {
         Ok(Ok(hits)) => hits,
-        Ok(Err(message)) => return writer.line(sp_scan_error_note(sub, message)).await,
-        Err(e) => return writer.line(sp_scan_error_note(sub, e.to_string())).await,
+        Ok(Err(message)) => {
+            writer.line(sp_scan_error_note(sub, message)).await?;
+            return Ok(false);
+        }
+        Err(e) => {
+            writer.line(sp_scan_error_note(sub, e.to_string())).await?;
+            return Ok(false);
+        }
     };
-    if hits.is_empty() {
-        return Ok(());
+    if !hits.is_empty() {
+        writer.line(sp_history_note(sub, 1.0, hits)).await?;
     }
-    writer.line(sp_history_note(sub, 1.0, hits)).await
+    Ok(true)
 }
 
 /// Push the current status of each of `outpoints`.
@@ -1789,8 +1815,10 @@ pub async fn write_sp_scan_step<W: AsyncWrite + Unpin>(
     if tip > live.through {
         // A block whose tip event came before this step had no subscription.
         // A closed range did not ask for the heights above it.
-        if live.sub.end.is_none() {
-            emit_sp_tip(writer, query, chain, &live.sub, live.through + 1, tip).await?;
+        if live.sub.end.is_none()
+            && !emit_sp_tip(writer, query, chain, &live.sub, live.through + 1, tip).await?
+        {
+            return Ok(());
         }
         live.through = tip;
     }

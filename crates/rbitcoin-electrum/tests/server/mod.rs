@@ -3682,9 +3682,10 @@ async fn pruned_scan_miss_is_not_an_empty_history() {
     .unwrap();
     let mut tip_body = Vec::new();
     let mut tip_writer = ConnWrite::new(Cursor::new(&mut tip_body), Duration::from_secs(2));
-    emit_sp_tip(&mut tip_writer, &q, &chain, &sub, 1, 1)
+    let read = emit_sp_tip(&mut tip_writer, &q, &chain, &sub, 1, 1)
         .await
         .unwrap();
+    assert!(!read, "the miss is reported to the caller");
     let tip_text = String::from_utf8(tip_body).unwrap();
     assert!(
         tip_text.contains("window miss"),
@@ -3694,6 +3695,100 @@ async fn pruned_scan_miss_is_not_an_empty_history() {
         !tip_text.contains("1.0"),
         "a tip miss must not report the height scanned, got {tip_text}"
     );
+    drop(q);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A live subscription whose new heights cannot be read ends, as a failed
+/// history scan does. Left live, it would mark those heights scanned.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_tip_miss_ends_the_subscription() {
+    use std::io::Cursor;
+
+    let (dir, q) = sp_pruned_chain_missing_height_1();
+    let chain = Arc::new(ChainParams::regtest());
+    let sub = |start: Value| {
+        rbitcoin_electrum::silent_scan::parse_sub(
+            &json!([SP_MISS_SCAN, SP_MISS_SPEND, start]),
+            bitcoin::Network::Regtest,
+            Some(1),
+            &no_times,
+        )
+        .unwrap()
+    };
+    let tip = TipNotify {
+        height: 1,
+        header_hex: String::new(),
+        reorg_from_height: None,
+    };
+
+    // A tip event: height 1 has no keep file.
+    let mut conn = ElectrumConn::new();
+    conn.sp_subs.push(SpLive {
+        sub: sub(json!(0)),
+        through: 0,
+    });
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(Cursor::new(&mut body), Duration::from_secs(2));
+    emit_sp_tips(&mut writer, &q, &chain, &mut conn, &tip)
+        .await
+        .unwrap();
+    assert!(conn.sp_subs.is_empty(), "the subscription ended");
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("window miss"), "{text}");
+
+    // A height already scanned is not read again, and the subscription stays.
+    let mut conn = ElectrumConn::new();
+    conn.sp_subs.push(SpLive {
+        sub: sub(json!(0)),
+        through: 1,
+    });
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(Cursor::new(&mut body), Duration::from_secs(2));
+    emit_sp_tips(&mut writer, &q, &chain, &mut conn, &tip)
+        .await
+        .unwrap();
+    assert_eq!(conn.sp_subs.len(), 1);
+    assert_eq!(conn.sp_subs[0].through, 1);
+    assert!(body.is_empty());
+
+    // The catch-up after a history scan: the scan ended at 0, the tip is 1.
+    let mut conn = ElectrumConn::new();
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(Cursor::new(&mut body), Duration::from_secs(2));
+    serve_sp_subscribe(
+        &mut writer,
+        &q,
+        &chain,
+        &"127.0.0.1:9".parse().unwrap(),
+        json!(1),
+        &json!([SP_MISS_SCAN, SP_MISS_SPEND, "0-0"]),
+        &mut conn,
+        DEFAULT_MAX_SP_SUBS,
+    )
+    .await
+    .unwrap();
+    conn.sp_scans[0].sub.end = None;
+    let address = conn.sp_scans[0].sub.address.clone();
+    let at_zero = SpScanStep {
+        hits: Vec::new(),
+        through: 0,
+        progress: 1.0,
+    };
+    write_sp_scan_step(
+        &mut writer,
+        &q,
+        &chain,
+        &mut conn,
+        &address,
+        Some(Ok(at_zero)),
+    )
+    .await
+    .unwrap();
+    assert!(conn.sp_scans.is_empty());
+    assert!(conn.sp_subs.is_empty(), "height 1 was not read");
+    let text = String::from_utf8(body).unwrap();
+    assert!(text.contains("window miss"), "{text}");
     drop(q);
     let _ = std::fs::remove_dir_all(&dir);
 }
