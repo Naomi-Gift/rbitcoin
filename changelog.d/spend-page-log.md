@@ -72,4 +72,6 @@ Fixed
   length is sampled is composed at the length taken with the freeze. A reader
   of many outputs checks the page log before `spent.body`. A spend accepted
   after the freeze raises the sealed tip, so a later disconnect below that
-  tip holds and does not fold it.
+  tip holds and does not fold it. A same-spender annotate whose log already
+  serves the slot does not read `spent.body`, so a torn body page does not
+  fail that rewrite. A miss still refuses a reserved flag.

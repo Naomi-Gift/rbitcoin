@@ -424,6 +424,55 @@ fn batched_annotate_keeps_the_logged_slot_and_the_cold_tail() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A same-spender re-annotate rewrites the log when the body slot will not decode.
+///
+/// The log already serves the slot, so the torn body is not consulted.
+#[test]
+fn known_skip_rewrites_a_logged_slot_over_a_torn_body() {
+    let (dir, t, spenders) = temp_table();
+    let (cfk, off, len) = put_one(&t);
+    let abs = rbitcoin_store::tx_table::spent_abs(off, 0);
+    let sfk = Fk(77);
+    assert!(put_spend_batch_by_abs_meta_known(
+        &t,
+        &spenders,
+        &[(abs, cfk, 0, sfk, 0)],
+        &[(Fk::NULL, 0, 0)],
+    )
+    .unwrap()
+    .is_empty());
+    t.spent
+        .write_body_abs(abs, &[0xff, 0, 0, 0, 0, 0, 0, 0])
+        .unwrap();
+    let cold =
+        put_spend_batch_by_abs_meta_known(&t, &spenders, &[(abs, cfk, 0, sfk, 0)], &[(sfk, 0, 0)])
+            .expect("a torn body must not fail a slot the log already serves");
+    assert!(cold.is_empty());
+    let (multi, field, vin) = t.get_output_spender_meta_at(off, len, 0).unwrap();
+    assert!(!multi && field == sfk && vin == 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A known skip with no log note still refuses a reserved body flag.
+#[test]
+fn known_skip_refuses_a_torn_body_when_the_log_misses() {
+    let (dir, t, spenders) = temp_table();
+    let (cfk, off, _len) = put_one(&t);
+    let abs = rbitcoin_store::tx_table::spent_abs(off, 0);
+    t.spent
+        .write_body_abs(abs, &[0xff, 0, 0, 0, 0, 0, 0, 0])
+        .unwrap();
+    let err = put_spend_batch_by_abs_meta_known(
+        &t,
+        &spenders,
+        &[(abs, cfk, 0, Fk(77), 0)],
+        &[(Fk(77), 0, 0)],
+    )
+    .unwrap_err();
+    assert!(matches!(err, StoreError::Corrupt(_)));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A published slot with no directory note and reserved flags fails the batch.
 #[test]
 fn batched_annotate_refuses_a_corrupt_body_slot() {

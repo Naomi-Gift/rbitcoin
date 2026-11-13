@@ -554,13 +554,12 @@ pub fn put_spend_batch_by_abs_meta_known(
         let (field, flags, field_vin) = known[i];
         match decide_annotate(field, flags, field_vin, sfk, vin, spenders)? {
             AnnotateOp::Skip => {
-                // A directory hit is not proof the body still has this spend.
-                // `keep` can drop or zero the image after this batch already
-                // decided to skip. Write the known slot again when the log
-                // still serves it, or when the body bytes are different.
-                let served = txs.spend_log_serves(abs);
-                let on_body = txs.body_slot_matches(abs, field, flags, field_vin)?;
-                if served || !on_body {
+                // `keep` can drop the image after this batch decided to skip.
+                // A slot the log still serves is written again. The body is
+                // read only on a miss, so a torn page does not fail that rewrite.
+                let rewrite = txs.spend_log_serves(abs)
+                    || !txs.body_slot_matches(abs, field, flags, field_vin)?;
+                if rewrite {
                     let meta = encode_spent_slot(flags, field, field_vin)?;
                     writes.push((abs, cfk, vout, sfk, vin, meta));
                 }
