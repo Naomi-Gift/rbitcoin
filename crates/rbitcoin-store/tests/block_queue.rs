@@ -28,6 +28,34 @@ fn second_enqueue_at_height_keeps_the_first_body() {
 }
 
 #[test]
+fn hashes_in_span_lists_only_occupied_heights() {
+    let mut q = BlockQueue::empty();
+    q.enqueue(10, [1u8; 32], 1, b"a").unwrap();
+    q.enqueue(12, [2u8; 32], 2, b"bb").unwrap();
+    q.enqueue(u32::MAX, [9u8; 32], 0, b"unk").unwrap();
+    assert_eq!(
+        q.hashes_in_span(10, 12),
+        vec![(10, [1u8; 32]), (12, [2u8; 32])]
+    );
+    assert!(q.hashes_in_span(11, 11).is_empty());
+    assert!(q.hashes_in_span(1, 9).is_empty());
+    assert_eq!(
+        q.hashes_in_span(u32::MAX, u32::MAX),
+        vec![(u32::MAX, [9u8; 32])]
+    );
+    assert_eq!(q.dequeue_height(10).unwrap(), 1);
+    assert_eq!(q.hashes_in_span(10, 12), vec![(12, [2u8; 32])]);
+
+    let mut high = BlockQueue::empty();
+    high.enqueue(u32::MAX - 1, [3u8; 32], 1, b"z").unwrap();
+    assert_eq!(
+        high.hashes_in_span(u32::MAX - 1, u32::MAX - 1),
+        vec![(u32::MAX - 1, [3u8; 32])]
+    );
+    assert!(high.hashes_in_span(u32::MAX - 2, u32::MAX - 2).is_empty());
+}
+
+#[test]
 fn get_by_height_peek_without_dequeue() {
     let dir = temp();
     let mut q = BlockQueue::open_or_create(&dir).unwrap();
