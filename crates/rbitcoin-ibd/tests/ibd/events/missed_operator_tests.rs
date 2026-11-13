@@ -569,6 +569,7 @@ fn framed_body_keeps_the_height_window_and_a_side_block() {
     offer_framed(&mut st, &hub, on_densify, on_densify_h, &payload, 3);
     assert!(hub.query.block_queue_has_hash(&on_densify.to_byte_array()));
     assert!(!st.body.is_missing(&on_densify));
+    assert!(!st.reorg.held_bodies.contains(&parent.block_hash()));
 
     let rejected = hash_n(43);
     st.body.mark_rejected(rejected);
