@@ -8,7 +8,7 @@
 use bitcoin::bip158::{BlockFilter, FilterHash, FilterHeader, GcsFilterWriter};
 use bitcoin::hashes::Hash;
 use bitcoin::{Block, OutPoint};
-use rbitcoin_primitives::{Fk, Height};
+use rbitcoin_primitives::{le_u64, Fk, Height};
 use rbitcoin_store::{
     read_index_window, BlockFilterRecord, BlockFilterSlot, BlockFilterTable, IndexHeight,
     IndexWindow, StoreError,
@@ -108,9 +108,8 @@ pub fn encode_basic_filter<'a>(
     block_hash: &[u8; 32],
     elements: impl Iterator<Item = &'a [u8]>,
 ) -> Result<BlockFilter, QueryError> {
-    let b = *block_hash;
-    let k0 = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
-    let k1 = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+    let k0 = le_u64!(block_hash, 0);
+    let k1 = le_u64!(block_hash, 8);
     let mut content = Vec::new();
     let mut writer = GcsFilterWriter::new(&mut content, k0, k1, BASIC_FILTER_M, BASIC_FILTER_P);
     for e in elements {

@@ -16,6 +16,8 @@
 //! `build` owns fingerprints on the heap. After `write_then_map` /
 //! `read_from`, fingerprints are a read-only file map (`fuse8=` heap 0).
 
+use rbitcoin_primitives::{le_u32, le_u64};
+
 use crate::binary_fuse8::{BinaryFuse8, Fingerprints};
 use crate::error::StoreError;
 use crate::readonly_map::ReadonlyMap;
@@ -107,10 +109,8 @@ pub fn open_file(path: &Path) -> Result<SealedFuse8, StoreError> {
         if &head[0..4] != MAGIC {
             return Err(StoreError::Corrupt("tx.head fuse magic"));
         }
-        let ver = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
-        let len = u64::from_le_bytes([
-            head[8], head[9], head[10], head[11], head[12], head[13], head[14], head[15],
-        ]);
+        let ver = le_u32!(head, 4);
+        let len = le_u64!(head, 8);
         let Some(end) = 16u64.checked_add(len) else {
             return Err(StoreError::Corrupt("fuse8 v2 body unreadable"));
         };
@@ -221,9 +221,5 @@ pub fn encode_body(filter: &BinaryFuse8) -> Vec<u8> {
 /// Fold a 32-byte mixed head key into a u64 fuse key (stable, keyed via mix).
 #[inline]
 pub fn fuse_key_from_mixed(mixed: &[u8; 32]) -> u64 {
-    let b = *mixed;
-    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
-        ^ u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]])
-        ^ u64::from_le_bytes([b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]])
-        ^ u64::from_le_bytes([b[24], b[25], b[26], b[27], b[28], b[29], b[30], b[31]])
+    le_u64!(mixed, 0) ^ le_u64!(mixed, 8) ^ le_u64!(mixed, 16) ^ le_u64!(mixed, 24)
 }

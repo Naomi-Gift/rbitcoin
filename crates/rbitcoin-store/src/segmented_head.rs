@@ -26,7 +26,7 @@ use crate::address_head::{AddressHead, HeadLayout, HEAD_LOAD_START, MAINNET_BITS
 use crate::error::StoreError;
 use crate::fuse8_filter::{fuse_key_from_mixed, open_file, SealedFuse8};
 use crate::tx_head_mphf::TxHeadMphf;
-use rbitcoin_primitives::{Fk, SCHEMA_VERSION, STORE_MAGIC};
+use rbitcoin_primitives::{le_u32, le_u64, Fk, SCHEMA_VERSION, STORE_MAGIC};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -1266,48 +1266,30 @@ pub fn read_meta(dir: &Path) -> Result<(u32, Vec<SegDesc>), StoreError> {
 
 #[doc(hidden)]
 pub fn read_meta_buf(buf: &[u8]) -> Result<(u32, Vec<SegDesc>), StoreError> {
-    if buf.len() < META_HEADER_LEN {
+    let Some(head) = buf.first_chunk::<META_HEADER_LEN>() else {
         return Err(StoreError::Corrupt("tx.head.meta short"));
-    }
-    if buf[0..4] != STORE_MAGIC {
+    };
+    if head[0..4] != STORE_MAGIC {
         return Err(StoreError::Corrupt("tx.head.meta magic"));
     }
-    let meta_ver = u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]);
+    let meta_ver = le_u32!(head, 8);
     if meta_ver != META_VERSION && meta_ver != META_V1_UNTAGGED {
         return Err(StoreError::Corrupt("tx.head.meta version"));
     }
-    let seg_count = u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]) as usize;
-    let bits = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
+    let seg_count = le_u32!(head, 12) as usize;
+    let bits = le_u32!(head, 16);
     let need = META_HEADER_LEN + seg_count * SEG_DESC_LEN;
     if buf.len() < need {
         return Err(StoreError::Corrupt("tx.head.meta truncated"));
     }
+    let (recs, _) = buf[META_HEADER_LEN..need].as_chunks::<SEG_DESC_LEN>();
     let mut descs = Vec::with_capacity(seg_count);
-    for i in 0..seg_count {
-        let o = META_HEADER_LEN + i * SEG_DESC_LEN;
+    for rec in recs {
         descs.push(SegDesc {
-            first_fk: u64::from_le_bytes([
-                buf[o],
-                buf[o + 1],
-                buf[o + 2],
-                buf[o + 3],
-                buf[o + 4],
-                buf[o + 5],
-                buf[o + 6],
-                buf[o + 7],
-            ]),
-            count: u64::from_le_bytes([
-                buf[o + 8],
-                buf[o + 9],
-                buf[o + 10],
-                buf[o + 11],
-                buf[o + 12],
-                buf[o + 13],
-                buf[o + 14],
-                buf[o + 15],
-            ]),
-            file_id: u32::from_le_bytes([buf[o + 16], buf[o + 17], buf[o + 18], buf[o + 19]]),
-            flags: u32::from_le_bytes([buf[o + 20], buf[o + 21], buf[o + 22], buf[o + 23]]),
+            first_fk: le_u64!(rec, 0),
+            count: le_u64!(rec, 8),
+            file_id: le_u32!(rec, 16),
+            flags: le_u32!(rec, 20),
         });
     }
     Ok((bits, descs))

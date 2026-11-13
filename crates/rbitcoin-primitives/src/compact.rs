@@ -48,26 +48,24 @@ pub fn read_compact_size(buf: &[u8]) -> Result<(u64, usize), PackError> {
     match buf[0] {
         n @ 0..=252 => Ok((u64::from(n), 1)),
         253 => {
-            if buf.len() < 3 {
+            let Some(raw) = buf.first_chunk::<3>() else {
                 return Err(PackError("compact size u16 truncated"));
-            }
-            let v = u16::from_le_bytes([buf[1], buf[2]]);
+            };
+            let v = crate::le_u16!(raw, 1);
             Ok((u64::from(v), 3))
         }
         254 => {
-            if buf.len() < 5 {
+            let Some(raw) = buf.first_chunk::<5>() else {
                 return Err(PackError("compact size u32 truncated"));
-            }
-            let v = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
+            };
+            let v = crate::le_u32!(raw, 1);
             Ok((u64::from(v), 5))
         }
         255 => {
-            if buf.len() < 9 {
+            let Some(raw) = buf.first_chunk::<9>() else {
                 return Err(PackError("compact size u64 truncated"));
-            }
-            let v = u64::from_le_bytes([
-                buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
-            ]);
+            };
+            let v = crate::le_u64!(raw, 1);
             Ok((v, 9))
         }
     }

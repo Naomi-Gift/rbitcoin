@@ -4,6 +4,8 @@
 //! store and node newtypes that must stay stable across crates.
 
 #[doc(hidden)]
+pub mod array_le;
+#[doc(hidden)]
 pub mod compact;
 #[doc(hidden)]
 pub mod hex;

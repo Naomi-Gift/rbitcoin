@@ -43,7 +43,7 @@ use crate::error::StoreError;
 use crate::file::{TableFile, TRAILING_FOOTER_LEN};
 use crate::hashhead::HeadScale;
 use crate::readonly_map::ReadonlyMap;
-use rbitcoin_primitives::{Fk, TableKind};
+use rbitcoin_primitives::{le_u16, le_u64, Fk, TableKind};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -170,8 +170,7 @@ pub fn fingerprint(mixed: &[u8; 32], bits: u32) -> u32 {
         return 0;
     }
     let mask = (1u32 << (32 - bits)) - 1;
-    let b = *mixed;
-    let w = u64::from_le_bytes([b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]]);
+    let w = le_u64!(mixed, 16);
     (w % u64::from(mask)) as u32 + 1
 }
 
@@ -541,7 +540,7 @@ pub fn decode_layout_ext(ext: &[u8; 16]) -> Result<(HeadLayout, u64), StoreError
             "tx.head footer layout magic (rebuild tx.head)",
         ));
     }
-    let ver = u16::from_le_bytes([ext[4], ext[5]]);
+    let ver = le_u16!(ext, 4);
     if ver != META_VERSION {
         return Err(StoreError::Corrupt(
             "tx.head footer layout version (footer-embedded meta; rebuild tx.head)",
@@ -553,9 +552,7 @@ pub fn decode_layout_ext(ext: &[u8; 16]) -> Result<(HeadLayout, u64), StoreError
         ));
     }
     let bits = u32::from(ext[6]);
-    let generation = u64::from_le_bytes([
-        ext[8], ext[9], ext[10], ext[11], ext[12], ext[13], ext[14], ext[15],
-    ]);
+    let generation = le_u64!(ext, 8);
     Ok((HeadLayout::new(bits)?, generation))
 }
 
