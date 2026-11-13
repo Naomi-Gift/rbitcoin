@@ -161,8 +161,6 @@ pub fn verify_control_commitment(
     let mut curr = TapNodeHash::from_byte_array(tapleaf_hash.to_byte_array());
     for i in 0..nodes {
         let start = CONTROL_BASE + i * CONTROL_NODE;
-        // `nodes` counted `extra / CONTROL_NODE` after a multiple check, so
-        // this range is exactly one node.
         let mut raw = [0u8; CONTROL_NODE];
         raw.copy_from_slice(&control[start..start + CONTROL_NODE]);
         let node = TapNodeHash::from_byte_array(raw);

@@ -35,7 +35,6 @@ pub fn sidecar(base: &Path, ext: &str) -> PathBuf {
 }
 
 pub fn mix_key16(key: &ShHeadKey) -> u64 {
-    // `ShHeadKey` is `[u8; 16]`, so each half is eight in-range bytes.
     let lo = u64::from_le_bytes([
         key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
     ]);

@@ -13,8 +13,7 @@ impl<'a> MedianWindow<'a> {
         Ok(Self { times })
     }
 
-    /// At least eleven timestamps. Fewer is not a window. Eleven is not empty,
-    /// so this does not repeat [`Self::new`]'s empty-window error.
+    /// `None` when `times` has fewer than eleven timestamps.
     pub fn at_least_eleven(times: &'a [u32]) -> Option<Self> {
         if times.len() < 11 {
             None

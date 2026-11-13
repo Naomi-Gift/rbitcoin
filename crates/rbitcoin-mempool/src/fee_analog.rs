@@ -160,7 +160,7 @@ impl AnalogHistory {
     pub fn pairs(&self, n_blocks: u32) -> usize {
         self.depths
             .iter()
-            .find(|d| d.n.get() == (n_blocks as usize).max(1))
+            .find(|d| d.n == blocks_in_window(n_blocks))
             .map_or(0, |d| d.pairs.len())
     }
 
@@ -171,7 +171,7 @@ impl AnalogHistory {
         let d = self
             .depths
             .iter()
-            .find(|d| d.n.get() == (n_blocks as usize).max(1))?;
+            .find(|d| d.n == blocks_in_window(n_blocks))?;
         if d.pairs.len() < ANALOG_READY_PAIRS || !(0.0..=1.0).contains(&confidence) {
             return None;
         }
