@@ -678,11 +678,7 @@ pub fn commit_header_rewind(
             slot.chain.note_rewind(&st.height_to_hash, prep.lca_h);
         }
     }
-    for h in hub.query.block_queue_queued_heights() {
-        if h > prep.lca_h {
-            let _ = hub.query.block_queue_dequeue_height(h);
-        }
-    }
+    let _ = hub.query.block_queue_dequeue_above(prep.lca_h);
     st.reorg.clear_explore();
     st.quiesce_refund();
 }

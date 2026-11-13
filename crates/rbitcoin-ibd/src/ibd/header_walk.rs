@@ -1187,11 +1187,7 @@ pub(crate) fn drop_dead_path(
     drop_queue_above(st, keep, &HashSet::new());
     st.clear_path_above(keep);
     if let Some(query) = query {
-        for queued in query.block_queue_queued_heights() {
-            if queued > keep {
-                let _ = query.block_queue_dequeue_height(queued);
-            }
-        }
+        let _ = query.block_queue_dequeue_above(keep);
     }
     st.quiesce_plan();
     st.max_ready_height = st.max_ready_height.min(keep);

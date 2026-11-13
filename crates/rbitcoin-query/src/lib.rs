@@ -2543,6 +2543,13 @@ impl Query {
         Ok(n)
     }
 
+    /// Drop every queued body above `keep`, and the decoded stash at those heights.
+    pub fn block_queue_dequeue_above(&self, keep: u32) -> Result<usize, QueryError> {
+        let n = self.block_queue.lock().unwrap().dequeue_above(keep)?;
+        self.bq_resolved.lock().unwrap().retain(|&h, _| h <= keep);
+        Ok(n)
+    }
+
     /// Index-only queue entries (ascending id, no payload clone). Empty after restart.
     pub fn block_queue_list_meta(&self) -> Vec<rbitcoin_store::QueuedBlockMeta> {
         self.block_queue.lock().unwrap().list_meta()
