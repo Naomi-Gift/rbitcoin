@@ -108,6 +108,7 @@ let
             hiddenService = true;
             i2p = true;
             maxSubs = 25000;
+            maxSpSubs = 100;
           };
           esplora = {
             enable = true;
@@ -156,6 +157,7 @@ let
           enable = true;
           package = fakePackage;
           electrum.maxSubs = 25000;
+          electrum.maxSpSubs = 100;
           heavyShCreates = 0;
           esplora.maxInflight = 1024;
           p2p = {
@@ -580,6 +582,7 @@ assert defaultCfg.tor.controlCookie == null;
 assert defaultCfg.electrum.hiddenService == false;
 assert defaultCfg.electrum.i2p == false;
 assert defaultCfg.electrum.maxSubs == null;
+assert defaultCfg.electrum.maxSpSubs == null;
 assert defaultCfg.heavyShCreates == null;
 assert defaultCfg.storeReadBudget == null;
 assert defaultCfg.esplora.hiddenService == false;
@@ -693,6 +696,8 @@ assert cfg.systemd.tmpfiles.settings."10-rbitcoin"."/run/rbitcoin".d.mode == "07
 assert builtins.match ".*--electrum-listen 127.0.0.1:50001.*" execStart != null;
 assert builtins.match ".*--electrum-max-subs 25000.*" execStart != null;
 assert builtins.match ".*--electrum-max-subs.*" listenOffExec == null;
+assert builtins.match ".*--electrum-max-sp-subs 100.*" execStart != null;
+assert builtins.match ".*--electrum-max-sp-subs.*" listenOffExec == null;
 assert builtins.match ".*--heavy-sh-creates 20000.*" execStart != null;
 assert builtins.match ".*--heavy-sh-creates 0.*" listenOffExec != null;
 assert builtins.match ".*--heavy-sh-creates.*" (

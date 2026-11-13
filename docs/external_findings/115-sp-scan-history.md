@@ -25,7 +25,7 @@ way:
 - The scan runs beside the session. It stops before its next chunk when
   the connection ends, when the client unsubscribes, or when a new
   subscribe to the same address replaces it. A connection has at most
-  16 addresses, each with one scan.
+  16 addresses by default (`--electrum-max-sp-subs`), each with one scan.
 - The scan reads one chunk ahead of what the client has taken and no
   further.
 

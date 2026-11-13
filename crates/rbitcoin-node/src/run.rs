@@ -1345,6 +1345,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
             config.listen.electrum,
             config.sptweaks_dust,
             config.electrum_max_subs,
+            config.electrum_max_sp_subs,
             &shutdown,
             &node.hub,
             &params,
@@ -1506,6 +1507,7 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
                             config.listen.electrum,
                             config.sptweaks_dust,
                             config.electrum_max_subs,
+                            config.electrum_max_sp_subs,
                             &shutdown,
                             &node.hub,
                             &params,
@@ -2913,6 +2915,7 @@ pub async fn start_electrum_if_ready(
     addr: Option<SocketAddr>,
     tweaks_min_dust: u64,
     electrum_max_subs: usize,
+    electrum_max_sp_subs: usize,
     shutdown: &Shutdown,
     hub: &ChainHub,
     params: &rbitcoin_consensus::ChainParams,
@@ -2944,6 +2947,7 @@ pub async fn start_electrum_if_ready(
     );
     let mut ecfg = ElectrumConfig::for_params(addr, params);
     ecfg.max_scripthash_subs = electrum_max_subs;
+    ecfg.max_sp_subs = electrum_max_sp_subs;
     ecfg.tweaks_min_dust = tweaks_min_dust;
     ecfg.onion_tcp = Arc::clone(&onion_tcp);
     ecfg.listen_state = Some(Arc::clone(electrum_listen));

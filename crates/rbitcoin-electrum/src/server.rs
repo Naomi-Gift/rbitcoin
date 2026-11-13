@@ -84,6 +84,12 @@ pub const DEFAULT_MAX_REQUEST_BYTES: usize = DEFAULT_MAX_LINE_BYTES;
 /// shared touch set. A reorg or a tick gap > 32 restatuses every sub in full.
 /// Operators can raise it (`--electrum-max-subs`).
 pub const DEFAULT_MAX_SCRIPTHASH_SUBS: usize = 10_000;
+/// Default cap on `blockchain.silentpayments.subscribe` addresses per
+/// connection. Each address scans every new block with its own key, and
+/// each subscribe may scan the whole chain, so this is far below the
+/// scripthash cap. Frigate's default is 100. Operators can raise it
+/// (`--electrum-max-sp-subs`).
+pub const DEFAULT_MAX_SP_SUBS: usize = 16;
 /// Idle read timeout — disconnect quiet clients (DoS of FD/tasks).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 /// Max raw tx hex chars for `transaction.broadcast` (~4 MiB wire → 8 MiB hex).
@@ -137,6 +143,8 @@ pub struct ElectrumConfig {
     pub limits: ServeLimits,
     /// Max `blockchain.scripthash.subscribe` entries per connection.
     pub max_scripthash_subs: usize,
+    /// Silent-payment addresses one connection may subscribe (>= 1).
+    pub max_sp_subs: usize,
     /// Max hex length accepted by `blockchain.transaction.broadcast`.
     pub max_broadcast_hex: usize,
     /// Omit served P2TR outs with `value <=` this (sats). `0` serves all.
@@ -170,6 +178,7 @@ impl ElectrumConfig {
             genesis_hash_hex: rbitcoin_primitives::display_hash_hex(genesis),
             limits: ServeLimits::for_public_proxy(),
             max_scripthash_subs: DEFAULT_MAX_SCRIPTHASH_SUBS,
+            max_sp_subs: DEFAULT_MAX_SP_SUBS,
             max_broadcast_hex: DEFAULT_MAX_BROADCAST_HEX,
             tweaks_min_dust: crate::tweaks::DEFAULT_TWEAKS_MIN_DUST,
             onion_tcp: Arc::new(OnceLock::new()),
@@ -734,6 +743,7 @@ where
                                         id,
                                         &params_v,
                                         &mut conn,
+                                        config.max_sp_subs,
                                     )
                                     .await?
                                 }
@@ -1343,7 +1353,8 @@ fn finish_reply(
 /// Frigate subscribe: the result line, then the history scan started beside
 /// the session. Its notes follow from [`write_sp_scan_step`]. A subscribe
 /// to an address the connection already has replaces that subscription and
-/// scans again.
+/// scans again. `max_subs` is the addresses the connection may hold.
+#[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub async fn serve_sp_subscribe<W>(
     writer: &mut ConnWrite<W>,
     query: &Arc<Query>,
@@ -1352,6 +1363,7 @@ pub async fn serve_sp_subscribe<W>(
     id: Value,
     params_v: &Value,
     conn: &mut ElectrumConn,
+    max_subs: usize,
 ) -> Result<(), std::io::Error>
 where
     W: AsyncWrite + Unpin,
@@ -1371,11 +1383,8 @@ where
         sub.start = sub.start.min(held_start);
     }
     let held = conn.sp_subs.len() + conn.sp_scans.len();
-    if sp_start(conn, &sub.address).is_none() && held >= crate::silent_scan::SP_MAX_SUBS {
-        let message = format!(
-            "subscription limit reached ({}) for this connection",
-            crate::silent_scan::SP_MAX_SUBS
-        );
+    if sp_start(conn, &sub.address).is_none() && held >= max_subs {
+        let message = format!("subscription limit reached ({max_subs}) for this connection");
         writer
             .line(json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": message}}))
             .await?;

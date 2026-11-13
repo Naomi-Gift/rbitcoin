@@ -271,6 +271,10 @@ let
   ++ optional (cfg.electrum.enable && cfg.electrum.maxSubs != null) (
     toString cfg.electrum.maxSubs
   )
+  ++ optional (cfg.electrum.enable && cfg.electrum.maxSpSubs != null) "--electrum-max-sp-subs"
+  ++ optional (cfg.electrum.enable && cfg.electrum.maxSpSubs != null) (
+    toString cfg.electrum.maxSpSubs
+  )
   ++ optional cfg.esplora.enable "--esplora-listen"
   ++ optional cfg.esplora.enable (
     if cfg.esplora.socketPath != null then
@@ -1200,6 +1204,17 @@ in
           blockchain.scripthash.subscribe cap per Electrum connection (--electrum-max-subs).
           Null keeps the node default (10000). Wallets subscribe every address up to their
           gap limit.
+        '';
+      };
+
+      maxSpSubs = mkOption {
+        type = types.nullOr types.ints.positive;
+        default = null;
+        example = 100;
+        description = ''
+          blockchain.silentpayments.subscribe address cap per Electrum connection
+          (--electrum-max-sp-subs). Null keeps the node default (16). Each address
+          scans every new block.
         '';
       };
     };

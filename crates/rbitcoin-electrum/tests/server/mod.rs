@@ -3217,19 +3217,21 @@ async fn sp_two_addresses_share_a_connection() {
     assert_eq!(heights(b, &history), vec![7]);
 }
 
-/// A connection's subscriptions are capped. Subscribing again to an address
-/// it already has is not counted.
+/// A connection's subscriptions are capped by the listener's configuration.
+/// Subscribing again to an address it already has is not counted.
 #[tokio::test]
 async fn sp_subscriptions_are_capped_per_connection() {
-    use crate::silent_scan::{SpChain, SP_CHAIN_WALLETS};
-    use rbitcoin_electrum::silent_scan::SP_MAX_SUBS;
+    use crate::silent_scan::SpChain;
 
-    assert!(usize::from(SP_CHAIN_WALLETS) > SP_MAX_SUBS);
-    let chain = SpChain::new("el-sp-cap", 1, &[]);
     let params = Arc::new(ChainParams::regtest());
+    let cfg = ElectrumConfig::for_params("127.0.0.1:0".parse().unwrap(), &params);
+    assert_eq!(cfg.max_sp_subs, DEFAULT_MAX_SP_SUBS);
+    assert_eq!(DEFAULT_MAX_SP_SUBS, 16);
+
+    let chain = SpChain::new("el-sp-cap", 1, &[]);
     let mut conn = ElectrumConn::new();
     let peer = "127.0.0.1:9".parse().unwrap();
-    let subscribe = async |conn: &mut ElectrumConn, wallet: u8| -> Value {
+    let subscribe = async |conn: &mut ElectrumConn, wallet: u8, max_subs: usize| -> Value {
         let mut body = Vec::new();
         let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
         serve_sp_subscribe(
@@ -3240,28 +3242,33 @@ async fn sp_subscriptions_are_capped_per_connection() {
             json!(1),
             &chain.sub_for(wallet, json!(0)),
             conn,
+            max_subs,
         )
         .await
         .unwrap();
         serde_json::from_slice(&body).unwrap()
     };
-    for wallet in 0..SP_MAX_SUBS {
-        let reply = subscribe(&mut conn, wallet as u8).await;
+    for wallet in 0..3 {
+        let reply = subscribe(&mut conn, wallet, 3).await;
         assert!(reply.get("error").is_none(), "{reply}");
     }
-    assert_eq!(conn.sp_scans.len(), SP_MAX_SUBS);
-    let over = subscribe(&mut conn, SP_MAX_SUBS as u8).await;
+    assert_eq!(conn.sp_scans.len(), 3);
+    let over = subscribe(&mut conn, 3, 3).await;
     assert!(
         over["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("subscription limit"),
+            .contains("subscription limit reached (3)"),
         "{over}"
     );
-    assert_eq!(conn.sp_scans.len(), SP_MAX_SUBS);
-    let again = subscribe(&mut conn, 0).await;
+    assert_eq!(conn.sp_scans.len(), 3);
+    let again = subscribe(&mut conn, 0, 3).await;
     assert!(again.get("error").is_none(), "{again}");
-    assert_eq!(conn.sp_scans.len(), SP_MAX_SUBS);
+    assert_eq!(conn.sp_scans.len(), 3);
+    // A higher cap on the listener admits the address.
+    let raised = subscribe(&mut conn, 3, 4).await;
+    assert!(raised.get("error").is_none(), "{raised}");
+    assert_eq!(conn.sp_scans.len(), 4);
 }
 
 /// Frigate: a subscribe to an address the connection has must not narrow
@@ -3285,6 +3292,7 @@ async fn sp_resubscribe_keeps_the_earlier_start() {
             json!(1),
             &chain.sub_for(wallet, json!(start)),
             conn,
+            DEFAULT_MAX_SP_SUBS,
         )
         .await
         .unwrap();
@@ -3374,6 +3382,7 @@ async fn sp_reorg_restarts_a_running_scan_above_the_fork() {
         json!(1),
         &chain.sub(json!(0)),
         &mut conn,
+        DEFAULT_MAX_SP_SUBS,
     )
     .await
     .unwrap();
@@ -3451,6 +3460,7 @@ async fn sp_unsubscribe_drops_a_running_scan() {
         json!(1),
         &chain.sub(json!(0)),
         &mut conn,
+        DEFAULT_MAX_SP_SUBS,
     )
     .await
     .unwrap();
@@ -3632,9 +3642,18 @@ async fn pruned_scan_miss_is_not_an_empty_history() {
     let mut writer = ConnWrite::new(Cursor::new(&mut body), Duration::from_secs(2));
     let mut conn = ElectrumConn::new();
     let peer: SocketAddr = "127.0.0.1:9".parse().unwrap();
-    serve_sp_subscribe(&mut writer, &q, &chain, &peer, json!(1), &params, &mut conn)
-        .await
-        .unwrap();
+    serve_sp_subscribe(
+        &mut writer,
+        &q,
+        &chain,
+        &peer,
+        json!(1),
+        &params,
+        &mut conn,
+        DEFAULT_MAX_SP_SUBS,
+    )
+    .await
+    .unwrap();
     assert_eq!(conn.sp_scans.len(), 1, "height 0 reads, so the scan starts");
     let (address, step) = next_sp_scan_step(&mut conn.sp_scans).await;
     write_sp_scan_step(&mut writer, &q, &chain, &mut conn, &address, step)
@@ -3698,6 +3717,7 @@ async fn sp_subscribe_refuses_a_start_it_cannot_read() {
         json!(7),
         &json!([SP_MISS_SCAN, SP_MISS_SPEND, 1]),
         &mut conn,
+        DEFAULT_MAX_SP_SUBS,
     )
     .await
     .unwrap();
