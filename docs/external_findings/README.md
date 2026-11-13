@@ -69,7 +69,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [062](./062-ibd-requested-progress.md) | high | Only a requested block moves the IBD stall clock | fixed | `unsolicited_block_does_not_refresh_progress` |
 | [063](./063-rest-own-queue.md) | high | REST is off unless --rest is set | fixed | `rest_is_404_without_the_flag` |
 | [064](./064-api-log-redaction.md) | medium | API logs redact scan secrets and extended keys | fixed | `api_call_redacts_scan_secrets_and_ext_privkeys` |
-| [065](./065-sp-scan-window.md) | medium | Silent-payment scan stays inside 256 blocks | fixed | `parse_sub_labels_start_and_networks` |
+| [065](./065-sp-scan-window.md) | medium | Silent-payment scan is bounded per chunk, not per span | fixed | `sp_scan_stops_when_the_session_drops_it` |
 | [066](./066-rpc-wait-cap.md) | medium | RPC accept times out and long-polls release the permit | fixed | `long_poll_does_not_hold_the_work_queue` |
 | [067](./067-fuse8-segment.md) | medium | fuse8 segment length must be a power of two | fixed | `fuse8_segment_length_must_be_power_of_two` |
 | [068](./068-published-end.md) | medium | Body reads compare the caller's published end | fixed | `body_read_past_published_end_is_corrupt` |

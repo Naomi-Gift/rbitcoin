@@ -16,7 +16,7 @@ steps.
 | H5 | high | IBD reader credits unsolicited data as progress | fixed | `unsolicited_block_does_not_refresh_progress` ([062](./062-ibd-requested-progress.md)) |
 | N1 | medium | Inv getdata does not charge the send budget | fixed | `inv_getdata_charges_send_budget` ([056](./056-inv-getdata-budget.md)) |
 | M1 | medium | Block getdata can queue past the send budget | fixed | `getdata_over_send_budget_waits_for_writer` ([057](./057-block-getdata-budget.md)) |
-| M2 | medium | Silent-payment scan span is unbounded when start is set | fixed | `parse_sub_labels_start_and_networks`, `sp_scan_stops_when_the_client_hangs_up` ([065](./065-sp-scan-window.md)) |
+| M2 | medium | Silent-payment scan span is unbounded when start is set | fixed | `sp_chunk_end_covers_one_height_and_stops_at_the_tip`, `sp_scan_stops_when_the_session_drops_it` ([065](./065-sp-scan-window.md)) |
 | M3 | medium | RPC listener has no accept timeout; long-poll holds a permit | fixed | `long_poll_does_not_hold_the_work_queue`, `wait_timeout_ms_caps_at_two_minutes` ([066](./066-rpc-wait-cap.md)) |
 | M4 | medium | fuse8 segment length need not be a power of two | fixed | `fuse8_segment_length_must_be_power_of_two` ([067](./067-fuse8-segment.md)) |
 | M5 | medium | Class A bulk read ignores the published end | fixed | `body_read_past_published_end_is_corrupt`, `create_loc_read_past_published_end_is_corrupt`, `body_read_uses_the_caller_published_end`, `create_loc_window_read_uses_the_planned_published_end` ([068](./068-published-end.md)) |
