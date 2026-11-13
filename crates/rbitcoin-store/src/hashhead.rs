@@ -16,7 +16,7 @@
 
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
-use rbitcoin_primitives::{Fk, TableKind};
+use rbitcoin_primitives::{le_u64, Fk, TableKind};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -250,10 +250,7 @@ impl MultiList {
         }
         let mut buf = [0u8; MULTI_REC_LEN];
         self.file.read_at(Self::offset(id), &mut buf)?;
-        Ok((
-            Fk(u64::from_le_bytes(buf[0..8].try_into().unwrap())),
-            Fk(u64::from_le_bytes(buf[8..16].try_into().unwrap())),
-        ))
+        Ok((Fk(le_u64!(buf, 0)), Fk(le_u64!(buf, 8))))
     }
 
     #[doc(hidden)]

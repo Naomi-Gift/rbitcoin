@@ -344,3 +344,37 @@ fn stale_annotate_clear_keeps_a_later_note() {
     assert_eq!(s.spend_annotate_pending(), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn spend_durable_load_reads_both_heights() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-spend-durable-fields-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    SpendDurable::new(0x0102_0304, 0x0506_0708)
+        .store(&dir)
+        .unwrap();
+    let got = SpendDurable::load(&dir).unwrap().unwrap();
+    assert_eq!(got.annotated_through(), 0x0102_0304);
+    assert_eq!(got.durable_through(), 0x0506_0708);
+    let path = dir.join(SPEND_DURABLE_NAME);
+    let full = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &full[..15]).unwrap();
+    match SpendDurable::load(&dir) {
+        Err(rbitcoin_store::error::StoreError::Corrupt(m)) => assert!(m.contains("short"), "{m}"),
+        other => panic!("short marker must be Corrupt, got {other:?}"),
+    }
+    let mut long = full.clone();
+    long.push(0);
+    std::fs::write(&path, &long).unwrap();
+    match SpendDurable::load(&dir) {
+        Err(rbitcoin_store::error::StoreError::Corrupt(m)) => assert!(m.contains("short"), "{m}"),
+        other => panic!("long marker must be Corrupt, got {other:?}"),
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
