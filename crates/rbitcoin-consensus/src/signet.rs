@@ -306,6 +306,23 @@ pub fn read_witness_stack(rdr: &mut &[u8]) -> Result<Witness, ConsensusError> {
     Ok(Witness::from_slice(&refs))
 }
 
+/// An odd leaf count is at least one. An even count is not duplicated.
+struct OddLeafCount<'a>(&'a [[u8; 32]]);
+
+impl<'a> OddLeafCount<'a> {
+    fn new(leaves: &'a [[u8; 32]]) -> Option<Self> {
+        if leaves.len() % 2 == 1 {
+            Some(Self(leaves))
+        } else {
+            None
+        }
+    }
+
+    fn last(self) -> [u8; 32] {
+        self.0[self.0.len() - 1]
+    }
+}
+
 #[doc(hidden)]
 pub fn modified_merkle_root(
     modified_cb: &Transaction,
@@ -317,9 +334,8 @@ pub fn modified_merkle_root(
         leaves.push(tx.compute_txid().to_byte_array());
     }
     while leaves.len() > 1 {
-        if leaves.len() % 2 == 1 {
-            let last = *leaves.last().expect("signet merkle loop keeps a leaf");
-            leaves.push(last);
+        if let Some(odd) = OddLeafCount::new(&leaves) {
+            leaves.push(odd.last());
         }
         let mut next = Vec::with_capacity(leaves.len() / 2);
         for pair in leaves.chunks(2) {

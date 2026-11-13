@@ -161,11 +161,9 @@ pub fn verify_control_commitment(
     let mut curr = TapNodeHash::from_byte_array(tapleaf_hash.to_byte_array());
     for i in 0..nodes {
         let start = CONTROL_BASE + i * CONTROL_NODE;
-        let node = TapNodeHash::from_byte_array(
-            control[start..start + CONTROL_NODE]
-                .try_into()
-                .expect("32-byte merkle node"),
-        );
+        let mut raw = [0u8; CONTROL_NODE];
+        raw.copy_from_slice(&control[start..start + CONTROL_NODE]);
+        let node = TapNodeHash::from_byte_array(raw);
         curr = TapNodeHash::from_node_hashes(curr, node);
     }
     let tweak = TapTweakHash::from_key_and_tweak(internal, Some(curr));

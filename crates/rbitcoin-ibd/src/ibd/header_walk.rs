@@ -3526,13 +3526,9 @@ pub fn batch_context_ok(
         if own_guard {
             seen.push((height, hash.to_byte_array()));
         }
-        let mtp = if times.len() < 11 {
-            0
-        } else {
-            // `len >= 11`, so `new` cannot fail. A shorter window is median 0 above.
-            let window = rbitcoin_primitives::MedianWindow::new(&times)
-                .expect("a window of at least 11 timestamps is not empty");
-            rbitcoin_primitives::median_time_past_times(window)
+        let mtp = match rbitcoin_primitives::MedianWindow::at_least_eleven(&times) {
+            Some(window) => rbitcoin_primitives::median_time_past_times(window),
+            None => 0,
         };
         parent_hash = hash;
         let Some(bits) = expected_lookahead_bits(hub, height, &parent, hdr.time, st, &diff) else {

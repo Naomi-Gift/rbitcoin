@@ -35,8 +35,13 @@ pub fn sidecar(base: &Path, ext: &str) -> PathBuf {
 }
 
 pub fn mix_key16(key: &ShHeadKey) -> u64 {
-    u64::from_le_bytes(key[0..8].try_into().expect("key16 half"))
-        ^ u64::from_le_bytes(key[8..16].try_into().expect("key16 half"))
+    let lo = u64::from_le_bytes([
+        key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+    ]);
+    let hi = u64::from_le_bytes([
+        key[8], key[9], key[10], key[11], key[12], key[13], key[14], key[15],
+    ]);
+    lo ^ hi
 }
 
 pub fn mix64_keys(recs: &[(ShHeadKey, u64)]) -> Vec<u64> {

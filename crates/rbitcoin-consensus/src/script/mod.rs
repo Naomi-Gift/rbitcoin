@@ -210,7 +210,7 @@ pub fn verify_input<'a>(
     }
 
     match kind {
-        ScriptKind::P2pkh => {
+        ScriptKind::P2pkh(spk) => {
             if needs_interpreted_ecdsa(job) {
                 return verify_bare(job, input_index, tx, amount, script);
             }
@@ -219,7 +219,7 @@ pub fn verify_input<'a>(
             // scriptPubKey (e.g. height 218596: "p2pkh scriptSig len"). Fall back
             // only for scriptSig *shape* errors (not DER/ECDSA), so bip66 failure
             // codes stay.
-            match p2pkh::verify(job, input_index, tx, sighash_cache(cache, tx), script) {
+            match p2pkh::verify(job, input_index, tx, sighash_cache(cache, tx), spk) {
                 Ok(()) => Ok(()),
                 Err(e) if p2pkh_scriptsig_shape_error(&e) => {
                     verify_bare(job, input_index, tx, amount, script)

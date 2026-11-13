@@ -743,14 +743,21 @@ fn corpus_fast_paths_call_typed_verifiers() {
         }
         .expect("prevout"),
     );
-    assert_eq!(classify(spk), ScriptKind::P2pkh);
+    let ScriptKind::P2pkh(typed) = classify(spk) else {
+        panic!("p2pkh template");
+    };
+    assert_eq!(&typed[3..23], &spk.as_bytes()[3..23]);
     assert!(!needs_interpreted_ecdsa(&job));
     let owned = Transaction::clone(&job.tx);
     let mut cache = SighashCache::new(&owned);
     {
         let i = job.inputs().next().unwrap();
         let spk = job.prevout_script(i).expect("prevout");
-        p2pkh::verify(&job, i, &owned, &mut cache, spk)
+        let script = Script::from_bytes(spk);
+        let ScriptKind::P2pkh(typed) = classify(script) else {
+            panic!("p2pkh template");
+        };
+        p2pkh::verify(&job, i, &owned, &mut cache, typed)
     }
     .expect("p2pkh typed accept");
     let tx: &Transaction = &job.tx;
@@ -798,7 +805,7 @@ fn corpus_fast_paths_call_typed_verifiers() {
         }
         .expect("prevout"),
     );
-    assert_ne!(classify(spk), ScriptKind::P2pkh);
+    assert!(!matches!(classify(spk), ScriptKind::P2pkh(_)));
     let tx: &Transaction = &job.tx;
     let mut dispatch_cache = None;
     assert!({
@@ -834,13 +841,19 @@ fn corpus_fast_paths_call_typed_verifiers() {
         }
         .expect("prevout"),
     );
-    assert_eq!(classify(spk), ScriptKind::P2pkh);
+    let ScriptKind::P2pkh(_) = classify(spk) else {
+        panic!("p2pkh template");
+    };
     let owned = Transaction::clone(&job.tx);
     let mut cache = SighashCache::new(&owned);
     let err = {
         let i = job.inputs().next().unwrap();
         let spk = job.prevout_script(i).expect("prevout");
-        p2pkh::verify(&job, i, &owned, &mut cache, spk)
+        let script = Script::from_bytes(spk);
+        let ScriptKind::P2pkh(typed) = classify(script) else {
+            panic!("p2pkh template");
+        };
+        p2pkh::verify(&job, i, &owned, &mut cache, typed)
     }
     .expect_err("collision");
     assert!(
@@ -1037,7 +1050,11 @@ fn corpus_fast_paths_call_typed_verifiers() {
     let err = {
         let i = job.inputs().next().unwrap();
         let spk = job.prevout_script(i).expect("prevout");
-        p2pkh::verify(&job, i, &owned, &mut cache, spk)
+        let script = Script::from_bytes(spk);
+        let ScriptKind::P2pkh(typed) = classify(script) else {
+            panic!("p2pkh template");
+        };
+        p2pkh::verify(&job, i, &owned, &mut cache, typed)
     }
     .expect_err("bad hashtype");
     assert!(format!("{err}").contains("ecdsa"), "{err}");
