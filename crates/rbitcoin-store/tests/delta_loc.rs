@@ -292,6 +292,28 @@ fn delta_loc_append_and_batch_order() {
     assert_eq!(got[4], None);
 }
 
+/// Create 1025 starts at the checkpoint open read from `seqsigwit.off`.
+#[test]
+fn delta_loc_open_reads_the_next_window() {
+    let dir = TempDir::labeled("delta-next-window").unwrap();
+    let loc = DeltaLoc::create(dir.path(), "seqsigwit").unwrap();
+    let mut starts = Vec::with_capacity(1025);
+    let mut lens = Vec::with_capacity(1025);
+    let mut cursor = FILE_HEADER_LEN as u64;
+    for _ in 0..1025 {
+        starts.push(cursor);
+        lens.push(8);
+        cursor += 8;
+    }
+    loc.append(&starts, &lens).unwrap();
+    drop(loc);
+    let loc = DeltaLoc::open(dir.path(), "seqsigwit").unwrap();
+    let start = FILE_HEADER_LEN as u64 + 1024 * 8;
+    assert_eq!(loc.range_batch(&[Fk(1025)]).unwrap()[0], Some((start, 8)));
+    let cps = loc.checkpoints.read().unwrap_or_else(|e| e.into_inner());
+    assert_eq!(cps.as_slice(), &[start]);
+}
+
 #[test]
 fn delta_loc_u16_overflow_and_missing() {
     let dir = TempDir::labeled("delta-ovf").unwrap();

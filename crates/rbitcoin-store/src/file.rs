@@ -35,7 +35,7 @@
 
 use crate::error::StoreError;
 use crate::io_handle::IoHandle;
-use rbitcoin_primitives::{schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
+use rbitcoin_primitives::{le_u64, schema_file_openable, TableKind, SCHEMA_VERSION, STORE_MAGIC};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -557,7 +557,7 @@ impl TableFile {
                 got,
             });
         }
-        let logical = u64::from_le_bytes(footer[8..16].try_into().unwrap());
+        let logical = le_u64!(footer, 8);
         if logical < TRAILING_FOOTER_LEN as u64 || logical > file_len {
             return Err(StoreError::Corrupt("trailing-header logical length"));
         }
@@ -616,7 +616,7 @@ impl TableFile {
         }
 
         let file_len = file.metadata().map_err(|e| StoreError::io(&path, e))?.len();
-        let mut logical = u64::from_le_bytes(header[8..16].try_into().unwrap());
+        let mut logical = le_u64!(header, 8);
         if logical < FILE_HEADER_LEN as u64 {
             logical = FILE_HEADER_LEN as u64;
         }

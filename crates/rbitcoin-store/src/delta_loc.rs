@@ -7,7 +7,7 @@ use crate::error::StoreError;
 use crate::file::{
     leading_header_bytes, write_synced_tmp_rename, GrowPolicy, TableFile, FILE_HEADER_LEN,
 };
-use rbitcoin_primitives::{Fk, TableKind, SCHEMA_VERSION};
+use rbitcoin_primitives::{le_u64, Fk, TableKind, SCHEMA_VERSION};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -320,8 +320,9 @@ impl DeltaLoc {
         if n_win > 0 {
             let mut bytes = vec![0u8; (n_win * 8) as usize];
             off.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
-            for (i, chunk) in bytes.chunks_exact(8).enumerate() {
-                checkpoints[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+            let (rows, _) = bytes.as_chunks::<8>();
+            for (i, row) in rows.iter().enumerate() {
+                checkpoints[i] = le_u64!(row, 0);
             }
         }
         let ovf_rows = load_u16_ovf(&ovf)?;
