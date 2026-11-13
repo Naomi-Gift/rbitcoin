@@ -13,6 +13,7 @@ use crate::scripthash_layout::{
     pack8_bytes, unpack8_bytes, ShHeadKey, ShHeadValue, SH_HEAD_KEY_LEN, SH_HEAD_SLOT_SIZE,
     SH_HEAD_VALUE_LEN,
 };
+use rbitcoin_primitives::{le_u16, le_u64};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -116,13 +117,13 @@ impl SortedHead {
         if header[0..4] != *DATA_MAGIC {
             return Err(StoreError::BadMagic);
         }
-        let ver = u16::from_le_bytes(header[4..6].try_into().unwrap());
+        let ver = le_u16!(header, 4);
         if ver != FORMAT_VER {
             return Err(StoreError::Corrupt(
                 "scripthash sorted head: unsupported version",
             ));
         }
-        let count = u64::from_le_bytes(header[6..14].try_into().unwrap());
+        let count = le_u64!(header, 6);
         let idx = read_idx(&idx_path(&path))?;
         let fuse = Some(SealedFuse8::read_from(&fuse_path(&path))?);
         Ok(Self {

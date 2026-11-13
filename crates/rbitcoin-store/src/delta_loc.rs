@@ -7,7 +7,7 @@ use crate::error::StoreError;
 use crate::file::{
     leading_header_bytes, write_synced_tmp_rename, GrowPolicy, TableFile, FILE_HEADER_LEN,
 };
-use rbitcoin_primitives::{le_u64, Fk, TableKind, SCHEMA_VERSION};
+use rbitcoin_primitives::{le_u16, le_u32, le_u64, Fk, TableKind, SCHEMA_VERSION};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
@@ -710,9 +710,10 @@ pub fn load_u16_ovf(ovf: &TableFile) -> Result<Vec<(u64, u32)>, StoreError> {
     ovf.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
     let mut rows = Vec::with_capacity(n);
     let mut prev = 0u64;
-    for chunk in bytes.chunks_exact(12) {
-        let fk = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-        let strides = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
+    let (raw, _) = bytes.as_chunks::<12>();
+    for row in raw {
+        let fk = le_u64!(row, 0);
+        let strides = le_u32!(row, 8);
         if fk == 0 || (prev != 0 && fk <= prev) {
             return Err(StoreError::Corrupt("invariant: loc ovf order"));
         }
@@ -780,10 +781,11 @@ pub fn load_create_ovf(ovf: &TableFile) -> Result<Vec<(u64, u32, u32)>, StoreErr
     ovf.read_at(FILE_HEADER_LEN as u64, &mut bytes)?;
     let mut rows = Vec::with_capacity(n);
     let mut prev = 0u64;
-    for chunk in bytes.chunks_exact(CREATE_OVF_SLOT as usize) {
-        let fk = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-        let strides = u32::from_le_bytes(chunk[8..12].try_into().unwrap());
-        let n_out = u32::from_le_bytes(chunk[12..16].try_into().unwrap());
+    let (raw, _) = bytes.as_chunks::<{ CREATE_OVF_SLOT as usize }>();
+    for row in raw {
+        let fk = le_u64!(row, 0);
+        let strides = le_u32!(row, 8);
+        let n_out = le_u32!(row, 12);
         if fk == 0 || (prev != 0 && fk <= prev) {
             return Err(StoreError::Corrupt("invariant: create.loc ovf order"));
         }
@@ -834,10 +836,11 @@ pub fn migrate_create_ovf_v22_if_needed(path: &Path) -> Result<(), StoreError> {
     let n = (data / CREATE_OVF_SLOT_V22) as usize;
     let mut payload = Vec::with_capacity(n * CREATE_OVF_SLOT as usize);
     let mut prev = 0u64;
-    for chunk in bytes.chunks_exact(CREATE_OVF_SLOT_V22 as usize) {
-        let fk = u64::from_le_bytes(chunk[0..8].try_into().unwrap());
-        let strides = u16::from_le_bytes(chunk[8..10].try_into().unwrap());
-        let n_out = u16::from_le_bytes(chunk[10..12].try_into().unwrap());
+    let (raw, _) = bytes.as_chunks::<{ CREATE_OVF_SLOT_V22 as usize }>();
+    for row in raw {
+        let fk = le_u64!(row, 0);
+        let strides = le_u16!(row, 8);
+        let n_out = le_u16!(row, 10);
         if fk == 0 || (prev != 0 && fk <= prev) {
             return Err(StoreError::Corrupt("invariant: create.loc ovf order"));
         }

@@ -315,6 +315,39 @@ fn delta_loc_open_reads_the_next_window() {
 }
 
 #[test]
+fn delta_loc_open_reads_the_overflow_row() {
+    let dir = TempDir::labeled("delta-ovf-row").unwrap();
+    let loc = DeltaLoc::create(dir.path(), "seqsigwit").unwrap();
+    let fat = 65536 * IDX_STRIDE;
+    loc.append(&[FILE_HEADER_LEN as u64], &[fat]).unwrap();
+    drop(loc);
+    let loc = DeltaLoc::open(dir.path(), "seqsigwit").unwrap();
+    let rows = loc
+        .ovf_rows
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    assert_eq!(rows, vec![(1, 65536)]);
+    assert_eq!(
+        loc.range_batch(&[Fk(1)]).unwrap()[0],
+        Some((FILE_HEADER_LEN as u64, fat))
+    );
+
+    let ragged = TempDir::labeled("delta-ovf-ragged").unwrap();
+    let loc = DeltaLoc::create(ragged.path(), "seqsigwit").unwrap();
+    loc.ovf.set_logical_len(FILE_HEADER_LEN as u64 + 4).unwrap();
+    drop(loc);
+    let err = match DeltaLoc::open(ragged.path(), "seqsigwit") {
+        Ok(_) => panic!("open accepted a ragged overflow file"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, StoreError::Corrupt(m) if m.contains("loc ovf size")),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn delta_loc_u16_overflow_and_missing() {
     let dir = TempDir::labeled("delta-ovf").unwrap();
     let loc = DeltaLoc::create(dir.path(), "seqsigwit").unwrap();
