@@ -219,8 +219,9 @@ pub fn encode_body(filter: &BinaryFuse8) -> Vec<u8> {
 /// Fold a 32-byte mixed head key into a u64 fuse key (stable, keyed via mix).
 #[inline]
 pub fn fuse_key_from_mixed(mixed: &[u8; 32]) -> u64 {
-    u64::from_le_bytes(mixed[0..8].try_into().unwrap())
-        ^ u64::from_le_bytes(mixed[8..16].try_into().unwrap())
-        ^ u64::from_le_bytes(mixed[16..24].try_into().unwrap())
-        ^ u64::from_le_bytes(mixed[24..32].try_into().unwrap())
+    let b = *mixed;
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+        ^ u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]])
+        ^ u64::from_le_bytes([b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]])
+        ^ u64::from_le_bytes([b[24], b[25], b[26], b[27], b[28], b[29], b[30], b[31]])
 }

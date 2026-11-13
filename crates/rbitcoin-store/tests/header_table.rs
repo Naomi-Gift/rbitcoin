@@ -430,8 +430,22 @@ fn header_record_roundtrip_is_88_bytes() {
     let back = HeaderRecord::decode(&enc).unwrap();
     assert_eq!(back.size, 0);
     assert_eq!(back.weight, 0);
+    assert_eq!(back.prev_fk, rec.prev_fk);
+    assert_eq!(back.version, rec.version);
+    assert_eq!(back.timestamp, rec.timestamp);
+    assert_eq!(back.bits, rec.bits);
+    assert_eq!(back.nonce, rec.nonce);
+    assert_eq!(back.merkle_root, rec.merkle_root);
     assert_eq!(back.hash, rec.hash);
-    assert!(HeaderRecord::decode(&[0u8; 40]).is_err());
+    assert!(matches!(
+        HeaderRecord::decode(&[0u8; 40]),
+        Err(StoreError::Corrupt(m)) if m == "short header record"
+    ));
+    let mut longer = [0u8; HEADER_RECORD_LEN_V24];
+    longer[..HEADER_RECORD_LEN].copy_from_slice(&enc);
+    let wide = HeaderRecord::decode(&longer).unwrap();
+    assert_eq!(wide.hash, rec.hash);
+    assert_eq!(wide.nonce, rec.nonce);
 }
 
 #[test]

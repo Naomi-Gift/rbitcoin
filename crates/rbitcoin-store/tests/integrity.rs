@@ -173,6 +173,8 @@ fn tip_seal_clamps_unsealed_extension() {
         .expect("seal after tip barrier");
     assert_eq!(seal.tip_height, 0);
     assert_eq!(seal.tip_hash, g.hash);
+    assert_eq!(seal.confirmed_len, 1);
+    assert_eq!(seal.generation, 1);
 
     // Extend tip in RAM + flush confirmed only *without* updating seal:
     // simulate by writing a higher tip then restoring old seal file.

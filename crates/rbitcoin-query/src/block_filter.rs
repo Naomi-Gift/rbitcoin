@@ -108,8 +108,9 @@ pub fn encode_basic_filter<'a>(
     block_hash: &[u8; 32],
     elements: impl Iterator<Item = &'a [u8]>,
 ) -> Result<BlockFilter, QueryError> {
-    let k0 = u64::from_le_bytes(block_hash[0..8].try_into().unwrap());
-    let k1 = u64::from_le_bytes(block_hash[8..16].try_into().unwrap());
+    let b = *block_hash;
+    let k0 = u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]);
+    let k1 = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
     let mut content = Vec::new();
     let mut writer = GcsFilterWriter::new(&mut content, k0, k1, BASIC_FILTER_M, BASIC_FILTER_P);
     for e in elements {

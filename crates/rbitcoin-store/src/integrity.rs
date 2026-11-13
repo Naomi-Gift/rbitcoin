@@ -117,15 +117,24 @@ impl TipSeal {
         if buf[0..4] != STORE_MAGIC {
             return Err(StoreError::BadMagic);
         }
-        let ver = u16::from_le_bytes(buf[4..6].try_into().unwrap());
+        let ver = u16::from_le_bytes([buf[4], buf[5]]);
         if !schema_file_openable(ver) {
             return Err(StoreError::BadSchema(ver));
         }
         Ok(Some(Self {
-            tip_height: u32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            confirmed_len: u64::from_le_bytes(buf[12..20].try_into().unwrap()),
-            generation: u64::from_le_bytes(buf[20..28].try_into().unwrap()),
-            tip_hash: buf[28..60].try_into().unwrap(),
+            tip_height: u32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            confirmed_len: u64::from_le_bytes([
+                buf[12], buf[13], buf[14], buf[15], buf[16], buf[17], buf[18], buf[19],
+            ]),
+            generation: u64::from_le_bytes([
+                buf[20], buf[21], buf[22], buf[23], buf[24], buf[25], buf[26], buf[27],
+            ]),
+            tip_hash: [
+                buf[28], buf[29], buf[30], buf[31], buf[32], buf[33], buf[34], buf[35], buf[36],
+                buf[37], buf[38], buf[39], buf[40], buf[41], buf[42], buf[43], buf[44], buf[45],
+                buf[46], buf[47], buf[48], buf[49], buf[50], buf[51], buf[52], buf[53], buf[54],
+                buf[55], buf[56], buf[57], buf[58], buf[59],
+            ],
         }))
     }
 

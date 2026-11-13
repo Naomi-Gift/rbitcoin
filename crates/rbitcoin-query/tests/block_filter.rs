@@ -43,3 +43,27 @@ fn wire_filter_missing_prevout_is_corrupt() {
         "{err}"
     );
 }
+
+/// GCS keys are the block hash. Membership uses rust-bitcoin's own key schedule.
+#[test]
+fn basic_filter_keys_match_the_block_hash() {
+    let mut hash = [0u8; 32];
+    hash[0] = 0x11;
+    hash[8] = 0x22;
+    hash[31] = 0x33;
+    let a: &[u8] = &[0x51];
+    let b: &[u8] = &[0x52, 0x21];
+    let filter = rbitcoin_query::basic_filter_from_scripts(&hash, [a, b], std::iter::empty())
+        .expect("encode");
+    let block_hash = bitcoin::BlockHash::from_byte_array(hash);
+    assert!(filter
+        .match_any(&block_hash, [a, b].into_iter())
+        .expect("match"));
+    let miss: &[u8] = &[0xff, 0x00];
+    assert!(!filter
+        .match_any(&block_hash, [miss].into_iter())
+        .expect("miss"));
+    let again = rbitcoin_query::basic_filter_from_scripts(&hash, [a, b], std::iter::empty())
+        .expect("encode again");
+    assert_eq!(filter.content, again.content);
+}

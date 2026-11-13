@@ -170,7 +170,8 @@ pub fn fingerprint(mixed: &[u8; 32], bits: u32) -> u32 {
         return 0;
     }
     let mask = (1u32 << (32 - bits)) - 1;
-    let w = u64::from_le_bytes(mixed[16..24].try_into().unwrap());
+    let b = *mixed;
+    let w = u64::from_le_bytes([b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]]);
     (w % u64::from(mask)) as u32 + 1
 }
 
