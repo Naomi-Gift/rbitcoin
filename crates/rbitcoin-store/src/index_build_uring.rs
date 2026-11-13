@@ -102,10 +102,7 @@ pub struct ReadJob<'p> {
 impl<'p> ReadJob<'p> {
     #[doc(hidden)]
     pub fn new((fd, path): (IoHandle, &'p Path), off: u64, len: u64) -> Result<Self, StoreError> {
-        if len > crate::var_table::VarTable::BODY_READ_MAX {
-            return Err(StoreError::Rejected("body read too large"));
-        }
-        let n = usize::try_from(len).map_err(|_| StoreError::Corrupt("body span too large"))?;
+        let n = crate::var_table::CappedBodyLen::new(len)?.get();
         Ok(Self {
             fd,
             path,

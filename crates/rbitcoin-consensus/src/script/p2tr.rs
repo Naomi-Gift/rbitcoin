@@ -25,10 +25,10 @@ pub fn verify(
     tx: &Transaction,
     tap_spent: &crypto::TapSpentHashes,
     amount: Amount,
+    output_key: &[u8; 32],
     spk: &[u8],
 ) -> Result<(), ConsensusError> {
-    debug_assert!(spk.len() == 34 && spk.starts_with(&rbitcoin_primitives::P2TR_PREFIX));
-    let output_key = &spk[2..34];
+    let output_key = output_key.as_slice();
 
     let input = &tx.input[input_index.get()];
     let wit_len = input.witness.len();

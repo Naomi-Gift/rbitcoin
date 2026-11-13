@@ -369,6 +369,27 @@ pub fn write_prepared_bodies_one_wave(
     Ok(())
 }
 
+/// Body read length at or under [`VarTable::BODY_READ_MAX`].
+///
+/// The cap fits in `usize`, so a failed `usize` conversion is not a second result.
+#[derive(Copy, Clone)]
+pub(crate) struct CappedBodyLen(usize);
+
+impl CappedBodyLen {
+    pub(crate) fn new(len: u64) -> Result<Self, StoreError> {
+        if len > VarTable::BODY_READ_MAX {
+            return Err(StoreError::Rejected("body read too large"));
+        }
+        Ok(Self(len as usize))
+    }
+
+    pub(crate) fn get(self) -> usize {
+        self.0
+    }
+}
+
+const _: () = assert!(VarTable::BODY_READ_MAX <= usize::MAX as u64);
+
 impl VarTable {
     /// Pre-grow body capacity so a following mega `put_batch` does not remap mid-write.
     pub fn reserve_append(&self, body_bytes: u64, _n_records: u64) -> Result<(), StoreError> {
@@ -570,11 +591,9 @@ impl VarTable {
     /// Cap and published end before any buffer is grown.
     #[doc(hidden)]
     pub fn checked_body_read(published: u64, offset: u64, len: u64) -> Result<usize, StoreError> {
-        if len > Self::BODY_READ_MAX {
-            return Err(StoreError::Rejected("body read too large"));
-        }
+        let n = CappedBodyLen::new(len)?;
         Self::require_published_body(published, offset, len)?;
-        usize::try_from(len).map_err(|_| StoreError::Corrupt("body span too large"))
+        Ok(n.get())
     }
 
     /// Compare `offset + len` to the caller's published-end integer.
