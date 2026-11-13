@@ -3270,6 +3270,21 @@ async fn tor_control_onion_lifecycle() {
         assert!(err.contains("--tor-control") && err.contains(want), "{err}");
     }
 
+    // A code that is not three digits is no reply, wherever a wide char falls.
+    // A 5xx code is still the refusal it names.
+    for (reply, want) in [
+        ("25\u{e9} x\r\n", "unexpected reply"),
+        ("250\u{e9} x\r\n", "unexpected reply"),
+        ("2x0 OK\r\n", "unexpected reply"),
+        ("550\u{e9} x\r\n", "tor control: 550\u{e9} x"),
+    ] {
+        let mut cfg = listen_and_exit_cfg(&dir);
+        cfg.tor.control = Some(wedged_tor(Some(reply.as_bytes())).await);
+        cfg.tor.password = Some(TOR_PASSWORD.into());
+        let err = start_and_exit(cfg).await.expect_err(reply).to_string();
+        assert!(err.contains(want), "{reply:?}: {err}");
+    }
+
     // A cookie from another Tor, a truncated cookie, and a Tor that only
     // offers plain COOKIE all refuse the start, and none sends AUTHENTICATE:
     // the node never hands the raw cookie to whatever owns the port.
