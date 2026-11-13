@@ -52,16 +52,14 @@ pub fn put_spend_on_create_at(
     if create_tx_fk.is_null() || spending_tx_fk.is_null() {
         return Err(StoreError::InvalidFk);
     }
-    let (multi, field, field_vin) = match body_range {
-        Some((off, len)) => txs.get_output_spender_meta_at(off, len, vout)?,
-        None => txs.get_output_spender_meta(create_tx_fk, vout)?,
+    let (body_off, body_len) = match body_range {
+        Some(range) => range,
+        None => txs.spent_range(create_tx_fk)?,
     };
+    let (multi, field, field_vin) = txs.get_output_spender_meta_at(body_off, body_len, vout)?;
 
     let set = |multi: bool, field: Fk, vin: u32| -> Result<(), StoreError> {
-        match body_range {
-            Some((off, len)) => txs.set_output_spender_meta_at(off, len, vout, multi, field, vin),
-            None => txs.set_output_spender_meta(create_tx_fk, vout, multi, field, vin),
-        }
+        txs.store_spend_slot_at(body_off, body_len, vout, multi, field, vin)
     };
 
     if !multi && field.is_null() {

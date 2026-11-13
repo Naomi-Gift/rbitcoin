@@ -247,6 +247,8 @@ impl VarTable {
         unsafe {
             buf.set_len(n);
         }
+        #[cfg(debug_assertions)]
+        crate::io_handle::note_test_pread();
         f(buf)
     }
 
@@ -271,6 +273,12 @@ impl VarTable {
     /// Prefer [`Self::write_body_blob_bulk`] for Class A append (bulk pwrite path).
     pub fn write_body_abs(&self, abs_offset: u64, data: &[u8]) -> Result<(), StoreError> {
         self.write_body_blob_bulk(abs_offset, data)
+    }
+
+    /// Slot patch via `pwrite`. The published end grows only, so this does not
+    /// rewrite a longer file-header mark and does not store neighbor bytes.
+    pub fn write_body_pwrite(&self, abs_offset: u64, data: &[u8]) -> Result<(), StoreError> {
+        self.body.write_at_pwrite(abs_offset, data)
     }
 
     /// Class A body payload write via bulk `WriteOp`. Falls back to plain pwrite

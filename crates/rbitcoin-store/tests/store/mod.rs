@@ -751,8 +751,25 @@ fn poke_logical_len(path: &Path, logical: u64) {
     f.write_all(&logical.to_le_bytes()).unwrap();
 }
 
+/// Schema 27 is master without the spend log. Opening it here rewrites meta
+/// to 28 so that build refuses the directory instead of writing under the log.
+#[test]
+fn schema_27_rewrites_meta_so_an_older_build_refuses() {
+    let dir = tmp();
+    {
+        let s = Store::create_tiny(&dir).unwrap();
+        s.flush().unwrap();
+    }
+    write_store_meta_ver(&dir, 27);
+    let s = Store::open_tiny(&dir).unwrap();
+    drop(s);
+    assert_eq!(read_store_meta_ver(&dir), 28);
+    assert_eq!(SCHEMA_VERSION, 28);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A 26 datadir whose witness locator is already the finished cut must open,
-/// keep the creates, and rewrite meta to 27. A 26 binary wipes that layout.
+/// keep the creates, and rewrite meta to 28. A 26 binary wipes that layout.
 #[test]
 fn pruned_schema_26_rewrites_meta_before_the_creates_are_read() {
     let dir = tmp();
@@ -777,12 +794,12 @@ fn pruned_schema_26_rewrites_meta_before_the_creates_are_read() {
     let s = Store::open_tiny(&dir).unwrap();
     assert_eq!(s.txs.count(), 1, "schema 26 prune open must keep creates");
     drop(s);
-    assert_eq!(read_store_meta_ver(&dir), 27);
-    assert_eq!(SCHEMA_VERSION, 27);
+    assert_eq!(read_store_meta_ver(&dir), 28);
+    assert_eq!(SCHEMA_VERSION, 28);
     let synced = rbitcoin_store::file::take_fsynced_dirs();
     assert!(
         synced.iter().any(|p| p == dir.path()),
-        "meta 27 must be durable before the witness cut; synced {synced:?}"
+        "the meta rewrite must be durable before the witness cut; synced {synced:?}"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

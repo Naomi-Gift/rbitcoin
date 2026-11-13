@@ -644,6 +644,7 @@ impl Query {
             return Ok(());
         }
         let cold = {
+            self.store.wait_spend_edge_room();
             let _utxo_view = self.store.hold_utxo_view();
             self.store.put_spend_batch_by_abs_meta(&abs_edges)?
         };

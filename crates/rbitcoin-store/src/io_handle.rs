@@ -267,6 +267,43 @@ pub fn arm_fail_preads(handle: IoHandle, n: u32) {
     }
 }
 
+/// Hide a page-log slot once this thread has pread a body.
+///
+/// `get_output_spender_metas_at` must read the log before that pread. A fold
+/// can drop the log entry in between, and the pread still holds the old null.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn arm_hide_after_pread() {
+    HIDE_AFTER_PREAD.with(|slot| slot.set(true));
+    PREAD_SEEN.with(|slot| slot.set(false));
+}
+
+/// Clear [`arm_hide_after_pread`] on this thread.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn disarm_hide_after_pread() {
+    HIDE_AFTER_PREAD.with(|slot| slot.set(false));
+    PREAD_SEEN.with(|slot| slot.set(false));
+}
+
+/// A body pread finished on this thread.
+#[cfg(debug_assertions)]
+pub(crate) fn note_test_pread() {
+    PREAD_SEEN.with(|slot| slot.set(true));
+}
+
+/// The log must answer as a miss when a pread already ran under the arm.
+#[cfg(debug_assertions)]
+pub(crate) fn hidden_after_pread() -> bool {
+    HIDE_AFTER_PREAD.with(|hide| hide.get()) && PREAD_SEEN.with(|seen| seen.get())
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static HIDE_AFTER_PREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static PREAD_SEEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Drop one fd's sync arm.
 #[cfg(debug_assertions)]
 #[doc(hidden)]

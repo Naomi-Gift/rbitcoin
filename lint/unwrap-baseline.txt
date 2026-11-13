@@ -14,5 +14,5 @@ crates/rbitcoin-store/src/idx_body_pipeline.rs	2
 crates/rbitcoin-store/src/scripthash.rs	1
 crates/rbitcoin-store/src/scripthash_head.rs	1
 crates/rbitcoin-store/src/scripthash_slabs.rs	1
-crates/rbitcoin-store/src/spend_annotate_uring.rs	4
+crates/rbitcoin-store/src/spend_annotate_uring.rs	1
 crates/rbitcoin-store/src/txid_body.rs	4

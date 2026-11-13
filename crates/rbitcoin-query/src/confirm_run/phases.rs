@@ -490,12 +490,12 @@ pub fn post_commit(
 ) -> Result<u64, ConfirmError> {
     let t_spent = Instant::now();
     if query.spend_index_enabled() && !slots.abs_edges.is_empty() {
+        query.store().wait_spend_edge_room();
         let _utxo_view = query.store().hold_utxo_view();
-        let backend = spend_ann_backend_next();
         let t_ann = Instant::now();
         let cold = query
             .store()
-            .put_spend_batch_by_abs_meta_known(&slots.abs_edges, &slots.known, backend)
+            .put_spend_batch_by_abs_meta_known(&slots.abs_edges, &slots.known)
             .map_err(ConfirmError::from)?;
         if !cold.is_empty() {
             return Err(ConfirmError::Store(StoreError::Corrupt(
@@ -508,7 +508,6 @@ pub fn post_commit(
             &query.confirm_stats().spend_ann_n,
             slots.abs_edges.len() as u64,
         );
-        let _ = backend;
         crate::note_confirm(
             &query.confirm_stats().spend_annotate_ranged,
             slots.abs_edges.len() as u64,

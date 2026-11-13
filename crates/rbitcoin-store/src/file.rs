@@ -153,6 +153,10 @@ where
 pub fn fsync_parent_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(unix)]
     {
+        #[cfg(debug_assertions)]
+        if fail_dir_sync() {
+            return Err(std::io::Error::other("injected directory sync failure"));
+        }
         let result = std::fs::File::open(dir)?.sync_all();
         #[cfg(debug_assertions)]
         if result.is_ok() {
@@ -191,6 +195,48 @@ thread_local! {
     static FSYNC_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static FSYNC_DIRS: std::cell::RefCell<Vec<PathBuf>> =
         const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Let `skip` directory syncs succeed, then fail the next `times` on this thread.
+///
+/// Debug tests use this for a rename that is already visible when only the
+/// parent-directory sync fails. A release build cannot arm it.
+#[cfg(all(debug_assertions, unix))]
+#[doc(hidden)]
+pub fn arm_fail_dir_sync_after(skip: u32, times: u32) {
+    DIR_SYNC_SKIP.with(|c| c.set(skip));
+    DIR_SYNC_FAIL.with(|c| c.set(times));
+}
+
+#[cfg(all(debug_assertions, unix))]
+fn fail_dir_sync() -> bool {
+    let skipping = DIR_SYNC_SKIP.with(|c| {
+        let n = c.get();
+        if n == 0 {
+            false
+        } else {
+            c.set(n - 1);
+            true
+        }
+    });
+    if skipping {
+        return false;
+    }
+    DIR_SYNC_FAIL.with(|c| {
+        let n = c.get();
+        if n == 0 {
+            false
+        } else {
+            c.set(n - 1);
+            true
+        }
+    })
+}
+
+#[cfg(all(debug_assertions, unix))]
+thread_local! {
+    static DIR_SYNC_SKIP: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    static DIR_SYNC_FAIL: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
 }
 
 // Only Unix calls this. Windows `fsync_parent_dir` is a no-op, and a

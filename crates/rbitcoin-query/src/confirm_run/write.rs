@@ -439,7 +439,8 @@ fn write_phase_inner(
         }
 
         let spend_ann_ns = {
-            let _gate = hold_spindle(query);
+            // Historical slots are a directory insert. The tail page is one
+            // append, not a random sweep, so this does not take the spindle.
             spindle_mark("ann-begin");
             let ns = post_commit(query, &slots)?;
             spindle_mark("ann-end");
@@ -569,7 +570,6 @@ pub fn finish_post_commit_hashes(
     };
 
     let annotate_res = {
-        let _gate = hold_spindle(query);
         spindle_mark("ann-begin");
         let res = (|| -> Result<(), ConfirmError> {
             if !query.spend_index_enabled() {
@@ -637,7 +637,9 @@ pub fn replay_spend_annotations(query: &Query) -> Result<u32, ConfirmError> {
         .store()
         .spend_annotated_through()
         .map_err(ConfirmError::from)?;
-    if annotated.is_some_and(|h| h > tip) {
+    // The page-log commit can name a higher height than the marker, and its
+    // freeze tip can sit above both. Hold before replay folds that image.
+    if annotated.is_some_and(|h| h > tip) || query.store().spend_log_above(tip) {
         query
             .store()
             .clamp_spend_durable()
@@ -673,9 +675,30 @@ pub fn publish_spend_marker(query: &Query, tip: u32) -> Result<(), ConfirmError>
 #[doc(hidden)]
 pub fn rewrite_spend_heights(query: &Query, annotated: u32, tip: u32) -> Result<u32, ConfirmError> {
     rbitcoin_log::info!("store: replay spend annotations ({annotated}, {tip}]");
-    let replayed = annotate_spend_heights(query, annotated + 1, tip)?;
+    let replayed = annotate_spend_heights_with(query, annotated + 1, tip, |height| {
+        checkpoint_replay_chunk(query, height)
+    })?;
     publish_spend_marker(query, tip)?;
     Ok(replayed)
+}
+
+/// Publish and fold when the open directory is already at the edge cap.
+///
+/// Startup replay runs before the sync thread exists, so nothing else drains
+/// these notes. The marker moves to this chunk. A crash resumes above it.
+/// The following checkpoint folds the generation this one published. This
+/// does not wait. Pending recovery uses [`annotate_spend_heights`] and does
+/// not take this path: that publish can sit above the capped marker.
+fn checkpoint_replay_chunk(query: &Query, height: u32) -> Result<(), ConfirmError> {
+    if !query.store().spend_checkpoint_early() {
+        return Ok(());
+    }
+    query
+        .store()
+        .checkpoint_spend_through(height)
+        .map_err(ConfirmError::from)?;
+    query.store().relax_spend_pace();
+    Ok(())
 }
 
 /// Finish the spend annotate a failed confirm write left after its tip commit.
@@ -705,6 +728,15 @@ pub fn annotate_pending_spends(query: &Query) -> Result<(), ConfirmError> {
 
 #[doc(hidden)]
 pub fn annotate_spend_heights(query: &Query, start: u32, tip: u32) -> Result<u32, ConfirmError> {
+    annotate_spend_heights_with(query, start, tip, |_| Ok(()))
+}
+
+fn annotate_spend_heights_with(
+    query: &Query,
+    start: u32,
+    tip: u32,
+    mut after_chunk: impl FnMut(u32) -> Result<(), ConfirmError>,
+) -> Result<u32, ConfirmError> {
     let heights: Vec<u32> = (start..=tip).collect();
     let replayed = heights.len() as u32;
     let started = std::time::Instant::now();
@@ -724,11 +756,14 @@ pub fn annotate_spend_heights(query: &Query, start: u32, tip: u32) -> Result<u32
             items.push((h, rec.hash));
         }
         finish_post_commit_hashes(query, &items)?;
+        let height = *chunk.last().unwrap_or(&tip);
+        after_chunk(height)?;
         done = done.saturating_add(chunk.len() as u32);
         let elapsed = logged_at.elapsed().as_millis() as u64;
         if elapsed >= REPLAY_STATUS_MS {
-            let h = *chunk.last().unwrap_or(&tip);
-            rbitcoin_log::info!("store: replay spend annotations {done}/{replayed} height={h}");
+            rbitcoin_log::info!(
+                "store: replay spend annotations {done}/{replayed} height={height}"
+            );
             logged_at = std::time::Instant::now();
         }
     }

@@ -100,6 +100,77 @@ fn clamp_drops_a_stale_height() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// The tip is already flushed when the commit patch fails. The marker still
+/// has to drop, or a later block passes the old height and replay skips it.
+#[test]
+fn clamp_lowers_the_marker_when_the_hold_patch_fails() {
+    use rbitcoin_primitives::{Fk, Height};
+    use rbitcoin_store::spend_page_log::SPEND_PAGES_COMMIT_NAME;
+    use rbitcoin_store::Store;
+
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-spend-clamp-hold-{}-{}",
+        std::process::id(),
+        unix_ms()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    let s = Store::create_tiny(&dir).unwrap();
+    let nbytes = 4096usize;
+    let prep = s
+        .txs
+        .spent
+        .prepare_batch_encode(1, nbytes, |_i, buf| {
+            buf.resize(buf.len() + nbytes, 0);
+        })
+        .unwrap()
+        .expect("one spent append");
+    s.txs
+        .spent
+        .write_body_blob_bulk(prep.start, &prep.body_blob)
+        .unwrap();
+    let abs = prep.start;
+    s.txs.spent.finish_prepared(prep).unwrap();
+    s.note_open_spend_slots(&[(abs, [0u8; 8])]).unwrap();
+    for h in 0..=4u32 {
+        s.confirmed
+            .set(
+                &rbitcoin_store::ClassCWrite::for_test(),
+                Height(h),
+                Fk(u64::from(h) + 1),
+            )
+            .unwrap();
+    }
+    s.note_spend_snapshot(4);
+    s.checkpoint_spend_through(4).unwrap();
+    let commit = dir.join(SPEND_PAGES_COMMIT_NAME);
+    assert!(commit.is_file(), "the checkpoint must leave a commit file");
+    for h in (1..=4u32).rev() {
+        s.confirmed
+            .disconnect_tip(&rbitcoin_store::ClassCWrite::for_test(), Height(h))
+            .unwrap();
+    }
+    assert_eq!(s.tip_height().map(|h| h.0), Some(0));
+    std::fs::remove_file(&commit).unwrap();
+    std::fs::create_dir(&commit).unwrap();
+    let err = s.clamp_spend_durable().unwrap_err();
+    assert!(
+        matches!(err, rbitcoin_store::error::StoreError::Io { .. }),
+        "the failed commit patch must still surface, got {err:?}"
+    );
+    let m = SpendDurable::load(s.path()).unwrap().unwrap();
+    assert_eq!(
+        (m.annotated_through(), m.durable_through()),
+        (0, 0),
+        "a failed hold patch must still lower the marker"
+    );
+    assert_eq!(
+        s.spend_snapshot_height(),
+        Some(0),
+        "a failed hold patch must still lower the snapshot"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A confirm write reads its tip, then a disconnect lowers the tip and the
 /// snapshot. The write's note must not raise the snapshot back over the
 /// new tip, or the checkpoint publishes a height a reconnect has not

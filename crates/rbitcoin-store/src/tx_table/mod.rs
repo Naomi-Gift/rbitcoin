@@ -685,6 +685,8 @@ pub struct TxTable {
     pub prune_seqsigwit_mode: std::sync::atomic::AtomicBool,
     /// `--datadir-hdd`: Class A body stems are one pwrite wave each.
     pub datadir_hdd: std::sync::atomic::AtomicBool,
+    /// Historical spend slots not yet folded into `spent.body`.
+    spend_pages: crate::spend_page_log::SpendPageLog,
     /// Per-fk packed `txout` decodes for an outs reader
     /// ([`Self::get_meta_and_outputs`], and [`Self::get`] through it), the
     /// decode the mempool and block-proposal pins count. [`Self::get_full`] is
@@ -1179,6 +1181,7 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(false),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
+            spend_pages: crate::spend_page_log::SpendPageLog::create(dir),
         })
     }
 
@@ -1397,6 +1400,7 @@ impl TxTable {
             }
         };
         let secret = crate::store_secret::StoreSecret::load_existing(dir)?;
+        let spent_body_end = spent.body_published_len();
         let t = Self {
             body,
             seqsigwit,
@@ -1415,6 +1419,7 @@ impl TxTable {
             rebuild_workers: workers,
             prune_seqsigwit_mode: std::sync::atomic::AtomicBool::new(prune_seqsigwit_mode),
             datadir_hdd: std::sync::atomic::AtomicBool::new(false),
+            spend_pages: crate::spend_page_log::SpendPageLog::load_clipped(dir, spent_body_end)?,
         };
         match input_open_tail(t.input.count(), n_bodies, t.seqsigwit.count()) {
             InputOpenTail::Backfill { from } => {
@@ -2252,13 +2257,12 @@ impl TxTable {
 
     /// Annotate spends at known absolute spender-meta offsets.
     ///
-    /// One 4 KiB page RMW per page (uring, else the same groups via `pwrite`):
-    /// read the page, decide sole / multi / promote, write the page if dirty.
-    /// `POSIX_FADV_RANDOM` covers the sweep and restores `POSIX_FADV_NORMAL`
-    /// on every exit. `spent.ovf` appends run inline on the decision.
+    /// One read of the current slot, then a page-log insert. A slot past the
+    /// published body is cold and is not written.
+    /// Decide sole / multi / promote from that slot.
+    /// `spent.ovf` appends run inline on the decision.
     ///
-    /// Returns edges that still need a full cold path (OOB abs / deferred).
-    /// Multi-list cases are handled here when uring/`pwrite` succeed (not returned).
+    /// Returns edges past the published body. Multi-list cases are handled here.
     pub fn put_spend_batch_by_abs_meta(
         &self,
         spenders: &crate::spender_table::SpenderTable,
@@ -2267,31 +2271,77 @@ impl TxTable {
         if abs_edges.is_empty() {
             return Ok(Vec::new());
         }
-        let _sweep = self.spent.advise_random_for_sweep();
         for &(_, _, _, sfk, _) in abs_edges {
             if sfk.is_null() {
                 return Err(StoreError::InvalidFk);
             }
         }
-        if crate::bulk_io::io_uring_enabled() {
-            match crate::spend_annotate_uring::put_spend_batch_by_abs_meta_uring(
-                self, spenders, abs_edges,
-            ) {
-                Ok(cold) => return Ok(cold),
-                Err(e) => {
-                    rbitcoin_log::debug!(
-                        "store: spend annotate uring unavailable ({e}); pwrite fallback"
-                    );
-                }
+        let known = self.known_spend_slots(abs_edges)?;
+        let body_pub = self.spent.body_published_len();
+        let mut cold = Vec::new();
+        let mut live_edges = Vec::with_capacity(abs_edges.len());
+        let mut live_known = Vec::with_capacity(abs_edges.len());
+        for (edge, slot) in abs_edges.iter().copied().zip(known) {
+            let (abs, cfk, vout, sfk, vin) = edge;
+            if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > body_pub {
+                cold.push((cfk, vout, sfk, vin));
+                continue;
             }
+            live_edges.push(edge);
+            live_known.push(slot);
         }
-        self.put_spend_batch_by_abs_meta_pwrite(spenders, abs_edges)
+        if !live_edges.is_empty() {
+            cold.extend(self.put_spend_batch_by_abs_meta_known(
+                spenders,
+                &live_edges,
+                &live_known,
+            )?);
+        }
+        Ok(cold)
     }
 
-    /// Page `pwrite` RMW for [`Self::put_spend_batch_by_abs_meta`].
+    /// One directory-or-body read for the whole batch.
     ///
-    /// Same slot bytes and cold list as the uring helper. Slots that share a
-    /// 4 KiB page are one read and one write.
+    /// A slot past the published body is `(NULL, 0, 0)` and is not read. A
+    /// short or undecodable in-range slot is read again here so that error
+    /// still fails the annotate.
+    fn known_spend_slots(
+        &self,
+        abs_edges: &[(u64, Fk, u32, Fk, u32)],
+    ) -> Result<Vec<(Fk, u8, u32)>, StoreError> {
+        let offs: Vec<u64> = abs_edges.iter().map(|edge| edge.0).collect();
+        let peeked = self.get_spender_meta_at_abs_batch(&offs)?;
+        let body_pub = self.spent.body_published_len();
+        let mut known = Vec::with_capacity(abs_edges.len());
+        for (edge, slot) in abs_edges.iter().zip(peeked) {
+            let past = edge.0.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > body_pub;
+            known.push(match slot {
+                Some((field, flags, vin)) => (field, flags, vin),
+                None if past => (Fk::NULL, 0, 0),
+                None => self.body_spend_slot(edge.0)?,
+            });
+        }
+        Ok(known)
+    }
+
+    /// Body slot at `abs`. The batch peek already skipped a directory hit.
+    fn body_spend_slot(&self, abs: u64) -> Result<(Fk, u8, u32), StoreError> {
+        let published = self.spent.body_published_len();
+        let mut buf = [0u8; OutputRecord::SPENT_SLOT_LEN];
+        self.spent.read_prefix_at_published(
+            published,
+            abs,
+            OutputRecord::SPENT_SLOT_LEN as u64,
+            &mut buf,
+        )?;
+        let (flags, field, vin) = decode_spent_slot(&buf)?;
+        Ok((field, flags, vin))
+    }
+
+    /// Page read, then 8-byte slot pwrites, for [`Self::put_spend_batch_by_abs_meta`].
+    ///
+    /// Same slot bytes and cold list as the uring helper. The write does not
+    /// store the rest of the page.
     #[doc(hidden)]
     pub fn put_spend_batch_by_abs_meta_pwrite(
         &self,
@@ -2369,21 +2419,26 @@ impl TxTable {
         let body_pub = self.spent.body_published_len();
         let body_path = self.spent.body_file_path();
 
+        let mut out: Vec<Option<SpenderSlot>> = vec![None; abs_offs.len()];
         let mut submitted: Vec<usize> = Vec::with_capacity(abs_offs.len());
         for (i, &off) in abs_offs.iter().enumerate() {
             let end = off.saturating_add(META_LEN as u64);
             if end > body_pub {
                 continue;
             }
+            if let Some(raw) = self.spend_pages.slot(off) {
+                let (flags, field, vin) = decode_spent_slot(&raw)?;
+                out[i] = Some((field, flags, vin));
+                continue;
+            }
             submitted.push(i);
         }
         if submitted.is_empty() {
-            return Ok(vec![None; abs_offs.len()]);
+            return Ok(out);
         }
 
         let live: Vec<u64> = submitted.iter().map(|&i| abs_offs[i]).collect();
         let plan = crate::idx_body_pipeline::plan_spend_slot_peeks(&live);
-        let mut out: Vec<Option<SpenderSlot>> = vec![None; abs_offs.len()];
         let depth = crate::uring_session::DEFAULT_ENTRIES as usize;
         for chunk in plan.chunks(depth.max(1)) {
             read_spend_peek_chunk(
@@ -2393,22 +2448,37 @@ impl TxTable {
         Ok(out)
     }
 
-    /// Page-RMW spend annotate using structural-known meta.
+    /// Directory spend annotate using structural-known meta.
     ///
     /// `known[i]` is `(field, flags, vin)` at `abs_edges[i].0` from structural spentness.
-    /// Backend: `pwrite` or `uring`. Both read a 4 KiB page, poke the prepared
-    /// slots, and write the page. Returns cold edges (OOB) — production callers
-    /// must treat non-empty as hard error.
+    /// A published slot is inserted into the spend directory. This does not
+    /// read or write a `spent.body` page. Returns cold edges (OOB). Production
+    /// callers must treat non-empty as a hard error.
     pub fn put_spend_batch_by_abs_meta_known(
         &self,
         spenders: &crate::spender_table::SpenderTable,
         abs_edges: &[(u64, Fk, u32, Fk, u32)],
         known: &[(Fk, u8, u32)],
-        backend: crate::io_backend::WriteIoBackend,
     ) -> Result<Vec<(Fk, u32, Fk, u32)>, StoreError> {
         crate::spend_annotate_uring::put_spend_batch_by_abs_meta_known(
-            self, spenders, abs_edges, known, backend,
+            self, spenders, abs_edges, known,
         )
+    }
+
+    pub(crate) fn spend_log_serves(&self, abs: u64) -> bool {
+        self.spend_pages.slot(abs).is_some()
+    }
+
+    /// True when the published body slot is exactly `(field, flags, vin)`.
+    pub(crate) fn body_slot_matches(
+        &self,
+        abs: u64,
+        field: Fk,
+        flags: u8,
+        vin: u32,
+    ) -> Result<bool, StoreError> {
+        let (got_field, got_flags, got_vin) = self.body_spend_slot(abs)?;
+        Ok(got_field == field && got_flags == flags && got_vin == vin)
     }
 
     /// Read multi + spender_field for create tx output (packed Class A body).
@@ -2433,6 +2503,10 @@ impl TxTable {
         if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
             return Err(StoreError::Corrupt("spent slot OOB"));
         }
+        if let Some(raw) = self.spend_pages.slot(abs) {
+            let (flags, field, vin) = decode_spent_slot(&raw)?;
+            return Ok((flags & output_flags::MULTI_SPENDER != 0, field, vin));
+        }
         self.spent
             .with_bytes_at(abs, OutputRecord::SPENT_SLOT_LEN as u64, |raw| {
                 let (flags, field, vin) = decode_spent_slot(raw)?;
@@ -2440,9 +2514,11 @@ impl TxTable {
             })
     }
 
-    /// One packed body walk: spender meta for many vouts (ascending).
+    /// Spender meta for many vouts.
     ///
-    /// Returns `(vout, multi, field)` for each found vout. Missing vouts omitted.
+    /// The page log is read first. One `spent.body` walk fills the misses.
+    /// Returns `(vout, multi, field, vin)` for each found vout. Missing vouts
+    /// are omitted.
     pub fn get_output_spender_metas_at(
         &self,
         body_off: u64,
@@ -2453,21 +2529,170 @@ impl TxTable {
             return Ok(Vec::new());
         }
         let slot = OutputRecord::SPENT_SLOT_LEN;
+        let end = body_off.saturating_add(body_len);
+        let mut hits: Vec<Option<(bool, Fk, u32)>> = Vec::with_capacity(vouts.len());
+        let mut misses = Vec::new();
+        for (i, &v) in vouts.iter().enumerate() {
+            let abs = spent_abs(body_off, v);
+            if abs.saturating_add(slot as u64) > end {
+                hits.push(None);
+                continue;
+            }
+            if let Some(logged) = self.spend_pages.slot(abs) {
+                hits.push(decode_spent_slot(&logged).ok().map(|(flags, field, vin)| {
+                    (flags & output_flags::MULTI_SPENDER != 0, field, vin)
+                }));
+            } else {
+                hits.push(None);
+                misses.push(i);
+            }
+        }
+        if misses.is_empty() {
+            return Ok(Self::pack_spender_metas(vouts, hits));
+        }
         self.spent.with_bytes_at(body_off, body_len, |raw| {
-            let mut out = Vec::with_capacity(vouts.len());
-            for &v in vouts {
+            for i in misses {
+                let v = vouts[i];
                 let start = (v as usize).saturating_mul(slot);
-                let end = start.saturating_add(slot);
-                if end > raw.len() {
+                let stop = start.saturating_add(slot);
+                if stop > raw.len() {
                     continue;
                 }
-                let Ok((flags, field, vin)) = decode_spent_slot(&raw[start..end]) else {
-                    continue;
-                };
-                out.push((v, flags & output_flags::MULTI_SPENDER != 0, field, vin));
+                if let Ok((flags, field, vin)) = decode_spent_slot(&raw[start..stop]) {
+                    hits[i] = Some((flags & output_flags::MULTI_SPENDER != 0, field, vin));
+                }
             }
-            Ok(out)
+            Ok(Self::pack_spender_metas(vouts, hits))
         })
+    }
+
+    fn pack_spender_metas(
+        vouts: &[u32],
+        hits: Vec<Option<(bool, Fk, u32)>>,
+    ) -> Vec<(u32, bool, Fk, u32)> {
+        vouts
+            .iter()
+            .zip(hits)
+            .filter_map(|(&v, hit)| hit.map(|(multi, field, vin)| (v, multi, field, vin)))
+            .collect()
+    }
+
+    pub(crate) fn note_historical_spend_slots(
+        &self,
+        slots: &[(u64, [u8; OutputRecord::SPENT_SLOT_LEN])],
+    ) -> Result<(), StoreError> {
+        self.spend_pages.note_slots(slots)
+    }
+
+    pub(crate) fn prepare_open_spend_pages<K, B, S>(
+        &self,
+        height: u32,
+        keep: K,
+        before_freeze: B,
+        seal_tip: S,
+    ) -> Result<(), StoreError>
+    where
+        K: FnMut(&[u8; OutputRecord::SPENT_SLOT_LEN]) -> Result<bool, StoreError>,
+        B: FnOnce(&crate::spend_page_log::SpendPageLog, &dyn Fn() -> u64) -> Result<(), StoreError>,
+        S: FnOnce(&crate::spend_page_log::SpendPageLog) -> Result<u32, StoreError>,
+    {
+        let published = self.spent.body_published_len();
+        let len_now = || self.spent.body_published_len();
+        self.spend_pages.prepare_commit_in(
+            height,
+            published,
+            |off, len| {
+                let mut buf = vec![0u8; len];
+                let end = self.spent.body_published_len();
+                self.spent
+                    .read_prefix_at_published(end, off, len as u64, &mut buf)?;
+                Ok(buf)
+            },
+            keep,
+            |log| before_freeze(log, &len_now),
+            seal_tip,
+        )
+    }
+
+    pub(crate) fn install_open_spend_pages(&self) -> Result<(), StoreError> {
+        self.spend_pages.install_commit()
+    }
+
+    pub(crate) fn bind_spend_sync_wake(&self, wake: crate::spend_page_log::SpendSyncWake) {
+        self.spend_pages.bind_sync_wake(wake);
+    }
+
+    pub(crate) fn spend_checkpoint_early(&self) -> bool {
+        self.spend_pages.checkpoint_early()
+    }
+
+    pub(crate) fn relax_spend_pace(&self) {
+        self.spend_pages.relax_pace();
+    }
+
+    pub(crate) fn wait_spend_edge_room(&self) {
+        self.spend_pages.wait_open_edge_room();
+    }
+
+    pub(crate) fn hold_spend_fold_above(&self, tip: u32) -> Result<(), StoreError> {
+        self.spend_pages.hold_fold_above(tip)
+    }
+
+    pub(crate) fn widen_for_checkpoint(&self, height: u32) {
+        self.spend_pages.widen_for_checkpoint(height);
+    }
+
+    pub(crate) fn spend_log_above(&self, tip: u32) -> bool {
+        self.spend_pages.above_tip(tip)
+    }
+
+    pub(crate) fn copy_cooled_spend_pages(&self) -> Result<(), StoreError> {
+        // Grow-only. `write_body_abs` samples the length, then stores that
+        // sample. Confirm can publish a longer end in between.
+        self.spend_pages.copy_cooled(
+            |off, image| self.spent.write_body_pwrite(off, image),
+            || self.spent.sync_data_only(),
+        )
+    }
+
+    pub(crate) fn finish_cooled_spend_pages(&self) -> Result<(), StoreError> {
+        self.spend_pages.finish_cooled()
+    }
+
+    /// Record one decided spend slot.
+    ///
+    /// A slot inside the published body, or one the page log already serves,
+    /// is a directory note. A later fold must not copy an older image over
+    /// that spend. A slot past the published body is the create-time overlay
+    /// and stays a `spent.body` write.
+    pub(crate) fn store_spend_slot_at(
+        &self,
+        body_off: u64,
+        body_len: u64,
+        vout: u32,
+        multi: bool,
+        field: Fk,
+        vin: u32,
+    ) -> Result<(), StoreError> {
+        let abs = spent_abs(body_off, vout);
+        let end = body_off.saturating_add(body_len);
+        if abs.saturating_add(OutputRecord::SPENT_SLOT_LEN as u64) > end {
+            return Err(StoreError::Corrupt("spent slot OOB"));
+        }
+        let flags = if multi {
+            output_flags::MULTI_SPENDER
+        } else {
+            0
+        };
+        let slot_vin = if multi { 0 } else { vin };
+        let meta = encode_spent_slot(flags, field, slot_vin)?;
+        let published = self.spent.body_published_len();
+        if self.spend_pages.slot(abs).is_some()
+            || crate::spend_page_log::is_historical(published, abs)
+        {
+            return self.note_historical_spend_slots(&[(abs, meta)]);
+        }
+        self.spent.write_body_pwrite(abs, &meta)
     }
 
     /// Patch multi + spender_field on create tx output (packed Class A body).
@@ -2505,7 +2730,7 @@ impl TxTable {
         };
         let slot_vin = if multi { 0 } else { vin };
         let slot = encode_spent_slot(flags, field, slot_vin)?;
-        self.spent.write_body_abs(abs, &slot)?;
+        self.spent.write_body_pwrite(abs, &slot)?;
         Ok(())
     }
 
@@ -3211,9 +3436,7 @@ impl TxTable {
                 let e = spenders.append(spend_fk, spend_vin, field)?;
                 (true, e, 0)
             };
-            self.set_output_spender_meta_at(
-                spent_off, spent_len, vout, new_multi, new_field, new_vin,
-            )?;
+            self.store_spend_slot_at(spent_off, spent_len, vout, new_multi, new_field, new_vin)?;
         }
         Ok(())
     }
