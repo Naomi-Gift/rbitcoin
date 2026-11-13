@@ -107,6 +107,7 @@ is over target.
 
 **Why this is safe:** when soft assign restricts densify to the confirm-time
 window, outstanding requests remain finite (per-peer in-flight window).
+Each outstanding hash keeps its holders in one list.
 Enqueueing those bodies cannot create a truly unbounded leak; the backlog
 drains as confirm dequeues. Bound queue size by **not requesting**, not by
 **not reading**. A tight slow pack keeps half the per-peer count cap of

@@ -2607,7 +2607,7 @@ impl WireRig {
                 .st
                 .inflight
                 .iter()
-                .flat_map(|(h, r)| r.peers.iter().map(move |p| (*h, *p)))
+                .flat_map(|(h, r)| r.racing().map(move |p| (*h, p)))
                 .filter(|(_, p)| self.st.slots.iter().any(|s| s.id == *p && s.alive))
                 .collect();
             for (hash, peer) in asks {
@@ -4831,7 +4831,7 @@ fn ibd_refused_body_is_asked_again() {
     let assign = |st: &mut IbdWorkState| {
         assign_work_ordered(st, &hub, &cfg, &stats, AssignDepth::Full, None);
     };
-    let owner = |st: &IbdWorkState, hash| *st.inflight[&hash].peers.iter().next().unwrap();
+    let owner = |st: &IbdWorkState, hash| st.inflight[&hash].racing().next().unwrap();
     let mut framed = |st: &mut IbdWorkState, peer, hash, payload| {
         apply_peer_event(
             st,
