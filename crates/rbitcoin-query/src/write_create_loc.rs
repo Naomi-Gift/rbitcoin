@@ -48,11 +48,10 @@ impl LocPack {
 #[derive(Clone, Copy, Debug)]
 struct LocCover {
     base: u64,
-    /// Exclusive end (`base + pairs.len()`). Saturates at `u64::MAX`.
-    end: u64,
+    len: u64,
     height: u32,
-    /// Max `end` of this cover and every cover earlier in `(base, height)` order.
-    max_end_through: u64,
+    /// Highest id covered by this cover or any cover earlier in `(base, height)` order.
+    max_id_through: u64,
 }
 
 /// Write-owned loc window. Note after append; prune after that write batch
@@ -104,18 +103,21 @@ impl WriteCreateLocRam {
     /// Lowest height whose range covers `id`.
     ///
     /// A lower height can start later and still overlap, so the rightmost
-    /// base is not the owner. Walk left while an earlier cover's max end
-    /// still reaches `id`.
+    /// base is not the owner. Walk left while an earlier cover's highest id
+    /// still reaches `id`. The span is the same offset check as [`LocPack::get`].
     fn covering_height(&self, id: u64) -> Option<u32> {
         let right = self.covers.partition_point(|cover| cover.base <= id);
         let mut index = right.checked_sub(1)?;
         let mut best: Option<u32> = None;
         loop {
             let cover = self.covers[index];
-            if id < cover.end {
+            if id
+                .checked_sub(cover.base)
+                .is_some_and(|off| off < cover.len)
+            {
                 best = Some(best.map_or(cover.height, |height| height.min(cover.height)));
             }
-            if index == 0 || self.covers[index - 1].max_end_through <= id {
+            if index == 0 || self.covers[index - 1].max_id_through < id {
                 break;
             }
             index -= 1;
@@ -132,16 +134,17 @@ impl WriteCreateLocRam {
             }
             covers.push(LocCover {
                 base: pack.base,
-                end: pack.base.saturating_add(len),
+                len,
                 height,
-                max_end_through: 0,
+                max_id_through: 0,
             });
         }
         covers.sort_unstable_by(|a, b| a.base.cmp(&b.base).then(a.height.cmp(&b.height)));
-        let mut max_end = 0u64;
+        let mut max_id = 0u64;
         for cover in &mut covers {
-            max_end = max_end.max(cover.end);
-            cover.max_end_through = max_end;
+            let last = cover.base.saturating_add(cover.len - 1);
+            max_id = max_id.max(last);
+            cover.max_id_through = max_id;
         }
         self.covers = covers;
     }
