@@ -376,6 +376,17 @@ fn promote_wave_drops_raw_and_charges_decoded() {
     assert_eq!(q.bytes(), 8 + 1);
     assert_eq!(q.promoted_count(), 1);
     assert!(q.get_by_height(10).unwrap().is_none());
+    assert_eq!(q.promote_wave(&[(11, 8)]).unwrap(), 0, "already promoted");
+    assert!(q.take_raw(11).is_none(), "a promoted row is not raw");
+    assert_eq!(q.promoted_count(), 1);
+    assert_eq!(q.dequeue_height(12).unwrap(), 1, "raw row");
+    assert_eq!(
+        q.promoted_count(),
+        1,
+        "removing a raw row keeps the promoted count"
+    );
+    assert_eq!(q.dequeue_height(11).unwrap(), 1);
+    assert_eq!(q.promoted_count(), 0);
     let _ = std::fs::remove_dir_all(&dir);
 }
 
