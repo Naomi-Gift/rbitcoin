@@ -3265,6 +3265,59 @@ async fn sp_subscriptions_are_capped_per_connection() {
     assert_eq!(conn.sp_scans.len(), SP_MAX_SUBS);
 }
 
+/// Frigate: a subscribe to an address the connection has must not narrow
+/// its coverage. The earlier start stays and is the one returned.
+#[tokio::test]
+async fn sp_resubscribe_keeps_the_earlier_start() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-widen", 9, &[]);
+    let params = Arc::new(ChainParams::regtest());
+    let mut conn = ElectrumConn::new();
+    let peer = "127.0.0.1:9".parse().unwrap();
+    let subscribe = async |conn: &mut ElectrumConn, wallet: u8, start: u32| -> Value {
+        let mut body = Vec::new();
+        let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+        serve_sp_subscribe(
+            &mut writer,
+            &chain.q,
+            &params,
+            &peer,
+            json!(1),
+            &chain.sub_for(wallet, json!(start)),
+            conn,
+        )
+        .await
+        .unwrap();
+        drop(writer);
+        serde_json::from_slice(&body).unwrap()
+    };
+    let first = subscribe(&mut conn, 0, 4).await;
+    assert_eq!(first["result"]["start_height"], 4);
+    // Still scanning: a later start keeps 4.
+    let later = subscribe(&mut conn, 0, 7).await;
+    assert_eq!(later["result"]["start_height"], 4, "{later}");
+    assert_eq!(conn.sp_scans[0].sub.start, 4);
+    // Another address is not bound by it.
+    let other = subscribe(&mut conn, 1, 7).await;
+    assert_eq!(other["result"]["start_height"], 7, "{other}");
+    // An earlier start widens.
+    let wider = subscribe(&mut conn, 0, 2).await;
+    assert_eq!(wider["result"]["start_height"], 2, "{wider}");
+
+    // Live: the history is sent, and a later start still keeps 2.
+    while conn.sp_subs.len() < 2 {
+        let mut sink = Vec::new();
+        let mut writer = ConnWrite::new(std::io::Cursor::new(&mut sink), Duration::from_secs(2));
+        let (address, step) = next_sp_scan_step(&mut conn.sp_scans).await;
+        write_sp_scan_step(&mut writer, &chain.q, &params, &mut conn, &address, step)
+            .await
+            .unwrap();
+    }
+    let live = subscribe(&mut conn, 0, 9).await;
+    assert_eq!(live["result"]["start_height"], 2, "{live}");
+}
+
 /// An unsubscribe stops the history scan it names.
 #[tokio::test]
 async fn sp_unsubscribe_drops_a_running_scan() {

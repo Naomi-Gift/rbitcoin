@@ -1356,7 +1356,7 @@ where
     W: AsyncWrite + Unpin,
 {
     let tip = query.tip_height().map(|h| h.0);
-    let sub = match parse_sp_sub(params_v, query, chain).await {
+    let mut sub = match parse_sp_sub(params_v, query, chain).await {
         Ok(s) => s,
         Err(e) => {
             writer
@@ -1365,8 +1365,12 @@ where
             return Ok(());
         }
     };
+    // Frigate: a subscribe must not narrow the coverage the address has.
+    if let Some(held_start) = sp_start(conn, &sub.address) {
+        sub.start = sub.start.min(held_start);
+    }
     let held = conn.sp_subs.len() + conn.sp_scans.len();
-    if !sp_subscribed(conn, &sub.address) && held >= crate::silent_scan::SP_MAX_SUBS {
+    if sp_start(conn, &sub.address).is_none() && held >= crate::silent_scan::SP_MAX_SUBS {
         let message = format!(
             "subscription limit reached ({}) for this connection",
             crate::silent_scan::SP_MAX_SUBS
@@ -1393,9 +1397,13 @@ where
     Ok(())
 }
 
-fn sp_subscribed(conn: &ElectrumConn, address: &str) -> bool {
-    conn.sp_subs.iter().any(|live| live.sub.address == address)
-        || conn.sp_scans.iter().any(|run| run.sub.address == address)
+/// The start height of the connection's subscription to `address`.
+fn sp_start(conn: &ElectrumConn, address: &str) -> Option<u32> {
+    let live = conn.sp_subs.iter().map(|live| &live.sub);
+    let scanning = conn.sp_scans.iter().map(|run| &run.sub);
+    live.chain(scanning)
+        .find(|sub| sub.address == address)
+        .map(|sub| sub.start)
 }
 
 /// End the subscription to `address`, live or still scanning.
