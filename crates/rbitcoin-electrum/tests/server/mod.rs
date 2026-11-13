@@ -3947,6 +3947,55 @@ async fn sp_tip_miss_ends_the_subscription() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A reorg may leave the tip below the last height scanned. The heights
+/// above the new tip are replaced, so the blocks that connect there later
+/// are scanned.
+#[tokio::test(flavor = "current_thread")]
+async fn sp_reorg_to_a_lower_tip_rewinds_the_scan() {
+    use crate::silent_scan::SpChain;
+
+    let chain = SpChain::new("el-sp-lower", 10, &[9]);
+    let params = ChainParams::regtest();
+    let sub = rbitcoin_electrum::silent_scan::parse_sub(
+        &chain.sub(json!(0)),
+        bitcoin::Network::Regtest,
+        Some(10),
+        &no_times,
+    )
+    .unwrap();
+    let mut conn = ElectrumConn::new();
+    conn.sp_subs.push(SpLive { sub, through: 10 });
+    let tip = |height: u32, reorg_from_height: Option<u32>| TipNotify {
+        height,
+        header_hex: String::new(),
+        reorg_from_height,
+    };
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+
+    // A late event for a lower height is not a reorg: nothing rewinds.
+    emit_sp_tips(&mut writer, &chain.q, &params, &mut conn, &tip(5, None))
+        .await
+        .unwrap();
+    assert_eq!(conn.sp_subs[0].through, 10);
+
+    // The chain forks at 6 and its new tip is 8.
+    emit_sp_tips(&mut writer, &chain.q, &params, &mut conn, &tip(8, Some(6)))
+        .await
+        .unwrap();
+    assert_eq!(conn.sp_subs[0].through, 8, "heights 9 and 10 are gone");
+
+    // Blocks connect at 9 and 10 again. Height 9 pays.
+    let mut body = Vec::new();
+    let mut writer = ConnWrite::new(std::io::Cursor::new(&mut body), Duration::from_secs(2));
+    emit_sp_tips(&mut writer, &chain.q, &params, &mut conn, &tip(10, None))
+        .await
+        .unwrap();
+    assert_eq!(conn.sp_subs[0].through, 10);
+    let note: Value = serde_json::from_slice(&body).expect("a note for height 9");
+    assert_eq!(note["params"][2][0]["height"], 9, "{note}");
+}
+
 /// A start the node cannot read is refused in the reply to the subscribe.
 /// A JSON-RPC notification has no error member for it.
 #[tokio::test(flavor = "current_thread")]

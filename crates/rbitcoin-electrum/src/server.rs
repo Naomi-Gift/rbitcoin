@@ -1540,7 +1540,12 @@ pub async fn emit_sp_tips<W: AsyncWrite + Unpin>(
         {
             continue;
         }
-        live.through = live.through.max(tip.height);
+        // A reorg replaced what was above its tip, so the tip is the last
+        // height scanned. A late event for a lower height rewinds nothing.
+        live.through = match tip.reorg_from_height {
+            Some(_) => tip.height,
+            None => live.through.max(tip.height),
+        };
         kept.push(live);
     }
     conn.sp_subs = kept;
