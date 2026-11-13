@@ -1,9 +1,10 @@
 //! Classify standard `scriptPubKey` templates.
 
 use bitcoin::script::Script;
+use rbitcoin_primitives::{OP_CHECKSIG, OP_DUP, OP_EQUALVERIFY, OP_HASH160, OP_PUSHBYTES_20};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScriptKind {
+pub enum ScriptKind<'a> {
     /// OP_0 OP_PUSHBYTES_20 <20>
     P2wpkh,
     /// OP_0 OP_PUSHBYTES_32 <32>
@@ -11,7 +12,7 @@ pub enum ScriptKind {
     /// OP_1 OP_PUSHBYTES_32 <32>
     P2tr,
     /// OP_DUP OP_HASH160 OP_PUSHBYTES_20 <20> OP_EQUALVERIFY OP_CHECKSIG
-    P2pkh,
+    P2pkh(&'a [u8; 25]),
     /// OP_HASH160 OP_PUSHBYTES_20 <20> OP_EQUAL
     P2sh,
     /// Bare (P2PK, custom, empty spk) — run interpreter
@@ -51,15 +52,30 @@ pub fn program_len(program: &[u8]) -> ProgramLen<'_> {
     }
 }
 
-pub fn classify(script: &Script) -> ScriptKind {
+/// P2PKH template as the 25-byte script. The keyhash is bytes 3..23.
+pub fn p2pkh_script(spk: &[u8]) -> Option<&[u8; 25]> {
+    let raw: &[u8; 25] = spk.try_into().ok()?;
+    if raw[0] == OP_DUP
+        && raw[1] == OP_HASH160
+        && raw[2] == OP_PUSHBYTES_20
+        && raw[23] == OP_EQUALVERIFY
+        && raw[24] == OP_CHECKSIG
+    {
+        Some(raw)
+    } else {
+        None
+    }
+}
+
+pub fn classify(script: &Script) -> ScriptKind<'_> {
     if script.is_p2wpkh() {
         ScriptKind::P2wpkh
     } else if script.is_p2wsh() {
         ScriptKind::P2wsh
     } else if script.is_p2tr() {
         ScriptKind::P2tr
-    } else if script.is_p2pkh() {
-        ScriptKind::P2pkh
+    } else if let Some(spk) = p2pkh_script(script.as_bytes()) {
+        ScriptKind::P2pkh(spk)
     } else if script.is_p2sh() {
         ScriptKind::P2sh
     } else {

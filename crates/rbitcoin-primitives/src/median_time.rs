@@ -12,6 +12,16 @@ impl<'a> MedianWindow<'a> {
         }
         Ok(Self { times })
     }
+
+    /// At least eleven timestamps. Fewer is not a window. Eleven is not empty,
+    /// so this does not repeat [`Self::new`]'s empty-window error.
+    pub fn at_least_eleven(times: &'a [u32]) -> Option<Self> {
+        if times.len() < 11 {
+            None
+        } else {
+            Some(Self { times })
+        }
+    }
 }
 
 /// Median of `times` (unsorted OK). The upper middle when the count is even.

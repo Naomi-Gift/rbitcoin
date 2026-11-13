@@ -74,6 +74,7 @@ fn verify_pubkey_hash_mismatch() {
     let err = {
         let i = job.inputs().next().unwrap();
         let spk = job.prevout_script(i).expect("prevout");
+        let spk: &[u8; 25] = spk.try_into().expect("p2pkh template");
         verify(&job, i, &job.tx, &mut cache, spk)
     }
     .unwrap_err();
