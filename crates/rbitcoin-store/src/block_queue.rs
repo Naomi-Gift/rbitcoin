@@ -169,7 +169,6 @@ impl HeightWindow {
         if height < self.base {
             let gap = (self.base - height) as usize;
             self.slots.splice(0..0, std::iter::repeat_n(None, gap));
-            self.start += gap;
             self.base = height;
             self.slots[0] = Some(id);
             self.start = 0;

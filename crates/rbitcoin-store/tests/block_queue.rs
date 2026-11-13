@@ -402,7 +402,14 @@ fn height_lookup_is_a_window_from_the_lowest() {
     assert_eq!(q.id_for_height(8), Some(id));
     assert!(q.contains_height(12));
     assert_eq!(q.heights(), vec![8, 12]);
+    assert_eq!(q.dequeue_height(8).unwrap(), 1);
+    assert!(q.contains_height(12));
+    assert_eq!(q.min_height(), Some(12));
+}
 
+/// Putting a height back into a dropped prefix keeps the rows above it.
+#[test]
+fn a_reinserted_low_height_keeps_the_rows_above_it() {
     let mut q = BlockQueue::empty();
     q.enqueue(10, [1u8; 32], 1, b"a").unwrap();
     q.enqueue(11, [2u8; 32], 1, b"b").unwrap();
@@ -415,6 +422,10 @@ fn height_lookup_is_a_window_from_the_lowest() {
     assert!(q.contains_height(11));
     assert!(q.contains_height(12));
     assert_eq!(q.heights(), vec![10, 11, 12]);
+    assert_eq!(q.dequeue_height(10).unwrap(), 1);
+    assert_eq!(q.dequeue_height(11).unwrap(), 1);
+    assert_eq!(q.heights(), vec![12]);
+    assert!(q.contains_height(12));
 }
 
 /// One queued hash keeps its height without a side list. A second height is
@@ -454,4 +465,14 @@ fn unknown_height_stays_out_of_the_window() {
     assert_eq!(q.max_height(), Some(0));
     assert!(q.contains_height(0));
     assert_eq!(q.height_to_id.span(), 1);
+    q.enqueue(1, [3u8; 32], 1, b"b").unwrap();
+    assert_eq!(q.dequeue_height(1).unwrap(), 1);
+    assert_eq!(q.max_height(), Some(0));
+    q.enqueue(u32::MAX, [2u8; 32], 1, b"unk").unwrap();
+    assert_eq!(q.dequeue_height(0).unwrap(), 1);
+    assert_eq!(q.min_height(), Some(u32::MAX));
+    assert_eq!(q.max_height(), Some(u32::MAX));
+    assert_eq!(q.dequeue_height(u32::MAX).unwrap(), 1);
+    assert_eq!(q.min_height(), None);
+    assert_eq!(q.max_height(), None);
 }
