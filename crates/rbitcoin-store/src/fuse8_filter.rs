@@ -101,14 +101,16 @@ pub fn open_file(path: &Path) -> Result<SealedFuse8, StoreError> {
     let mut map = ReadonlyMap::map_path(path)?;
     let geo = {
         let bytes = map.as_file_bytes();
-        if bytes.len() < 16 {
+        let Some(head) = bytes.first_chunk::<16>() else {
+            return Err(StoreError::Corrupt("tx.head fuse magic"));
+        };
+        if &head[0..4] != MAGIC {
             return Err(StoreError::Corrupt("tx.head fuse magic"));
         }
-        if &bytes[0..4] != MAGIC {
-            return Err(StoreError::Corrupt("tx.head fuse magic"));
-        }
-        let ver = u32::from_le_bytes(bytes[4..8].try_into().unwrap());
-        let len = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        let ver = u32::from_le_bytes([head[4], head[5], head[6], head[7]]);
+        let len = u64::from_le_bytes([
+            head[8], head[9], head[10], head[11], head[12], head[13], head[14], head[15],
+        ]);
         let Some(end) = 16u64.checked_add(len) else {
             return Err(StoreError::Corrupt("fuse8 v2 body unreadable"));
         };
@@ -219,8 +221,9 @@ pub fn encode_body(filter: &BinaryFuse8) -> Vec<u8> {
 /// Fold a 32-byte mixed head key into a u64 fuse key (stable, keyed via mix).
 #[inline]
 pub fn fuse_key_from_mixed(mixed: &[u8; 32]) -> u64 {
-    u64::from_le_bytes(mixed[0..8].try_into().unwrap())
-        ^ u64::from_le_bytes(mixed[8..16].try_into().unwrap())
-        ^ u64::from_le_bytes(mixed[16..24].try_into().unwrap())
-        ^ u64::from_le_bytes(mixed[24..32].try_into().unwrap())
+    let b = *mixed;
+    u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]])
+        ^ u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]])
+        ^ u64::from_le_bytes([b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]])
+        ^ u64::from_le_bytes([b[24], b[25], b[26], b[27], b[28], b[29], b[30], b[31]])
 }

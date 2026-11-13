@@ -46,17 +46,29 @@ impl HeaderRecord {
     }
 
     pub fn decode(buf: &[u8]) -> Result<Self, StoreError> {
-        if buf.len() < HEADER_RECORD_LEN {
+        let Some(buf) = buf.first_chunk::<HEADER_RECORD_LEN>() else {
             return Err(StoreError::Corrupt("short header record"));
-        }
+        };
         Ok(Self {
-            prev_fk: Fk(u64::from_le_bytes(buf[0..8].try_into().unwrap())),
-            version: i32::from_le_bytes(buf[8..12].try_into().unwrap()),
-            timestamp: u32::from_le_bytes(buf[12..16].try_into().unwrap()),
-            bits: u32::from_le_bytes(buf[16..20].try_into().unwrap()),
-            nonce: u32::from_le_bytes(buf[20..24].try_into().unwrap()),
-            merkle_root: buf[24..56].try_into().unwrap(),
-            hash: buf[56..88].try_into().unwrap(),
+            prev_fk: Fk(u64::from_le_bytes([
+                buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
+            ])),
+            version: i32::from_le_bytes([buf[8], buf[9], buf[10], buf[11]]),
+            timestamp: u32::from_le_bytes([buf[12], buf[13], buf[14], buf[15]]),
+            bits: u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]),
+            nonce: u32::from_le_bytes([buf[20], buf[21], buf[22], buf[23]]),
+            merkle_root: [
+                buf[24], buf[25], buf[26], buf[27], buf[28], buf[29], buf[30], buf[31], buf[32],
+                buf[33], buf[34], buf[35], buf[36], buf[37], buf[38], buf[39], buf[40], buf[41],
+                buf[42], buf[43], buf[44], buf[45], buf[46], buf[47], buf[48], buf[49], buf[50],
+                buf[51], buf[52], buf[53], buf[54], buf[55],
+            ],
+            hash: [
+                buf[56], buf[57], buf[58], buf[59], buf[60], buf[61], buf[62], buf[63], buf[64],
+                buf[65], buf[66], buf[67], buf[68], buf[69], buf[70], buf[71], buf[72], buf[73],
+                buf[74], buf[75], buf[76], buf[77], buf[78], buf[79], buf[80], buf[81], buf[82],
+                buf[83], buf[84], buf[85], buf[86], buf[87],
+            ],
             size: 0,
             weight: 0,
         })

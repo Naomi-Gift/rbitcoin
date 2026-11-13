@@ -170,7 +170,8 @@ pub fn fingerprint(mixed: &[u8; 32], bits: u32) -> u32 {
         return 0;
     }
     let mask = (1u32 << (32 - bits)) - 1;
-    let w = u64::from_le_bytes(mixed[16..24].try_into().unwrap());
+    let b = *mixed;
+    let w = u64::from_le_bytes([b[16], b[17], b[18], b[19], b[20], b[21], b[22], b[23]]);
     (w % u64::from(mask)) as u32 + 1
 }
 
@@ -552,7 +553,9 @@ pub fn decode_layout_ext(ext: &[u8; 16]) -> Result<(HeadLayout, u64), StoreError
         ));
     }
     let bits = u32::from(ext[6]);
-    let generation = u64::from_le_bytes(ext[8..16].try_into().unwrap());
+    let generation = u64::from_le_bytes([
+        ext[8], ext[9], ext[10], ext[11], ext[12], ext[13], ext[14], ext[15],
+    ]);
     Ok((HeadLayout::new(bits)?, generation))
 }
 
