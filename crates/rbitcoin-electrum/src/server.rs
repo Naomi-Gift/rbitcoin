@@ -1550,6 +1550,13 @@ pub struct SpScanRun {
     steps: tokio::sync::mpsc::Receiver<Result<SpScanStep, String>>,
     /// When the client last got a note of this scan.
     noted: Instant,
+    task: JoinHandle<usize>,
+}
+
+impl Drop for SpScanRun {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl SpScanRun {
@@ -1562,7 +1569,7 @@ impl SpScanRun {
         // One step of slack: the scan reads the next chunk while the session
         // writes this one, and no further ahead of a slow client.
         let (tx, steps) = tokio::sync::mpsc::channel(1);
-        tokio::spawn(run_sp_scan(
+        let task = tokio::spawn(run_sp_scan(
             Arc::clone(query),
             Arc::clone(chain),
             sub.clone(),
@@ -1573,6 +1580,7 @@ impl SpScanRun {
             sub,
             steps,
             noted: Instant::now(),
+            task,
         }
     }
 
@@ -1682,13 +1690,11 @@ pub async fn write_sp_scan_step<W: AsyncWrite + Unpin>(
     if !done {
         return Ok(());
     }
-    let Some(run) = conn.sp_scan.take() else {
-        return Ok(());
-    };
     let mut live = SpLive {
-        sub: run.sub,
+        sub: run.sub.clone(),
         through: step.through,
     };
+    conn.sp_scan = None;
     // A block whose tip event came before this step had no subscription.
     let tip = query.tip_height().map_or(live.through, |tip| tip.0);
     if tip > live.through {
