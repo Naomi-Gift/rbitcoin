@@ -20,7 +20,7 @@ pub struct BlockTxStatRows {
     pub txstat_bytes: u64,
 }
 
-/// Stamped `txstat.body` rows for one confirmed block (every row non-zero).
+/// Stamped `txstat.body` rows for one stored block (every row non-zero).
 #[derive(Debug, Clone)]
 pub struct StampedTxstatBlock {
     pub rec: HeaderRecord,
@@ -487,15 +487,8 @@ impl Query {
             Err(StoreError::NotFound) | Err(StoreError::InvalidFk) => return Ok(None),
             Err(e) => return Err(e),
         };
-        let Some((first, n)) = self.store.header_txs.get_range(header_fk)? else {
-            return Ok(None);
-        };
-        let last = first.0.saturating_add(u64::from(n) - 1);
-        if let Ok(rows) = self.store.txstat_range(header_fk, first.0, last) {
-            if rows.len() == n as usize && rows.iter().all(|row| row.is_some()) {
-                let plain: Vec<_> = rows.into_iter().flatten().collect();
-                return Ok(Some(block_size_weight_from_txstat(&plain)?));
-            }
+        if let Some(size_weight) = self.stamped_block_size_weight(header_fk)? {
+            return Ok(Some(size_weight));
         }
         let Some(tx_fks) = self.store.header_txs.get_list(header_fk)? else {
             return Ok(None);
@@ -507,6 +500,28 @@ impl Query {
         let weight = u32::try_from(block.weight().to_wu())
             .map_err(|_| StoreError::Corrupt("invariant: block size/weight"))?;
         Ok(Some((size, weight)))
+    }
+
+    /// BIP144 size and BIP141 weight from complete `txstat` rows only.
+    /// Missing bodies or unstamped rows return `None`; no wire reconstruction.
+    pub fn stamped_block_size_weight(
+        &self,
+        header_fk: Fk,
+    ) -> Result<Option<(u32, u32)>, QueryError> {
+        let Some((first, n)) = self.store.header_txs.get_range(header_fk)? else {
+            return Ok(None);
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        let last = first.0.saturating_add(u64::from(n) - 1);
+        if let Ok(rows) = self.store.txstat_range(header_fk, first.0, last) {
+            if rows.len() == n as usize && rows.iter().all(|row| row.is_some()) {
+                let plain: Vec<_> = rows.into_iter().flatten().collect();
+                return Ok(Some(block_size_weight_from_txstat(&plain)?));
+            }
+        }
+        Ok(None)
     }
 
     /// Wire rebuild when header row + tx fk list are already known.
@@ -575,6 +590,14 @@ impl Query {
         let Some((header_fk, rec)) = self.header_at_height(height)? else {
             return Ok(None);
         };
+        self.stamped_txstat_header(header_fk, rec)
+    }
+
+    fn stamped_txstat_header(
+        &self,
+        header_fk: Fk,
+        rec: HeaderRecord,
+    ) -> Result<Option<StampedTxstatBlock>, QueryError> {
         let Some((first, n)) = self.store.header_txs.get_range(header_fk)? else {
             return Ok(None);
         };
@@ -607,26 +630,27 @@ impl Query {
         }))
     }
 
-    /// Txid, fee, weight, and output value of every tx in best-chain block
-    /// `hash`, coinbase first. `None` when `hash` is not on the best chain.
+    /// Txid, fee, weight, and output value of every tx in stored block
+    /// `hash`, coinbase first. Active or disconnected by this process only.
+    /// `None` for unknown, header-only, never-connected, or reopened stale blocks.
     ///
     /// Reads `txstat`, `create.loc`, `txout.body`, and `txid.body` over the
-    /// block's create span. A block with unstamped `txstat` rows gives the
-    /// same rows from the reconstructed block, which needs `seqsigwit`
-    /// (`Pruned` when cut). Nothing is written.
+    /// block's create span. An active block with unstamped `txstat` rows gives
+    /// the same rows from the reconstructed block, which needs `seqsigwit`
+    /// (`Pruned` when cut). Unstamped stale blocks return `None`. Nothing is written.
     pub fn block_tx_summary(
         &self,
         hash: &[u8; 32],
     ) -> Result<Option<Vec<BlockTxSummary>>, QueryError> {
-        let Some(height) = self.height_of_hash(hash)? else {
+        let Some((header_fk, rec)) = self.connected_block_header(hash)? else {
             return Ok(None);
         };
-        let Some(stamped) = self.stamped_txstat_block(height)? else {
+        let Some(stamped) = self.stamped_txstat_header(header_fk, rec)? else {
+            if self.published_height_of_hash(hash).is_none() {
+                return Ok(None);
+            }
             return self.block_tx_summary_from_wire(hash);
         };
-        if stamped.rec.hash != *hash {
-            return Ok(None);
-        }
         let (Some(first), Some(last)) = (stamped.fks.first(), stamped.fks.last()) else {
             return Err(StoreError::Corrupt(
                 "invariant: stamped block without creates",

@@ -1394,9 +1394,8 @@ pub async fn block_header(State(st): State<AppState>, Path(hash_hex): Path<Strin
     let Ok(hash) = parse_hash32(&hash_hex) else {
         return not_found();
     };
-    // Prefer best-chain height path (fills prev correctly for wire header).
-    match st.query.height_of_hash(&hash) {
-        Ok(Some(h)) => match st.query.wire_header_at_height(h) {
+    match st.query.connected_block_header(&hash) {
+        Ok(Some((_, rec))) => match st.query.wire_header_from_record(&rec) {
             Ok(hdr) => match encode_header_hex(&hdr) {
                 Ok(hex) => plain_ok(hex),
                 Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),

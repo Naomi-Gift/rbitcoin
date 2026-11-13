@@ -1509,9 +1509,26 @@ fn summary_spend(tag: u8, prev: [u8; 32], vout: u32, outs: &[u64], wit: bool) ->
     }
 }
 
+async fn assert_block_routes_not_found(addr: SocketAddr, hash: &str, reason: &str) {
+    for suffix in [
+        "",
+        "/status",
+        "/header",
+        "/raw",
+        "/txids",
+        "/txid/0",
+        "/txs",
+        "/txs/0",
+        "/txs/summary",
+    ] {
+        let (st, _, _) = http_get_raw(addr, &format!("/block/{hash}{suffix}")).await;
+        assert_eq!(st, 404, "{reason}: {suffix}");
+    }
+}
+
 /// `/block/:hash/txs/summary`: one `[txid, fee, weight, value]` row per tx in
 /// `/txids` order, coinbase first with fee 0, the same chain-tip stamp, and
-/// the same 404s as `/txids` for a malformed, unknown, or reorged-out hash.
+/// the same archive eligibility as `/txids`, including current-process reorgs.
 #[tokio::test]
 async fn block_txs_summary_rows_and_misses() {
     let (dir, q) = temp_query("blk-txs-summary");
@@ -1575,6 +1592,17 @@ async fn block_txs_summary_rows_and_misses() {
         assert_eq!(st, want, "{path}: {body}");
     }
 
+    let parent_fk = q.header_at_height(Height(3)).unwrap().unwrap().0;
+    let (header_only, header_only_cb) = coinbase(4, parent_fk, Some(h3.hash));
+    q.put_header(&header_only).unwrap();
+    let header_only_hex = block_hash_hex(&header_only.hash);
+    assert_block_routes_not_found(addr, &header_only_hex, "header without an archived body").await;
+
+    q.commit_class_a_only(&header_only, &[header_only_cb])
+        .unwrap();
+    assert_block_routes_not_found(addr, &header_only_hex, "archived body that never connected")
+        .await;
+
     q.disconnect_tip().unwrap();
     let (mut alt, alt_cb) = coinbase(3, prev, parent_hash);
     alt.nonce += 1;
@@ -1587,14 +1615,51 @@ async fn block_txs_summary_rows_and_misses() {
         alt.nonce,
     );
     q.connect_block(Height(3), &alt, &[alt_cb]).unwrap();
-    let (st_ids, _) = http_get(addr, &format!("/block/{hash}/txids")).await;
+    let (st_ids, stale_ids) = http_get(addr, &format!("/block/{hash}/txids")).await;
     let (st, body) = http_get(addr, &format!("/block/{hash}/txs/summary")).await;
-    assert_eq!((st, st_ids), (404, 404), "reorged out: {body}");
+    assert_eq!((st, st_ids), (200, 200), "reorged out: {body}");
+    assert_eq!(serde_json::from_str::<Vec<Value>>(&body).unwrap(), rows);
+    assert_eq!(
+        serde_json::from_str::<Vec<String>>(&stale_ids).unwrap(),
+        ids
+    );
     let alt_hex = block_hash_hex(&alt.hash);
     let (st, body) = http_get(addr, &format!("/block/{alt_hex}/txs/summary")).await;
     assert_eq!(st, 200, "{body}");
     let alt_rows: Vec<Value> = serde_json::from_str(&body).unwrap();
     assert_eq!(alt_rows.len(), 1, "{body}");
+
+    let first = q
+        .store()
+        .header_txs
+        .get_range(parent_fk)
+        .unwrap()
+        .unwrap()
+        .0;
+    q.store()
+        .write_txstat_row(
+            first,
+            &rbitcoin_store::TxStatRow {
+                fee_sat: 0,
+                base: 0,
+                wit_extra: 0,
+            },
+        )
+        .unwrap();
+    let rebuilds_before = q.reconstruct_archived.load(Ordering::Relaxed);
+    for suffix in ["", "/txs/summary"] {
+        let (st, _, _) = http_get_raw(addr, &format!("/block/{hash}{suffix}")).await;
+        assert_eq!(
+            st, 404,
+            "unstamped stale summary must not reconstruct: {suffix}"
+        );
+    }
+
+    assert_eq!(
+        q.reconstruct_archived.load(Ordering::Relaxed),
+        rebuilds_before,
+        "summary requests must not reconstruct an unstamped stale block"
+    );
 
     handle.shutdown().await;
     let _ = std::fs::remove_dir_all(&dir);
