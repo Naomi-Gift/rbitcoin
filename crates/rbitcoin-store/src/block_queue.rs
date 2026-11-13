@@ -18,6 +18,7 @@
 //! window). This type **always** accepts already-requested payloads (OOM aside).
 
 use crate::error::StoreError;
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,6 +88,217 @@ pub struct QueuedBlockMeta {
     pub resolve_complete: bool,
 }
 
+/// Height → queue id, from the lowest queued height.
+///
+/// A hole is an empty slot. `start` is a dropped prefix. It stays until it is
+/// at least as long as the live tail, then the tail is moved once.
+/// `u32::MAX` is the unknown-height row. It is one id beside the window, not
+/// a slot four billion entries past the low height.
+#[derive(Debug)]
+pub struct HeightWindow {
+    base: u32,
+    start: usize,
+    slots: Vec<Option<u64>>,
+    live: usize,
+    unknown: Option<u64>,
+}
+
+impl HeightWindow {
+    fn new() -> Self {
+        Self {
+            base: 0,
+            start: 0,
+            slots: Vec::new(),
+            live: 0,
+            unknown: None,
+        }
+    }
+
+    /// Slots in the height window. The unknown-height row is not one of them.
+    pub fn span(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Lowest height still queued.
+    pub fn lowest(&self) -> Option<u32> {
+        if self.live == 0 {
+            self.unknown.map(|_| u32::MAX)
+        } else {
+            Some(self.base + self.start as u32)
+        }
+    }
+
+    /// Highest height still queued.
+    pub fn highest(&self) -> Option<u32> {
+        if self.unknown.is_some() {
+            Some(u32::MAX)
+        } else if self.live == 0 {
+            None
+        } else {
+            Some(self.base + self.slots.len() as u32 - 1)
+        }
+    }
+
+    pub fn get(&self, height: u32) -> Option<u64> {
+        if height == u32::MAX {
+            return self.unknown;
+        }
+        let i = self.index_of(height)?;
+        if i < self.start {
+            return None;
+        }
+        self.slots.get(i).copied().flatten()
+    }
+
+    pub fn contains(&self, height: u32) -> bool {
+        self.get(height).is_some()
+    }
+
+    pub fn insert(&mut self, height: u32, id: u64) -> Option<u64> {
+        if height == u32::MAX {
+            return self.unknown.replace(id);
+        }
+        if self.live == 0 {
+            self.base = height;
+            self.start = 0;
+            self.slots.clear();
+            self.slots.push(Some(id));
+            self.live = 1;
+            return None;
+        }
+        if height < self.base {
+            let gap = (self.base - height) as usize;
+            self.slots.splice(0..0, std::iter::repeat_n(None, gap));
+            self.base = height;
+            self.slots[0] = Some(id);
+            self.start = 0;
+            self.live += 1;
+            return None;
+        }
+        let i = (height - self.base) as usize;
+        if i < self.start {
+            self.slots[i] = Some(id);
+            self.start = i;
+            self.live += 1;
+            return None;
+        }
+        if i >= self.slots.len() {
+            self.slots.resize(i + 1, None);
+        }
+        let prev = self.slots[i].replace(id);
+        if prev.is_none() {
+            self.live += 1;
+        }
+        prev
+    }
+
+    pub fn remove(&mut self, height: u32) -> Option<u64> {
+        if height == u32::MAX {
+            return self.unknown.take();
+        }
+        let i = self.index_of(height)?;
+        if i < self.start {
+            return None;
+        }
+        let prev = self.slots.get_mut(i)?.take()?;
+        self.live -= 1;
+        self.trim();
+        Some(prev)
+    }
+
+    fn index_of(&self, height: u32) -> Option<usize> {
+        height.checked_sub(self.base).map(|d| d as usize)
+    }
+
+    fn trim(&mut self) {
+        if self.live == 0 {
+            self.base = 0;
+            self.start = 0;
+            self.slots.clear();
+            self.slots.shrink_to_fit();
+            return;
+        }
+        while self.start < self.slots.len() && self.slots[self.start].is_none() {
+            self.start += 1;
+        }
+        while self.slots.len() > self.start && self.slots.last().is_some_and(|slot| slot.is_none())
+        {
+            self.slots.pop();
+        }
+        let tail = self.slots.len() - self.start;
+        if self.start > 0 && self.start >= tail {
+            let kept = self.slots.split_off(self.start);
+            self.base = self.base.saturating_add(self.start as u32);
+            self.start = 0;
+            self.slots = kept;
+            self.slots.shrink_to_fit();
+        }
+    }
+
+    fn heights(&self) -> impl Iterator<Item = u32> + '_ {
+        let base = self.base;
+        let unknown = self.unknown.map(|_| u32::MAX);
+        self.slots
+            .iter()
+            .enumerate()
+            .skip(self.start)
+            .filter_map(move |(i, slot)| slot.map(|_| base + i as u32))
+            .chain(unknown)
+    }
+}
+
+/// Heights still queued for one hash. One height stays inline.
+#[derive(Clone, Debug)]
+pub enum QueuedHeights {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+impl QueuedHeights {
+    pub fn is_inline(&self) -> bool {
+        matches!(self, Self::One(_))
+    }
+
+    fn contains(&self, height: u32) -> bool {
+        match self {
+            Self::One(h) => *h == height,
+            Self::Many(heights) => heights.contains(&height),
+        }
+    }
+
+    fn push_new(&mut self, height: u32) {
+        if self.contains(height) {
+            return;
+        }
+        match self {
+            Self::One(h) => *self = Self::Many(vec![*h, height]),
+            Self::Many(heights) => heights.push(height),
+        }
+    }
+
+    fn without(self, height: u32) -> Option<Self> {
+        match self {
+            Self::One(h) if h == height => None,
+            Self::One(h) => Some(Self::One(h)),
+            Self::Many(heights) => {
+                let heights: Vec<u32> = heights.into_iter().filter(|h| *h != height).collect();
+                match heights.len() {
+                    0 => None,
+                    1 => Some(Self::One(heights[0])),
+                    _ => Some(Self::Many(heights)),
+                }
+            }
+        }
+    }
+
+    fn to_vec(&self) -> Vec<u32> {
+        match self {
+            Self::One(h) => vec![*h],
+            Self::Many(heights) => heights.clone(),
+        }
+    }
+}
+
 /// Process-local FIFO of block payloads (append + delete-by-id).
 ///
 /// Same shape as the former on-disk queue (`id`, height, hash, header_fk,
@@ -96,11 +308,12 @@ pub struct BlockQueue {
     pub next_id: AtomicU64,
     /// id → entry (payload owned). Ascending id is enqueue order.
     pub index: BTreeMap<u64, IndexEntry>,
-    /// First-wins height → id. Ordered so max/min height are the ends.
+    /// First-wins height → id. A window from the lowest queued height.
     /// Height APIs must not walk `index.values()`.
-    pub height_to_id: BTreeMap<u32, u64>,
-    /// Hash → heights that still hold that hash. `has_hash` is one map lookup.
-    pub by_hash: HashMap<[u8; 32], Vec<u32>>,
+    pub height_to_id: HeightWindow,
+    /// Hash → heights that still hold that hash. One height stays inline.
+    /// `has_hash` is one map lookup.
+    pub by_hash: HashMap<[u8; 32], QueuedHeights>,
     pub bytes: u64,
 }
 
@@ -133,7 +346,7 @@ impl BlockQueue {
         Self {
             next_id: AtomicU64::new(1),
             index: BTreeMap::new(),
-            height_to_id: BTreeMap::new(),
+            height_to_id: HeightWindow::new(),
             by_hash: HashMap::new(),
             bytes: 0,
         }
@@ -176,7 +389,7 @@ impl BlockQueue {
         n_inputs: u32,
         sender: Option<u64>,
     ) -> Result<u64, StoreError> {
-        if let Some(&id) = self.height_to_id.get(&height) {
+        if let Some(id) = self.height_to_id.get(height) {
             return Ok(id);
         }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -200,31 +413,35 @@ impl BlockQueue {
 
     #[doc(hidden)]
     pub fn remember_hash(&mut self, hash: [u8; 32], height: u32) {
-        let heights = self.by_hash.entry(hash).or_default();
-        if !heights.contains(&height) {
-            heights.push(height);
+        match self.by_hash.entry(hash) {
+            Entry::Occupied(mut slot) => slot.get_mut().push_new(height),
+            Entry::Vacant(slot) => {
+                slot.insert(QueuedHeights::One(height));
+            }
         }
     }
 
     #[doc(hidden)]
     pub fn forget_hash(&mut self, hash: &[u8; 32], height: u32) {
-        let Some(heights) = self.by_hash.get_mut(hash) else {
+        let Some(heights) = self.by_hash.remove(hash) else {
             return;
         };
-        heights.retain(|h| *h != height);
-        if heights.is_empty() {
-            self.by_hash.remove(hash);
+        if let Some(heights) = heights.without(height) {
+            self.by_hash.insert(*hash, heights);
         }
     }
 
     /// True if any row still carries `hash`. One map lookup, no row scan.
     pub fn has_hash(&self, hash: &[u8; 32]) -> bool {
-        self.by_hash.get(hash).is_some_and(|h| !h.is_empty())
+        self.by_hash.contains_key(hash)
     }
 
     /// Heights whose row hash is `hash` (first-wins order).
     pub fn heights_for_hash(&self, hash: &[u8; 32]) -> Vec<u32> {
-        self.by_hash.get(hash).cloned().unwrap_or_default()
+        self.by_hash
+            .get(hash)
+            .map(QueuedHeights::to_vec)
+            .unwrap_or_default()
     }
 
     /// Load payload by id.
@@ -252,8 +469,8 @@ impl BlockQueue {
             return Ok(false);
         };
         self.bytes = self.bytes.saturating_sub(e.body.charge());
-        if self.height_to_id.get(&e.height) == Some(&id) {
-            self.height_to_id.remove(&e.height);
+        if self.height_to_id.get(e.height) == Some(id) {
+            self.height_to_id.remove(e.height);
         }
         self.forget_hash(&e.hash, e.height);
         Ok(true)
@@ -261,7 +478,7 @@ impl BlockQueue {
 
     /// Take raw payload and remove the row. `None` if missing or already promoted.
     pub fn take_raw(&mut self, height: u32) -> Option<TakenRaw> {
-        let id = *self.height_to_id.get(&height)?;
+        let id = self.height_to_id.get(height)?;
         let e = self.index.get_mut(&id)?;
         let payload = match &mut e.body {
             QueuedBody::Raw(v) => {
@@ -283,7 +500,7 @@ impl BlockQueue {
 
     /// Dequeue the row at `height` (0 or 1; a second body at the same height is not stored).
     pub fn dequeue_height(&mut self, height: u32) -> Result<usize, StoreError> {
-        let Some(&id) = self.height_to_id.get(&height) else {
+        let Some(id) = self.height_to_id.get(height) else {
             return Ok(0);
         };
         Ok(usize::from(self.dequeue(id)?))
@@ -318,8 +535,8 @@ impl BlockQueue {
                 if let Some(slot) = lens.as_mut() {
                     let Some(wire) = self
                         .height_to_id
-                        .get(&h)
-                        .and_then(|id| self.index.get(id))
+                        .get(h)
+                        .and_then(|id| self.index.get(&id))
                         .map(|e| e.body.charge())
                     else {
                         break;
@@ -356,7 +573,7 @@ impl BlockQueue {
     ///
     /// Does **not** dequeue — confirm-write / permanent reject removes the rec.
     pub fn get_by_height(&self, height: u32) -> Result<Option<QueuedBlock>, StoreError> {
-        let Some(&id) = self.height_to_id.get(&height) else {
+        let Some(id) = self.height_to_id.get(height) else {
             return Ok(None);
         };
         self.get(id)
@@ -364,43 +581,39 @@ impl BlockQueue {
 
     /// True if any rec exists for `height`.
     pub fn contains_height(&self, height: u32) -> bool {
-        self.height_to_id.contains_key(&height)
+        self.height_to_id.contains(height)
     }
 
     /// Heights currently on the queue (ascending).
     pub fn heights(&self) -> Vec<u32> {
-        self.height_to_id.keys().copied().collect()
+        self.height_to_id.heights().collect()
     }
 
     /// Highest height among recs (`None` if empty).
     pub fn max_height(&self) -> Option<u32> {
-        self.height_to_id.last_key_value().map(|(&h, _)| h)
+        self.height_to_id.highest()
     }
 
     /// Lowest height among recs (`None` if empty).
     pub fn min_height(&self) -> Option<u32> {
-        self.height_to_id.first_key_value().map(|(&h, _)| h)
+        self.height_to_id.lowest()
     }
 
     /// First queue id for `height`, if any.
     pub fn id_for_height(&self, height: u32) -> Option<u64> {
-        self.height_to_id.get(&height).copied()
+        self.height_to_id.get(height)
     }
 
     #[doc(hidden)]
     pub fn entry_for_height(&self, height: u32) -> Option<&IndexEntry> {
         self.height_to_id
-            .get(&height)
-            .and_then(|id| self.index.get(id))
+            .get(height)
+            .and_then(|id| self.index.get(&id))
     }
 
     #[doc(hidden)]
     pub fn entry_mut_for_height(&mut self, height: u32) -> Result<&mut IndexEntry, StoreError> {
-        let id = self
-            .height_to_id
-            .get(&height)
-            .copied()
-            .ok_or(StoreError::NotFound)?;
+        let id = self.height_to_id.get(height).ok_or(StoreError::NotFound)?;
         self.index.get_mut(&id).ok_or(StoreError::NotFound)
     }
 

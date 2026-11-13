@@ -377,3 +377,102 @@ fn height_index_survives_promote_and_dequeue() {
     assert_eq!(q.id_for_height(12), Some(3));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A height sits in the window that starts at the lowest queued height.
+/// Dropping that lowest height moves the window up, and a later body below
+/// the new low does not revive the dropped id.
+#[test]
+fn height_lookup_is_a_window_from_the_lowest() {
+    let mut q = BlockQueue::empty();
+    q.enqueue(10, [1u8; 32], 1, b"a").unwrap();
+    q.enqueue(12, [2u8; 32], 1, b"b").unwrap();
+    assert_eq!(q.height_to_id.lowest(), Some(10));
+    assert_eq!(q.height_to_id.get(11), None);
+    assert_eq!(q.min_height(), Some(10));
+    assert_eq!(q.max_height(), Some(12));
+    assert_eq!(q.dequeue_height(10).unwrap(), 1);
+    assert_eq!(q.height_to_id.lowest(), Some(12));
+    assert_eq!(q.height_to_id.get(10), None);
+    assert_eq!(q.min_height(), Some(12));
+    let id = q.enqueue(8, [3u8; 32], 1, b"c").unwrap();
+    assert_eq!(q.height_to_id.lowest(), Some(8));
+    assert_eq!(q.height_to_id.get(9), None);
+    assert_eq!(q.height_to_id.get(10), None);
+    assert_eq!(q.height_to_id.get(11), None);
+    assert_eq!(q.id_for_height(8), Some(id));
+    assert!(q.contains_height(12));
+    assert_eq!(q.heights(), vec![8, 12]);
+    assert_eq!(q.dequeue_height(8).unwrap(), 1);
+    assert!(q.contains_height(12));
+    assert_eq!(q.min_height(), Some(12));
+}
+
+/// Putting a height back into a dropped prefix keeps the rows above it.
+#[test]
+fn a_reinserted_low_height_keeps_the_rows_above_it() {
+    let mut q = BlockQueue::empty();
+    q.enqueue(10, [1u8; 32], 1, b"a").unwrap();
+    q.enqueue(11, [2u8; 32], 1, b"b").unwrap();
+    q.enqueue(12, [3u8; 32], 1, b"c").unwrap();
+    assert_eq!(q.dequeue_height(10).unwrap(), 1);
+    assert_eq!(q.height_to_id.lowest(), Some(11));
+    assert_eq!(q.height_to_id.get(10), None);
+    let again = q.enqueue(10, [4u8; 32], 1, b"d").unwrap();
+    assert_eq!(q.id_for_height(10), Some(again));
+    assert!(q.contains_height(11));
+    assert!(q.contains_height(12));
+    assert_eq!(q.heights(), vec![10, 11, 12]);
+    assert_eq!(q.dequeue_height(10).unwrap(), 1);
+    assert_eq!(q.dequeue_height(11).unwrap(), 1);
+    assert_eq!(q.heights(), vec![12]);
+    assert!(q.contains_height(12));
+}
+
+/// One queued hash keeps its height without a side list. A second height is
+/// the list, and dropping back to one height removes that list.
+#[test]
+fn one_queued_hash_keeps_its_height_inline() {
+    let mut q = BlockQueue::empty();
+    let hash = [4u8; 32];
+    q.enqueue(4, hash, 1, b"a").unwrap();
+    assert!(q.by_hash.get(&hash).unwrap().is_inline());
+    assert_eq!(q.heights_for_hash(&hash), vec![4]);
+    q.enqueue(7, hash, 1, b"b").unwrap();
+    assert!(!q.by_hash.get(&hash).unwrap().is_inline());
+    assert_eq!(q.heights_for_hash(&hash), vec![4, 7]);
+    assert_eq!(q.dequeue_height(4).unwrap(), 1);
+    assert!(q.by_hash.get(&hash).unwrap().is_inline());
+    assert_eq!(q.heights_for_hash(&hash), vec![7]);
+    assert_eq!(q.dequeue_height(7).unwrap(), 1);
+    assert!(!q.has_hash(&hash));
+}
+
+/// `u32::MAX` is the unknown-height row. It stays queued beside a low height
+/// and does not open a slot for every height in between.
+#[test]
+fn unknown_height_stays_out_of_the_window() {
+    let mut q = BlockQueue::empty();
+    q.enqueue(0, [1u8; 32], 1, b"a").unwrap();
+    q.enqueue(u32::MAX, [2u8; 32], 1, b"unk").unwrap();
+    assert_eq!(q.height_to_id.span(), 1);
+    assert_eq!(q.min_height(), Some(0));
+    assert_eq!(q.max_height(), Some(u32::MAX));
+    assert!(q.contains_height(u32::MAX));
+    assert_eq!(q.height_to_id.get(1), None);
+    assert_eq!(q.heights(), vec![0, u32::MAX]);
+    assert_eq!(q.dequeue_height(u32::MAX).unwrap(), 1);
+    assert!(!q.contains_height(u32::MAX));
+    assert_eq!(q.max_height(), Some(0));
+    assert!(q.contains_height(0));
+    assert_eq!(q.height_to_id.span(), 1);
+    q.enqueue(1, [3u8; 32], 1, b"b").unwrap();
+    assert_eq!(q.dequeue_height(1).unwrap(), 1);
+    assert_eq!(q.max_height(), Some(0));
+    q.enqueue(u32::MAX, [2u8; 32], 1, b"unk").unwrap();
+    assert_eq!(q.dequeue_height(0).unwrap(), 1);
+    assert_eq!(q.min_height(), Some(u32::MAX));
+    assert_eq!(q.max_height(), Some(u32::MAX));
+    assert_eq!(q.dequeue_height(u32::MAX).unwrap(), 1);
+    assert_eq!(q.min_height(), None);
+    assert_eq!(q.max_height(), None);
+}
