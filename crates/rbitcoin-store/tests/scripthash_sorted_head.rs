@@ -27,6 +27,34 @@ fn recs(n: u32) -> Vec<(ShHeadKey, [u8; SH_HEAD_VALUE_LEN])> {
 }
 
 #[test]
+fn sorted_head_open_reads_the_count() {
+    let path = tmp();
+    let recs = recs(3);
+    SortedHead::write(&path, &recs).unwrap();
+    let h = SortedHead::open(&path).unwrap();
+    assert_eq!(h.count, 3);
+    assert_eq!(
+        h.get(&key_of(1)).unwrap().unwrap().inline_fks(),
+        vec![Fk(2)]
+    );
+
+    let mut bad_ver = std::fs::read(&path).unwrap();
+    bad_ver[4..6].copy_from_slice(&99u16.to_le_bytes());
+    let verp = path.with_extension("count-ver");
+    std::fs::write(&verp, &bad_ver).unwrap();
+    std::fs::copy(idx_path(&path), idx_path(&verp)).unwrap();
+    std::fs::copy(fuse_path(&path), fuse_path(&verp)).unwrap();
+    let err = match SortedHead::open(&verp) {
+        Ok(_) => panic!("open accepted a foreign version"),
+        Err(err) => err,
+    };
+    assert!(
+        matches!(err, StoreError::Corrupt(m) if m.contains("unsupported version")),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn sorted_head_hit_miss_update() {
     let path = tmp();
     let n = 10_000u32;

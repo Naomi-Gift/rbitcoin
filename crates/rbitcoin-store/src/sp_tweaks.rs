@@ -23,7 +23,7 @@
 use crate::error::StoreError;
 use crate::file::{TableFile, FILE_HEADER_LEN};
 use crate::seg_pair::{locate, SegDirs, SegPair as Seg};
-use rbitcoin_primitives::{Height, TableKind};
+use rbitcoin_primitives::{le_u32, Height, TableKind};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -142,8 +142,8 @@ impl SpTweaksTable {
         }
         let mut prefix = [0u8; 8];
         meta.read_at(FILE_HEADER_LEN as u64, &mut prefix)?;
-        let origin = u32::from_le_bytes(prefix[..4].try_into().unwrap());
-        let fmt = u32::from_le_bytes(prefix[4..8].try_into().unwrap());
+        let origin = le_u32!(prefix, 0);
+        let fmt = le_u32!(prefix, 4);
         if fmt != IDX_FMT_SEG_TIP {
             return Err(StoreError::Corrupt("sp_tweaks idx format"));
         }
