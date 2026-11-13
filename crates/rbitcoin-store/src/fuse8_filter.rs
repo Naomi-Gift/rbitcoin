@@ -154,20 +154,15 @@ pub struct V2Geometry {
 
 #[doc(hidden)]
 pub fn parse_v2_geometry(payload: &[u8]) -> Result<V2Geometry, StoreError> {
-    if payload.len() < 8 + 4 + 4 + 4 + 8 {
+    let Some(head) = payload.first_chunk::<28>() else {
         return Err(StoreError::Corrupt("fuse8 body short"));
-    }
-    let mut o = 0usize;
-    let seed = u64::from_le_bytes(payload[o..o + 8].try_into().unwrap());
-    o += 8;
-    let segment_length = u32::from_le_bytes(payload[o..o + 4].try_into().unwrap());
-    o += 4;
-    let segment_length_mask = u32::from_le_bytes(payload[o..o + 4].try_into().unwrap());
-    o += 4;
-    let segment_count_length = u32::from_le_bytes(payload[o..o + 4].try_into().unwrap());
-    o += 4;
-    let fp_len = u64::from_le_bytes(payload[o..o + 8].try_into().unwrap()) as usize;
-    o += 8;
+    };
+    let seed = le_u64!(head, 0);
+    let segment_length = le_u32!(head, 8);
+    let segment_length_mask = le_u32!(head, 12);
+    let segment_count_length = le_u32!(head, 16);
+    let fp_len = le_u64!(head, 20) as usize;
+    let o = 28usize;
     if fp_len > 512 * 1024 * 1024 {
         return Err(StoreError::Corrupt("fuse8 fingerprints too large"));
     }

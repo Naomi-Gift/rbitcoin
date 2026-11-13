@@ -4635,6 +4635,42 @@ fn decode_body_meta_v17_reserved_bits_still_corrupt() {
     }
 }
 
+#[test]
+fn tx_record_decode_reads_the_txid_prefix() {
+    let txid = std::array::from_fn(|i| (i as u8).wrapping_mul(7).wrapping_add(1));
+    let rec = TxRecord {
+        txid,
+        version: 0x0107,
+        locktime: 0,
+        input_count: 0,
+        output_count: 0,
+    };
+    let enc = rec.encode();
+    let got = TxRecord::decode(&enc).unwrap();
+    assert_eq!(got.txid, txid);
+    assert_eq!(got.version, 0x0107);
+    assert_eq!(got.locktime, 0);
+    match TxRecord::decode(&enc[..31]) {
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("short tx record"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn v17_version_word_is_the_four_bytes_after_flags() {
+    let flags = BODY_META_V17_LAYOUT17 | BODY_META_V17_N_IN_TXSTAT | BODY_META_V17_LOCKTIME_ZERO;
+    match decode_body_meta_v17(&[flags]) {
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("short v17 txout version"), "{msg}"),
+        other => panic!("{other:?}"),
+    }
+    let buf = [flags, 0x07, 0x01, 0x00, 0x00];
+    let (got, n) = decode_body_meta_v17(&buf).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(got.version, 0x0107);
+    assert_eq!(got.locktime, 0);
+    assert_eq!(got.input_count, 0);
+}
+
 fn p2pkh_script(h160: [u8; 20]) -> Vec<u8> {
     let mut s = vec![0x76, 0xa9, 0x14];
     s.extend_from_slice(&h160);

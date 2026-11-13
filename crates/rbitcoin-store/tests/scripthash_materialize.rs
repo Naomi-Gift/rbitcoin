@@ -179,6 +179,23 @@ fn two_spills_fold_repeat_key_to_zero_without_sort() {
 }
 
 #[test]
+fn keys_spill_header_counts_select_the_key() {
+    let mut bytes = vec![0u8; KEYS_SPILL_HDR];
+    bytes[..8].copy_from_slice(KEYS_SPILL_MAGIC);
+    bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+    bytes[12..16].copy_from_slice(&0u32.to_le_bytes());
+    let key = std::array::from_fn(|i| (i as u8).wrapping_add(1));
+    bytes.extend_from_slice(&key);
+    let mut map = Key16PackMap::default();
+    fold_keys_spill_bytes(&mut map, &bytes).unwrap();
+    assert_eq!(map.get(&key).copied(), Some(0));
+    match fold_keys_spill_bytes(&mut map, &bytes[..15]) {
+        Err(StoreError::Corrupt(_)) => {}
+        other => panic!("short spill header must refuse, got {other:?}"),
+    }
+}
+
+#[test]
 fn keys_spill_magic_wrong_refuses() {
     let dir = rbitcoin_store::testutil::TempDir::labeled("sh-bad-magic").expect("temp");
     std::fs::create_dir_all(unsorted_keys_path(dir.path(), 0)).unwrap();

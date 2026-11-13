@@ -7,7 +7,7 @@ use crate::error::StoreError;
 use crate::hashhead::HeadOpenOpts;
 use crate::segmented_head::SegmentedTxHead;
 use crate::var_table::VarTable;
-use rbitcoin_primitives::{read_uleb128, write_uleb128, Fk, TableKind};
+use rbitcoin_primitives::{le_i32, read_uleb128, write_uleb128, Fk, TableKind};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -90,11 +90,11 @@ impl TxRecord {
 
     /// Decode full record with leading txid (soft / test buffers).
     pub fn decode(buf: &[u8]) -> Result<Self, StoreError> {
-        if buf.len() < 32 {
+        let Some(txid) = buf.first_chunk::<32>() else {
             return Err(StoreError::Corrupt("short tx record"));
-        }
+        };
         let (mut rec, _) = Self::decode_body_meta(&buf[32..])?;
-        rec.txid = buf[0..32].try_into().unwrap();
+        rec.txid = *txid;
         Ok(rec)
     }
 
@@ -166,10 +166,10 @@ pub fn decode_body_meta_v17(buf: &[u8]) -> Result<(TxRecord, usize), StoreError>
     }
     let mut off = 1usize;
     let version = if ver_bits == 0 {
-        if buf.len() < off + 4 {
+        let Some(raw) = buf[off..].first_chunk::<4>() else {
             return Err(StoreError::Corrupt("short v17 txout version"));
-        }
-        let v = i32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+        };
+        let v = le_i32!(raw, 0);
         off += 4;
         v
     } else if ver_bits == BODY_META_V17_VER_1 {
