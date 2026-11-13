@@ -216,7 +216,7 @@ pub const LOOKAHEAD_ASK: Duration = Duration::from_secs(5);
 #[doc(hidden)]
 pub const HEADER_MISS_DISCONNECT: u8 = 2;
 /// Recent block traffic permits two extra header misses, not indefinite silence.
-const PRODUCTIVE_HEADER_MISS_DISCONNECT: u8 = HEADER_MISS_DISCONNECT + 2;
+const PRODUCTIVE_HEADER_MISS_DISCONNECT: u8 = 4;
 /// Header-only timeouts must not destroy a productive block session. Match
 /// the minimum block-stall window; pings and unrelated bytes do not renew it.
 #[doc(hidden)]
@@ -317,7 +317,6 @@ impl HeaderWalk {
         self.origin = true;
         self.proven = true;
         self.tip.height = height;
-        self.tip.height_wide = u64::from(height);
     }
 }
 
@@ -466,7 +465,6 @@ pub fn install_origin(st: &mut IbdWorkState, hub: &ChainHub, loaded: OriginLoade
     st.header_walk.tip = WalkTip {
         hash,
         height,
-        height_wide: u64::from(height),
         work,
         milestone_hash,
         milestone_prev,
@@ -590,9 +588,11 @@ pub fn header_status_view(st: &IbdWorkState, hub: &ChainHub) -> HeaderStatusView
     }
 }
 
-/// Operator line for the header walk. Production logs this from the status
-/// thread. Tests call this to observe the once-only caught-up latch.
+/// Debug stand-in for the status thread's header line. The thread keeps
+/// `saw_quiet` and emits the caught-up line itself.
+// Debug status line only. `announced_done` is not a session result.
 #[cfg(debug_assertions)]
+#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn log_status(st: &mut IbdWorkState, hub: &ChainHub, horizon: u32) {
     if !st.header_walk.origin {
         return;
@@ -1206,7 +1206,6 @@ fn cut_back_to(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, height: u
     let mut tip = WalkTip {
         hash: Some(hash),
         height,
-        height_wide: u64::from(height),
         work: work_at(st, hub, hash).unwrap_or(Work::from_be_bytes([0; 32])),
         header: parent_header(st, hub, hash),
         times: times_ending_at(st, hub, hash),
@@ -1214,6 +1213,7 @@ fn cut_back_to(st: &mut IbdWorkState, hub: &ChainHub, hash: BlockHash, height: u
         milestone_hash: st.header_walk.tip.milestone_hash,
         milestone_prev: st.header_walk.tip.milestone_prev,
         milestone_header: st.header_walk.tip.milestone_header,
+        ..WalkTip::default()
     };
     forget_milestone_below(st, hub, height);
     if height < hub.milestone.height {
@@ -1448,6 +1448,11 @@ impl Default for WalkTip {
     }
 }
 
+/// `height` when `wide` was never stored, and `wide` after the walk passes `u32::MAX`.
+fn wide_height(wide: u64, height: u32) -> u64 {
+    wide.max(u64::from(height))
+}
+
 /// One header onto the tip. Milestone latch and the query note stay with the caller.
 #[doc(hidden)]
 pub fn push_header(tip: &mut WalkTip, hub: &ChainHub, hdr: &Header) -> bool {
@@ -1458,7 +1463,7 @@ pub fn push_header(tip: &mut WalkTip, hub: &ChainHub, hdr: &Header) -> bool {
         return false;
     }
     tip.work = tip.work + hdr.work();
-    let next = tip.height_wide.max(u64::from(tip.height)).saturating_add(1);
+    let next = wide_height(tip.height_wide, tip.height).saturating_add(1);
     tip.height_wide = next;
     tip.height = u32::try_from(next).unwrap_or(u32::MAX);
     tip.hash = Some(hdr.block_hash());
@@ -1519,7 +1524,7 @@ pub fn checkpoint_at(tip: &WalkTip) -> Checkpoint {
             .hash
             .unwrap_or_else(|| BlockHash::from_byte_array([0; 32])),
         height: tip.height,
-        height_wide: tip.height_wide.max(u64::from(tip.height)),
+        height_wide: wide_height(tip.height_wide, tip.height),
         work: tip.work.to_be_bytes(),
         header: tip.header,
         times: tip.times.clone(),
@@ -1533,7 +1538,7 @@ pub fn tip_from_checkpoint(c: &Checkpoint) -> WalkTip {
     WalkTip {
         hash: Some(c.hash),
         height: c.height,
-        height_wide: c.height_wide.max(u64::from(c.height)),
+        height_wide: wide_height(c.height_wide, c.height),
         work: Work::from_be_bytes(c.work),
         ..WalkTip::default()
     }
@@ -1544,7 +1549,6 @@ pub fn tip_from_base(st: &IbdWorkState) -> WalkTip {
     WalkTip {
         hash: st.header_walk.base_hash,
         height: st.header_walk.base_height,
-        height_wide: u64::from(st.header_walk.base_height),
         work: Work::from_be_bytes(st.header_walk.base_work),
         ..WalkTip::default()
     }
@@ -1608,7 +1612,7 @@ pub fn extend_challenger(
         return true;
     }
     let too_long = st.header_walk.challenger.as_ref().is_some_and(|ch| {
-        let wide = ch.tip.height_wide.max(u64::from(ch.tip.height));
+        let wide = wide_height(ch.tip.height_wide, ch.tip.height);
         over_length_at(st, wide.saturating_add(headers.len() as u64))
     });
     if too_long {
@@ -2612,11 +2616,7 @@ fn over_length_at(st: &IbdWorkState, end_height: u64) -> bool {
 }
 
 fn over_length(st: &IbdWorkState, extra: usize) -> bool {
-    let wide = st
-        .header_walk
-        .tip
-        .height_wide
-        .max(u64::from(st.header_walk.tip.height));
+    let wide = wide_height(st.header_walk.tip.height_wide, st.header_walk.tip.height);
     over_length_at(st, wide.saturating_add(extra as u64))
 }
 
@@ -2654,9 +2654,6 @@ fn extend_connected(
     headers: &[Header],
     peer: Option<usize>,
 ) -> bool {
-    if headers.is_empty() || !pow_linked(headers) {
-        return false;
-    }
     if over_length(st, headers.len()) {
         st.header_walk.length_exceeded = true;
         return false;
@@ -4108,7 +4105,7 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         checkpoints.push(Checkpoint {
             hash: BlockHash::from_byte_array(hash),
             height,
-            height_wide: u64::from(height),
+            height_wide: 0,
             work,
             header,
             times,
@@ -4153,10 +4150,8 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         tip: WalkTip {
             hash,
             height,
-            height_wide: u64::from(height),
             work: Work::from_be_bytes(work),
             header: tip_header,
-            times: Vec::new(),
             diff: DiffSnap {
                 period_header,
                 period_height,
@@ -4164,8 +4159,7 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
                 full_diff_height,
             },
             milestone_hash,
-            milestone_prev: BlockHash::from_byte_array([0; 32]),
-            milestone_header: None,
+            ..WalkTip::default()
         },
         origin: true,
         dead_ends: HashSet::new(),

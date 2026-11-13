@@ -85,6 +85,31 @@ pub const CTRL_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(5);
 #[doc(hidden)]
 pub const BODY_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(40);
 
+/// Body drain stops once `elapsed` reaches [`BODY_DRAIN_TIME_BUDGET`].
+#[doc(hidden)]
+pub fn body_drain_budget_spent(elapsed: Duration) -> bool {
+    elapsed >= BODY_DRAIN_TIME_BUDGET
+}
+
+/// Control drain keeps going while both the event cap and the time cap remain.
+#[doc(hidden)]
+pub fn ctrl_drain_continues(ctrl_n: u64, elapsed: Duration) -> bool {
+    ctrl_n < CTRL_DRAIN_EVENT_BUDGET && elapsed < CTRL_DRAIN_TIME_BUDGET
+}
+
+/// Another header still fits on the ordered path, including past the soft cap
+/// when the body window needs headroom.
+#[doc(hidden)]
+pub fn ordered_live_has_header_room(live: usize, need_ready_headroom: bool) -> bool {
+    live < MAX_ORDERED_HEADERS && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom)
+}
+
+// Perf meter only. `drain_events` is not a session result; the drain returns `Ok(true)` either way.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn count_drain_event(events: &mut u64) {
+    *events += 1;
+}
+
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 /// Non-blocking drain of archive results + peer events.
 ///
@@ -109,12 +134,12 @@ pub fn drain_ready_peer_and_body_events(
 
     let body_t0 = Instant::now();
     loop {
-        if body_t0.elapsed() >= BODY_DRAIN_TIME_BUDGET {
+        if body_drain_budget_spent(body_t0.elapsed()) {
             break;
         }
         match body_rx.try_recv() {
             Ok(ev) => {
-                events += 1;
+                count_drain_event(&mut events);
                 apply_peer_event(
                     st,
                     hub,
@@ -131,13 +156,13 @@ pub fn drain_ready_peer_and_body_events(
 
     let ctrl_t0 = Instant::now();
     let mut ctrl_n = 0u64;
-    while ctrl_n < CTRL_DRAIN_EVENT_BUDGET && ctrl_t0.elapsed() < CTRL_DRAIN_TIME_BUDGET {
+    while ctrl_drain_continues(ctrl_n, ctrl_t0.elapsed()) {
         if st.header_cmd.as_ref().is_some_and(|tx| tx.capacity() == 0) {
             break;
         }
         match ctrl_rx.try_recv() {
             Ok(ev) => {
-                events += 1;
+                count_drain_event(&mut events);
                 ctrl_n += 1;
                 apply_peer_event(
                     st,
@@ -421,8 +446,7 @@ pub fn on_known_headers_batch(
         4096,
     );
     let lag = header_lag_behind_peers(st, hub.tip_height().unwrap_or(0));
-    if live < MAX_ORDERED_HEADERS
-        && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom)
+    if ordered_live_has_header_room(live, need_ready_headroom)
         && should_advance_locator_after_known_batch(
             live,
             lag,
@@ -821,8 +845,7 @@ pub fn complete_stored_headers(
             4096,
         );
         return batch_len >= MAX_HEADERS_RESULTS
-            && live < MAX_ORDERED_HEADERS
-            && (live < ORDERED_HEADERS_SOFT_CAP || need_ready_headroom);
+            && ordered_live_has_header_room(live, need_ready_headroom);
     }
     // A stored plan has at least one header. An empty batch never reaches here.
     on_known_headers_batch(st, hub, 0, batch_len);
@@ -1195,14 +1218,23 @@ pub fn inject_learned_addrs(
             _ => {}
         }
         if book.add_learned_addr(a, MAX_PEER_POOL) {
-            added += 1;
+            tally_learned_addr(&mut added);
         }
     }
+    log_learned_addrs(from_peer, added, book.len());
+}
+
+// Learned-address tally only feeds the debug line. The book insert is the session result.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn tally_learned_addr(added: &mut usize) {
+    *added += 1;
+}
+
+// The total only chooses whether the debug line is emitted.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn log_learned_addrs(from_peer: usize, added: usize, book_len: usize) {
     if added > 0 {
-        rbitcoin_log::debug!(
-            "ibd: peer[{from_peer}] taught {added} addr(s); book={}",
-            book.len()
-        );
+        rbitcoin_log::debug!("ibd: peer[{from_peer}] taught {added} addr(s); book={book_len}");
     }
 }
 
@@ -1519,7 +1551,7 @@ pub(crate) fn finish_deferred_archived_clear(
 }
 
 #[doc(hidden)]
-pub(crate) fn apply_soft_wire_reject(
+pub fn apply_soft_wire_reject(
     st: &mut IbdWorkState,
     height: u32,
     hash: BlockHash,
@@ -1712,6 +1744,16 @@ fn apply_tip_child_bad_prev(
     note_confirm_stuck(st);
 }
 
+// Clock-wait log rate only. The halt reads `cascade_at`, not this sample.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn log_time_too_new_wait(height: u32, hash: BlockHash, err: &str) {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 3 || n.is_multiple_of(60) {
+        warn!("ibd: confirm waits @{height} {hash}: {err} (n={n})");
+    }
+}
+
 #[doc(hidden)]
 pub fn apply_cascade_reject(
     st: &mut IbdWorkState,
@@ -1727,11 +1769,7 @@ pub fn apply_cascade_reject(
     // waits before it tries again, and it connects once the clock catches up.
     if super::confirm::is_time_too_new(err) {
         note_confirm_stuck(st);
-        static N: AtomicU32 = AtomicU32::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-        if n <= 3 || n.is_multiple_of(60) {
-            warn!("ibd: confirm waits @{height} {hash}: {err} (n={n})");
-        }
+        log_time_too_new_wait(height, hash, err);
         return;
     }
     const CASCADE_HALT_AFTER: u8 = 3;
@@ -1792,6 +1830,16 @@ pub fn apply_engine_fault_reject(
     );
 }
 
+// Consensus-invalid log rate only. Stuck, rewind, and the height map do not read it.
+#[cfg_attr(feature = "mutants", mutants::skip)]
+fn log_consensus_invalid(height: u32, hash: BlockHash, err: &str) {
+    static N: AtomicU32 = AtomicU32::new(0);
+    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 8 || n.is_multiple_of(50) {
+        warn!("ibd: confirm reject applied {hash} @{height}: {err} (consensus-invalid, count={n})");
+    }
+}
+
 #[doc(hidden)]
 pub fn apply_consensus_invalid_reject(
     st: &mut IbdWorkState,
@@ -1819,11 +1867,7 @@ pub fn apply_consensus_invalid_reject(
     }
     remove_from_ordered(&mut st.ordered, &mut st.ordered_set, hash);
     clear_hash_inflight(&mut st.slots, &mut st.inflight, hash);
-    static N: AtomicU32 = AtomicU32::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed) + 1;
-    if n <= 8 || n.is_multiple_of(50) {
-        warn!("ibd: confirm reject applied {hash} @{height}: {err} (consensus-invalid, count={n})");
-    }
+    log_consensus_invalid(height, hash, err);
     if let Some(h) = hub {
         for t in super::reorg::competing_valid_header_tips(st, h) {
             st.reorg
