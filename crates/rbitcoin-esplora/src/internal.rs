@@ -1,6 +1,8 @@
 //! mempool/electrs `/internal/*` bulk REST and `/mempool/txids/page`.
 
-use crate::handlers::{outspend_json, spawn_join, write_outspends};
+#[cfg(unix)]
+use crate::handlers::outspend_json;
+use crate::handlers::{spawn_join, write_outspends};
 #[cfg(unix)]
 use crate::server::not_found;
 use crate::server::{
@@ -24,6 +26,7 @@ use rbitcoin_query::ChainViewKind;
 #[cfg(unix)]
 use rbitcoin_store::StoreError;
 use serde::Deserialize;
+#[cfg(unix)]
 use serde_json::{json, Value};
 
 #[doc(hidden)]
