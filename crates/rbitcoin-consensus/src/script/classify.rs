@@ -34,6 +34,23 @@ pub fn witness_program(script: &Script) -> Option<(u8, &[u8])> {
     Some((version.to_num(), &script.as_bytes()[2..]))
 }
 
+/// Program length as a type. A 20-byte or 32-byte program cannot be another length.
+pub enum ProgramLen<'a> {
+    N20(&'a [u8; 20]),
+    N32(&'a [u8; 32]),
+    Other(&'a [u8]),
+}
+
+pub fn program_len(program: &[u8]) -> ProgramLen<'_> {
+    if let Ok(program) = <&[u8; 20]>::try_from(program) {
+        ProgramLen::N20(program)
+    } else if let Ok(program) = <&[u8; 32]>::try_from(program) {
+        ProgramLen::N32(program)
+    } else {
+        ProgramLen::Other(program)
+    }
+}
+
 pub fn classify(script: &Script) -> ScriptKind {
     if script.is_p2wpkh() {
         ScriptKind::P2wpkh

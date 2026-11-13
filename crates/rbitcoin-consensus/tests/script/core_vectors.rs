@@ -715,7 +715,9 @@ fn load_corpus_rows() -> Vec<Value> {
 fn corpus_fast_paths_call_typed_verifiers() {
     use bitcoin::sighash::SighashCache;
 
-    use rbitcoin_consensus::script::classify::{classify, witness_program, ScriptKind};
+    use rbitcoin_consensus::script::classify::{
+        classify, program_len, witness_program, ProgramLen, ScriptKind,
+    };
     use rbitcoin_consensus::script::crypto::TapSpentHashes;
     use rbitcoin_consensus::script::p2pkh;
     use rbitcoin_consensus::script::p2tr;
@@ -888,7 +890,10 @@ fn corpus_fast_paths_call_typed_verifiers() {
         let pre = job.pre().expect("script precompute");
         let i = job.inputs().next().unwrap();
         let (value, script) = job.prevout_parts(i).expect("prevout");
-        p2wpkh::verify(&job, i, tx, pre, script, Amount::from_sat(value))
+        let ProgramLen::N20(keyhash) = program_len(program) else {
+            panic!("p2wpkh program");
+        };
+        p2wpkh::verify(&job, i, tx, pre, keyhash, script, Amount::from_sat(value))
     }
     .expect("p2wpkh typed accept");
     let mut dispatch_cache = None;
@@ -927,12 +932,15 @@ fn corpus_fast_paths_call_typed_verifiers() {
     );
     let (version, program) = witness_program(spk).expect("still a v0 program");
     assert_eq!((version, program.len()), (0, 20));
+    let ProgramLen::N20(keyhash) = program_len(program) else {
+        panic!("p2wpkh program");
+    };
     let tx: &Transaction = &job.tx;
     assert!({
         let pre = job.pre().expect("script precompute");
         let i = job.inputs().next().unwrap();
         let (value, script) = job.prevout_parts(i).expect("prevout");
-        p2wpkh::verify(&job, i, tx, pre, script, Amount::from_sat(value))
+        p2wpkh::verify(&job, i, tx, pre, keyhash, script, Amount::from_sat(value))
     }
     .is_err());
 
@@ -949,7 +957,19 @@ fn corpus_fast_paths_call_typed_verifiers() {
     {
         let i = job.inputs().next().unwrap();
         let (value, script) = job.prevout_parts(i).expect("prevout");
-        p2tr::verify(&job, i, tx, &tap, Amount::from_sat(value), script)
+        let (_, program) = witness_program(Script::from_bytes(script)).expect("v1 program");
+        let ProgramLen::N32(output_key) = program_len(program) else {
+            panic!("p2tr program");
+        };
+        p2tr::verify(
+            &job,
+            i,
+            tx,
+            &tap,
+            Amount::from_sat(value),
+            output_key,
+            script,
+        )
     }
     .expect("key path typed accept");
     let mut dispatch_cache = None;
@@ -983,7 +1003,19 @@ fn corpus_fast_paths_call_typed_verifiers() {
     assert!({
         let i = job.inputs().next().unwrap();
         let (value, script) = job.prevout_parts(i).expect("prevout");
-        p2tr::verify(&job, i, tx, &tap, Amount::from_sat(value), script)
+        let (_, program) = witness_program(Script::from_bytes(script)).expect("v1 program");
+        let ProgramLen::N32(output_key) = program_len(program) else {
+            panic!("p2tr program");
+        };
+        p2tr::verify(
+            &job,
+            i,
+            tx,
+            &tap,
+            Amount::from_sat(value),
+            output_key,
+            script,
+        )
     }
     .is_err());
 

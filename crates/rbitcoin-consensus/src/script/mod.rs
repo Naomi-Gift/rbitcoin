@@ -287,20 +287,24 @@ pub fn verify_native_witness(
     if !bitcoin::script::read_scriptbool(program) {
         return Err(ConsensusError::Script("EVAL_FALSE".into()));
     }
-    match (version, program.len()) {
-        (0, 20) if needs_interpreted_ecdsa(job) => {
-            p2wpkh::verify_interpreted(job, input_index, tx, program, amount)
+    match (version, classify::program_len(program)) {
+        (0, classify::ProgramLen::N20(keyhash)) if needs_interpreted_ecdsa(job) => {
+            p2wpkh::verify_interpreted(job, input_index, tx, keyhash, amount)
         }
-        (0, 20) => p2wpkh::verify(job, input_index, tx, pre, script, amount),
-        (0, 32) => p2wsh::verify(job, input_index, tx, script, amount),
-        (0, _) => Err(ConsensusError::Script(
+        (0, classify::ProgramLen::N20(keyhash)) => {
+            p2wpkh::verify(job, input_index, tx, pre, keyhash, script, amount)
+        }
+        (0, classify::ProgramLen::N32(scripthash)) => {
+            p2wsh::verify_with_scripthash(job, input_index, tx, scripthash, amount)
+        }
+        (0, classify::ProgramLen::Other(_)) => Err(ConsensusError::Script(
             "WITNESS_PROGRAM_WRONG_LENGTH".into(),
         )),
-        (1, 32) if job.taproot_active => {
-            p2tr::verify(job, input_index, tx, tap_spent, amount, script)
+        (1, classify::ProgramLen::N32(output_key)) if job.taproot_active => {
+            p2tr::verify(job, input_index, tx, tap_spent, amount, output_key, script)
         }
-        (1, 32) => Ok(()),
-        (1, 2) if program == PAY_TO_ANCHOR_PROGRAM => Ok(()),
+        (1, classify::ProgramLen::N32(_)) => Ok(()),
+        (1, classify::ProgramLen::Other(prog)) if prog == PAY_TO_ANCHOR_PROGRAM => Ok(()),
         _ => {
             if job.discourage_upgradable_witness {
                 return Err(ConsensusError::Script(

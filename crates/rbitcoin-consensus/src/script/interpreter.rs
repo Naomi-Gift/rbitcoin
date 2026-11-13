@@ -435,10 +435,10 @@ pub fn require_clean_true(stack: &[Vec<u8>]) -> Result<(), ConsensusError> {
 /// **Not** cleanstack — BIP62 CLEANSTACK was never activated for non-witness
 /// consensus. Requiring `len==1` falsely rejected valid P2SH (signet 219477).
 pub fn require_true_top(stack: &[Vec<u8>]) -> Result<(), ConsensusError> {
-    if stack.is_empty() || !bitcoin::script::read_scriptbool(stack.last().unwrap()) {
-        return Err(ConsensusError::Script("script false".into()));
+    match stack.last() {
+        Some(top) if bitcoin::script::read_scriptbool(top) => Ok(()),
+        _ => Err(ConsensusError::Script("script false".into())),
     }
-    Ok(())
 }
 
 /// Evaluate scriptSig as push-only onto `stack` (BIP16 P2SH / SIGPUSHONLY).
@@ -741,9 +741,9 @@ pub fn eval_script(
                         stack.swap(n - 3, n - 1);
                     }
                     0x73 => {
-                        require_n(stack, 1)?;
-                        if bitcoin::script::read_scriptbool(stack.last().unwrap()) {
-                            let v = stack.last().unwrap().clone();
+                        let top = stack_top(stack)?;
+                        if bitcoin::script::read_scriptbool(top) {
+                            let v = top.clone();
                             push(stack, altstack.len(), v)?;
                         }
                     }
@@ -755,8 +755,7 @@ pub fn eval_script(
                         pop(stack)?;
                     }
                     0x76 => {
-                        require_n(stack, 1)?;
-                        let v = stack.last().unwrap().clone();
+                        let v = stack_top(stack)?.clone();
                         push(stack, altstack.len(), v)?;
                     }
                     0x77 => {
@@ -806,8 +805,7 @@ pub fn eval_script(
                         stack.swap(n - 3, n - 2);
                     }
                     0x82 => {
-                        require_n(stack, 1)?;
-                        let sz = stack.last().unwrap().len() as i64;
+                        let sz = stack_top(stack)?.len() as i64;
                         push(stack, altstack.len(), scriptnum_encode(sz))?;
                     }
                     0x87 => {
@@ -949,9 +947,8 @@ pub fn eval_script(
                         if !ctx.bip65_active {
                             continue;
                         }
-                        require_n(stack, 1)?;
                         // BIP65 locktime: 5-byte script integer, minimal encoding when required.
-                        let locktime = scriptnum_decode_width(stack.last().unwrap(), 5, rm)?;
+                        let locktime = scriptnum_decode_width(stack_top(stack)?, 5, rm)?;
                         if locktime < 0 {
                             return Err(ConsensusError::Script("CLTV negative".into()));
                         }
@@ -974,8 +971,7 @@ pub fn eval_script(
                         if !ctx.bip112_active {
                             continue;
                         }
-                        require_n(stack, 1)?;
-                        let csv = scriptnum_decode_width(stack.last().unwrap(), 5, rm)?;
+                        let csv = scriptnum_decode_width(stack_top(stack)?, 5, rm)?;
                         if csv < 0 {
                             return Err(ConsensusError::Script("CSV negative".into()));
                         }
@@ -1617,6 +1613,15 @@ pub fn require_n(stack: &[Vec<u8>], n: usize) -> Result<(), ConsensusError> {
         return Err(ConsensusError::Script("stack empty".into()));
     }
     Ok(())
+}
+
+/// Top element. An empty stack is the same script error as [`require_n`] of one.
+#[doc(hidden)]
+pub fn stack_top(stack: &[Vec<u8>]) -> Result<&Vec<u8>, ConsensusError> {
+    match stack.last() {
+        Some(top) => Ok(top),
+        None => Err(ConsensusError::Script("stack empty".into())),
+    }
 }
 
 #[doc(hidden)]

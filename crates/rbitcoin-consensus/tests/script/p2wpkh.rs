@@ -1,10 +1,18 @@
 use bitcoin::Transaction;
 use rbitcoin_consensus::block::ScriptCheckJob;
+use rbitcoin_consensus::script::classify::{program_len, ProgramLen};
 use rbitcoin_consensus::script::p2wpkh::*;
 
 use bitcoin::absolute::LockTime;
 use bitcoin::script::ScriptBuf;
 use bitcoin::{Amount, OutPoint, Sequence, TxIn, TxOut, Witness};
+
+fn fixture_keyhash(spk: &[u8]) -> &[u8; 20] {
+    let ProgramLen::N20(keyhash) = program_len(&spk[2..]) else {
+        panic!("fixture is a 20-byte program");
+    };
+    keyhash
+}
 
 fn job_with_witness(items: &[&[u8]]) -> ScriptCheckJob {
     let mut spk = vec![0x00, 0x14];
@@ -59,7 +67,7 @@ fn witness_shape_errors() {
         let i = job.inputs().next().unwrap();
         let spk = job.prevout_script(i).expect("spk");
         let amount = job.prevout_amount(i).expect("amount");
-        verify(&job, i, &job.tx, &pre, spk, amount)
+        verify(&job, i, &job.tx, &pre, fixture_keyhash(spk), spk, amount)
     }
     .is_err());
 
@@ -69,7 +77,7 @@ fn witness_shape_errors() {
         let i = job.inputs().next().unwrap();
         let spk = job.prevout_script(i).expect("spk");
         let amount = job.prevout_amount(i).expect("amount");
-        verify(&job, i, &job.tx, &pre, spk, amount)
+        verify(&job, i, &job.tx, &pre, fixture_keyhash(spk), spk, amount)
     }
     .is_err());
 
@@ -79,7 +87,7 @@ fn witness_shape_errors() {
         let i = job.inputs().next().unwrap();
         let spk = job.prevout_script(i).expect("spk");
         let amount = job.prevout_amount(i).expect("amount");
-        verify(&job, i, &job.tx, &pre, spk, amount)
+        verify(&job, i, &job.tx, &pre, fixture_keyhash(spk), spk, amount)
     }
     .is_err());
 
@@ -89,7 +97,7 @@ fn witness_shape_errors() {
         let i = job.inputs().next().unwrap();
         let spk = job.prevout_script(i).expect("spk");
         let amount = job.prevout_amount(i).expect("amount");
-        verify(&job, i, &job.tx, &pre, spk, amount)
+        verify(&job, i, &job.tx, &pre, fixture_keyhash(spk), spk, amount)
     }
     .unwrap_err();
     assert!(format!("{err}").contains("p2wpkh"));
