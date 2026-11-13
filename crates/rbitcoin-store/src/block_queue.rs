@@ -606,6 +606,15 @@ impl BlockQueue {
             .collect()
     }
 
+    /// How many rows `keep` accepts. `keep` sees the height and whether
+    /// lookup finished. It must not take this queue's lock again.
+    pub fn count_rows(&self, mut keep: impl FnMut(u32, bool) -> bool) -> usize {
+        self.index
+            .values()
+            .filter(|e| keep(e.height, e.resolve_complete))
+            .count()
+    }
+
     /// Load payload for a height (confirm load intake). First match by height.
     ///
     /// Does **not** dequeue — confirm-write / permanent reject removes the rec.

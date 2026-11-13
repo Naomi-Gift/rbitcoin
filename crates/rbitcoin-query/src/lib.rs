@@ -2548,6 +2548,12 @@ impl Query {
         self.block_queue.lock().unwrap().list_meta()
     }
 
+    /// Count queued rows without copying a metadata record per row.
+    /// `keep` must not call back into the block queue.
+    pub fn block_queue_count_rows(&self, keep: impl FnMut(u32, bool) -> bool) -> usize {
+        self.block_queue.lock().unwrap().count_rows(keep)
+    }
+
     /// Distinct queued heights. Lookup keep must not use `list_meta`.
     pub fn block_queue_queued_heights(&self) -> std::collections::BTreeSet<u32> {
         self.block_queue

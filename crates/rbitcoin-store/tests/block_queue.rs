@@ -132,6 +132,27 @@ fn fifo_oldest_and_heights() {
 }
 
 #[test]
+fn count_rows_matches_the_ready_predicate_without_a_meta_copy() {
+    let mut q = BlockQueue::empty();
+    q.enqueue(4, [4u8; 32], 1, b"a").unwrap();
+    q.enqueue(5, [5u8; 32], 2, b"bb").unwrap();
+    q.enqueue(6, [6u8; 32], 3, b"ccc").unwrap();
+    q.mark_resolve_complete(5).unwrap();
+    q.mark_resolve_complete(6).unwrap();
+    let ready = q.count_rows(|height, resolve_complete| height >= 5 && resolve_complete);
+    assert_eq!(ready, 2);
+    let skipped =
+        q.count_rows(|height, resolve_complete| height >= 5 && resolve_complete && height != 6);
+    assert_eq!(skipped, 1);
+    let meta_ready = q
+        .list_meta()
+        .into_iter()
+        .filter(|m| m.height >= 5 && m.resolve_complete)
+        .count();
+    assert_eq!(ready, meta_ready);
+}
+
+#[test]
 fn list_meta_matches_payload_len() {
     let dir = temp();
     let mut q = BlockQueue::open_or_create(&dir).unwrap();
