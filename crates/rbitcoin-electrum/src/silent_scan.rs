@@ -58,9 +58,19 @@ pub fn parse_sub(
             let (from, to) = height_range(s, tip)?;
             (from, Some(to))
         }
-        Some(Value::Number(n)) => (open_start(n.as_u64().unwrap_or(0), tip, block_time)?, None),
-        Some(Value::String(s)) => (open_start(s.parse().unwrap_or(0), tip, block_time)?, None),
-        _ => (0, None),
+        None | Some(Value::Null) => (0, None),
+        // Read as 0, a start that is not a height would scan from genesis.
+        Some(other) => {
+            let start = match other {
+                Value::Number(n) => n.as_u64(),
+                Value::String(s) => s.parse().ok(),
+                _ => None,
+            };
+            let start = start.ok_or(
+                "start must be a block height, a Unix time, or a 'FROM-TO' range of heights",
+            )?;
+            (open_start(start, tip, block_time)?, None)
+        }
     };
     let mut labels = vec![0u32];
     if let Some(arr) = params

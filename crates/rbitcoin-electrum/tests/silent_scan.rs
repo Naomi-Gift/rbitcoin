@@ -253,14 +253,37 @@ fn parse_sub_labels_start_and_networks() {
     )
     .unwrap();
     assert_eq!(at_cap.start, 3);
-    let bool_start = parse_sub(
-        &json!([scan, spend, true]),
-        Network::Regtest,
-        Some(0),
-        &no_times,
-    )
-    .unwrap();
-    assert_eq!(bool_start.start, 0);
+}
+
+/// A start that is not a height, a time, or a range is refused. Read as 0
+/// it would scan from genesis.
+#[test]
+fn start_that_is_not_a_height_is_refused() {
+    let parse = |start: serde_json::Value| {
+        parse_sub(
+            &json!([SYNTH_SCAN, SYNTH_SPEND, start]),
+            Network::Regtest,
+            Some(100),
+            &no_times,
+        )
+    };
+    for bad in [
+        json!("nope"),
+        json!(""),
+        json!(1.5),
+        json!(-3),
+        json!(true),
+        json!([7]),
+        json!({"height": 7}),
+    ] {
+        match parse(bad.clone()) {
+            Err(e) => assert!(e.contains("start must be"), "{bad}: {e}"),
+            Ok(sub) => panic!("{bad} parsed to start {}", sub.start),
+        }
+    }
+    assert_eq!(parse(json!("12")).unwrap().start, 12);
+    assert_eq!(parse(json!(12)).unwrap().start, 12);
+    assert_eq!(parse(json!(null)).unwrap().start, 0);
 }
 
 #[test]
