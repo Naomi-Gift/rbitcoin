@@ -210,7 +210,7 @@ pub struct ConfirmFeed {
     /// [`Self::set_unproven_bounds`]. Offer compares this and skips `inner`
     /// when the triple is unchanged and no reservation has moved.
     lead_bounds: std::sync::Mutex<Option<InstalledLead>>,
-    /// A reservation was taken, released, or cleared since the last install.
+    /// A reservation was released or cleared since the last install.
     /// The next identical allowance still has to recompute the remainder.
     lead_bounds_dirty: AtomicBool,
 }
@@ -348,7 +348,7 @@ impl ConfirmFeed {
     /// Install the next unproven lead. A repeat of the lifted lead does not
     /// lock the feed. `None` means no cap, so the skip runs only once both
     /// caps are already clear. The same height cap, match, and allowance
-    /// also skip, until a reservation is taken, released, or cleared.
+    /// also skip, until a reservation is released or cleared.
     pub fn install_unproven_bounds(
         &self,
         height_limit: Option<u32>,

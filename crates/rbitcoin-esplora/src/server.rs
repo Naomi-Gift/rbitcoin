@@ -1339,10 +1339,7 @@ pub async fn run_esplora(
         #[cfg(unix)]
         EsploraListen::Unix(path) => {
             if let Some(parent) = path.parent() {
-                // `create_dir_all("")` fails. A bare `name.sock` has an empty parent.
-                if !parent.as_os_str().is_empty() {
-                    std::fs::create_dir_all(parent)?;
-                }
+                std::fs::create_dir_all(parent)?;
             }
             let _ = std::fs::remove_file(&path);
             let listener = bind_unix_mode(&path, 0o660)?;
