@@ -211,11 +211,9 @@ pub fn verify_script_path(
     if annex.is_some() {
         items.pop();
     }
-    if items.len() < 2 {
+    let (Some(control_bytes), Some(script_bytes)) = (items.pop(), items.pop()) else {
         return Err(ConsensusError::Script("p2tr script path short".into()));
-    }
-    let control_bytes = items.remove(items.len() - 1);
-    let script_bytes = items.remove(items.len() - 1);
+    };
     let mut stack = items;
 
     let script = Script::from_bytes(&script_bytes);
