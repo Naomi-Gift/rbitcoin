@@ -69,7 +69,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [062](./062-ibd-requested-progress.md) | high | Only a requested block moves the IBD stall clock | fixed | `unsolicited_block_does_not_refresh_progress` |
 | [063](./063-rest-own-queue.md) | high | REST is off unless --rest is set | fixed | `rest_is_404_without_the_flag` |
 | [064](./064-api-log-redaction.md) | medium | API logs redact scan secrets and extended keys | fixed | `api_call_redacts_scan_secrets_and_ext_privkeys` |
-| [065](./065-sp-scan-window.md) | medium | Silent-payment scan is bounded per chunk, not per span | fixed | `sp_scan_stops_when_the_session_drops_it` |
+| [065](./065-sp-scan-window.md) | medium | Silent-payment scan stays inside 256 blocks | fixed | `parse_sub_labels_start_and_networks` |
 | [066](./066-rpc-wait-cap.md) | medium | RPC accept times out and long-polls release the permit | fixed | `long_poll_does_not_hold_the_work_queue` |
 | [067](./067-fuse8-segment.md) | medium | fuse8 segment length must be a power of two | fixed | `fuse8_segment_length_must_be_power_of_two` |
 | [068](./068-published-end.md) | medium | Body reads compare the caller's published end | fixed | `body_read_past_published_end_is_corrupt` |
@@ -118,6 +118,7 @@ rbitcoin reference, or redteam static analysis). Numbered reports live beside th
 | [112](./112-stall-solicited-bytes.md) | medium | Stall counted unsolicited socket bytes as block progress | fixed | `disconnect_stalled_drops_a_peer_sending_only_unsolicited_bytes`, `disconnect_stalled_keeps_a_peer_still_sending_a_block`, `relative_slow_zero_throughput_uses_solicited_bytes`, `open_block_bytes_count_a_frame_past_a_headers_message`, `block_progress_stamp_records_solicited_bytes` |
 | [113](./113-proved-header-adopt.md) | medium | A proved header walk rewrote `header.adopt` on every short batch | fixed | `proved_short_batches_do_not_rewrite_header_adopt`, `promoting_a_challenger_persists_that_chains_tip` |
 | [114](./114-respend-after-rejected-write.md) | critical | Re-spend of a same-block spend connects after a merged IBD write rejects | fixed | `respend_of_a_same_block_spend_rejects_on_single_block_retry`, `merged_respend_of_a_same_block_spend_is_rejected_alone` |
+| [115](./115-sp-scan-history.md) | medium | Silent-payment scan dropped history older than 256 blocks (follows 065) | fixed | `sp_timestamp_start_finds_a_payment_older_than_one_chunk` |
 
 **012–021:** fuzzamoto differential report (`rbitcoin-report.tar.gz`, baseline
 `8f3990f`). Report-local 001–010 are **renumbered** here. Identity/BIP30
