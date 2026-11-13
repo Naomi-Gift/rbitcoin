@@ -642,6 +642,8 @@ pub struct StructuralScratch {
     /// `meta_at` is the next unused index. `None` means this scratch has no
     /// prefetch and the block reads its own offsets.
     pub meta_prefetch: Vec<Option<(rbitcoin_primitives::Fk, u8, u32)>>,
+    /// Offsets `meta_prefetch` was read for. Each block's disk offsets must match its slice.
+    pub meta_offs: Vec<u64>,
     pub meta_at: Option<usize>,
 }
 
@@ -664,6 +666,7 @@ impl Default for StructuralScratch {
             batch_vouts: Vec::new(),
             slots: AnnotateSlots::default(),
             meta_prefetch: Vec::new(),
+            meta_offs: Vec::new(),
             meta_at: None,
         }
     }
@@ -678,6 +681,7 @@ impl StructuralScratch {
         self.batch_creates.clear();
         self.batch_vouts.clear();
         self.meta_prefetch.clear();
+        self.meta_offs.clear();
         self.meta_at = None;
     }
 
@@ -1019,6 +1023,18 @@ pub fn structural_abs_heights(
     Ok(())
 }
 
+/// True when `planned[at..]` is exactly `abs_offs`.
+///
+/// A shorter plan, a wrap, or a different offset is a miss. The load uses
+/// this so a block cannot apply another block's spender meta.
+#[doc(hidden)]
+pub fn meta_prefetch_slice_matches(planned: &[u64], at: usize, abs_offs: &[u64]) -> bool {
+    let Some(end) = at.checked_add(abs_offs.len()) else {
+        return false;
+    };
+    end <= planned.len() && planned[at..end] == *abs_offs
+}
+
 #[doc(hidden)]
 pub fn structural_load_durable_spent(
     query: &Query,
@@ -1042,7 +1058,9 @@ pub fn structural_load_durable_spent(
     }
     let metas = if let Some(at) = scratch.meta_at {
         let end = at.saturating_add(scratch.abs_offs.len());
-        if end > scratch.meta_prefetch.len() {
+        if end > scratch.meta_prefetch.len()
+            || !meta_prefetch_slice_matches(&scratch.meta_offs, at, &scratch.abs_offs)
+        {
             return Err(ConfirmError::Store(rbitcoin_store::StoreError::Corrupt(
                 "invariant: structural meta prefetch short",
             )));

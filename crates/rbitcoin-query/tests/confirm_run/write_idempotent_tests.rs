@@ -1819,6 +1819,16 @@ fn structural_scratch_second_block_does_not_replay_first_slots() {
     let _ = std::fs::remove_dir_all(&path);
 }
 
+#[test]
+fn meta_prefetch_slice_rejects_a_shifted_offset() {
+    use rbitcoin_query::block_pipeline::meta_prefetch_slice_matches;
+    assert!(meta_prefetch_slice_matches(&[10, 18, 26], 0, &[10, 18]));
+    assert!(meta_prefetch_slice_matches(&[10, 18, 26], 2, &[26]));
+    assert!(!meta_prefetch_slice_matches(&[10, 18, 26], 0, &[10, 26]));
+    assert!(!meta_prefetch_slice_matches(&[10, 18], 1, &[18, 26]));
+    assert!(!meta_prefetch_slice_matches(&[10], usize::MAX, &[10]));
+}
+
 /// Spend index off must not write or count annotate slots structural already filled.
 #[test]
 fn post_commit_spend_index_off_leaves_slots_unwritten() {

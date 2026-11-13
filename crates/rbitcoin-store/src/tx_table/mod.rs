@@ -2572,20 +2572,27 @@ impl TxTable {
         }
         let slot = OutputRecord::SPENT_SLOT_LEN;
         let end = body_off.saturating_add(body_len);
-        let mut hits: Vec<Option<(bool, Fk, u32)>> = Vec::with_capacity(vouts.len());
-        let mut misses = Vec::new();
+        let mut hits: Vec<Option<(bool, Fk, u32)>> = vec![None; vouts.len()];
+        let mut in_range: Vec<(usize, u64)> = Vec::new();
         for (i, &v) in vouts.iter().enumerate() {
             let abs = spent_abs(body_off, v);
-            if abs.saturating_add(slot as u64) > end {
-                hits.push(None);
-                continue;
+            if abs.saturating_add(slot as u64) <= end {
+                in_range.push((i, abs));
             }
-            if let Some(logged) = self.spend_pages.slot(abs) {
-                hits.push(decode_spent_slot(&logged).ok().map(|(flags, field, vin)| {
+        }
+        let logged = self
+            .spend_pages
+            .slots_at(&in_range.iter().map(|(_, abs)| *abs).collect::<Vec<_>>());
+        let mut misses = Vec::new();
+        for (&(i, _), raw) in in_range.iter().zip(logged) {
+            if let Some(logged) = raw {
+                hits[i] = decode_spent_slot(&logged).ok().map(|(flags, field, vin)| {
                     (flags & output_flags::MULTI_SPENDER != 0, field, vin)
-                }));
+                });
+                if hits[i].is_none() {
+                    misses.push(i);
+                }
             } else {
-                hits.push(None);
                 misses.push(i);
             }
         }

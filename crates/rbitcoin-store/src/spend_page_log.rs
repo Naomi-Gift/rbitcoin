@@ -412,10 +412,14 @@ impl SpendPageLog {
     /// Current 8-byte image for `abs`, from the open directory, the frozen
     /// generation, or a committed page. `None` means the body still holds the slot.
     pub fn slot(&self, abs: u64) -> Option<[u8; SLOT]> {
-        self.slots_at(std::slice::from_ref(&abs))
-            .into_iter()
-            .next()
-            .flatten()
+        #[cfg(debug_assertions)]
+        if crate::io_handle::hidden_after_pread() {
+            return None;
+        }
+        let page_off = abs & !(BODY_PAGE_SIZE - 1);
+        let rel = ((abs - page_off) / SLOT as u64) as u16;
+        let g = self.lock();
+        noted_slot(&g, page_off, rel)
     }
 
     /// Same bytes as [`Self::slot`] for each offset. One directory lock for
@@ -447,16 +451,8 @@ impl SpendPageLog {
             while end < order.len() && order[end].0 == page_off {
                 end += 1;
             }
-            let later = g.later.get(&page_off);
-            let open = g.open.get(&page_off);
-            let frozen = g.frozen.get(&page_off);
-            let committed = g.committed.get(&page_off);
             for &(_, rel, i) in &order[start..end] {
-                if let Some(meta) = page_hit(later, rel)
-                    .or_else(|| page_hit(open, rel))
-                    .or_else(|| page_hit(frozen, rel))
-                    .or_else(|| committed.and_then(|page| slot_in_image(&page.image, rel)))
-                {
+                if let Some(meta) = noted_slot(&g, page_off, rel) {
                     out[i] = Some(meta);
                 }
             }
@@ -1937,7 +1933,10 @@ fn insert_note(
         return Ok(false);
     }
     page.slots.insert(i, (rel, meta));
-    page.reindex();
+    let rel = rel as usize;
+    if rel < OPEN_SLOT_PRESENCE_BYTES * 8 {
+        page.present[rel / 64] |= 1u64 << (rel % 64);
+    }
     Ok(true)
 }
 
@@ -1974,6 +1973,18 @@ fn merge_later(g: &mut Inner, reset_edges: bool) {
 
 fn page_hit(page: Option<&OpenPage>, rel: u16) -> Option<[u8; SLOT]> {
     page?.hit(rel)
+}
+
+/// Directory bytes for one slot. `None` means `spent.body` still holds it.
+fn noted_slot(g: &Inner, page_off: u64, rel: u16) -> Option<[u8; SLOT]> {
+    page_hit(g.later.get(&page_off), rel)
+        .or_else(|| page_hit(g.open.get(&page_off), rel))
+        .or_else(|| page_hit(g.frozen.get(&page_off), rel))
+        .or_else(|| {
+            g.committed
+                .get(&page_off)
+                .and_then(|page| slot_in_image(&page.image, rel))
+        })
 }
 
 /// `None` when `rel` sits past the stored image. The body still holds it.

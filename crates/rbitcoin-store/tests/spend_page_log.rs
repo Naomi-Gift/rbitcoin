@@ -76,16 +76,16 @@ fn batched_slot_read_matches_the_single_offset_read() {
     );
     assert_eq!(open_batch[1], Some(noted));
     assert_eq!(open_batch[2], None);
-    for (i, off) in open_offs.iter().enumerate() {
-        assert_eq!(open_batch[i], log.slot(*off));
-    }
+    assert_eq!(log.slot(24), None);
+    assert_eq!(log.slot(16), Some(noted));
+    assert_eq!(log.slot(32), None);
     log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
     log.note_slots(&[(16, shadow)]).unwrap();
     let offs = [16u64, 24, 4096];
     let batch = log.slots_at(&offs);
-    for (i, off) in offs.iter().enumerate() {
-        assert_eq!(batch[i], log.slot(*off));
-    }
+    assert_eq!(log.slot(16), Some(shadow));
+    assert_eq!(log.slot(24), Some([0u8; 8]));
+    assert_eq!(log.slot(4096), None);
     assert_eq!(
         batch[0],
         Some(shadow),
