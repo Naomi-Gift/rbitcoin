@@ -22,7 +22,7 @@ use crate::scripthash_layout::{head_key_from_full, ShHeadKey, SH_HEAD_KEY_LEN};
 use crate::scripthash_mphf::{mix_key16, mphf_path, val_path, MphfHead};
 use crate::store::Store;
 use crate::tx_table::TxTable;
-use rbitcoin_primitives::{read_uleb128, write_uleb128, Fk};
+use rbitcoin_primitives::{le_u32, read_uleb128, write_uleb128, Fk};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -576,11 +576,14 @@ pub fn encode_keys_spill(map: &Key16PackMap) -> Vec<u8> {
 
 #[doc(hidden)]
 pub fn fold_keys_spill_bytes(map: &mut Key16PackMap, bytes: &[u8]) -> Result<(), StoreError> {
-    if bytes.len() < KEYS_SPILL_HDR || bytes[0..8] != KEYS_SPILL_MAGIC[..] {
+    let Some(head) = bytes.first_chunk::<KEYS_SPILL_HDR>() else {
+        return Err(refuse_keys_leftover());
+    };
+    if head[0..8] != KEYS_SPILL_MAGIC[..] {
         return Err(refuse_keys_leftover());
     }
-    let n_multi = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as usize;
-    let n_single = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+    let n_multi = le_u32!(head, 8) as usize;
+    let n_single = le_u32!(head, 12) as usize;
     let mut i = KEYS_SPILL_HDR;
     for _ in 0..n_multi {
         if bytes.len().saturating_sub(i) < KEY16_LEN {

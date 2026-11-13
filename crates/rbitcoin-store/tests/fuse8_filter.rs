@@ -290,3 +290,28 @@ fn open_unknown_version_is_corrupt() {
     assert!(open_file(&path).is_err());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn v2_geometry_reads_each_fixed_field() {
+    let mut payload = vec![0u8; 28 + 12];
+    payload[0..8].copy_from_slice(&0x0807_0605_0403_0201u64.to_le_bytes());
+    payload[8..12].copy_from_slice(&4u32.to_le_bytes());
+    payload[12..16].copy_from_slice(&3u32.to_le_bytes());
+    payload[16..20].copy_from_slice(&4u32.to_le_bytes());
+    payload[20..28].copy_from_slice(&12u64.to_le_bytes());
+    let geo = match parse_v2_geometry(&payload) {
+        Ok(geo) => geo,
+        Err(err) => panic!("{err}"),
+    };
+    assert_eq!(geo.seed, 0x0807_0605_0403_0201);
+    assert_eq!(geo.segment_length, 4);
+    assert_eq!(geo.segment_length_mask, 3);
+    assert_eq!(geo.segment_count_length, 4);
+    assert_eq!(geo.fp_off, 28);
+    assert_eq!(geo.fp_len, 12);
+    match parse_v2_geometry(&payload[..27]) {
+        Err(StoreError::Corrupt(msg)) => assert!(msg.contains("short"), "{msg}"),
+        Ok(_) => panic!("short payload decoded"),
+        Err(err) => panic!("{err}"),
+    }
+}
