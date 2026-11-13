@@ -1035,12 +1035,14 @@ pub fn meta_prefetch_slice_matches(planned: &[u64], at: usize, abs_offs: &[u64])
     end <= planned.len() && planned[at..end] == *abs_offs
 }
 
+type StructuralMeta = Option<(rbitcoin_primitives::Fk, u8, u32)>;
+
 fn structural_meta_row(
-    prefetch: &[Option<(rbitcoin_primitives::Fk, u8, u32)>],
-    read: Option<&[Option<(rbitcoin_primitives::Fk, u8, u32)>]>,
+    prefetch: &[StructuralMeta],
+    read: Option<&[StructuralMeta]>,
     at: usize,
     i: usize,
-) -> Option<(rbitcoin_primitives::Fk, u8, u32)> {
+) -> StructuralMeta {
     match read {
         Some(rows) => rows[i],
         None => prefetch[at + i],
