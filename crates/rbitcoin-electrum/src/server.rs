@@ -90,6 +90,10 @@ pub const DEFAULT_MAX_SCRIPTHASH_SUBS: usize = 10_000;
 /// scripthash cap. Frigate's default is 100. Operators can raise it
 /// (`--electrum-max-sp-subs`).
 pub const DEFAULT_MAX_SP_SUBS: usize = 16;
+/// Silent-payment history scans the process runs at once, across every
+/// connection. The per-connection cap alone leaves connections x addresses.
+/// A subscribe past this is refused until a scan ends. Not a knob.
+pub const DEFAULT_MAX_SP_SCANS: usize = 32;
 /// Idle read timeout — disconnect quiet clients (DoS of FD/tasks).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 120;
 /// Max raw tx hex chars for `transaction.broadcast` (~4 MiB wire → 8 MiB hex).
@@ -145,6 +149,13 @@ pub struct ElectrumConfig {
     pub max_scripthash_subs: usize,
     /// Silent-payment addresses one connection may subscribe (>= 1).
     pub max_sp_subs: usize,
+    /// One permit per running silent-payment history scan
+    /// ([`DEFAULT_MAX_SP_SCANS`]). Clones of the config share it, so it is
+    /// one bound for every listener.
+    pub sp_scan_slots: Arc<Semaphore>,
+    /// Heights one history scan step reads. Tests shorten it.
+    #[doc(hidden)]
+    pub sp_scan_chunk: u32,
     /// Max hex length accepted by `blockchain.transaction.broadcast`.
     pub max_broadcast_hex: usize,
     /// Omit served P2TR outs with `value <=` this (sats). `0` serves all.
@@ -179,6 +190,8 @@ impl ElectrumConfig {
             limits: ServeLimits::for_public_proxy(),
             max_scripthash_subs: DEFAULT_MAX_SCRIPTHASH_SUBS,
             max_sp_subs: DEFAULT_MAX_SP_SUBS,
+            sp_scan_slots: Arc::new(Semaphore::new(DEFAULT_MAX_SP_SCANS)),
+            sp_scan_chunk: crate::silent_scan::SP_SCAN_CHUNK,
             max_broadcast_hex: DEFAULT_MAX_BROADCAST_HEX,
             tweaks_min_dust: crate::tweaks::DEFAULT_TWEAKS_MIN_DUST,
             onion_tcp: Arc::new(OnceLock::new()),
@@ -736,7 +749,7 @@ where
                                         id,
                                         &params_v,
                                         &mut conn,
-                                        config.max_sp_subs,
+                                        &config,
                                     )
                                     .await?
                                 }
@@ -1346,7 +1359,8 @@ fn finish_reply(
 /// Frigate subscribe: the result line, then the history scan started beside
 /// the session. Its notes follow from [`write_sp_scan_step`]. A subscribe
 /// to an address the connection already has replaces that subscription and
-/// scans again. `max_subs` is the addresses the connection may hold.
+/// scans again. `config` caps the addresses of the connection and the scans
+/// of the process.
 #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
 pub async fn serve_sp_subscribe<W>(
     writer: &mut ConnWrite<W>,
@@ -1356,11 +1370,12 @@ pub async fn serve_sp_subscribe<W>(
     id: Value,
     params_v: &Value,
     conn: &mut ElectrumConn,
-    max_subs: usize,
+    config: &ElectrumConfig,
 ) -> Result<(), std::io::Error>
 where
     W: AsyncWrite + Unpin,
 {
+    let max_subs = config.max_sp_subs;
     let tip = query.tip_height().map(|h| h.0);
     let mut sub = match parse_sp_sub(params_v, query, chain).await {
         Ok(s) => s,
@@ -1402,6 +1417,28 @@ where
             .await?;
         return Ok(());
     }
+    // One slot per running scan, process-wide. A scan this subscribe
+    // replaces hands its slot on.
+    let replaced = conn
+        .sp_scans
+        .iter()
+        .position(|run| run.sub.address == sub.address)
+        .map(|i| conn.sp_scans.remove(i));
+    let slot = match replaced {
+        Some(run) => run.slot,
+        None => {
+            match Arc::clone(&config.sp_scan_slots).try_acquire_owned() {
+                Ok(slot) => slot,
+                Err(_) => {
+                    let message = "silent payment scan limit reached, try again later";
+                    writer
+                    .line(json!({"jsonrpc":"2.0","id": id, "error": {"code": 1, "message": message}}))
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+    };
     let result = crate::silent_scan::subscribe_result(&sub);
     rbitcoin_log::api_call(
         "electrum",
@@ -1415,8 +1452,15 @@ where
     let last = sub.end.unwrap_or(tip.unwrap_or(sub.start).max(sub.start));
     drop_sp_address(conn, &sub.address);
     let from = sub.start;
-    conn.sp_scans
-        .push(SpScanRun::start(query, chain, sub, from, last));
+    conn.sp_scans.push(SpScanRun::start(
+        query,
+        chain,
+        sub,
+        from,
+        last,
+        config.sp_scan_chunk,
+        slot,
+    ));
     Ok(())
 }
 
@@ -1580,12 +1624,11 @@ pub fn redact_sp_params(params: &Value) -> String {
     serde_json::to_string(&v).unwrap_or_else(|_| "[]".into())
 }
 
-/// Last height of the scan chunk that starts at `from`, at most `last`.
+/// Last height of the scan chunk of `chunk` heights that starts at `from`,
+/// at most `last`.
 #[doc(hidden)]
-pub fn sp_chunk_end(from: u32, last: u32) -> u32 {
-    use crate::silent_scan::SP_SCAN_CHUNK;
-    from.saturating_add(SP_SCAN_CHUNK.saturating_sub(1))
-        .min(last)
+pub fn sp_chunk_end(from: u32, last: u32, chunk: u32) -> u32 {
+    from.saturating_add(chunk.saturating_sub(1)).min(last)
 }
 
 /// A subscription whose history is sent, and the last height scanned for it.
@@ -1617,8 +1660,17 @@ pub struct SpScanStep {
     pub progress: f64,
 }
 
+/// A scan task that is aborted when its owner drops it.
+struct SpScanTask(JoinHandle<usize>);
+
+impl Drop for SpScanTask {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// A history scan running beside the session. Dropping it stops the scan
-/// before its next chunk.
+/// before its next chunk and frees its slot.
 pub struct SpScanRun {
     pub sub: crate::silent_scan::SpSub,
     steps: tokio::sync::mpsc::Receiver<Result<SpScanStep, String>>,
@@ -1627,25 +1679,56 @@ pub struct SpScanRun {
     /// First height whose step the session has not taken.
     #[doc(hidden)]
     pub next: u32,
-    task: JoinHandle<usize>,
-}
-
-impl Drop for SpScanRun {
-    fn drop(&mut self) {
-        self.task.abort();
-    }
+    chunk: u32,
+    task: SpScanTask,
+    /// This scan's share of [`ElectrumConfig::sp_scan_slots`].
+    slot: tokio::sync::OwnedSemaphorePermit,
 }
 
 impl SpScanRun {
-    /// Scan `from..=last` for `sub`. `from` is `sub.start`, or above it
-    /// when a scan resumes.
+    /// Scan `from..=last` for `sub`, `chunk` heights a step.
+    #[allow(clippy::too_many_arguments)] // call-site args stay unbundled
     fn start(
         query: &Arc<Query>,
         chain: &Arc<ChainParams>,
         sub: crate::silent_scan::SpSub,
         from: u32,
         last: u32,
+        chunk: u32,
+        slot: tokio::sync::OwnedSemaphorePermit,
     ) -> Self {
+        let (steps, task) = Self::spawn(query, chain, &sub, from, last, chunk);
+        Self {
+            sub,
+            steps,
+            noted: Instant::now(),
+            next: from,
+            chunk,
+            task,
+            slot,
+        }
+    }
+
+    /// Scan again from `from`, in the same slot. The old task is aborted
+    /// and a step it had queued is dropped.
+    fn restart(&mut self, query: &Arc<Query>, chain: &Arc<ChainParams>, from: u32, last: u32) {
+        let (steps, task) = Self::spawn(query, chain, &self.sub, from, last, self.chunk);
+        self.steps = steps;
+        self.task = task;
+        self.next = from;
+    }
+
+    fn spawn(
+        query: &Arc<Query>,
+        chain: &Arc<ChainParams>,
+        sub: &crate::silent_scan::SpSub,
+        from: u32,
+        last: u32,
+        chunk: u32,
+    ) -> (
+        tokio::sync::mpsc::Receiver<Result<SpScanStep, String>>,
+        SpScanTask,
+    ) {
         // One step of slack: the scan reads the next chunk while the session
         // writes this one, and no further ahead of a slow client.
         let (tx, steps) = tokio::sync::mpsc::channel(1);
@@ -1655,15 +1738,10 @@ impl SpScanRun {
             sub.clone(),
             from,
             last,
+            chunk,
             tx,
         ));
-        Self {
-            sub,
-            steps,
-            noted: Instant::now(),
-            next: from,
-            task,
-        }
+        (steps, SpScanTask(task))
     }
 }
 
@@ -1702,13 +1780,13 @@ pub fn restart_sp_scans_after_reorg(
     for run in scans.iter_mut() {
         let from = run.next.min(fork.saturating_add(1)).max(run.sub.start);
         let last = run.sub.end.unwrap_or(tip.height).max(from);
-        *run = SpScanRun::start(query, chain, run.sub.clone(), from, last);
+        run.restart(query, chain, from, last);
     }
 }
 
-/// Scan `from..=last` in chunks, one step per chunk. A start with no
-/// end goes on to the tip while it keeps moving. Stops when the receiver is gone. Returns the
-/// chunks scanned.
+/// Scan `from..=last`, `chunk` heights a step. A start with no end goes on
+/// to the tip while it keeps moving. Stops when the receiver is gone.
+/// Returns the chunks scanned.
 #[doc(hidden)]
 pub async fn run_sp_scan(
     query: Arc<Query>,
@@ -1716,13 +1794,14 @@ pub async fn run_sp_scan(
     sub: crate::silent_scan::SpSub,
     mut from: u32,
     mut last: u32,
+    chunk: u32,
     steps: tokio::sync::mpsc::Sender<Result<SpScanStep, String>>,
 ) -> usize {
     use crate::silent_scan::SP_SCAN_PERMITS;
     static PERMITS: Semaphore = Semaphore::const_new(SP_SCAN_PERMITS);
     let mut chunks = 0usize;
     loop {
-        let end = sp_chunk_end(from, last);
+        let end = sp_chunk_end(from, last, chunk);
         let permit = tokio::select! {
             permit = PERMITS.acquire() => permit,
             _ = steps.closed() => return chunks,
