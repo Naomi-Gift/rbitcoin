@@ -91,12 +91,15 @@ pub struct QueuedBlockMeta {
 ///
 /// A hole is an empty slot. `start` is a dropped prefix. It stays until it is
 /// at least as long as the live tail, then the tail is moved once.
+/// `u32::MAX` is the unknown-height row. It is one id beside the window, not
+/// a slot four billion entries past the low height.
 #[derive(Debug)]
 pub struct HeightWindow {
     base: u32,
     start: usize,
     slots: Vec<Option<u64>>,
     live: usize,
+    unknown: Option<u64>,
 }
 
 impl HeightWindow {
@@ -106,21 +109,29 @@ impl HeightWindow {
             start: 0,
             slots: Vec::new(),
             live: 0,
+            unknown: None,
         }
     }
 
-    /// Lowest height still in the window.
+    /// Slots in the height window. The unknown-height row is not one of them.
+    pub fn span(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Lowest height still queued.
     pub fn lowest(&self) -> Option<u32> {
         if self.live == 0 {
-            None
+            self.unknown.map(|_| u32::MAX)
         } else {
             Some(self.base + self.start as u32)
         }
     }
 
-    /// Highest height still in the window.
+    /// Highest height still queued.
     pub fn highest(&self) -> Option<u32> {
-        if self.live == 0 {
+        if self.unknown.is_some() {
+            Some(u32::MAX)
+        } else if self.live == 0 {
             None
         } else {
             Some(self.base + self.slots.len() as u32 - 1)
@@ -128,6 +139,9 @@ impl HeightWindow {
     }
 
     pub fn get(&self, height: u32) -> Option<u64> {
+        if height == u32::MAX {
+            return self.unknown;
+        }
         let i = self.index_of(height)?;
         if i < self.start {
             return None;
@@ -140,6 +154,9 @@ impl HeightWindow {
     }
 
     pub fn insert(&mut self, height: u32, id: u64) -> Option<u64> {
+        if height == u32::MAX {
+            return self.unknown.replace(id);
+        }
         if self.live == 0 {
             self.base = height;
             self.start = 0;
@@ -176,6 +193,9 @@ impl HeightWindow {
     }
 
     pub fn remove(&mut self, height: u32) -> Option<u64> {
+        if height == u32::MAX {
+            return self.unknown.take();
+        }
         let i = self.index_of(height)?;
         if i < self.start {
             return None;
@@ -217,11 +237,13 @@ impl HeightWindow {
 
     fn heights(&self) -> impl Iterator<Item = u32> + '_ {
         let base = self.base;
+        let unknown = self.unknown.map(|_| u32::MAX);
         self.slots
             .iter()
             .enumerate()
             .skip(self.start)
             .filter_map(move |(i, slot)| slot.map(|_| base + i as u32))
+            .chain(unknown)
     }
 }
 

@@ -435,3 +435,23 @@ fn one_queued_hash_keeps_its_height_inline() {
     assert_eq!(q.dequeue_height(7).unwrap(), 1);
     assert!(!q.has_hash(&hash));
 }
+
+/// `u32::MAX` is the unknown-height row. It stays queued beside a low height
+/// and does not open a slot for every height in between.
+#[test]
+fn unknown_height_stays_out_of_the_window() {
+    let mut q = BlockQueue::empty();
+    q.enqueue(0, [1u8; 32], 1, b"a").unwrap();
+    q.enqueue(u32::MAX, [2u8; 32], 1, b"unk").unwrap();
+    assert_eq!(q.height_to_id.span(), 1);
+    assert_eq!(q.min_height(), Some(0));
+    assert_eq!(q.max_height(), Some(u32::MAX));
+    assert!(q.contains_height(u32::MAX));
+    assert_eq!(q.height_to_id.get(1), None);
+    assert_eq!(q.heights(), vec![0, u32::MAX]);
+    assert_eq!(q.dequeue_height(u32::MAX).unwrap(), 1);
+    assert!(!q.contains_height(u32::MAX));
+    assert_eq!(q.max_height(), Some(0));
+    assert!(q.contains_height(0));
+    assert_eq!(q.height_to_id.span(), 1);
+}
