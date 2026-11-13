@@ -56,6 +56,23 @@ fn hashes_in_span_lists_only_occupied_heights() {
 }
 
 #[test]
+fn dequeue_above_keeps_the_cut_and_drops_the_unknown_height() {
+    let mut q = BlockQueue::empty();
+    q.enqueue(10, [1u8; 32], 1, b"a").unwrap();
+    q.enqueue(12, [2u8; 32], 2, b"bb").unwrap();
+    q.enqueue(u32::MAX, [9u8; 32], 0, b"unk").unwrap();
+    q.promote_wave(&[(12, 4)]).unwrap();
+    assert_eq!(q.promoted_count(), 1);
+    assert_eq!(q.dequeue_above(10).unwrap(), 2);
+    assert!(q.contains_height(10));
+    assert!(!q.contains_height(12));
+    assert!(!q.contains_height(u32::MAX));
+    assert_eq!(q.promoted_count(), 0);
+    assert_eq!(q.dequeue_above(10).unwrap(), 0);
+    assert_eq!(q.dequeue_above(u32::MAX).unwrap(), 0);
+}
+
+#[test]
 fn get_by_height_peek_without_dequeue() {
     let dir = temp();
     let mut q = BlockQueue::open_or_create(&dir).unwrap();

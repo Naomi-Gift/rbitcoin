@@ -550,6 +550,17 @@ impl BlockQueue {
         Ok(usize::from(self.dequeue(id)?))
     }
 
+    /// Drop every queued height above `keep`, including the unknown height.
+    /// One walk of the window, then one removal per dropped height.
+    pub fn dequeue_above(&mut self, keep: u32) -> Result<usize, StoreError> {
+        let drop_these: Vec<u32> = self.height_to_id.heights().filter(|&h| h > keep).collect();
+        let mut n = 0;
+        for height in drop_these {
+            n += self.dequeue_height(height)?;
+        }
+        Ok(n)
+    }
+
     /// Contiguous unresolved heights from `path_lo`. Stops at the first height
     /// not on the queue (a hole). Skips resolve-complete and `skip` without
     /// treating those as a gap. Capped at `cap`.
