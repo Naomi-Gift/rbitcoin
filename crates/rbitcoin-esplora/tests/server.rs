@@ -416,6 +416,138 @@ fn join_idle_evicts_after_ttl() {
     assert!(map.contains_key("fresh"));
 }
 
+#[test]
+fn join_idle_at_the_ttl_is_gone_and_the_client_cap_keeps_256() {
+    let mut map = HashMap::new();
+    let now = Instant::now();
+    map.insert(
+        "edge".into(),
+        ClientJoins {
+            last_req: now.checked_sub(JOIN_IDLE).unwrap(),
+            ..ClientJoins::default()
+        },
+    );
+    map.insert(
+        "inside".into(),
+        ClientJoins {
+            last_req: now
+                .checked_sub(JOIN_IDLE - Duration::from_nanos(1))
+                .unwrap(),
+            ..ClientJoins::default()
+        },
+    );
+    sweep_clients(&mut map, now);
+    assert!(!map.contains_key("edge"));
+    assert!(map.contains_key("inside"));
+
+    let mut full = HashMap::new();
+    for i in 0..JOIN_MAX_CLIENTS {
+        full.insert(
+            format!("c{i}"),
+            ClientJoins {
+                last_req: now,
+                ..ClientJoins::default()
+            },
+        );
+    }
+    sweep_clients(&mut full, now);
+    assert_eq!(full.len(), JOIN_MAX_CLIENTS);
+
+    full.insert(
+        "oldest".into(),
+        ClientJoins {
+            last_req: now.checked_sub(Duration::from_secs(1)).unwrap(),
+            ..ClientJoins::default()
+        },
+    );
+    sweep_clients(&mut full, now);
+    assert_eq!(full.len(), JOIN_MAX_CLIENTS);
+    assert!(!full.contains_key("oldest"));
+}
+
+#[test]
+fn join_bulk_cap_is_16_mib_and_keeps_a_two_mib_slot() {
+    assert_eq!(JOIN_BULK_CAP, 16_777_216);
+    let two_mib = rbitcoin_query::ShJoinSlot::with_spender_fk_count((2 * 1024 * 1024 - 144) / 8);
+    assert!(two_mib.packed_bytes() > 1_048_576);
+    assert!(two_mib.packed_bytes() < JOIN_BULK_CAP);
+    let mut c = ClientJoins {
+        last_bulk: HashMap::from([([1u8; 32], two_mib)]),
+        ..ClientJoins::default()
+    };
+    cap_bulk(&mut c);
+    assert_eq!(c.last_bulk.len(), 1);
+}
+
+#[test]
+fn cap_bulk_keeps_the_cap_and_drops_one_byte_over() {
+    let exact = rbitcoin_query::ShJoinSlot::with_spender_fk_count((JOIN_BULK_CAP - 144) / 8);
+    assert_eq!(exact.packed_bytes(), JOIN_BULK_CAP);
+    let mut at = ClientJoins {
+        last_bulk: HashMap::from([([2u8; 32], Arc::clone(&exact))]),
+        ..ClientJoins::default()
+    };
+    cap_bulk(&mut at);
+    assert_eq!(at.last_bulk.len(), 1);
+
+    let over = rbitcoin_query::testutil::sh_join_slot_over_16mib();
+    let mut c = ClientJoins {
+        last_bulk: HashMap::from([([3u8; 32], over)]),
+        ..ClientJoins::default()
+    };
+    cap_bulk(&mut c);
+    assert!(c.last_bulk.is_empty());
+}
+
+#[test]
+fn retain_join_budget_keeps_a_last_sh_at_the_cap() {
+    let exact = rbitcoin_query::ShJoinSlot::with_spender_fk_count((JOIN_BULK_CAP - 144) / 8);
+    let mut c = ClientJoins {
+        last_sh: Some(([4u8; 32], exact, 1)),
+        ..ClientJoins::default()
+    };
+    retain_join_budget(&mut c);
+    assert!(c.last_sh.is_some());
+}
+
+#[test]
+fn named_join_client_drops_only_an_empty_id() {
+    assert_eq!(named_join_client(None), None);
+    assert_eq!(named_join_client(Some("")), None);
+    assert_eq!(named_join_client(Some("c1")), Some("c1"));
+}
+
+#[test]
+fn esplora_stop_load_follows_store() {
+    let stop = EsploraStop::new(false);
+    assert!(!stop.load());
+    stop.store(true);
+    assert!(stop.load());
+}
+
+#[test]
+fn blindbit_default_inflight_is_half_the_pool() {
+    let pool = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .max(4);
+    assert_eq!(rbitcoin_esplora::blindbit::default_max_inflight(), pool / 2);
+    assert!(rbitcoin_esplora::blindbit::default_max_inflight() >= 2);
+}
+
+#[test]
+fn esplora_perf_window_resets_and_totals_keep_the_note() {
+    const NOTE: u64 = 1_000_000_000;
+    let _ = sample_reset_perf();
+    let before = perf_totals();
+    METER.note(NOTE);
+    let window = sample_reset_perf();
+    let after = perf_totals();
+    assert!(window.0 >= 1 && window.1 >= NOTE && window.2 >= NOTE);
+    assert!(after.0 > before.0);
+    assert!(after.1 >= before.1.saturating_add(NOTE));
+}
+
 fn join_only_state(q: Arc<Query>, cache: Arc<Mutex<JoinCache>>) -> AppState {
     AppState {
         query: q,

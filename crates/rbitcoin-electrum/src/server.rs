@@ -50,15 +50,11 @@ pub static METER: RequestMeter = RequestMeter::new();
 
 /// Electrum request meters since the previous sample: `(count, sum_us, max_us)`.
 /// Running totals are untouched ([`perf_totals`]).
-// Node `/metrics` and `tip: perf` read the window. No Electrum response does.
-#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn sample_reset_perf() -> (u64, u64, u64) {
     METER.take_window()
 }
 
 /// Running Electrum totals for `/metrics`: `(requests, sum_us)`.
-// Node `/metrics` reads the totals. No Electrum response does.
-#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn perf_totals() -> (u64, u64) {
     METER.totals()
 }

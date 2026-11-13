@@ -40,15 +40,11 @@ pub static METER: RequestMeter = RequestMeter::new();
 
 /// Esplora REST request meters since the previous sample: `(count, sum_us, max_us)`.
 /// Running totals are untouched ([`perf_totals`]).
-// Node tip log. No Esplora response reads the tuple.
-#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn sample_reset_perf() -> (u64, u64, u64) {
     METER.take_window()
 }
 
 /// Running Esplora REST totals for `/metrics`: `(requests, sum_us)`.
-// Node `/metrics` counters. No Esplora response reads the tuple.
-#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn perf_totals() -> (u64, u64) {
     METER.totals()
 }
@@ -480,8 +476,6 @@ impl EsploraStop {
         })
     }
 
-    // Accept also breaks on `notified()` after `store(true)`. This load only loses a race the suite does not hit.
-    #[cfg_attr(feature = "mutants", mutants::skip)]
     pub fn load(&self) -> bool {
         self.flag.load(Ordering::SeqCst)
     }
@@ -621,8 +615,6 @@ pub const JOIN_IDLE: Duration = Duration::from_secs(30);
 #[doc(hidden)]
 pub const JOIN_MAX_CLIENTS: usize = 256;
 #[doc(hidden)]
-// A smaller cap drops a bulk this cap keeps. The next GET rebuilds the same JSON.
-#[cfg_attr(feature = "mutants", mutants::skip)]
 pub const JOIN_BULK_CAP: usize = 16 * 1024 * 1024;
 
 #[doc(hidden)]
@@ -749,8 +741,6 @@ impl JoinCache {
 }
 
 #[doc(hidden)]
-// Idle and client-cap eviction only change which cache slot is reused. A miss rebuilds the same JSON.
-#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn sweep_clients(map: &mut HashMap<String, ClientJoins>, now: Instant) {
     map.retain(|_, c| now.saturating_duration_since(c.last_req) < JOIN_IDLE);
     while map.len() > JOIN_MAX_CLIENTS {
@@ -768,8 +758,6 @@ pub fn sweep_clients(map: &mut HashMap<String, ClientJoins>, now: Instant) {
 }
 
 #[doc(hidden)]
-// Dropping a cached bulk does not change the next JSON. The GET rebuilds it.
-#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn cap_bulk(c: &mut ClientJoins) {
     let last_sh_bytes = c
         .last_sh
@@ -793,8 +781,6 @@ pub fn cap_bulk(c: &mut ClientJoins) {
 }
 
 #[doc(hidden)]
-// A last-sh over the cap is dropped. The next GET rebuilds the same JSON.
-#[cfg_attr(feature = "mutants", mutants::skip)]
 pub fn retain_join_budget(c: &mut ClientJoins) {
     if c.last_sh
         .as_ref()
@@ -1119,9 +1105,8 @@ fn spawn_capped<L: CappedAccept>(
     })
 }
 
-// `JoinClient` already drops an empty id. Sharing one slot does not change the JSON.
-#[cfg_attr(feature = "mutants", mutants::skip)]
-fn named_join_client(client: Option<&str>) -> Option<&str> {
+#[doc(hidden)]
+pub fn named_join_client(client: Option<&str>) -> Option<&str> {
     client.filter(|s| !s.is_empty())
 }
 

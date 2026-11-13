@@ -37,8 +37,7 @@ pub const BLINDBIT_V1_PREFIX: &str = "/blindbit/v1";
 /// read runs there and keeps its permit until it returns. spdk keeps about
 /// 200 asks open per scan; they queue here, before they take a listener slot.
 ///
-/// 0 and 1 both clamp to one permit. Queue depth does not change the body.
-#[cfg_attr(feature = "mutants", mutants::skip)]
+/// Parallelism is raised to 4, then halved, so the gate is at least two permits.
 pub fn default_max_inflight() -> usize {
     std::thread::available_parallelism()
         .map(|p| p.get())
