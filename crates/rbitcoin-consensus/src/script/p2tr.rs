@@ -214,8 +214,8 @@ pub fn verify_script_path(
     if items.len() < 2 {
         return Err(ConsensusError::Script("p2tr script path short".into()));
     }
-    let control_bytes = items.pop().unwrap();
-    let script_bytes = items.pop().unwrap();
+    let control_bytes = items.remove(items.len() - 1);
+    let script_bytes = items.remove(items.len() - 1);
     let mut stack = items;
 
     let script = Script::from_bytes(&script_bytes);

@@ -20,6 +20,32 @@ fn mixed(i: u64) -> [u8; 32] {
 }
 
 #[test]
+fn ensure_open_reuses_unsealed_tail_and_meta_decodes() {
+    let dir = tmp();
+    let layout = HeadLayout::new(10).unwrap();
+    let h = SegmentedTxHead::create(&dir, layout).unwrap();
+    let (bits, descs) = read_meta(&dir).unwrap();
+    assert_eq!(bits, 10);
+    assert!(descs.is_empty());
+    let raw = std::fs::read(meta_path(&dir)).unwrap();
+    assert!(matches!(
+        read_meta_buf(&raw[..8]),
+        Err(StoreError::Corrupt("tx.head.meta short"))
+    ));
+    h.ensure_open_for(1).unwrap();
+    assert_eq!(h.segment_count(), 1);
+    h.ensure_open_for(1).unwrap();
+    assert_eq!(h.segment_count(), 1, "unsealed tail stays the open segment");
+    let (bits, descs) = read_meta(&dir).unwrap();
+    assert_eq!(bits, 10);
+    assert_eq!(descs.len(), 1);
+    assert_eq!(descs[0].first_fk, 1);
+    assert_eq!(descs[0].count, 0);
+    assert_eq!(descs[0].file_id, 0);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn probe_candidates_batch_empty_is_empty() {
     let dir = tmp();
     let layout = HeadLayout::new(10).unwrap();

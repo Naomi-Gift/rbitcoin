@@ -58,14 +58,16 @@ pub fn read_compact_size(buf: &[u8]) -> Result<(u64, usize), PackError> {
             if buf.len() < 5 {
                 return Err(PackError("compact size u32 truncated"));
             }
-            let v = u32::from_le_bytes(buf[1..5].try_into().unwrap());
+            let v = u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]]);
             Ok((u64::from(v), 5))
         }
         255 => {
             if buf.len() < 9 {
                 return Err(PackError("compact size u64 truncated"));
             }
-            let v = u64::from_le_bytes(buf[1..9].try_into().unwrap());
+            let v = u64::from_le_bytes([
+                buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
+            ]);
             Ok((v, 9))
         }
     }
