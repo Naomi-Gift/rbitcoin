@@ -380,6 +380,26 @@ pub fn structural_run(
     }
     let mut tot = StructuralPhaseNs::default();
     let bip34_ancestor = bip34_ancestor_for_write(query, params, prepared);
+    let offs = crate::block_pipeline::write_meta_abs_offs(
+        prepared
+            .iter()
+            .zip(abs_jobs.iter())
+            .map(|(p, jobs)| (p.spends.as_slice(), jobs.as_slice())),
+        class_a_wave,
+    );
+    if !offs.is_empty() {
+        let meta_backend = rbitcoin_store::spend_meta_backend();
+        let t_meta = Instant::now();
+        reuse.scratch.meta_prefetch = query
+            .store()
+            .get_spender_meta_at_abs_batch_backend(&offs, meta_backend)
+            .map_err(ConfirmError::from)?;
+        let meta_ns = t_meta.elapsed().as_nanos() as u64;
+        crate::note_confirm(&query.confirm_stats().spend_meta_ns, meta_ns);
+        crate::note_confirm(&query.confirm_stats().spend_meta_n, offs.len() as u64);
+        let _ = meta_backend;
+    }
+    reuse.scratch.meta_at = Some(0);
     for (i, p) in prepared.iter().enumerate() {
         rbitcoin_consensus::note_block_height(p.height.0);
         let ctx = ValidationContext::at(params, p.height, milestone);

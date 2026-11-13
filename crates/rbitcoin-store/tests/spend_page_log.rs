@@ -1,7 +1,8 @@
 use rbitcoin_store::error::StoreError;
 use rbitcoin_store::spend_page_log::{
-    pace_after_checkpoint, spend_checkpoint_early, spend_note_arms, SpendPageLog, LOG_IMAGE_CAP,
-    OPEN_EDGE_CAP, SPEND_PAGES_COMMIT_NAME, SPEND_PAGES_NAME,
+    open_slot_present, pace_after_checkpoint, spend_checkpoint_early, spend_note_arms,
+    SpendPageLog, LOG_IMAGE_CAP, OPEN_EDGE_CAP, OPEN_SLOT_PRESENCE_BYTES, SPEND_PAGES_COMMIT_NAME,
+    SPEND_PAGES_NAME,
 };
 use std::path::PathBuf;
 
@@ -38,6 +39,65 @@ fn image_cap_schedules_one_followup_and_the_edge_cap_stays_due() {
         LOG_IMAGE_CAP - 1,
         false
     ));
+}
+
+#[test]
+fn open_slot_presence_is_one_bit_of_512() {
+    assert_eq!(OPEN_SLOT_PRESENCE_BYTES, 64);
+    let mut present = [0u64; 8];
+    assert!(!open_slot_present(&present, 0));
+    assert!(!open_slot_present(&present, 63));
+    assert!(!open_slot_present(&present, 64));
+    assert!(!open_slot_present(&present, 511));
+    assert!(!open_slot_present(&present, 512));
+    present[0] |= 1 << 63;
+    present[1] |= 1;
+    present[7] |= 1 << 63;
+    assert!(!open_slot_present(&present, 0));
+    assert!(open_slot_present(&present, 63));
+    assert!(open_slot_present(&present, 64));
+    assert!(!open_slot_present(&present, 65));
+    assert!(open_slot_present(&present, 511));
+    assert!(!open_slot_present(&present, 512));
+}
+
+#[test]
+fn batched_slot_read_matches_the_single_offset_read() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let noted = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    let shadow = [7u8, 9, 8, 7, 6, 5, 4, 3];
+    log.note_slots(&[(16, noted)]).unwrap();
+    let open_offs = [24u64, 16, 32];
+    let open_batch = log.slots_at(&open_offs);
+    assert_eq!(
+        open_batch[0], None,
+        "sibling on an open page is a presence miss"
+    );
+    assert_eq!(open_batch[1], Some(noted));
+    assert_eq!(open_batch[2], None);
+    for (i, off) in open_offs.iter().enumerate() {
+        assert_eq!(open_batch[i], log.slot(*off));
+    }
+    log.commit_open(1, 8192, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(16, shadow)]).unwrap();
+    let offs = [16u64, 24, 4096];
+    let batch = log.slots_at(&offs);
+    for (i, off) in offs.iter().enumerate() {
+        assert_eq!(batch[i], log.slot(*off));
+    }
+    assert_eq!(
+        batch[0],
+        Some(shadow),
+        "a later note shadows the page image"
+    );
+    assert_eq!(
+        batch[1],
+        Some([0u8; 8]),
+        "a slot with no note is the committed image"
+    );
+    assert_eq!(batch[2], None, "the next page was never noted");
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 fn zeros(off: u64, len: usize) -> Result<Vec<u8>, StoreError> {

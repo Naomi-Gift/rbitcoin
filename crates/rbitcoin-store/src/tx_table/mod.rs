@@ -1120,6 +1120,45 @@ fn publish_body_pair(
     Ok((fks, left_ok && right_ok))
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static SPEND_META_BATCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static SPEND_META_PEEK_GROUPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Zero the debug counters [`spend_meta_read_counts`] returns.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn reset_spend_meta_read_counts() {
+    SPEND_META_BATCHES.with(|n| n.set(0));
+    SPEND_META_PEEK_GROUPS.with(|n| n.set(0));
+}
+
+/// `(directory-or-body batch calls, body peek groups)` since the last reset.
+///
+/// A group is one [`crate::idx_body_pipeline::plan_spend_slot_peeks`] result.
+/// Directory hits add a batch and zero groups.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn spend_meta_read_counts() -> (u64, u64) {
+    (
+        SPEND_META_BATCHES.with(|n| n.get()),
+        SPEND_META_PEEK_GROUPS.with(|n| n.get()),
+    )
+}
+
+fn note_spend_meta_read(groups: usize) {
+    #[cfg(debug_assertions)]
+    {
+        SPEND_META_BATCHES.with(|n| n.set(n.get().saturating_add(1)));
+        SPEND_META_PEEK_GROUPS.with(|n| n.set(n.get().saturating_add(groups as u64)));
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = groups;
+    }
+}
+
 impl TxTable {
     pub fn create(dir: &Path) -> Result<Self, StoreError> {
         Self::create_with_opts(dir, HeadOpenOpts::MAINNET)
@@ -2420,13 +2459,14 @@ impl TxTable {
         let body_path = self.spent.body_file_path();
 
         let mut out: Vec<Option<SpenderSlot>> = vec![None; abs_offs.len()];
+        let logged = self.spend_pages.slots_at(abs_offs);
         let mut submitted: Vec<usize> = Vec::with_capacity(abs_offs.len());
         for (i, &off) in abs_offs.iter().enumerate() {
             let end = off.saturating_add(META_LEN as u64);
             if end > body_pub {
                 continue;
             }
-            if let Some(raw) = self.spend_pages.slot(off) {
+            if let Some(raw) = logged[i] {
                 let (flags, field, vin) = decode_spent_slot(&raw)?;
                 out[i] = Some((field, flags, vin));
                 continue;
@@ -2434,11 +2474,13 @@ impl TxTable {
             submitted.push(i);
         }
         if submitted.is_empty() {
+            note_spend_meta_read(0);
             return Ok(out);
         }
 
         let live: Vec<u64> = submitted.iter().map(|&i| abs_offs[i]).collect();
         let plan = crate::idx_body_pipeline::plan_spend_slot_peeks(&live);
+        note_spend_meta_read(plan.len());
         let depth = crate::uring_session::DEFAULT_ENTRIES as usize;
         for chunk in plan.chunks(depth.max(1)) {
             read_spend_peek_chunk(
