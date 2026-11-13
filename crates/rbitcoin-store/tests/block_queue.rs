@@ -73,6 +73,23 @@ fn dequeue_above_keeps_the_cut_and_drops_the_unknown_height() {
 }
 
 #[test]
+fn id_window_drops_a_dequeued_prefix() {
+    let mut q = BlockQueue::empty();
+    q.enqueue(1, [1u8; 32], 1, b"a").unwrap();
+    q.enqueue(2, [2u8; 32], 1, b"b").unwrap();
+    q.enqueue(3, [3u8; 32], 1, b"c").unwrap();
+    assert_eq!(q.index.span(), 3);
+    assert_eq!(q.dequeue_height(1).unwrap(), 1);
+    assert_eq!(q.dequeue_height(2).unwrap(), 1);
+    assert_eq!(q.index.span(), 1, "a dropped prefix is not kept as slots");
+    assert_eq!(q.count(), 1);
+    let id = q.id_for_height(3).unwrap();
+    assert_eq!(q.get(id).unwrap().unwrap().height, 3);
+    assert!(q.get(1).unwrap().is_none());
+    assert_eq!(q.ids(), vec![id]);
+}
+
+#[test]
 fn get_by_height_peek_without_dequeue() {
     let dir = temp();
     let mut q = BlockQueue::open_or_create(&dir).unwrap();

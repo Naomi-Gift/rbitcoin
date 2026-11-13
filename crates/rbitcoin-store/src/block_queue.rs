@@ -19,7 +19,7 @@
 
 use crate::error::StoreError;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -343,8 +343,8 @@ impl QueuedHeights {
 /// compatibility and to optionally ignore/remove a legacy `block_queue/` dir.
 pub struct BlockQueue {
     pub next_id: AtomicU64,
-    /// id → entry (payload owned). Ascending id is enqueue order.
-    pub index: BTreeMap<u64, IndexEntry>,
+    /// id → entry. A window from the oldest live id.
+    pub index: IdWindow,
     /// First-wins height → id. A window from the lowest queued height.
     /// Height APIs must not walk `index.values()`.
     pub height_to_id: HeightWindow,
@@ -370,6 +370,141 @@ pub struct IndexEntry {
     pub sender: Option<u64>,
 }
 
+/// Queue id → row. Ids come from `fetch_add(1)`, so the live ids are a
+/// window from the oldest survivor. A dropped prefix stays until it is at
+/// least as long as the live tail, then the tail is moved once.
+#[derive(Debug)]
+pub struct IdWindow {
+    base: u64,
+    start: usize,
+    slots: Vec<Option<IndexEntry>>,
+    live: usize,
+}
+
+impl IdWindow {
+    fn new() -> Self {
+        Self {
+            base: 0,
+            start: 0,
+            slots: Vec::new(),
+            live: 0,
+        }
+    }
+
+    /// Slots in the id window, including a hole that has not been compacted.
+    pub fn span(&self) -> usize {
+        self.slots.len()
+    }
+
+    fn len(&self) -> usize {
+        self.live
+    }
+
+    fn get(&self, id: u64) -> Option<&IndexEntry> {
+        let i = self.index_of(id)?;
+        if i < self.start {
+            return None;
+        }
+        self.slots.get(i)?.as_ref()
+    }
+
+    fn get_mut(&mut self, id: u64) -> Option<&mut IndexEntry> {
+        let i = self.index_of(id)?;
+        if i < self.start {
+            return None;
+        }
+        self.slots.get_mut(i)?.as_mut()
+    }
+
+    fn insert(&mut self, id: u64, entry: IndexEntry) {
+        if self.live == 0 {
+            self.base = id;
+            self.start = 0;
+            self.slots.clear();
+            self.slots.push(Some(entry));
+            self.live = 1;
+            return;
+        }
+        if id < self.base {
+            let gap = usize::try_from(self.base - id).unwrap_or(usize::MAX);
+            self.slots.splice(0..0, std::iter::repeat_n(None, gap));
+            self.base = id;
+            self.start = 0;
+            self.slots[0] = Some(entry);
+            self.live += 1;
+            return;
+        }
+        let i = (id - self.base) as usize;
+        if i >= self.slots.len() {
+            self.slots.resize(i + 1, None);
+        }
+        if self.slots[i].is_none() {
+            self.live += 1;
+        }
+        self.slots[i] = Some(entry);
+    }
+
+    fn remove(&mut self, id: u64) -> Option<IndexEntry> {
+        let i = self.index_of(id)?;
+        if i < self.start {
+            return None;
+        }
+        let prev = self.slots.get_mut(i)?.take()?;
+        self.live -= 1;
+        self.trim();
+        Some(prev)
+    }
+
+    fn ids(&self) -> Vec<u64> {
+        self.iter().map(|(id, _)| id).collect()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u64, &IndexEntry)> {
+        let base = self.base;
+        self.slots
+            .iter()
+            .enumerate()
+            .skip(self.start)
+            .filter_map(move |(i, slot)| slot.as_ref().map(|entry| (base + i as u64, entry)))
+    }
+
+    fn values(&self) -> impl Iterator<Item = &IndexEntry> {
+        self.slots
+            .iter()
+            .skip(self.start)
+            .filter_map(Option::as_ref)
+    }
+
+    fn index_of(&self, id: u64) -> Option<usize> {
+        id.checked_sub(self.base).map(|d| d as usize)
+    }
+
+    fn trim(&mut self) {
+        if self.live == 0 {
+            self.base = 0;
+            self.start = 0;
+            self.slots.clear();
+            self.slots.shrink_to_fit();
+            return;
+        }
+        while self.start < self.slots.len() && self.slots[self.start].is_none() {
+            self.start += 1;
+        }
+        while self.slots.len() > self.start && self.slots.last().is_some_and(|slot| slot.is_none())
+        {
+            self.slots.pop();
+        }
+        let tail = self.slots.len() - self.start;
+        if self.start > 0 && self.start >= tail {
+            let kept = self.slots.split_off(self.start);
+            self.base = self.base.saturating_add(self.start as u64);
+            self.start = 0;
+            self.slots = kept;
+            self.slots.shrink_to_fit();
+        }
+    }
+}
+
 impl BlockQueue {
     /// Create an empty in-RAM queue. Legacy on-disk `store_dir/block_queue/` is
     /// not loaded (redownload after restart); best-effort remove stale files.
@@ -385,7 +520,7 @@ impl BlockQueue {
     pub fn empty() -> Self {
         Self {
             next_id: AtomicU64::new(1),
-            index: BTreeMap::new(),
+            index: IdWindow::new(),
             height_to_id: HeightWindow::new(),
             by_hash: HashMap::new(),
             bytes: 0,
@@ -487,7 +622,7 @@ impl BlockQueue {
 
     /// Load payload by id.
     pub fn get(&self, id: u64) -> Result<Option<QueuedBlock>, StoreError> {
-        let Some(e) = self.index.get(&id) else {
+        let Some(e) = self.index.get(id) else {
             return Ok(None);
         };
         Ok(Some(QueuedBlock {
@@ -501,12 +636,12 @@ impl BlockQueue {
 
     /// List all ids ascending.
     pub fn ids(&self) -> Vec<u64> {
-        self.index.keys().copied().collect()
+        self.index.ids()
     }
 
     /// Remove after confirm-write / permanent reject.
     pub fn dequeue(&mut self, id: u64) -> Result<bool, StoreError> {
-        let Some(e) = self.index.remove(&id) else {
+        let Some(e) = self.index.remove(id) else {
             return Ok(false);
         };
         self.bytes = self.bytes.saturating_sub(e.body.charge());
@@ -523,7 +658,7 @@ impl BlockQueue {
     /// Take raw payload and remove the row. `None` if missing or already promoted.
     pub fn take_raw(&mut self, height: u32) -> Option<TakenRaw> {
         let id = self.height_to_id.get(height)?;
-        let e = self.index.get_mut(&id)?;
+        let e = self.index.get_mut(id)?;
         let payload = match &mut e.body {
             QueuedBody::Raw(v) => {
                 let arc = std::mem::replace(v, Arc::new(Vec::new()));
@@ -531,7 +666,7 @@ impl BlockQueue {
             }
             QueuedBody::Promoted { .. } => return None,
         };
-        let e = self.index.get(&id)?;
+        let e = self.index.get(id)?;
         let out = TakenRaw {
             hash: e.hash,
             header_fk: e.header_fk,
@@ -591,7 +726,7 @@ impl BlockQueue {
                     let Some(wire) = self
                         .height_to_id
                         .get(h)
-                        .and_then(|id| self.index.get(&id))
+                        .and_then(|id| self.index.get(id))
                         .map(|e| e.body.charge())
                     else {
                         break;
@@ -612,7 +747,7 @@ impl BlockQueue {
     pub fn list_meta(&self) -> Vec<QueuedBlockMeta> {
         self.index
             .iter()
-            .map(|(&id, e)| QueuedBlockMeta {
+            .map(|(id, e)| QueuedBlockMeta {
                 id,
                 height: e.height,
                 hash: e.hash,
@@ -672,13 +807,13 @@ impl BlockQueue {
     pub fn entry_for_height(&self, height: u32) -> Option<&IndexEntry> {
         self.height_to_id
             .get(height)
-            .and_then(|id| self.index.get(&id))
+            .and_then(|id| self.index.get(id))
     }
 
     #[doc(hidden)]
     pub fn entry_mut_for_height(&mut self, height: u32) -> Result<&mut IndexEntry, StoreError> {
         let id = self.height_to_id.get(height).ok_or(StoreError::NotFound)?;
-        self.index.get_mut(&id).ok_or(StoreError::NotFound)
+        self.index.get_mut(id).ok_or(StoreError::NotFound)
     }
 
     /// Lookup finished this height: every external parent has a hit (or none exist).
@@ -703,7 +838,7 @@ impl BlockQueue {
         self.height_to_id
             .ids_in_span(lo, hi)
             .into_iter()
-            .filter_map(|(height, id)| self.index.get(&id).map(|e| (height, e.hash)))
+            .filter_map(|(height, id)| self.index.get(id).map(|e| (height, e.hash)))
             .collect()
     }
 
