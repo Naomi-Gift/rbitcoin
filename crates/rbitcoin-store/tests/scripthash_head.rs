@@ -174,9 +174,16 @@ fn sh_head_one_key_roundtrip() {
     let h = ScriptHashHead::create_with_slots(&path, 64).unwrap();
     let mut key = [0u8; 32];
     key[0] = 3;
-    let val = ShHeadValue::inline_one(Fk(19));
-    h.insert(&key, &val).unwrap();
-    assert_eq!(h.get(&key).unwrap().unwrap(), val);
+    h.insert_many(&[
+        (key, ShHeadValue::inline_one(Fk(19))),
+        (key, ShHeadValue::inline_one(Fk(20))),
+    ])
+    .unwrap();
+    assert_eq!(
+        h.get(&key).unwrap().unwrap(),
+        ShHeadValue::inline_one(Fk(20))
+    );
+    assert_eq!(h.occupied(), 1);
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(occ_sidecar_path(&path));
 }

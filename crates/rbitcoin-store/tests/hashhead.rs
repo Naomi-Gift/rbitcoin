@@ -366,7 +366,8 @@ fn hashhead_one_key_roundtrip() {
     let h = HashHead::create_with_slots(&path, 64).unwrap();
     let mut key = [0u8; 32];
     key[0] = 9;
-    h.insert_many(&[(key, Fk(77))]).unwrap();
-    assert_eq!(h.get(&key).unwrap(), Some(Fk(77)));
+    h.insert_many(&[(key, Fk(77)), (key, Fk(78))]).unwrap();
+    assert_eq!(h.get_all(&key).unwrap(), vec![Fk(78), Fk(77)]);
+    assert_eq!(h.occupied(), 1);
     cleanup_hh(&path);
 }
