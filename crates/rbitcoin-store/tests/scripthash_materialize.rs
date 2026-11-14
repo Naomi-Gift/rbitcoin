@@ -644,6 +644,10 @@ fn phase_done_reads_the_last_fk_and_ignores_a_short_file() {
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     write_phase_done(&dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, 42, &[3, 4]).unwrap();
+    assert_eq!(
+        read_phase_done(&dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, 2).map(|d| d.counts),
+        Some(vec![3, 4])
+    );
     assert_eq!(unsorted_done_last_fk(&dir, 2), Some(42));
     let path = dir.join(KEYS_DONE_NAME);
     let mut bytes = std::fs::read(&path).unwrap();

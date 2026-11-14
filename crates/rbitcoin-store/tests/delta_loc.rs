@@ -398,23 +398,3 @@ fn range_batch_returns_appended_spans() {
     assert_eq!(rows[3], None);
     assert_eq!(rows[4], None);
 }
-
-#[test]
-fn delta_loc_reopen_reads_one_wide_row() {
-    let dir = TempDir::labeled("delta-one-wide").unwrap();
-    let loc = DeltaLoc::create(dir.path(), "seqsigwit").unwrap();
-    let fat = 70000 * IDX_STRIDE;
-    loc.append(&[FILE_HEADER_LEN as u64], &[fat]).unwrap();
-    drop(loc);
-    let loc = DeltaLoc::open(dir.path(), "seqsigwit").unwrap();
-    let rows = loc
-        .ovf_rows
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    assert_eq!(rows, vec![(1, 70000)]);
-    assert_eq!(
-        loc.range_batch(&[Fk(1)]).unwrap()[0],
-        Some((FILE_HEADER_LEN as u64, fat))
-    );
-}

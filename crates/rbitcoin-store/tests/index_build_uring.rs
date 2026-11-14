@@ -206,12 +206,16 @@ fn tweak_window_reads_the_parent_txid() {
         .write(true)
         .open(&txid_path)
         .unwrap()
-        .set_len(40)
+        .set_len(
+            rbitcoin_store::txid_body::TXID_BODY_HEADER
+                + rbitcoin_store::txid_body::TXID_ENTRY_LEN
+                + 8,
+        )
         .unwrap();
     match read_index_window(&t, &one_child(true)) {
         Err(err) => {
             let msg = err.to_string();
-            assert!(msg.contains("short") || msg.contains("txid"), "{msg}");
+            assert!(msg.contains("short"), "{msg}");
         }
         Ok(_) => panic!("a short txid body was read"),
     }

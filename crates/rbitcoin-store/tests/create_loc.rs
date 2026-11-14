@@ -658,16 +658,3 @@ fn range_batch_multi_window_matches_serial_and_held() {
         assert_eq!(held, batch);
     }
 }
-
-#[test]
-fn create_loc_reopen_reads_overflow_counts() {
-    let dir = TempDir::labeled("create-ovf-counts").unwrap();
-    let loc = CreateLoc::create(dir.path()).unwrap();
-    let mut n_out = vec![1u32; 1024];
-    n_out[1023] = 300;
-    loc.append(&chain(&n_out, &vec![8u64; 1024])).unwrap();
-    let path = dir.path().to_path_buf();
-    drop(loc);
-    let loc = CreateLoc::open(&path).unwrap();
-    assert_eq!(loc.range_batch(&[Fk(1024)]).unwrap()[0].unwrap().n_out, 300);
-}

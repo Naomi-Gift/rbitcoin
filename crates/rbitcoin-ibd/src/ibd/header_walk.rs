@@ -3743,13 +3743,13 @@ pub fn write_diff(buf: &mut Vec<u8>, diff: &DiffSnap) {
     buf.extend_from_slice(&bits.to_le_bytes());
 }
 
-#[doc(hidden)]
 fn le_u32_exact(bytes: &[u8], off: usize) -> u32 {
     let mut word = [0u8; 4];
     word.copy_from_slice(&bytes[off..off + 4]);
     u32::from_le_bytes(word)
 }
 
+#[doc(hidden)]
 pub fn read_diff(bytes: &[u8]) -> Option<DiffSnap> {
     if bytes.len() < DIFF_SNAP_LEN {
         return None;
