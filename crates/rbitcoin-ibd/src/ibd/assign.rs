@@ -112,10 +112,37 @@ pub fn need_body_in_hand(st: &IbdWorkState, hub: &ChainHub, h: &BlockHash) -> bo
         || hub.query.block_queue_has_hash(&h.to_byte_array())
 }
 
+/// Occupant of `path_lo` when that hash still needs a body and `hash_height`
+/// still records it there.
+///
+/// `None` leaves the question open. The caller scans `hash_height` for a
+/// competitor: no occupant, the map moved that hash, or the occupant is
+/// dead or already in hand.
+#[doc(hidden)]
+pub fn path_lo_occupant_needs_body(
+    st: &IbdWorkState,
+    hub: &ChainHub,
+    path_lo: u32,
+) -> Option<BlockHash> {
+    let h = *st.height_to_hash.get(&path_lo)?;
+    if st.hash_height.get(&h) != Some(&path_lo) {
+        return None;
+    }
+    if need_body_dead(st, &h) || need_body_in_hand(st, hub, &h) {
+        return None;
+    }
+    Some(h)
+}
+
 #[doc(hidden)]
 pub fn need_path_lo_alt(st: &IbdWorkState, hub: &ChainHub, path_lo: u32) -> bool {
+    if path_lo_occupant_needs_body(st, hub, path_lo).is_some() {
+        return true;
+    }
+    // The occupant does not open the gate. A moved hash is not at this height.
+    let skip = st.height_to_hash.get(&path_lo).copied();
     for (&h, &ht) in &st.hash_height {
-        if ht != path_lo {
+        if ht != path_lo || skip == Some(h) {
             continue;
         }
         if need_body_dead(st, &h) {

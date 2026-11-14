@@ -38,6 +38,81 @@ fn need_any_valid_body_download_empty_and_missing_tip_child() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// The height-index occupant opens the gate only while `hash_height` still
+/// records that hash at the height and the body is still needed. A dead or
+/// archived occupant, or a hash the map has moved, leaves the question open
+/// so a competitor at that height is still seen.
+#[test]
+fn path_lo_occupant_needs_body_when_the_slot_still_matches() {
+    let (dir, hub) = tmp_hub();
+    hub.ensure_genesis().unwrap();
+    let mut st = IbdWorkState::new(Vec::new(), hub.tip_hash(), hub.tip_height());
+    let path_lo = hub.tip_height().unwrap().saturating_add(1);
+    let occupant = h(0x21);
+    let other = h(0x22);
+    st.record_height(occupant, path_lo);
+    st.hash_height.insert(other, path_lo);
+    st.body.mark_missing(occupant);
+    st.body.mark_missing(other);
+    assert_eq!(
+        path_lo_occupant_needs_body(&st, &hub, path_lo),
+        Some(occupant),
+        "an occupant that still needs a body settles the gate"
+    );
+    assert!(need_path_lo_alt(&st, &hub, path_lo));
+
+    st.body.mark_archived(occupant);
+    assert_eq!(
+        path_lo_occupant_needs_body(&st, &hub, path_lo),
+        None,
+        "an archived occupant does not settle the gate"
+    );
+    assert!(
+        need_path_lo_alt(&st, &hub, path_lo),
+        "a competitor still opens the gate when the occupant is in hand"
+    );
+
+    st.body.mark_archived(other);
+    assert_eq!(path_lo_occupant_needs_body(&st, &hub, path_lo), None);
+    assert!(
+        !need_path_lo_alt(&st, &hub, path_lo),
+        "both hashes in hand leave nothing to fetch"
+    );
+
+    st.body.mark_missing(occupant);
+    st.body.mark_rejected(occupant);
+    st.body.mark_missing(other);
+    assert_eq!(
+        path_lo_occupant_needs_body(&st, &hub, path_lo),
+        None,
+        "a rejected occupant does not settle the gate"
+    );
+    assert!(
+        need_path_lo_alt(&st, &hub, path_lo),
+        "a live competitor still opens the gate"
+    );
+
+    st.hash_height.insert(occupant, path_lo.saturating_add(1));
+    st.body.mark_missing(occupant);
+    st.hash_height.remove(&other);
+    assert_eq!(
+        path_lo_occupant_needs_body(&st, &hub, path_lo),
+        None,
+        "a moved hash is not the occupant answer"
+    );
+    assert!(
+        !need_path_lo_alt(&st, &hub, path_lo),
+        "the height map, not the stale slot, decides there is nothing at this height"
+    );
+
+    st.height_to_hash.remove(&path_lo);
+    st.hash_height.insert(other, path_lo);
+    st.body.mark_missing(other);
+    assert_eq!(path_lo_occupant_needs_body(&st, &hub, path_lo), None);
+    assert!(need_path_lo_alt(&st, &hub, path_lo));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 pub(crate) fn h(n: u32) -> BlockHash {
     let mut b = [0u8; 32];
     b[0..4].copy_from_slice(&n.to_le_bytes());
