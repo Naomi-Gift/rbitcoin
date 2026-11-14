@@ -18,6 +18,12 @@ pub const MIN_RELAY_FEE_RATE_SAT_PER_KVB: u64 = 100;
 /// Absolute weight cap for a single transaction (4_000_000 = block weight).
 pub const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
 
+/// `getmempoolinfo.maxdatacarriersize`: Core 32.1's default cap
+/// ([`MAX_STANDARD_TX_WEIGHT`] / 4). Libre does not enforce a datacarrier
+/// cap, and that default does not bind a standard-weight transaction either,
+/// so both report the same number. Core prints 0 only for `-datacarrier=0`.
+pub const MAX_DATACARRIER_REPORTED_BYTES: u64 = MAX_STANDARD_TX_WEIGHT / 4;
+
 /// BIP 431 TRUC: the `nVersion` that opts in (Core `TRUC_VERSION`).
 pub const TRUC_VERSION: i32 = 3;
 /// Largest TRUC tx, in sigop-adjusted vbytes (Core `TRUC_MAX_VSIZE`).

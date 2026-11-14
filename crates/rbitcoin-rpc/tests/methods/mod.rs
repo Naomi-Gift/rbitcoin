@@ -2696,6 +2696,33 @@ fn getblock_named_verbose_genesis_and_hex() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Core `getblock` verbosity 1 carries `size`, `strippedsize` and `weight` for
+/// a side-branch block too; they are the block's own, equal to what it showed
+/// while it was active and to verbosity 2 and 3.
+#[test]
+fn stale_block_v1_carries_size_fields() {
+    let (ctx, dir, _hub) = ctx_from_mature_pad(300_000_000);
+    let parent_sat = generated_coinbase_value(&ctx, 1);
+    let (hex, _) =
+        mature_coinbase_spend(&ctx, parent_sat - 1_000, ScriptBuf::from_bytes(vec![0x51]));
+    dispatch(&ctx, "sendrawtransaction", vec![json!(hex)]).unwrap();
+    let tip = dispatch(&ctx, "generate", vec![json!(1)]).unwrap()[0].clone();
+    let active = dispatch(&ctx, "getblock", vec![tip.clone(), json!(1)]).unwrap();
+    dispatch(&ctx, "invalidateblock", vec![tip.clone()]).unwrap();
+    for verbosity in [1, 2, 3] {
+        let stale = dispatch(&ctx, "getblock", vec![tip.clone(), json!(verbosity)]).unwrap();
+        assert_eq!(stale["confirmations"], json!(-1), "{stale}");
+        for field in ["size", "strippedsize", "weight"] {
+            assert!(
+                stale[field].is_u64(),
+                "v{verbosity} {field} missing: {stale}"
+            );
+            assert_eq!(stale[field], active[field], "v{verbosity} {field}");
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Core `mediantime` on an inactive header is the median of that header and
 /// up to 10 ancestors, not the header's own timestamp.
 #[test]

@@ -1197,7 +1197,9 @@ fn chain_ops_mempoolinfo_constants(ctx: &RpcContext) {
     let mem = dispatch(ctx, "getmempoolinfo", vec![]).unwrap();
     assert_eq!(mem["permitbaremultisig"], true, "{mem}");
     assert_eq!(mem["fullrbf"], true);
-    assert!(mem["maxdatacarriersize"].is_null());
+    // Core prints a number (default 100000). Libre has no datacarrier cap;
+    // the tx weight bound makes 100000 the largest reachable script.
+    assert_eq!(mem["maxdatacarriersize"], 100_000, "{mem}");
     assert_eq!(mem["limitclustercount"], 64);
     assert_eq!(mem["limitclustersize"], 101_000);
     assert_eq!(mem["loaded"], true);
