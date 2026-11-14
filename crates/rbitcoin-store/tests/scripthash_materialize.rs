@@ -618,3 +618,43 @@ fn fold_posts_spill_bytes_reads_key_count_and_refuses_short() {
         other => panic!("bad magic must refuse, got {other:?}"),
     }
 }
+
+#[test]
+fn key16_hasher_reads_sixteen_and_skips_short() {
+    let mut k = [0u8; KEY16_LEN];
+    k[0..8].copy_from_slice(&9u64.to_le_bytes());
+    k[8..16].copy_from_slice(&4u64.to_le_bytes());
+    let mut h = Key16IdentityHasher::default();
+    h.write(&k);
+    assert_eq!(h.finish(), 9 ^ 4);
+    h.write(&[1, 2, 3, 4]);
+    assert_eq!(h.finish(), 9 ^ 4);
+}
+
+#[test]
+fn phase_done_reads_the_last_fk_and_ignores_a_short_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "rbitcoin-phase-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    write_phase_done(&dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, 42, &[3, 4]).unwrap();
+    assert_eq!(
+        read_phase_done(&dir, KEYS_DONE_NAME, KEYS_DONE_MAGIC, 2).map(|d| d.counts),
+        Some(vec![3, 4])
+    );
+    assert_eq!(unsorted_done_last_fk(&dir, 2), Some(42));
+    let path = dir.join(KEYS_DONE_NAME);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.truncate(20);
+    std::fs::write(&path, &bytes).unwrap();
+    assert_eq!(unsorted_done_last_fk(&dir, 2), None);
+    std::fs::write(&path, b"SHKEYS02").unwrap();
+    assert_eq!(unsorted_done_last_fk(&dir, 2), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}

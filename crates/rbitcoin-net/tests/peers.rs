@@ -2085,3 +2085,19 @@ fn filter_and_compact_block_replies_charge_their_consensus_payload() {
         "a served compact block uses the same payload charge"
     );
 }
+
+#[test]
+fn pong_reads_eight_byte_nonce_and_rejects_short() {
+    let hub = PeerHub::new();
+    let a = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 1);
+    let p = hub.register(a, a, &ver("/rbitcoin:test/"), false, PeerConnType::Inbound);
+    let nonce = p.take_ping_send(10_000).expect("ping due");
+    assert!(p.on_pong(&nonce.to_le_bytes(), 10_001).is_none());
+    let short = p.on_pong(&[1, 2, 3], 10_002).expect("short pong");
+    assert!(short.contains("Short payload"), "{short}");
+    let nonce = p.take_ping_send(10_200).expect("next ping");
+    let mut wrong = nonce.to_le_bytes();
+    wrong[0] ^= 0xff;
+    let mismatch = p.on_pong(&wrong, 10_201).expect("mismatched pong");
+    assert!(mismatch.contains("Nonce mismatch"), "{mismatch}");
+}

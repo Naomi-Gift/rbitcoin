@@ -22,7 +22,7 @@ use crate::scripthash_layout::{head_key_from_full, ShHeadKey, SH_HEAD_KEY_LEN};
 use crate::scripthash_mphf::{mix_key16, mphf_path, val_path, MphfHead};
 use crate::store::Store;
 use crate::tx_table::TxTable;
-use rbitcoin_primitives::{le_u32, read_uleb128, write_uleb128, Fk};
+use rbitcoin_primitives::{le_u32, le_u64, read_uleb128, write_uleb128, Fk};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
@@ -314,18 +314,21 @@ pub fn read_phase_done(
     if buf.len() < 20 || &buf[0..8] != magic {
         return None;
     }
-    let n = u32::from_le_bytes(buf[8..12].try_into().ok()?) as usize;
+    let mut n_bytes = [0u8; 4];
+    n_bytes.copy_from_slice(&buf[8..12]);
+    let n = le_u32!(n_bytes, 0) as usize;
     if n != n_shards {
         return None;
     }
-    let last_fk = u64::from_le_bytes(buf[12..20].try_into().ok()?);
+    let mut last = [0u8; 8];
+    last.copy_from_slice(&buf[12..20]);
+    let last_fk = le_u64!(last, 0);
     if buf.len() != 20 + n * 8 {
         return None;
     }
     let mut counts = Vec::with_capacity(n);
-    for i in 0..n {
-        let o = 20 + i * 8;
-        counts.push(u64::from_le_bytes(buf[o..o + 8].try_into().ok()?));
+    for row in buf[20..].as_chunks::<8>().0 {
+        counts.push(le_u64!(row, 0));
     }
     Some(PhaseDone { last_fk, counts })
 }
@@ -408,10 +411,8 @@ pub fn note_scanned_fks(scanned: &AtomicU64, lo: u64, hi: u64) -> u64 {
 }
 
 #[doc(hidden)]
-pub fn key16_halves_bytes(bytes: &[u8]) -> (u64, u64) {
-    let a = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
-    let b = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
-    (a, b)
+pub fn key16_halves_bytes(bytes: &[u8; KEY16_LEN]) -> (u64, u64) {
+    (le_u64!(bytes, 0), le_u64!(bytes, 8))
 }
 
 /// Identity hasher for uniform key16: `finish()` is the xor of the two LE u64 halves.
@@ -424,7 +425,9 @@ impl Hasher for Key16IdentityHasher {
     #[inline]
     fn write(&mut self, bytes: &[u8]) {
         if bytes.len() == KEY16_LEN {
-            let (a, b) = key16_halves_bytes(bytes);
+            let mut key = [0u8; KEY16_LEN];
+            key.copy_from_slice(bytes);
+            let (a, b) = key16_halves_bytes(&key);
             self.0 = a ^ b;
         }
     }

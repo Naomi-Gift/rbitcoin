@@ -5260,3 +5260,77 @@ fn output_value_sums_missing_location_is_an_error() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn input_sequence_and_create_fk_keep_values_and_reject_short() {
+    let flags =
+        input_flags::PREV_ON_INPUTS | input_flags::EMPTY_SCRIPT | input_flags::EMPTY_WITNESS;
+    let mut buf = vec![flags];
+    buf.extend_from_slice(&0x11u32.to_le_bytes());
+    let (rec, n) = InputRecord::decode_at(&buf).unwrap();
+    assert_eq!(n, 5);
+    assert_eq!(rec.sequence, 0x11);
+    match InputRecord::decode_at(&buf[..3]) {
+        Err(StoreError::Corrupt("input sequence truncated")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a short sequence decoded"),
+    }
+
+    let mut prev = Vec::new();
+    prev.extend_from_slice(&7u64.to_le_bytes());
+    prev.push(2);
+    let mut off = 0usize;
+    let got = read_inline_prevout(&prev, 0, &mut off).unwrap();
+    assert_eq!(got, Some((Fk(7), 2)));
+    assert_eq!(off, 9);
+    match read_inline_prevout(&prev[..4], 0, &mut 0) {
+        Err(StoreError::Corrupt("input create_fk truncated")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a short create_fk decoded"),
+    }
+    let mut zero = 0u64.to_le_bytes().to_vec();
+    zero.push(0);
+    match read_inline_prevout(&zero, 0, &mut 0) {
+        Err(StoreError::Corrupt("non-coinbase create_fk is null")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a null create_fk decoded"),
+    }
+}
+
+#[test]
+fn txid_pread_pairs_keep_the_written_id_and_reject_short() {
+    use rbitcoin_store::io_handle::IoHandle;
+    use rbitcoin_store::store_secret::StoreSecret;
+    use rbitcoin_store::txid_body::TXID_BODY_HEADER;
+    use std::fs::OpenOptions;
+    use std::io::Write;
+
+    let dir = tempfile_dir("txid-pread");
+    let path = dir.join("txid.body");
+    let mut txid = [0u8; 32];
+    txid[0] = 0x5a;
+    let mut raw = vec![0u8; TXID_BODY_HEADER as usize];
+    raw.extend_from_slice(&txid);
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap();
+    file.write_all(&raw).unwrap();
+    let secret = StoreSecret::from_bytes([3u8; 32]);
+    let fd = IoHandle::from_file(&file);
+    let pairs = TxTable::fuse_pairs_from_txid_pread(fd, &path, &secret, 1, 1).unwrap();
+    assert_eq!(pairs.len(), 1);
+    assert_eq!(pairs[0].1, 1);
+    let expect = rbitcoin_store::fuse8_filter::fuse_key_from_mixed(&secret.mix_txid(&txid));
+    assert_eq!(pairs[0].0, expect);
+
+    file.set_len(TXID_BODY_HEADER + 8).unwrap();
+    match TxTable::fuse_pairs_from_txid_pread(IoHandle::from_file(&file), &path, &secret, 1, 1) {
+        Err(StoreError::Corrupt("tx.head seal collect txid.body short")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a short txid body collected"),
+    }
+}

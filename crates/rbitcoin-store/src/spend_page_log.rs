@@ -12,7 +12,9 @@
 use crate::error::StoreError;
 use crate::file::{fsync_parent_dir, write_file_synced_tmp_rename, write_synced_tmp_file};
 use crate::tx_table::BODY_PAGE_SIZE;
-use rbitcoin_primitives::{schema_file_openable, SCHEMA_VERSION, STORE_MAGIC};
+use rbitcoin_primitives::{
+    le_u16, le_u32, le_u64, schema_file_openable, SCHEMA_VERSION, STORE_MAGIC,
+};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2214,31 +2216,37 @@ fn parse_commit(buf: &[u8]) -> Result<ParsedCommit, StoreError> {
     if buf[..4] != STORE_MAGIC {
         return Err(StoreError::BadMagic);
     }
-    let ver = u16::from_le_bytes(buf[4..6].try_into().unwrap());
+    let mut head = [0u8; COMMIT_HEAD];
+    head.copy_from_slice(&buf[..COMMIT_HEAD]);
+    let ver = le_u16!(head, 4);
     if !schema_file_openable(ver) {
         return Err(StoreError::BadSchema(ver));
     }
-    let fold_held = u16::from_le_bytes(buf[6..8].try_into().unwrap()) != 0;
-    let height = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-    let generation = u32::from_le_bytes(buf[12..16].try_into().unwrap());
-    let committed_len = u64::from_le_bytes(buf[16..24].try_into().unwrap());
-    let n = u32::from_le_bytes(buf[24..28].try_into().unwrap()) as usize;
+    let fold_held = le_u16!(head, 6) != 0;
+    let height = le_u32!(head, 8);
+    let generation = le_u32!(head, 12);
+    let committed_len = le_u64!(head, 16);
+    let n = le_u32!(head, 24) as usize;
     let need = COMMIT_HEAD.saturating_add(n.saturating_mul(COMMIT_REC));
     if buf.len() < need {
         return Err(StoreError::Corrupt("spend.pages.commit short"));
     }
     let sealed_tip = if buf.len() >= need + 4 {
-        u32::from_le_bytes(buf[need..need + 4].try_into().unwrap())
+        let mut tip = [0u8; 4];
+        tip.copy_from_slice(&buf[need..need + 4]);
+        le_u32!(tip, 0)
     } else {
         height
     };
     let mut recs = Vec::with_capacity(n);
     for i in 0..n {
         let at = COMMIT_HEAD + i * COMMIT_REC;
+        let mut rec = [0u8; COMMIT_REC];
+        rec.copy_from_slice(&buf[at..at + COMMIT_REC]);
         recs.push(CommitRec {
-            page_off: u64::from_le_bytes(buf[at..at + 8].try_into().unwrap()),
-            log_off: u64::from_le_bytes(buf[at + 8..at + 16].try_into().unwrap()),
-            image_len: u32::from_le_bytes(buf[at + 16..at + 20].try_into().unwrap()),
+            page_off: le_u64!(rec, 0),
+            log_off: le_u64!(rec, 8),
+            image_len: le_u32!(rec, 16),
         });
     }
     Ok(ParsedCommit {

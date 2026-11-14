@@ -83,7 +83,7 @@ pub(crate) fn unresolved_ovf_cut(
     if ovf.pread_all(ovf.logical_len(), &mut row[..width]).is_err() {
         return Ok(None);
     }
-    cut_for_ovf_row(loc, count, last_ovf_fk, &row[..width], pair)
+    cut_for_ovf_row(loc, count, last_ovf_fk, &row, pair)
 }
 
 /// Creates covered while the overflow header lags the RAM end.
@@ -111,7 +111,7 @@ pub(crate) fn withheld_ovf_limit(
     let last_ovf_fk = if durable_data >= width {
         let mut row = [0u8; 16];
         ovf.pread_all(durable_end - width, &mut row[..width as usize])?;
-        u64::from_le_bytes(row[0..8].try_into().unwrap())
+        le_u64!(row, 0)
     } else {
         0
     };
@@ -135,17 +135,17 @@ fn ovf_row_cut(
     let width = if pair { 16 } else { 12 };
     let mut row = [0u8; 16];
     ovf.pread_all(row_at, &mut row[..width])?;
-    cut_for_ovf_row(loc, count, last_ovf_fk, &row[..width], pair)
+    cut_for_ovf_row(loc, count, last_ovf_fk, &row, pair)
 }
 
 fn cut_for_ovf_row(
     loc: &TableFile,
     count: u64,
     last_ovf_fk: u64,
-    row: &[u8],
+    row: &[u8; 16],
     pair: bool,
 ) -> Result<Option<u64>, StoreError> {
-    let fk = u64::from_le_bytes(row[0..8].try_into().unwrap());
+    let fk = le_u64!(row, 0);
     if fk == 0 || fk <= last_ovf_fk || fk > count {
         return Ok(None);
     }
@@ -157,10 +157,10 @@ fn cut_for_ovf_row(
     Ok(Some(fk.saturating_sub(1)))
 }
 
-fn ovf_row_matches_slot(row: &[u8], slot: &[u8; 2], pair: bool) -> bool {
+fn ovf_row_matches_slot(row: &[u8; 16], slot: &[u8; 2], pair: bool) -> bool {
     if pair {
-        let strides = u32::from_le_bytes(row[8..12].try_into().unwrap());
-        let n_out = u32::from_le_bytes(row[12..16].try_into().unwrap());
+        let strides = le_u32!(row, 8);
+        let n_out = le_u32!(row, 12);
         if slot[0] != 0 && u32::from(slot[0]) != strides {
             return false;
         }
@@ -174,7 +174,7 @@ fn ovf_row_matches_slot(row: &[u8], slot: &[u8; 2], pair: bool) -> bool {
     if slot[0] != 0 || slot[1] != 0 {
         return false;
     }
-    u32::from_le_bytes(row[8..12].try_into().unwrap()) >= 65536
+    le_u32!(row, 8) >= 65536
 }
 
 #[doc(hidden)]

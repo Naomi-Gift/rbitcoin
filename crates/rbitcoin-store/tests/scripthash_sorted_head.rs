@@ -151,3 +151,26 @@ fn sorted_ovf_fuse_skips_pread_on_miss() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(idx_path(&path));
 }
+
+#[test]
+fn sorted_idx_roundtrip_and_short_file() {
+    let path = tmp();
+    let rows = vec![(key_of(1), 24u64), (key_of(2), 48)];
+    write_idx(&path, &rows).unwrap();
+    assert_eq!(read_idx(&path).unwrap(), rows);
+    std::fs::write(&path, b"SHIX").unwrap();
+    match read_idx(&path) {
+        Err(StoreError::Corrupt("scripthash sorted head: bad idx")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a short idx opened"),
+    }
+    let mut hdr = vec![0u8; IDX_HEADER_LEN + 8];
+    hdr[0..4].copy_from_slice(IDX_MAGIC);
+    hdr[6..10].copy_from_slice(&1u32.to_le_bytes());
+    std::fs::write(&path, &hdr).unwrap();
+    match read_idx(&path) {
+        Err(StoreError::Corrupt("scripthash sorted head: short idx")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a truncated idx entry opened"),
+    }
+}

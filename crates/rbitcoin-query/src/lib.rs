@@ -146,7 +146,13 @@ use bitcoin::{
     Amount, Block, BlockHash, CompactTarget, OutPoint, ScriptBuf, Sequence, Transaction, TxIn,
     TxMerkleNode, TxOut, Witness,
 };
-use rbitcoin_primitives::{Fk, Height};
+use rbitcoin_primitives::{le_u32, le_u64, Fk, Height};
+
+fn spill_id_len(raw: &[u8], i: usize) -> (u64, usize) {
+    let mut hdr = [0u8; 12];
+    hdr.copy_from_slice(&raw[i..i + 12]);
+    (le_u64!(hdr, 0), le_u32!(hdr, 8) as usize)
+}
 use rbitcoin_store::{
     script_hash, HeaderRecord, InputRecord, OutputRecord, PointRecord, ScriptHashRecord,
     SpTweaksTable, Store, StoreError, StoreLayout, TxRecord,
@@ -1670,10 +1676,8 @@ impl Query {
         }
         let mut i = 0usize;
         while i.saturating_add(12) <= raw.len() && !need.is_empty() {
-            let id = u64::from_le_bytes(raw[i..i + 8].try_into().unwrap());
-            i += 8;
-            let n = u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()) as usize;
-            i += 4;
+            let (id, n) = spill_id_len(&raw, i);
+            i += 12;
             if i.saturating_add(n) > raw.len() {
                 return Err(StoreError::Corrupt("seqsigwit spill short row"));
             }
@@ -1706,10 +1710,8 @@ impl Query {
         let mut i = 0usize;
         let want = fk.get().ok_or(StoreError::InvalidFk)?;
         while i.saturating_add(12) <= raw.len() {
-            let id = u64::from_le_bytes(raw[i..i + 8].try_into().unwrap());
-            i += 8;
-            let n = u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()) as usize;
-            i += 4;
+            let (id, n) = spill_id_len(&raw, i);
+            i += 12;
             if i.saturating_add(n) > raw.len() {
                 return Err(StoreError::Corrupt("seqsigwit spill short row"));
             }
@@ -1780,10 +1782,8 @@ impl Query {
         let mut have = Vec::with_capacity(tx_fks.len());
         let mut i = 0usize;
         while i.saturating_add(12) <= raw.len() {
-            let id = u64::from_le_bytes(raw[i..i + 8].try_into().unwrap());
-            i += 8;
-            let n = u32::from_le_bytes(raw[i..i + 4].try_into().unwrap()) as usize;
-            i += 4;
+            let (id, n) = spill_id_len(&raw, i);
+            i += 12;
             if i.saturating_add(n) > raw.len() {
                 return Err(StoreError::Corrupt("seqsigwit spill short row"));
             }

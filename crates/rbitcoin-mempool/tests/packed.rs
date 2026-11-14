@@ -251,3 +251,30 @@ fn decode_packed_prefix_keeps_fee_and_rejects_short() {
         Err(MempoolError::Corrupt("packed live short"))
     ));
 }
+
+#[test]
+fn take_arr_keeps_four_and_rejects_short() {
+    let mut off = 0usize;
+    let got = take_arr::<4>(&[9, 8, 7, 6, 5], &mut off).unwrap();
+    assert_eq!(got, [9, 8, 7, 6]);
+    assert_eq!(off, 4);
+    match take_arr::<4>(&[1, 2], &mut 0) {
+        Err(MempoolError::Corrupt("packed short")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a short window was taken"),
+    }
+}
+
+#[test]
+fn core_dat_empty_roundtrip_and_rejects_short() {
+    let raw = rbitcoin_mempool::CoreMempoolDat::default().encode(None);
+    let got = rbitcoin_mempool::CoreMempoolDat::decode(&raw).unwrap();
+    assert!(got.txs.is_empty());
+    let keyed = rbitcoin_mempool::CoreMempoolDat::default().encode(Some([9u8; 8]));
+    let got = rbitcoin_mempool::CoreMempoolDat::decode(&keyed).unwrap();
+    assert!(got.txs.is_empty());
+    match rbitcoin_mempool::CoreMempoolDat::decode(&[1, 0, 0]) {
+        Err(err) => assert!(err.contains("end of data"), "{err}"),
+        Ok(_) => panic!("a short file decoded"),
+    }
+}

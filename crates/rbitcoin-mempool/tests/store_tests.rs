@@ -1189,3 +1189,37 @@ fn compact_rejects_a_live_slot_whose_body_range_is_not_in_the_file() {
     }
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn body_logical_len_reads_the_word_and_rejects_short() {
+    let mut body = vec![0u8; BODY_HEADER];
+    body[8..16].copy_from_slice(&24u64.to_le_bytes());
+    body.extend_from_slice(&[0u8; 8]);
+    assert_eq!(body_logical_len(&body).unwrap(), 24);
+    match body_logical_len(&body[..8]) {
+        Err(MempoolError::Corrupt("body too short")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a short body reported a length"),
+    }
+    body[8..16].copy_from_slice(&4u64.to_le_bytes());
+    match body_logical_len(&body) {
+        Err(MempoolError::Corrupt("body logical len")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a logical length under the header was accepted"),
+    }
+}
+
+#[test]
+fn live_slot_accept_secs_and_txid_roundtrip() {
+    let dir = tmp_dir();
+    let mut mp = Mempool::open_or_create(&dir).unwrap();
+    let tx = tiny_tx();
+    let tid = tx.compute_txid();
+    let slot = put_live(&mut mp, &tid, 15, 80);
+    assert_eq!(mp.live_accept_secs(slot), Some(1_700_000_000));
+    let live = mp.load_live_txs().unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].packed.txid, tid);
+    assert_eq!(live[0].packed.fee_sat, 15);
+    assert_eq!(live[0].slot, slot);
+}

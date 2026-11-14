@@ -282,7 +282,9 @@ impl InputRecord {
             if buf.len() < off + 4 {
                 return Err(StoreError::Corrupt("input sequence truncated"));
             }
-            let s = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
+            let mut seq = [0u8; 4];
+            seq.copy_from_slice(&buf[off..off + 4]);
+            let s = u32::from_le_bytes(seq);
             off += 4;
             s
         };
@@ -728,7 +730,9 @@ pub fn read_inline_prevout(
     if buf.len() < *off + 8 {
         return Err(StoreError::Corrupt("input create_fk truncated"));
     }
-    let id = u64::from_le_bytes(buf[*off..*off + 8].try_into().unwrap());
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&buf[*off..*off + 8]);
+    let id = u64::from_le_bytes(word);
     *off += 8;
     if id == 0 {
         return Err(StoreError::Corrupt("non-coinbase create_fk is null"));

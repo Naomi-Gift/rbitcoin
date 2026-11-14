@@ -339,7 +339,8 @@ pub fn take_arr<const N: usize>(buf: &[u8], off: &mut usize) -> Result<[u8; N], 
     if end > buf.len() {
         return Err(MempoolError::Corrupt("packed short"));
     }
-    let arr = buf[*off..end].try_into().unwrap();
+    let mut arr = [0u8; N];
+    arr.copy_from_slice(&buf[*off..end]);
     *off = end;
     Ok(arr)
 }

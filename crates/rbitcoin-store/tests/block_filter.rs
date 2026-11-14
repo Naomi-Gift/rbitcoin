@@ -178,3 +178,11 @@ fn rolls_a_segment_when_the_next_start_passes_u32() {
     assert!(!BlockFilterTable::seg_dirs(&dir).body_path(1).exists());
     assert_eq!(t.next_height(), Height(1));
 }
+
+#[test]
+fn block_filter_slot_roundtrip_keeps_the_row() {
+    let row = decode_slot(&encode_slot(9, 40, &slot(3)));
+    assert_eq!(row.off, 9);
+    assert_eq!(row.len, 40);
+    assert_eq!(row.slot, slot(3));
+}
