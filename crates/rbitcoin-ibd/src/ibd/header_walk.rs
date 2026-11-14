@@ -3744,14 +3744,20 @@ pub fn write_diff(buf: &mut Vec<u8>, diff: &DiffSnap) {
 }
 
 #[doc(hidden)]
+fn le_u32_exact(bytes: &[u8], off: usize) -> u32 {
+    let mut word = [0u8; 4];
+    word.copy_from_slice(&bytes[off..off + 4]);
+    u32::from_le_bytes(word)
+}
+
 pub fn read_diff(bytes: &[u8]) -> Option<DiffSnap> {
     if bytes.len() < DIFF_SNAP_LEN {
         return None;
     }
-    let period_height = u32::from_le_bytes(bytes[0..4].try_into().ok()?);
+    let period_height = le_u32_exact(bytes, 0);
     let period_header = read_header(&bytes[4..84]);
-    let full_diff_height = u32::from_le_bytes(bytes[84..88].try_into().ok()?);
-    let full_bits = u32::from_le_bytes(bytes[88..92].try_into().ok()?);
+    let full_diff_height = le_u32_exact(bytes, 84);
+    let full_bits = le_u32_exact(bytes, 88);
     let full_diff_bits = (full_bits != 0).then_some(CompactTarget::from_consensus(full_bits));
     Some(DiffSnap {
         period_header,
@@ -4078,7 +4084,7 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
     if bytes.len() < 8 + 4 + 32 || &bytes[..8] != ADOPT_MAGIC {
         return None;
     }
-    let n = u32::from_le_bytes(bytes[8..12].try_into().ok()?) as usize;
+    let n = le_u32_exact(bytes, 8) as usize;
     const CKPT: usize = 32 + 4 + 32 + 80 + 1 + 11 * 4 + DIFF_SNAP_LEN;
     let body = 12 + n * CKPT;
     const TAIL: usize = 32 + 32 + 4 + 32 + 80 + 4 + 80 + 4 + 4 + DIFF_SNAP_LEN;
@@ -4091,7 +4097,7 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
         let mut hash = [0u8; 32];
         hash.copy_from_slice(&bytes[off..off + 32]);
         off += 32;
-        let height = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
+        let height = le_u32_exact(bytes, off);
         off += 4;
         let mut work = [0u8; 32];
         work.copy_from_slice(&bytes[off..off + 32]);
@@ -4120,20 +4126,20 @@ pub fn parse_adopt(bytes: &[u8]) -> Option<HeaderWalk> {
     let mut base = [0u8; 32];
     base.copy_from_slice(&bytes[off..off + 32]);
     off += 32;
-    let base_height = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
+    let base_height = le_u32_exact(bytes, off);
     off += 4;
     let mut base_work = [0u8; 32];
     base_work.copy_from_slice(&bytes[off..off + 32]);
     off += 32;
     let tip_header = read_header(&bytes[off..off + 80]);
     off += 80;
-    let period_height = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
+    let period_height = le_u32_exact(bytes, off);
     off += 4;
     let period_header = read_header(&bytes[off..off + 80]);
     off += 80;
-    let full_diff_height = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
+    let full_diff_height = le_u32_exact(bytes, off);
     off += 4;
-    let full_bits = u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?);
+    let full_bits = le_u32_exact(bytes, off);
     off += 4;
     let full_diff_bits = (full_bits != 0).then_some(CompactTarget::from_consensus(full_bits));
     let base_diff = read_diff(&bytes[off..off + DIFF_SNAP_LEN])?;
@@ -4401,9 +4407,8 @@ pub fn read_times(bytes: &[u8]) -> Option<Vec<u32>> {
         return None;
     }
     let mut times = Vec::with_capacity(n);
-    for i in 0..n {
-        let off = 1 + i * 4;
-        times.push(u32::from_le_bytes(bytes[off..off + 4].try_into().ok()?));
+    for row in bytes[1..1 + n * 4].as_chunks::<4>().0 {
+        times.push(u32::from_le_bytes(*row));
     }
     Some(times)
 }

@@ -101,7 +101,9 @@ pub fn load_include_hwm(store_dir: &Path) -> u64 {
     if buf.len() < 8 {
         return 0;
     }
-    u64::from_le_bytes(buf[0..8].try_into().unwrap_or([0; 8]))
+    let mut word = [0u8; 8];
+    word.copy_from_slice(&buf[..8]);
+    u64::from_le_bytes(word)
 }
 
 /// Store durable inclusion HWM (monotonic: never decreases).

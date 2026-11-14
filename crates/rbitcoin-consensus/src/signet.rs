@@ -13,6 +13,7 @@ use bitcoin::{Amount, Block, OutPoint, Sequence, Transaction, TxIn, TxOut, Witne
 
 use crate::block::ScriptCheckJob;
 use crate::error::ConsensusError;
+use rbitcoin_primitives::bytes;
 
 /// BIP325 magic prefix inside the witness commitment push.
 #[doc(hidden)]
@@ -34,9 +35,8 @@ pub fn default_signet_challenge() -> ScriptBuf {
 /// its CompactSize length prefix, and uses the first four digest bytes.
 pub fn signet_magic(challenge: &Script) -> [u8; 4] {
     let encoded = serialize(&challenge.as_bytes().to_vec());
-    sha256d::Hash::hash(&encoded).to_byte_array()[..4]
-        .try_into()
-        .expect("four-byte digest prefix")
+    let digest = sha256d::Hash::hash(&encoded).to_byte_array();
+    bytes!(digest, 0, 4)
 }
 
 /// Validate BIP325 signet block solution against `challenge`.

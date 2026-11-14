@@ -617,7 +617,11 @@ pub fn read_witnesses_and_parent_locs(
     }
     let txids = (0..parent_fks.len())
         .map(|k| match jobs.get(txid_j + k) {
-            Some(job) if want_txids => job.buf.as_slice().try_into().unwrap_or([0u8; 32]),
+            Some(job) if want_txids => {
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&job.buf);
+                id
+            }
             _ => [0u8; 32],
         })
         .collect();

@@ -23,3 +23,4 @@ mod reorg;
 mod state;
 mod status;
 mod trust_peer;
+mod typed_width;

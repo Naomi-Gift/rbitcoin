@@ -111,7 +111,9 @@ impl FramedMessage {
         if !self.is_ping() || self.payload.len() < 8 {
             return None;
         }
-        Some(u64::from_le_bytes(self.payload[..8].try_into().ok()?))
+        let mut nonce = [0u8; 8];
+        nonce.copy_from_slice(&self.payload[..8]);
+        Some(u64::from_le_bytes(nonce))
     }
 
     /// Block hash from the wire header (first 80 payload bytes) — no full deserialize.

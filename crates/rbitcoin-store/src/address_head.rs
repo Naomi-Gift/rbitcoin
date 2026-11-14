@@ -267,7 +267,9 @@ pub fn entry_file_off(slot: u64) -> u64 {
 pub fn entry_from_page_buf(buf: &[u8], local: u64) -> Option<u64> {
     let off = (local as usize).checked_mul(ENTRY_BYTES as usize)?;
     let bytes = buf.get(off..off + ENTRY_BYTES as usize)?;
-    Some(u64::from(u32::from_le_bytes(bytes.try_into().ok()?)))
+    let mut word = [0u8; ENTRY_BYTES as usize];
+    word.copy_from_slice(bytes);
+    Some(u64::from(u32::from_le_bytes(word)))
 }
 
 /// One key's hop plus its page's occupancy (leftover-miss dump).

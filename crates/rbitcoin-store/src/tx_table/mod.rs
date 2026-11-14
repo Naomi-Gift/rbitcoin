@@ -1760,11 +1760,9 @@ impl TxTable {
             if (rc as usize) != blob.len() {
                 return Err(StoreError::Corrupt("tx.head seal collect txid.body short"));
             }
-            for i in 0..n {
-                let s = i * 32;
-                let txid: [u8; 32] = blob[s..s + 32].try_into().unwrap();
+            for txid in blob.as_chunks::<32>().0 {
                 pairs.push((
-                    crate::fuse8_filter::fuse_key_from_mixed(&secret.mix_txid(&txid)),
+                    crate::fuse8_filter::fuse_key_from_mixed(&secret.mix_txid(txid)),
                     rel,
                 ));
                 rel = rel.saturating_add(1);

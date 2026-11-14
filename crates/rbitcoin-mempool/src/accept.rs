@@ -9,7 +9,7 @@ use crate::packed::VinAux;
 use crate::store::Mempool;
 use bitcoin::{OutPoint, Transaction, TxOut, Txid, Wtxid};
 use rbitcoin_consensus::policy::{self, PolicyResult};
-use rbitcoin_primitives::Fk;
+use rbitcoin_primitives::{bytes, Fk};
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -861,8 +861,8 @@ impl ActiveMempool {
             if self.store.slots[off] != SLOT_LIVE || self.store.slots[off + 1] == 0 {
                 continue;
             }
-            let txid =
-                Txid::from_byte_array(self.store.slots[off + 16..off + 48].try_into().unwrap());
+            let rec = crate::store::slot_rec(&self.store.slots, off);
+            let txid = Txid::from_byte_array(bytes!(rec, 16, 32));
             out.push((slot, txid));
         }
         out

@@ -1645,7 +1645,9 @@ impl LivePeer {
         let (problem, received, finish) = if payload.len() < 8 {
             (Some("Short payload"), 0u64, true)
         } else {
-            let received = u64::from_le_bytes(payload[..8].try_into().unwrap_or([0; 8]));
+            let mut word = [0u8; 8];
+            word.copy_from_slice(&payload[..8]);
+            let received = u64::from_le_bytes(word);
             if expected == 0 {
                 (Some("Unsolicited pong without ping"), received, false)
             } else if received == expected {

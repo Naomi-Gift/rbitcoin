@@ -4044,3 +4044,14 @@ fn scripthash_page_free_revisit_is_corrupt() {
     }
     assert_eq!(head, page_b, "each page is freed once");
 }
+
+#[test]
+fn include_hwm_reads_eight_and_ignores_short() {
+    let dir = rbitcoin_store::testutil::TempDir::labeled("include-hwm").unwrap();
+    assert_eq!(load_include_hwm(dir.path()), 0);
+    store_include_hwm(dir.path(), 42).unwrap();
+    assert_eq!(load_include_hwm(dir.path()), 42);
+    let path = dir.path().join("scripthash.include_hwm");
+    std::fs::write(&path, [1u8, 2, 3]).unwrap();
+    assert_eq!(load_include_hwm(dir.path()), 0);
+}

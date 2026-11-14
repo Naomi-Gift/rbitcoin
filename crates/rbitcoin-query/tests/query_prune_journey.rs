@@ -1403,3 +1403,45 @@ fn seal_uses_the_keep_file_when_the_append_cache_is_empty() {
     assert!(err.to_string().contains("window miss"), "{err}");
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn spill_file_roundtrip_reads_the_row_and_rejects_a_short_row() {
+    let (dir, q) = temp_query("spill-width");
+    let mut hashes = Vec::new();
+    connect_range(&q, Fk::NULL, None, 2, &[0x44], &mut hashes);
+    q.set_prune_seqsigwit(true).unwrap();
+    q.set_pruneheight(Some(Height(0))).unwrap();
+    let fk = q.block_tx_fks(Height(1)).unwrap()[0];
+    let tx = q.get_tx(fk).unwrap();
+    let ins = vec![q.tx_input_at_fk(fk, &tx, 0).unwrap()];
+    let rows = [(fk, ins.as_slice())];
+    q.persist_seqsigwit_spill_height(Height(1), &rows).unwrap();
+    q.clear_seqsigwit_ram_window();
+    let got = q
+        .seqsigwit_spill_inputs_with_count(fk, tx.input_count)
+        .unwrap()
+        .expect("spill row");
+    assert_eq!(got[0].witness, vec![vec![0x44]]);
+    let again = q.confirm_block(Height(1), &hashes[1]).unwrap();
+    assert_eq!(again, q.tip_header_fk().unwrap().unwrap());
+    let path = q.store().path().join("seqsigwit.window/1.bin");
+    let mut raw = std::fs::read(&path).unwrap();
+    raw.truncate(12);
+    raw[8..12].copy_from_slice(&100u32.to_le_bytes());
+    std::fs::write(&path, &raw).unwrap();
+    match q.seqsigwit_spill_inputs_with_count(fk, tx.input_count) {
+        Err(err) => assert!(
+            err.to_string().contains("seqsigwit spill short row"),
+            "{err}"
+        ),
+        Ok(_) => panic!("a short spill row was read"),
+    }
+    match q.confirm_block(Height(1), &hashes[1]) {
+        Err(err) => assert!(
+            err.to_string().contains("seqsigwit spill short row"),
+            "{err}"
+        ),
+        Ok(_) => panic!("confirm treated a short spill as covering"),
+    }
+    let _ = std::fs::remove_dir_all(dir);
+}

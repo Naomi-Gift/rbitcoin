@@ -3263,3 +3263,21 @@ fn review_1501_commit_unlink_failure_keeps_the_pages() {
     );
     let _ = std::fs::remove_dir_all(&d);
 }
+
+#[test]
+fn spend_commit_reload_serves_the_slot_and_rejects_short() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [6u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(2, 64, zeros, |_| Ok(true)).unwrap();
+    let loaded = SpendPageLog::load(&d).unwrap();
+    assert_eq!(loaded.slot(16), Some(slot));
+    std::fs::write(d.join(SPEND_PAGES_COMMIT_NAME), b"tiny").unwrap();
+    match SpendPageLog::load(&d) {
+        Err(StoreError::Corrupt("spend.pages.commit short")) => {}
+        Err(err) => panic!("{err}"),
+        Ok(_) => panic!("a short commit loaded"),
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}

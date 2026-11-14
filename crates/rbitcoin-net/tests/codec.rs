@@ -374,6 +374,15 @@ fn peer_frames_keep_rare_commands_and_feefilter_bounds() {
     );
 }
 
+#[test]
+fn ping_nonce_reads_eight_and_ignores_short() {
+    let nonce = 0x1122_3344_5566_7788u64;
+    let full = frame(*b"ping\0\0\0\0\0\0\0\0", nonce.to_le_bytes().to_vec());
+    assert_eq!(full.ping_nonce(), Some(nonce));
+    let short = frame(*b"ping\0\0\0\0\0\0\0\0", vec![1, 2, 3]);
+    assert_eq!(short.ping_nonce(), None);
+}
+
 fn frame(command: [u8; 12], payload: Vec<u8>) -> FramedMessage {
     FramedMessage {
         magic: signet_magic(),

@@ -888,3 +888,13 @@ fn head_access_env_probe_stats_and_layout_helpers() {
     remove_legacy_meta_sidecar(&path);
     assert!(!meta.exists());
 }
+
+#[test]
+fn entry_from_page_reads_four_and_skips_short() {
+    let word = 0x0102_0304u32.to_le_bytes();
+    assert_eq!(
+        entry_from_page_buf(&word, 0),
+        Some(u64::from(0x0102_0304u32))
+    );
+    assert_eq!(entry_from_page_buf(&word[..3], 0), None);
+}
