@@ -20,22 +20,30 @@ fn dir() -> PathBuf {
 fn image_cap_schedules_one_followup_and_the_edge_cap_stays_due() {
     assert!(!spend_checkpoint_early(
         OPEN_EDGE_CAP - 1,
+        0,
         LOG_IMAGE_CAP - 1
     ));
-    assert!(spend_checkpoint_early(OPEN_EDGE_CAP, 0));
-    assert!(spend_checkpoint_early(0, LOG_IMAGE_CAP));
-    assert_eq!(pace_after_checkpoint(0, LOG_IMAGE_CAP, false), (true, true));
-    assert_eq!(pace_after_checkpoint(0, LOG_IMAGE_CAP, true), (false, true));
+    assert!(spend_checkpoint_early(OPEN_EDGE_CAP, 0, 0));
+    assert!(spend_checkpoint_early(0, 0, LOG_IMAGE_CAP));
     assert_eq!(
-        pace_after_checkpoint(OPEN_EDGE_CAP, LOG_IMAGE_CAP, true),
+        pace_after_checkpoint(0, 0, LOG_IMAGE_CAP, false),
         (true, true)
     );
-    assert_eq!(pace_after_checkpoint(0, 0, true), (false, false));
-    assert!(spend_note_arms(0, LOG_IMAGE_CAP, false));
-    assert!(!spend_note_arms(0, LOG_IMAGE_CAP, true));
-    assert!(spend_note_arms(OPEN_EDGE_CAP, LOG_IMAGE_CAP, true));
+    assert_eq!(
+        pace_after_checkpoint(0, 0, LOG_IMAGE_CAP, true),
+        (false, true)
+    );
+    assert_eq!(
+        pace_after_checkpoint(OPEN_EDGE_CAP, 0, LOG_IMAGE_CAP, true),
+        (true, true)
+    );
+    assert_eq!(pace_after_checkpoint(0, 0, 0, true), (false, false));
+    assert!(spend_note_arms(0, 0, LOG_IMAGE_CAP, false));
+    assert!(!spend_note_arms(0, 0, LOG_IMAGE_CAP, true));
+    assert!(spend_note_arms(OPEN_EDGE_CAP, 0, LOG_IMAGE_CAP, true));
     assert!(!spend_note_arms(
         OPEN_EDGE_CAP - 1,
+        0,
         LOG_IMAGE_CAP - 1,
         false
     ));
@@ -3095,6 +3103,243 @@ fn review_1501_fold_spindle() {
         });
     }
     drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A published page is the generation file. A zero in that file hides the body.
+///
+/// The body a later compose would read is a different pattern. Lookup returns
+/// the file, including an explicit zero. A slot past the short image is not
+/// covered. Fold copies the file bytes, skipping the 16-byte header on page 0,
+/// and the directory then misses the page.
+#[test]
+fn published_image_is_the_generation_file_until_fold() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let spend = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    let neighbor = [9u8, 9, 9, 9, 9, 9, 9, 9];
+    let zero = [0u8; 8];
+    let mut body = [0xabu8; 200];
+    body[16..24].copy_from_slice(&spend);
+    body[24..32].copy_from_slice(&neighbor);
+    let published = body.len() as u64;
+    log.note_slots(&[(16, spend)]).unwrap();
+    log.commit_open(
+        1,
+        published,
+        |_off, len| Ok(body[..len].to_vec()),
+        |_| Ok(true),
+    )
+    .unwrap();
+    log.note_slots(&[(24, zero)]).unwrap();
+    let later_body = [0x11u8; 200];
+    log.commit_open(
+        2,
+        published,
+        |_off, len| Ok(later_body[..len].to_vec()),
+        |_| Ok(true),
+    )
+    .unwrap();
+    let carried = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
+    assert_eq!(&carried[16..24], &spend);
+    assert_eq!(&carried[24..32], &zero);
+    assert_eq!(&carried[32..40], &body[32..40]);
+    assert_ne!(&carried[32..40], &later_body[32..40]);
+    assert_eq!(log.slot(16), Some(spend));
+    assert_eq!(
+        log.slot(24),
+        Some(zero),
+        "an explicit zero in the generation file hides the body"
+    );
+    assert_eq!(log.slot(32), Some(body[32..40].try_into().unwrap()));
+    assert_eq!(
+        log.slot(published),
+        None,
+        "a slot past the published image stays on spent.body"
+    );
+    assert_eq!(
+        log.resident_image_bytes(),
+        0,
+        "the installed directory keeps file coordinates, not page images"
+    );
+    log.commit_open(
+        3,
+        published,
+        |_off, len| Ok(later_body[..len].to_vec()),
+        |_| Ok(true),
+    )
+    .unwrap();
+    let mut folded = None;
+    log.fold_into(
+        |off, image| {
+            folded = Some((off, image.to_vec()));
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    let (off, image) = folded.expect("fold copies the generation file");
+    assert_eq!(off, 16);
+    assert_eq!(
+        image,
+        carried[16..],
+        "fold writes the generation-file bytes past the page-0 header"
+    );
+    assert_eq!(log.slot(16), None, "a folded page leaves the directory");
+    assert_eq!(log.slot(24), None);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The distinct-page budget arms inside 64k..=128k and stays armed while the
+/// open set is still over it. The edge cap is unchanged.
+#[test]
+fn page_budget_stays_armed_and_the_edge_cap_is_unchanged() {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    assert_eq!(OPEN_EDGE_CAP, 2_000_000);
+    let budget = rbitcoin_store::spend_page_log::OPEN_PAGE_BUDGET;
+    assert!(
+        (65_536..=131_072).contains(&budget),
+        "the page budget must sit in the 64k..=128k band"
+    );
+    assert!(!spend_checkpoint_early(0, budget - 1, 0));
+    assert!(spend_checkpoint_early(0, budget, 0));
+    assert!(spend_checkpoint_early(OPEN_EDGE_CAP, 0, 0));
+    assert_eq!(
+        pace_after_checkpoint(0, budget, 0, true),
+        (true, true),
+        "a full page budget keeps requesting after the image follow-up is used"
+    );
+    assert_eq!(
+        pace_after_checkpoint(0, budget - 1, 0, true),
+        (false, false)
+    );
+    assert!(spend_note_arms(0, budget, 0, true));
+    assert!(!spend_note_arms(0, budget - 1, 0, true));
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let wake = Arc::new((Mutex::new(false), Condvar::new()));
+    log.bind_sync_wake(Arc::clone(&wake));
+    let slot = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    let mut batch = Vec::with_capacity(1024);
+    for i in 0..budget {
+        batch.push((i * 4096, slot));
+        if batch.len() == 1024 {
+            log.note_slots(&batch).unwrap();
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        log.note_slots(&batch).unwrap();
+    }
+    assert!(
+        log.checkpoint_early(),
+        "noting one slot on each budget page must arm a checkpoint"
+    );
+    log.relax_pace();
+    assert!(
+        log.checkpoint_early(),
+        "relaxing the pace must keep the checkpoint armed while those pages are open"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Freeze wakes an edge-cap waiter before the cooled body copy runs.
+#[cfg(debug_assertions)]
+#[test]
+fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    let d = dir();
+    let store = rbitcoin_store::Store::create_tiny(&d).unwrap();
+    let nbytes = 4096usize;
+    let prep = store
+        .txs
+        .spent
+        .prepare_batch_encode(1, nbytes, |_i, buf| {
+            buf.resize(buf.len() + nbytes, 0);
+        })
+        .unwrap()
+        .expect("one spent append");
+    store
+        .txs
+        .spent
+        .write_body_blob_bulk(prep.start, &prep.body_blob)
+        .unwrap();
+    store.txs.spent.finish_prepared(prep).unwrap();
+    let slot =
+        rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk::NULL, 0).unwrap();
+    store.note_open_spend_slots(&[(16, slot)]).unwrap();
+    store.checkpoint_spend_through(0).unwrap();
+    assert_eq!(store.spend_directory_slot(16), Some(slot));
+
+    let mut batch = Vec::with_capacity(4096);
+    let mut n = 0u64;
+    while n < OPEN_EDGE_CAP {
+        let page = 1 + n / 512;
+        let rel = n % 512;
+        batch.push((page * 4096 + rel * 8, slot));
+        n += 1;
+        if batch.len() == 4096 {
+            store.note_open_spend_slots(&batch).unwrap();
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        store.note_open_spend_slots(&batch).unwrap();
+    }
+    let wake = Arc::new((Mutex::new(false), Condvar::new()));
+    store.bind_spend_sync_wake(Arc::clone(&wake));
+    let (lock, cv) = &*wake;
+    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let released = AtomicBool::new(false);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            store.wait_spend_edge_room();
+            released.store(true, Ordering::SeqCst);
+            let _ = done_tx.send(());
+        });
+        let (_guard, waited) = cv
+            .wait_timeout(guard, Duration::from_secs(30))
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !waited.timed_out(),
+            "confirm must be blocked on the edge cap before the checkpoint"
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let checkpoint = scope.spawn(|| {
+            FOLD_GATE.with(|slot| {
+                *slot.borrow_mut() = Some(FoldGate {
+                    entered: entered_tx,
+                    release: release_rx,
+                });
+            });
+            rbitcoin_store::Store::arm_spend_fold_probe(review_1501_fold_probe);
+            store.checkpoint_spend_through(0)
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the cooled copy must start");
+        let woke = done_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).expect("release fold");
+        woke.expect("freeze must wake the edge-cap waiter before the cooled copy finishes");
+        assert!(released.load(Ordering::SeqCst));
+        checkpoint
+            .join()
+            .unwrap()
+            .expect("checkpoint finishes after the copy");
+    });
+    rbitcoin_store::Store::disarm_spend_fold_probe();
+    assert_eq!(
+        store.spend_directory_slot(16),
+        None,
+        "the cooled page is copied from the generation file before the next one is assembled"
+    );
     let _ = std::fs::remove_dir_all(&d);
 }
 

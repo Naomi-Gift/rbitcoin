@@ -2681,12 +2681,22 @@ impl TxTable {
         self.spend_pages.wait_open_edge_room();
     }
 
+    #[doc(hidden)]
+    pub fn spend_log_slot(&self, abs: u64) -> Option<[u8; 8]> {
+        self.spend_pages.slot(abs)
+    }
+
     pub(crate) fn hold_spend_fold_above(&self, tip: u32) -> Result<(), StoreError> {
         self.spend_pages.hold_fold_above(tip)
     }
 
     pub(crate) fn widen_for_checkpoint(&self, height: u32) {
         self.spend_pages.widen_for_checkpoint(height);
+    }
+
+    pub(crate) fn freeze_open_spend_pages(&self, tip: u32) {
+        self.spend_pages.cover_confirmed_tip(tip);
+        self.spend_pages.freeze_open();
     }
 
     pub(crate) fn spend_log_above(&self, tip: u32) -> bool {

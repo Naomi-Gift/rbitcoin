@@ -1976,6 +1976,12 @@ impl Store {
         self.txs.wait_spend_edge_room();
     }
 
+    /// Directory answer for one absolute spend slot, when the log serves it.
+    #[doc(hidden)]
+    pub fn spend_directory_slot(&self, abs: u64) -> Option<[u8; 8]> {
+        self.txs.spend_log_slot(abs)
+    }
+
     pub fn bind_spend_sync_wake(&self, wake: crate::spend_page_log::SpendSyncWake) {
         self.txs.bind_spend_sync_wake(wake);
     }
@@ -2039,15 +2045,21 @@ impl Store {
         height: u32,
         keep: impl FnMut(&[u8; 8]) -> Result<bool, StoreError>,
     ) -> Result<(), StoreError> {
-        // A loaded commit above this checkpoint is held before the quiet
-        // pages are copied. The freeze tip is read under the utxo view after
-        // that copy. The sealed tip is raised again after the second keep.
+        // Freeze, and wake an edge-cap waiter, before the cooled-page copy.
+        // The copy finishes before the next generation file is assembled.
+        // The callback freezes again so notes taken during the copy join
+        // this generation. That second freeze is a reuse and does not notify.
         self.txs.widen_for_checkpoint(height);
-        self.fold_sealed_spend_pages()?;
         let publish = &self.utxo_publish;
         let view = &self.utxo_view;
         let confirmed = &self.confirmed;
         let spenders = &self.spenders;
+        {
+            let _g = hold_view(publish, view);
+            let tip = confirmed.tip_height().map(|h| h.0).unwrap_or(height);
+            self.txs.freeze_open_spend_pages(tip);
+        }
+        self.fold_sealed_spend_pages()?;
         self.txs.prepare_open_spend_pages(
             height,
             keep,

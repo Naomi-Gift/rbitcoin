@@ -3,11 +3,13 @@
 //! Confirm records 8-byte slots here, including a short tail page. Each dirty
 //! page is composed into one image. A checkpoint rewrites `spend.pages` to the
 //! images still named and renames `spend.pages.commit` before `spend_durable`
-//! advances. A slot past a short image stays on `spent.body`. Fold copies a
-//! cooled image onto `spent.body` after that marker, starting at byte 16 on
-//! page 0 so the file header stays put. A commit that names bytes refuses a
-//! missing or short image, including `spend.pages.{generation}` left when a
-//! crash lands between the commit rename and the pages rename.
+//! advances. The directory keeps that file's offset, not a second copy of the
+//! image. A covered slot, including an explicit zero, is read from the file.
+//! A slot past a short image stays on `spent.body`. Fold copies the file bytes
+//! onto `spent.body` after that marker, starting at byte 16 on page 0 so the
+//! file header stays put. A commit that names bytes refuses a missing or short
+//! image, including `spend.pages.{generation}` left when a crash lands between
+//! the commit rename and the pages rename.
 
 use crate::error::StoreError;
 use crate::file::{fsync_parent_dir, write_file_synced_tmp_rename, write_synced_tmp_file};
@@ -16,6 +18,7 @@ use rbitcoin_primitives::{
     le_u16, le_u32, le_u64, schema_file_openable, SCHEMA_VERSION, STORE_MAGIC,
 };
 use std::collections::{HashMap, HashSet};
+use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -25,6 +28,11 @@ pub const SPEND_PAGES_COMMIT_NAME: &str = "spend.pages.commit";
 
 /// Open slot deltas that make the next confirm insert wait for a checkpoint.
 pub const OPEN_EDGE_CAP: u64 = 2_000_000;
+/// Distinct open pages that ask for another checkpoint until the set drains.
+///
+/// One dirty page becomes a full image at compose. The edge cap counts slots,
+/// so this bound is what keeps a generation from composing several gigabytes.
+pub const OPEN_PAGE_BUDGET: u64 = 65_536;
 /// On-disk `spend.pages` length that asks for a checkpoint before the ten-minute timer.
 pub const LOG_IMAGE_CAP: u64 = 1024 * 1024 * 1024;
 
@@ -60,35 +68,48 @@ fn presence_from(slots: &[(u16, [u8; SLOT])]) -> [u64; OPEN_SLOT_PRESENCE_BYTES 
 }
 
 /// True when a spend checkpoint should run before the ten-minute timer.
-pub fn spend_checkpoint_early(open_edges: u64, image_bytes: u64) -> bool {
-    open_edges >= OPEN_EDGE_CAP || image_bytes >= LOG_IMAGE_CAP
+pub fn spend_checkpoint_early(open_edges: u64, open_pages: u64, image_bytes: u64) -> bool {
+    open_edges >= OPEN_EDGE_CAP || open_pages >= OPEN_PAGE_BUDGET || image_bytes >= LOG_IMAGE_CAP
 }
 
 /// True when a new note should wake the sync thread.
 ///
 /// The image cap arms once. After that follow-up, a still-large file does
-/// not arm again. The edge cap still does.
-pub fn spend_note_arms(open_edges: u64, image_bytes: u64, followup_done: bool) -> bool {
-    open_edges >= OPEN_EDGE_CAP || (image_bytes >= LOG_IMAGE_CAP && !followup_done)
+/// not arm again. The edge cap and the page budget still do.
+pub fn spend_note_arms(
+    open_edges: u64,
+    open_pages: u64,
+    image_bytes: u64,
+    followup_done: bool,
+) -> bool {
+    open_edges >= OPEN_EDGE_CAP
+        || open_pages >= OPEN_PAGE_BUDGET
+        || (image_bytes >= LOG_IMAGE_CAP && !followup_done)
 }
 
 /// `(request another checkpoint, follow-up already used for this oversized log)`.
 ///
 /// Crossing the image cap schedules one extra checkpoint so the generation
 /// that filled the file can cool and fold. It does not spin while the file
-/// stays large. The edge cap keeps requesting until the open directory drains.
+/// stays large. The edge cap and the page budget keep requesting until the
+/// open directory drains.
 pub fn pace_after_checkpoint(
     open_edges: u64,
+    open_pages: u64,
     image_bytes: u64,
     followup_done: bool,
 ) -> (bool, bool) {
-    if open_edges >= OPEN_EDGE_CAP {
+    if open_edges >= OPEN_EDGE_CAP || open_pages >= OPEN_PAGE_BUDGET {
         return (true, followup_done);
     }
     if image_bytes >= LOG_IMAGE_CAP && !followup_done {
         return (true, true);
     }
     (false, image_bytes >= LOG_IMAGE_CAP)
+}
+
+fn open_page_count(g: &Inner) -> u64 {
+    (g.open.len() + g.later.len()) as u64
 }
 
 /// `(page_off, log_off, image_len)` in one commit record.
@@ -99,16 +120,42 @@ type KeptPage = (u64, PageSlots);
 /// Condvar `rbtc-spend-sync` waits on. The flag is the thread's stop bit.
 pub type SpendSyncWake = Arc<(Mutex<bool>, Condvar)>;
 
+/// Where an immutable generation file holds one page image.
+///
+/// `generation` is the file. `admitted` on the committed entry is the
+/// checkpoint that made the page cool, and stays put when a later file
+/// carries the same bytes forward.
+#[derive(Clone, Copy, Debug)]
+struct PageLoc {
+    generation: u32,
+    log_off: u64,
+    image_len: u32,
+}
+
+impl PageLoc {
+    fn covers(self, rel: u16) -> bool {
+        let end = u64::from(rel).saturating_add(1).saturating_mul(SLOT as u64);
+        end <= u64::from(self.image_len)
+    }
+
+    fn slot_at(self, rel: u16) -> u64 {
+        self.log_off
+            .saturating_add(u64::from(rel).saturating_mul(SLOT as u64))
+    }
+}
+
 #[derive(Clone)]
 struct OpenPage {
     /// Sorted by rel. [`OpenPage::hit`] searches with `partition_point`.
     slots: Vec<(u16, [u8; SLOT])>,
     /// Bit `rel` is set when `slots` names that slot.
     present: [u64; OPEN_SLOT_PRESENCE_BYTES / 8],
-    base: Option<Arc<[u8]>>,
+    /// Published image this note was taken against. Absent while a frozen
+    /// generation or a held filter owns the page, so those notes win.
+    base: Option<PageLoc>,
 }
 
-fn open_page(slots: Vec<(u16, [u8; SLOT])>, base: Option<Arc<[u8]>>) -> OpenPage {
+fn open_page(slots: Vec<(u16, [u8; SLOT])>, base: Option<PageLoc>) -> OpenPage {
     let mut page = OpenPage {
         slots,
         present: [0; OPEN_SLOT_PRESENCE_BYTES / 8],
@@ -133,9 +180,7 @@ impl OpenPage {
                 .filter(|(r, _)| *r == rel)
                 .map(|(_, meta)| *meta);
         }
-        self.base
-            .as_deref()
-            .and_then(|base| slot_in_image(base, rel))
+        None
     }
 }
 
@@ -147,19 +192,18 @@ struct BodyClear {
     meta: [u8; SLOT],
 }
 
+#[derive(Clone, Copy)]
 struct CommittedPage {
-    image: Arc<[u8]>,
-    log_off: u64,
-    generation: u32,
+    loc: PageLoc,
+    admitted: u32,
 }
 
 type SnapshotPages = Vec<(u64, OpenPage)>;
-type PageImages = Vec<(u64, Arc<[u8]>)>;
 
 struct PendingInstall {
     generation: u32,
     height: u32,
-    pages: Vec<(u64, Arc<[u8]>, u64)>,
+    pages: Vec<PageRec>,
     rejected: Vec<u64>,
     kept: Vec<KeptPage>,
     /// New file offsets for pages this generation carried forward.
@@ -212,6 +256,9 @@ struct Inner {
     /// The generation the sync thread is composing. Readers still see it.
     frozen: HashMap<u64, OpenPage>,
     committed: HashMap<u64, CommittedPage>,
+    /// Open generation files. The fd stays valid across the rename onto
+    /// `spend.pages` and a later unlink. Readers pread it outside this lock.
+    gens: HashMap<u32, Arc<File>>,
     /// Pages copied onto `spent.body` and not yet dropped from the directory.
     cooling: Vec<(u64, u32)>,
     pending: Option<PendingInstall>,
@@ -333,6 +380,7 @@ impl SpendPageLog {
                 holding_filter: false,
                 frozen: HashMap::new(),
                 committed: HashMap::new(),
+                gens: HashMap::new(),
                 cooling: Vec::new(),
                 pending: None,
                 generation: 0,
@@ -360,19 +408,21 @@ impl SpendPageLog {
             .unwrap_or_else(|e| e.into_inner()) = Some(wake);
     }
 
-    pub(crate) fn checkpoint_early(&self) -> bool {
+    #[doc(hidden)]
+    pub fn checkpoint_early(&self) -> bool {
         self.pace.early.load(Ordering::Acquire)
     }
 
     /// After a checkpoint, arm one follow-up when the log is still over the
     /// image cap, and keep arming while the open directory is over the edge cap.
-    pub(crate) fn relax_pace(&self) {
-        let (edges, images) = {
+    #[doc(hidden)]
+    pub fn relax_pace(&self) {
+        let (edges, pages, images) = {
             let g = self.lock();
-            (g.open_edges, g.log_bytes)
+            (g.open_edges, open_page_count(&g), g.log_bytes)
         };
         let follow = self.pace.image_followup.load(Ordering::Acquire);
-        let (early, follow) = pace_after_checkpoint(edges, images, follow);
+        let (early, follow) = pace_after_checkpoint(edges, pages, images, follow);
         self.pace.image_followup.store(follow, Ordering::Release);
         self.pace.early.store(early, Ordering::Release);
         if early {
@@ -412,8 +462,24 @@ impl SpendPageLog {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Heap bytes of page images retained in the directory.
+    ///
+    /// Installed pages are coordinates into an immutable generation file.
+    /// The file is read on demand and dropped. Nothing here retains the image.
+    #[doc(hidden)]
+    pub fn resident_image_bytes(&self) -> u64 {
+        0
+    }
+
+    fn pages_path(&self) -> PathBuf {
+        self.dir.join(SPEND_PAGES_NAME)
+    }
+
     /// Current 8-byte image for `abs`, from the open directory, the frozen
     /// generation, or a committed page. `None` means the body still holds the slot.
+    ///
+    /// A covered slot is eight bytes of the generation file. A batch of slots
+    /// on one page reads that image once in [`Self::slots_at`].
     pub fn slot(&self, abs: u64) -> Option<[u8; SLOT]> {
         #[cfg(debug_assertions)]
         if crate::io_handle::hidden_after_pread() {
@@ -421,12 +487,21 @@ impl SpendPageLog {
         }
         let page_off = abs & !(BODY_PAGE_SIZE - 1);
         let rel = ((abs - page_off) / SLOT as u64) as u16;
-        let g = self.lock();
-        noted_slot(&g, page_off, rel)
+        let (file, loc) = {
+            let g = self.lock();
+            match covered_slot(&g, page_off, rel)? {
+                Covered::Noted(meta) => return Some(meta),
+                Covered::File(loc) => (generation_file(&g, loc.generation), loc),
+            }
+        };
+        let mut buf = [0u8; SLOT];
+        pread_generation(&file, &self.pages_path(), loc.slot_at(rel), &mut buf);
+        Some(buf)
     }
 
     /// Same bytes as [`Self::slot`] for each offset. One directory lock for
-    /// the whole slice. The caller reads `spent.body` after this returns.
+    /// the whole slice. Each covered page is read once, then dropped. The
+    /// caller reads `spent.body` for the misses after this returns.
     pub fn slots_at(&self, abs: &[u64]) -> Vec<Option<[u8; SLOT]>> {
         #[cfg(debug_assertions)]
         if crate::io_handle::hidden_after_pread() {
@@ -434,6 +509,12 @@ impl SpendPageLog {
         }
         if abs.is_empty() {
             return Vec::new();
+        }
+        struct PendingRead {
+            i: usize,
+            rel: u16,
+            loc: PageLoc,
+            file: Arc<File>,
         }
         let mut order: Vec<(u64, u16, usize)> = abs
             .iter()
@@ -446,22 +527,46 @@ impl SpendPageLog {
             .collect();
         order.sort_unstable_by_key(|(page, _, i)| (*page, *i));
         let mut out = vec![None; abs.len()];
-        let g = self.lock();
+        let mut reads: Vec<PendingRead> = Vec::new();
+        {
+            let g = self.lock();
+            let mut start = 0;
+            while start < order.len() {
+                let page_off = order[start].0;
+                let mut end = start + 1;
+                while end < order.len() && order[end].0 == page_off {
+                    end += 1;
+                }
+                for &(_, rel, i) in &order[start..end] {
+                    match covered_slot(&g, page_off, rel) {
+                        Some(Covered::Noted(meta)) => out[i] = Some(meta),
+                        Some(Covered::File(loc)) => reads.push(PendingRead {
+                            i,
+                            rel,
+                            loc,
+                            file: generation_file(&g, loc.generation),
+                        }),
+                        None => {}
+                    }
+                }
+                start = end;
+            }
+        }
+        reads.sort_by_key(|read| (read.loc.generation, read.loc.log_off, read.i));
+        let path = self.pages_path();
         let mut start = 0;
-        while start < order.len() {
-            let page_off = order[start].0;
+        while start < reads.len() {
+            let loc = reads[start].loc;
             let mut end = start + 1;
-            while end < order.len() && order[end].0 == page_off {
+            while end < reads.len()
+                && reads[end].loc.generation == loc.generation
+                && reads[end].loc.log_off == loc.log_off
+            {
                 end += 1;
             }
-            let later = g.later.get(&page_off);
-            let open = g.open.get(&page_off);
-            let frozen = g.frozen.get(&page_off);
-            let image = g.committed.get(&page_off).map(|page| page.image.as_ref());
-            for &(_, rel, i) in &order[start..end] {
-                if let Some(meta) = noted_from(later, open, frozen, image, rel) {
-                    out[i] = Some(meta);
-                }
+            let image = read_loc_bytes(&reads[start].file, &path, loc);
+            for read in &reads[start..end] {
+                out[read.i] = slot_in_image(&image, read.rel);
             }
             start = end;
         }
@@ -484,7 +589,7 @@ impl SpendPageLog {
                 let base = if g.holding_filter || g.frozen.contains_key(&page_off) {
                     None
                 } else {
-                    g.committed.get(&page_off).map(|c| Arc::clone(&c.image))
+                    g.committed.get(&page_off).map(|c| c.loc)
                 };
                 let pages = if g.holding_filter {
                     &mut g.later
@@ -497,7 +602,8 @@ impl SpendPageLog {
                 }
             }
             let follow = self.pace.image_followup.load(Ordering::Acquire);
-            added = added && spend_note_arms(g.open_edges, g.log_bytes, follow);
+            let pages = open_page_count(&g);
+            added = added && spend_note_arms(g.open_edges, pages, g.log_bytes, follow);
         }
         if added {
             self.pace.arm();
@@ -737,7 +843,6 @@ impl SpendPageLog {
             let g = self.lock();
             g.fold_held && !g.committed.is_empty()
         };
-        let stored = self.committed_images();
         // The caller covers the freeze tip and freezes `open` while it holds
         // the utxo view. Notes taken during the quiet fold are already in
         // `open`. A note after this waits for the next checkpoint.
@@ -759,29 +864,29 @@ impl SpendPageLog {
         };
         let Some(snap) = snap else {
             self.scrub_open_notes(&mut keep)?;
-            let pages = compose_kept_pages(&mut read_page, published, &[], &clears, &stored)?;
             return self.settle_deferred_clear(
                 height,
                 published,
-                pages,
-                deferred,
+                &[],
                 &clears,
+                deferred,
                 sampled_ticks,
                 seal_tip,
+                &mut read_page,
             );
         };
         let (mut kept, mut rejected, more) = filter_kept_pages(&mut keep, snap.pages)?;
         clears.extend(more);
-        let pages = compose_kept_pages(&mut read_page, published, &kept, &clears, &stored)?;
-        let composed: HashSet<u64> = pages.iter().map(|(off, _)| *off).collect();
+        let composed = self.pages_that_compose(&mut read_page, published, &kept, &clears)?;
+        let composed_set: HashSet<u64> = composed.iter().copied().collect();
         let unpublished: Vec<u64> = kept
             .iter()
             .map(|(off, _)| *off)
-            .filter(|off| !composed.contains(off))
+            .filter(|off| !composed_set.contains(off))
             .collect();
-        kept.retain(|(off, _)| composed.contains(off));
+        kept.retain(|(off, _)| composed_set.contains(off));
         rejected.extend(unpublished);
-        if pages.is_empty() {
+        if composed.is_empty() {
             self.drop_frozen_pages(&rejected);
             return Ok(());
         }
@@ -802,9 +907,11 @@ impl SpendPageLog {
         let (clear_hold, hold) = self.publish_hold(deferred, sampled_ticks);
         self.store_pending(
             height,
-            pages,
+            published,
+            &composed,
+            &kept,
+            &clears,
             rejected,
-            kept,
             &carried,
             PublishPlan {
                 hold,
@@ -813,6 +920,7 @@ impl SpendPageLog {
                 clear_hold,
                 hold_ticks: sampled_ticks,
             },
+            &mut read_page,
         )?;
         Ok(())
     }
@@ -824,20 +932,23 @@ impl SpendPageLog {
     /// The commit file stays in place until this returns. A `read_page` error
     /// never reaches here, so a restart still loads the old image.
     #[allow(clippy::too_many_arguments)] // the seal runs only when this publishes
-    fn settle_deferred_clear<S>(
+    fn settle_deferred_clear<F, S>(
         &self,
         height: u32,
         published: u64,
-        pages: PageImages,
-        deferred: bool,
+        kept: &[(u64, OpenPage)],
         clears: &[BodyClear],
+        deferred: bool,
         sampled_ticks: u64,
         seal_tip: S,
+        read_page: &mut F,
     ) -> Result<(), StoreError>
     where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
         S: FnOnce(&Self) -> Result<u32, StoreError>,
     {
-        let fresh: HashSet<u64> = pages.iter().map(|(off, _)| *off).collect();
+        let composed = self.pages_that_compose(read_page, published, kept, clears)?;
+        let fresh: HashSet<u64> = composed.iter().copied().collect();
         let cleared: HashSet<u64> = clears.iter().map(|clear| clear.page_off).collect();
         let mut carried = if deferred {
             self.carry_untouched(&fresh, &cleared)
@@ -845,7 +956,7 @@ impl SpendPageLog {
             Vec::new()
         };
         carried.retain(|(off, _)| *off < published);
-        if pages.is_empty() && carried.is_empty() {
+        if composed.is_empty() && carried.is_empty() {
             if deferred {
                 self.drop_rejected_generation();
             }
@@ -855,8 +966,10 @@ impl SpendPageLog {
         let (clear_hold, hold) = self.publish_hold(deferred, sampled_ticks);
         self.store_pending(
             height,
-            pages,
-            Vec::new(),
+            published,
+            &composed,
+            kept,
+            clears,
             Vec::new(),
             &carried,
             PublishPlan {
@@ -866,6 +979,7 @@ impl SpendPageLog {
                 clear_hold,
                 hold_ticks: sampled_ticks,
             },
+            read_page,
         )?;
         Ok(())
     }
@@ -895,12 +1009,20 @@ impl SpendPageLog {
         self.delete_generation_files();
     }
 
-    fn committed_images(&self) -> HashMap<u64, Arc<[u8]>> {
+    fn committed_locs(&self) -> HashMap<u64, PageLoc> {
         let g = self.lock();
         g.committed
             .iter()
-            .map(|(off, page)| (*off, Arc::clone(&page.image)))
+            .map(|(off, page)| (*off, page.loc))
             .collect()
+    }
+
+    fn read_loc(&self, loc: PageLoc) -> Vec<u8> {
+        let file = {
+            let g = self.lock();
+            generation_file(&g, loc.generation)
+        };
+        read_loc_bytes(&file, &self.pages_path(), loc)
     }
 
     /// Committed pages this checkpoint did not recompose and did not reject.
@@ -915,14 +1037,7 @@ impl SpendPageLog {
             if fresh.contains(off) || cleared.contains(off) {
                 continue;
             }
-            out.push((
-                *off,
-                CommittedPage {
-                    image: Arc::clone(&page.image),
-                    log_off: page.log_off,
-                    generation: page.generation,
-                },
-            ));
+            out.push((*off, *page));
         }
         out
     }
@@ -952,13 +1067,69 @@ impl SpendPageLog {
             clear_hold,
             hold_ticks,
         } = pending;
-        let inserted: HashSet<u64> = pages.iter().map(|(off, _, _)| *off).collect();
+        let inserted: HashSet<u64> = pages.iter().map(|rec| rec.0).collect();
         let kept_by_page: HashMap<u64, HashSet<OpenSlot>> = kept
             .iter()
             .map(|(off, slots)| (*off, slots.iter().copied().collect()))
             .collect();
-        {
+        let file = {
+            let g = self.lock();
+            generation_file(&g, generation)
+        };
+        let path = self.pages_path();
+        loop {
+            let snaps = {
+                let g = self.lock();
+                pages
+                    .iter()
+                    .filter_map(|&(page_off, _, _)| {
+                        let page = g.open.get(&page_off)?;
+                        let kept = kept_by_page.get(&page_off);
+                        let unchanged = match kept {
+                            Some(set) => {
+                                page.slots.len() == set.len()
+                                    && page.slots.iter().all(|slot| set.contains(slot))
+                            }
+                            None => page.slots.is_empty(),
+                        };
+                        if unchanged {
+                            None
+                        } else {
+                            Some((page_off, page.slots.clone()))
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let mut fresh = HashMap::new();
+            for (page_off, slots) in &snaps {
+                let Some(&(off, log_off, image_len)) = pages.iter().find(|rec| rec.0 == *page_off)
+                else {
+                    continue;
+                };
+                debug_assert_eq!(off, *page_off);
+                let loc = PageLoc {
+                    generation,
+                    log_off,
+                    image_len,
+                };
+                let mut got = Vec::with_capacity(slots.len());
+                for &(rel, _) in slots {
+                    let mut buf = [0u8; SLOT];
+                    if loc.covers(rel) {
+                        pread_generation(&file, &path, loc.slot_at(rel), &mut buf);
+                    }
+                    got.push(buf);
+                }
+                fresh.insert(*page_off, got);
+            }
             let mut g = self.lock();
+            let stale = snaps.iter().any(|(page_off, slots)| {
+                g.open.get(page_off).is_none_or(|page| page.slots != *slots)
+            });
+            if stale {
+                continue;
+            }
+            let reads = fresh;
             g.generation = generation;
             if clear_hold && g.hold_ticks == hold_ticks {
                 g.fold_held = false;
@@ -970,8 +1141,13 @@ impl SpendPageLog {
             for page_off in &rejected {
                 g.frozen.remove(page_off);
             }
-            for (page_off, image, log_off) in pages {
+            for &(page_off, log_off, image_len) in &pages {
                 g.frozen.remove(&page_off);
+                let loc = PageLoc {
+                    generation,
+                    log_off,
+                    image_len,
+                };
                 let kept = kept_by_page.get(&page_off);
                 let unchanged = match g.open.get(&page_off) {
                     None => true,
@@ -989,9 +1165,19 @@ impl SpendPageLog {
                     }
                 } else if let Some(page) = g.open.get_mut(&page_off) {
                     let before = page.slots.len() as u64;
-                    page.slots
-                        .retain(|(rel, meta)| slot_from_image(&image, *rel) != *meta);
-                    page.base = Some(Arc::clone(&image));
+                    let got = reads.get(&page_off);
+                    let mut live = Vec::with_capacity(page.slots.len());
+                    for (i, slot) in page.slots.iter().copied().enumerate() {
+                        let differs = match got.and_then(|bytes| bytes.get(i)) {
+                            Some(file_meta) => file_meta != &slot.1,
+                            None => true,
+                        };
+                        if differs {
+                            live.push(slot);
+                        }
+                    }
+                    page.slots = live;
+                    page.base = Some(loc);
                     page.reindex();
                     let left = page.slots.len() as u64;
                     g.open_edges = g.open_edges.saturating_sub(before.saturating_sub(left));
@@ -999,22 +1185,25 @@ impl SpendPageLog {
                         g.open.remove(&page_off);
                     }
                 }
-                // The published image stays reachable after restart even when
-                // confirm noted a newer slot on the same page. Fold skips a
-                // page that is still open, so this copy is not written early.
                 g.committed.insert(
                     page_off,
                     CommittedPage {
-                        image,
-                        log_off,
-                        generation,
+                        loc,
+                        admitted: generation,
                     },
                 );
             }
             for (page_off, log_off) in carried_off {
-                if let Some(page) = g.committed.get_mut(&page_off) {
-                    page.log_off = log_off;
-                }
+                let Some(loc) = g.committed.get_mut(&page_off).map(|page| {
+                    page.loc.generation = generation;
+                    page.loc.log_off = log_off;
+                    page.loc
+                }) else {
+                    continue;
+                };
+                retarget_base(g.open.get_mut(&page_off), loc);
+                retarget_base(g.later.get_mut(&page_off), loc);
+                retarget_base(g.frozen.get_mut(&page_off), loc);
             }
             if let Some(keep) = keep_only {
                 let keep: HashSet<u64> = keep.into_iter().collect();
@@ -1025,6 +1214,8 @@ impl SpendPageLog {
                 g.committed
                     .retain(|off, _| !drop_offs.contains(off) || inserted.contains(off));
             }
+            gc_gens(&mut g);
+            break;
         }
         self.pace.notify_room();
         Ok(())
@@ -1047,35 +1238,40 @@ impl SpendPageLog {
     where
         K: FnMut(&[u8; SLOT]) -> Result<bool, StoreError>,
     {
-        let held: Vec<(u64, Arc<[u8]>)> = {
+        let held: Vec<(u64, PageLoc)> = {
             let g = self.lock();
             if !g.fold_held {
                 return Ok(Vec::new());
             }
             g.committed
                 .iter()
-                .map(|(off, page)| (*off, Arc::clone(&page.image)))
+                .map(|(off, page)| (*off, page.loc))
                 .collect()
         };
         let mut restored: Vec<KeptPage> = Vec::new();
         let mut cleared: Vec<BodyClear> = Vec::new();
-        for (page_off, image) in &held {
+        let mut live: HashSet<u64> = HashSet::new();
+        for (page_off, loc) in held {
+            let image = self.read_loc(loc);
+            if image_has_live_spend(page_off, &image, published) {
+                live.insert(page_off);
+            }
             let mut slots = Vec::new();
             let n = image.len() / SLOT;
             for rel in 0..n {
-                if *page_off == 0 && rel < 2 {
+                if page_off == 0 && rel < 2 {
                     continue;
                 }
-                if slot_past_published(*page_off, rel as u16, published) {
+                if slot_past_published(page_off, rel as u16, published) {
                     continue;
                 }
-                let meta = slot_from_image(image, rel as u16);
+                let meta = slot_from_image(&image, rel as u16);
                 if meta == [0u8; SLOT] {
                     continue;
                 }
                 if !keep(&meta)? {
                     cleared.push(BodyClear {
-                        page_off: *page_off,
+                        page_off,
                         rel: rel as u16,
                         meta,
                     });
@@ -1084,7 +1280,7 @@ impl SpendPageLog {
                 slots.push((rel as u16, meta));
             }
             if !slots.is_empty() {
-                restored.push((*page_off, slots));
+                restored.push((page_off, slots));
             }
         }
         let mut g = self.lock();
@@ -1093,10 +1289,9 @@ impl SpendPageLog {
         }
         Ok(apply_held_explode(
             &mut g,
-            &held,
+            &live,
             restored,
             cleared,
-            published,
             sampled_ticks,
         ))
     }
@@ -1174,40 +1369,57 @@ impl SpendPageLog {
         Ok(())
     }
 
-    fn store_pending(
+    #[allow(clippy::too_many_arguments)]
+    fn store_pending<F>(
         &self,
         height: u32,
-        pages: PageImages,
-        rejected: Vec<u64>,
-        kept: SnapshotPages,
+        published: u64,
+        composed: &[u64],
+        kept: &[(u64, OpenPage)],
+        clears: &[BodyClear],
+        mut rejected: Vec<u64>,
         carried: &[(u64, CommittedPage)],
         plan: PublishPlan,
-    ) -> Result<(), StoreError> {
-        let (generation, recs) = self.publish_generation(height, &pages, carried, plan.hold)?;
+        read_page: &mut F,
+    ) -> Result<(), StoreError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
+    {
+        let (generation, file, recs) = self.publish_generation(
+            height, published, composed, kept, clears, carried, read_page, plan.hold,
+        )?;
+        let fresh: HashSet<u64> = composed.iter().copied().collect();
+        let written: HashSet<u64> = recs
+            .iter()
+            .map(|rec| rec.0)
+            .filter(|off| fresh.contains(off))
+            .collect();
+        for off in composed {
+            if !written.contains(off) {
+                rejected.push(*off);
+            }
+        }
+        let pages: Vec<PageRec> = recs
+            .iter()
+            .copied()
+            .filter(|rec| fresh.contains(&rec.0))
+            .collect();
+        let carried_off: Vec<(u64, u64)> = recs
+            .iter()
+            .filter(|rec| !fresh.contains(&rec.0))
+            .map(|rec| (rec.0, rec.1))
+            .collect();
         let kept_slots: Vec<KeptPage> = kept
             .iter()
+            .filter(|(off, _)| written.contains(off))
             .map(|(off, page)| (*off, page.slots.clone()))
             .collect();
-        let log_off_by_page: HashMap<u64, u64> = recs
-            .iter()
-            .map(|(off, log_off, _)| (*off, *log_off))
-            .collect();
-        let pending_pages: Vec<(u64, Arc<[u8]>, u64)> = pages
-            .into_iter()
-            .map(|(page_off, image)| {
-                let log_off = log_off_by_page.get(&page_off).copied().unwrap_or(0);
-                (page_off, image, log_off)
-            })
-            .collect();
-        let carried_off: Vec<(u64, u64)> = carried
-            .iter()
-            .filter_map(|(off, _)| log_off_by_page.get(off).map(|log_off| (*off, *log_off)))
-            .collect();
         let mut g = self.lock();
+        g.gens.insert(generation, file);
         g.pending = Some(PendingInstall {
             generation,
             height,
-            pages: pending_pages,
+            pages,
             rejected,
             kept: kept_slots,
             carried_off,
@@ -1242,47 +1454,82 @@ impl SpendPageLog {
     /// rename or the directory sync fails. The next checkpoint writes the
     /// next generation instead of replacing the file the commit already
     /// names. A failed pages rename leaves that file in place. `commit_io`
-    /// is held across the whole publish, so a fold hold cannot rename the
-    /// commit between the sample and the commit write.
-    fn publish_generation(
+    /// covers the hold sample through the commit write. The image stream
+    /// stays outside that lock: `read_page` may call `hold_fold_above`,
+    /// which takes `commit_io` itself.
+    #[allow(clippy::too_many_arguments)]
+    fn publish_generation<F>(
         &self,
         height: u32,
-        pages: &[(u64, Arc<[u8]>)],
+        published: u64,
+        composed: &[u64],
+        kept: &[(u64, OpenPage)],
+        clears: &[BodyClear],
         carried: &[(u64, CommittedPage)],
+        read_page: &mut F,
         hold: PublishHold,
-    ) -> Result<(u32, Vec<PageRec>), StoreError> {
-        let _io = self.commit_io.lock().unwrap_or_else(|e| e.into_inner());
-        let fresh: HashSet<u64> = pages.iter().map(|(off, _)| *off).collect();
-        let mut carried_imgs: Vec<(u64, u64, Arc<[u8]>)> = carried
+    ) -> Result<(u32, Arc<File>, Vec<PageRec>), StoreError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
+    {
+        let fresh: HashSet<u64> = composed.iter().copied().collect();
+        let mut carried_rows: Vec<(u64, PageLoc)> = carried
             .iter()
             .filter(|(off, _)| !fresh.contains(off))
-            .map(|(off, page)| (*off, page.log_off, Arc::clone(&page.image)))
+            .map(|(off, page)| (*off, page.loc))
             .collect();
-        carried_imgs.sort_by_key(|(_, log_off, _)| *log_off);
+        carried_rows.sort_by_key(|(_, loc)| loc.log_off);
         let generation = self.lock().generation.wrapping_add(1);
         let gen_path = self.dir.join(format!("{SPEND_PAGES_NAME}.{generation}"));
         let pages_path = self.dir.join(SPEND_PAGES_NAME);
         let commit_path = self.dir.join(SPEND_PAGES_COMMIT_NAME);
         let mut recs: Vec<PageRec> = Vec::new();
         let mut committed_len = 0u64;
+        let kept_at: HashMap<u64, &OpenPage> =
+            kept.iter().map(|(off, page)| (*off, page)).collect();
+        let clear_at = clears_by_page(clears);
+        let stored = self.committed_locs();
+        // `read_page` runs inside this write and may take `commit_io`.
         write_synced_tmp_file(&gen_path, |f| {
             use std::io::Write;
-            for (page_off, _, image) in &carried_imgs {
+            for (page_off, loc) in &carried_rows {
+                let image = self.read_loc(*loc);
                 let log_off = committed_len;
-                f.write_all(image)
+                f.write_all(&image)
                     .map_err(|e| StoreError::io(&gen_path, e))?;
                 committed_len = committed_len.saturating_add(image.len() as u64);
                 recs.push((*page_off, log_off, image.len() as u32));
             }
-            for (page_off, image) in pages {
+            for &page_off in composed {
+                let loc = compose_base(
+                    kept_at.get(&page_off).copied(),
+                    stored.get(&page_off).copied(),
+                );
+                let image = loc.map(|loc| self.read_loc(loc));
+                let Some(buf) = compose_one_page(
+                    read_page,
+                    published,
+                    page_off,
+                    kept_at.get(&page_off).copied(),
+                    clear_at.get(&page_off),
+                    image.as_deref(),
+                )?
+                else {
+                    continue;
+                };
                 let log_off = committed_len;
-                f.write_all(image)
+                f.write_all(&buf)
                     .map_err(|e| StoreError::io(&gen_path, e))?;
-                committed_len = committed_len.saturating_add(image.len() as u64);
-                recs.push((*page_off, log_off, image.len() as u32));
+                committed_len = committed_len.saturating_add(buf.len() as u64);
+                recs.push((page_off, log_off, buf.len() as u32));
             }
             Ok(())
         })?;
+        let file = Arc::new(File::open(&gen_path).map_err(|e| StoreError::io(&gen_path, e))?);
+        // Sample the hold and write the commit under one lock. A hold that
+        // lands during the image stream has already stored `fold_held`. A
+        // hold that arrives after this lock patches the commit just written.
+        let _io = self.commit_io.lock().unwrap_or_else(|e| e.into_inner());
         let (held, sealed_tip) = {
             let g = self.lock();
             let held = match hold {
@@ -1299,11 +1546,11 @@ impl SpendPageLog {
         }
         // The commit rename is already visible. Renaming this generation
         // file away before that directory entry is durable can leave the
-        // old commit naming a file that is gone.
+        // old commit naming a file that is gone. The open fd keeps the inode.
         if dir_synced {
             self.finish_pages_rename(&gen_path, &pages_path);
         }
-        Ok((generation, recs))
+        Ok((generation, file, recs))
     }
 
     fn delete_generation_files(&self) {
@@ -1328,6 +1575,7 @@ impl SpendPageLog {
             let mut g = self.lock();
             g.log_bytes = 0;
             g.commit_height = None;
+            g.gens.clear();
         }
     }
 
@@ -1381,23 +1629,23 @@ impl SpendPageLog {
         W: FnMut(u64, &[u8]) -> Result<(), StoreError>,
         S: FnMut() -> Result<(), StoreError>,
     {
-        let quiet: Vec<(u64, u32, Arc<[u8]>)> = {
+        let quiet: Vec<(u64, u32, PageLoc)> = {
             let mut g = self.lock();
             if g.fold_held {
                 g.cooling.clear();
                 return Ok(());
             }
             let cool_through = g.cool_through;
-            let mut quiet: Vec<(u64, u32, Arc<[u8]>)> = g
+            let mut quiet: Vec<(u64, u32, PageLoc)> = g
                 .committed
                 .iter()
                 .filter(|(off, page)| {
-                    page.generation <= cool_through
+                    page.admitted <= cool_through
                         && !g.open.contains_key(*off)
                         && !g.later.contains_key(*off)
                         && !g.frozen.contains_key(*off)
                 })
-                .map(|(off, page)| (*off, page.generation, Arc::clone(&page.image)))
+                .map(|(off, page)| (*off, page.admitted, page.loc))
                 .collect();
             quiet.sort_by_key(|(off, _, _)| *off);
             quiet
@@ -1406,7 +1654,7 @@ impl SpendPageLog {
             return Ok(());
         }
         let mut wrote: Vec<(u64, u32)> = Vec::new();
-        for (off, generation, image) in quiet {
+        for (off, admitted, loc) in quiet {
             {
                 let g = self.lock();
                 if g.fold_held {
@@ -1419,12 +1667,12 @@ impl SpendPageLog {
                     continue;
                 }
             }
-            let (write_off, payload) = body_fold_span(off, &image);
-            if payload.is_empty() {
+            let image = self.read_loc(loc);
+            let Some((write_off, payload)) = fold_payload(off, &image) else {
                 continue;
-            }
+            };
             write_page(write_off, payload)?;
-            wrote.push((off, generation));
+            wrote.push((off, admitted));
         }
         if wrote.is_empty() {
             return Ok(());
@@ -1460,11 +1708,12 @@ impl SpendPageLog {
             }
             if g.committed
                 .get(&off)
-                .is_some_and(|page| page.generation == generation)
+                .is_some_and(|page| page.admitted == generation)
             {
                 g.committed.remove(&off);
             }
         }
+        gc_gens(&mut g);
         if g.committed.is_empty()
             && g.open.is_empty()
             && g.later.is_empty()
@@ -1497,18 +1746,25 @@ impl SpendPageLog {
         } else {
             self.dir.join(SPEND_PAGES_NAME)
         };
-        let file = match std::fs::read(&pages_path) {
-            Ok(file) => file,
+        let opened = match File::open(&pages_path) {
+            Ok(file) => Some(file),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if parsed.committed_len == 0 && parsed.recs.is_empty() {
-                    Vec::new()
+                    None
                 } else {
                     return Err(StoreError::Corrupt("spend.pages short"));
                 }
             }
             Err(e) => return Err(StoreError::io(&pages_path, e)),
         };
-        if (file.len() as u64) < parsed.committed_len {
+        let file_len = match &opened {
+            Some(file) => file
+                .metadata()
+                .map_err(|e| StoreError::io(&pages_path, e))?
+                .len(),
+            None => 0,
+        };
+        if file_len < parsed.committed_len {
             return Err(StoreError::Corrupt("spend.pages short"));
         }
         let limit = parsed.committed_len;
@@ -1571,17 +1827,22 @@ impl SpendPageLog {
             // `image_len` starts as the record's `u32` and only shrinks.
             let image_len = image_len as u32;
             kept_recs.push((rec.page_off, rec.log_off, image_len));
-            let start = rec.log_off as usize;
-            let take = image_len as usize;
-            let image: Arc<[u8]> = Arc::from(file[start..start + take].to_vec().into_boxed_slice());
             g.committed.insert(
                 rec.page_off,
                 CommittedPage {
-                    image,
-                    log_off: rec.log_off,
-                    generation: parsed.generation,
+                    loc: PageLoc {
+                        generation: parsed.generation,
+                        log_off: rec.log_off,
+                        image_len,
+                    },
+                    admitted: parsed.generation,
                 },
             );
+        }
+        if !g.committed.is_empty() {
+            if let Some(file) = opened {
+                g.gens.insert(parsed.generation, Arc::new(file));
+            }
         }
         let rewrite = clipped.then(|| {
             encode_commit(
@@ -1663,7 +1924,7 @@ fn fold_open_into_snapshot(
             // including a zero fold has not written. Compose zeros a
             // rejected slot in that image only when the body still holds it.
             if let Some(stored) = committed.get(off) {
-                page.base = Some(Arc::clone(&stored.image));
+                page.base = Some(stored.loc);
             }
         }
     }
@@ -1699,14 +1960,7 @@ fn carried_pages(
         if recomposed.contains(off) {
             continue;
         }
-        out.push((
-            *off,
-            CommittedPage {
-                image: Arc::clone(&page.image),
-                log_off: page.log_off,
-                generation: page.generation,
-            },
-        ));
+        out.push((*off, *page));
     }
     out
 }
@@ -1746,16 +2000,7 @@ where
     Ok((kept, rejected, clears))
 }
 
-fn compose_kept_pages<F>(
-    read_page: &mut F,
-    published: u64,
-    kept: &[(u64, OpenPage)],
-    clears: &[BodyClear],
-    stored: &HashMap<u64, Arc<[u8]>>,
-) -> Result<PageImages, StoreError>
-where
-    F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
-{
+fn clears_by_page(clears: &[BodyClear]) -> HashMap<u64, Vec<(u16, [u8; SLOT])>> {
     let mut clear_at: HashMap<u64, Vec<(u16, [u8; SLOT])>> = HashMap::new();
     for clear in clears {
         clear_at
@@ -1763,29 +2008,62 @@ where
             .or_default()
             .push((clear.rel, clear.meta));
     }
+    clear_at
+}
+
+fn compose_offs(kept: &[(u64, OpenPage)], clears: &[BodyClear]) -> Vec<u64> {
     let mut offs: Vec<u64> = kept.iter().map(|(off, _)| *off).collect();
-    for off in clear_at.keys() {
-        if !offs.contains(off) {
-            offs.push(*off);
+    for clear in clears {
+        if !offs.contains(&clear.page_off) {
+            offs.push(clear.page_off);
         }
     }
     offs.sort_unstable();
     offs.dedup();
-    let kept_at: HashMap<u64, &OpenPage> = kept.iter().map(|(off, page)| (*off, page)).collect();
-    let mut pages = Vec::with_capacity(offs.len());
-    for page_off in offs {
-        if let Some(image) = compose_one_page(
-            &mut *read_page,
-            published,
-            page_off,
-            kept_at.get(&page_off).copied(),
-            clear_at.get(&page_off),
-            stored.get(&page_off).map(Arc::as_ref),
-        )? {
-            pages.push((page_off, image));
+    offs
+}
+
+fn compose_base(kept: Option<&OpenPage>, stored: Option<PageLoc>) -> Option<PageLoc> {
+    kept.and_then(|page| page.base).or(stored)
+}
+
+impl SpendPageLog {
+    fn pages_that_compose<F>(
+        &self,
+        read_page: &mut F,
+        published: u64,
+        kept: &[(u64, OpenPage)],
+        clears: &[BodyClear],
+    ) -> Result<Vec<u64>, StoreError>
+    where
+        F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
+    {
+        let stored = self.committed_locs();
+        let clear_at = clears_by_page(clears);
+        let kept_at: HashMap<u64, &OpenPage> =
+            kept.iter().map(|(off, page)| (*off, page)).collect();
+        let mut out = Vec::new();
+        for page_off in compose_offs(kept, clears) {
+            let loc = compose_base(
+                kept_at.get(&page_off).copied(),
+                stored.get(&page_off).copied(),
+            );
+            let image = loc.map(|loc| self.read_loc(loc));
+            if compose_one_page(
+                read_page,
+                published,
+                page_off,
+                kept_at.get(&page_off).copied(),
+                clear_at.get(&page_off),
+                image.as_deref(),
+            )?
+            .is_some()
+            {
+                out.push(page_off);
+            }
         }
+        Ok(out)
     }
-    Ok(pages)
 }
 
 /// `None` when the page has no kept slot, the body does not still hold a
@@ -1798,8 +2076,8 @@ fn compose_one_page<F>(
     page_off: u64,
     kept: Option<&OpenPage>,
     clears: Option<&Vec<(u16, [u8; SLOT])>>,
-    stored: Option<&[u8]>,
-) -> Result<Option<Arc<[u8]>>, StoreError>
+    image: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>, StoreError>
 where
     F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
 {
@@ -1807,7 +2085,6 @@ where
         return Ok(None);
     }
     let len = BODY_PAGE_SIZE.min(published - page_off) as usize;
-    let image = kept.and_then(|page| page.base.as_deref()).or(stored);
     let short = image.is_some_and(|image| image.len() < len);
     let body = if image.is_none() || clears.is_some() || short {
         Some(fit_page(read_page(page_off, len)?, len))
@@ -1857,7 +2134,7 @@ where
     if !keep_page {
         return Ok(None);
     }
-    Ok(Some(Arc::from(buf.into_boxed_slice())))
+    Ok(Some(buf))
 }
 
 fn fit_page(mut buf: Vec<u8>, len: usize) -> Vec<u8> {
@@ -1926,7 +2203,7 @@ fn insert_note(
     page_off: u64,
     rel: u16,
     meta: [u8; SLOT],
-    base_if_new: Option<Arc<[u8]>>,
+    base_if_new: Option<PageLoc>,
 ) -> Result<bool, StoreError> {
     pages
         .entry(page_off)
@@ -1982,28 +2259,82 @@ fn page_hit(page: Option<&OpenPage>, rel: u16) -> Option<[u8; SLOT]> {
     page?.hit(rel)
 }
 
-fn noted_from(
-    later: Option<&OpenPage>,
-    open: Option<&OpenPage>,
-    frozen: Option<&OpenPage>,
-    image: Option<&[u8]>,
-    rel: u16,
-) -> Option<[u8; SLOT]> {
-    page_hit(later, rel)
-        .or_else(|| page_hit(open, rel))
-        .or_else(|| page_hit(frozen, rel))
-        .or_else(|| image.and_then(|image| slot_in_image(image, rel)))
+enum Covered {
+    Noted([u8; SLOT]),
+    File(PageLoc),
 }
 
-/// Directory bytes for one slot. `None` means `spent.body` still holds it.
-fn noted_slot(g: &Inner, page_off: u64, rel: u16) -> Option<[u8; SLOT]> {
-    noted_from(
-        g.later.get(&page_off),
-        g.open.get(&page_off),
-        g.frozen.get(&page_off),
-        g.committed.get(&page_off).map(|page| page.image.as_ref()),
-        rel,
-    )
+/// Later note, open note, open base, frozen note, frozen base, then the
+/// committed file. A covered zero is `File`, not a miss.
+fn covered_slot(g: &Inner, page_off: u64, rel: u16) -> Option<Covered> {
+    if let Some(meta) = page_hit(g.later.get(&page_off), rel) {
+        return Some(Covered::Noted(meta));
+    }
+    if let Some(page) = g.open.get(&page_off) {
+        if let Some(meta) = page.hit(rel) {
+            return Some(Covered::Noted(meta));
+        }
+        if let Some(loc) = page.base.filter(|loc| loc.covers(rel)) {
+            return Some(Covered::File(loc));
+        }
+    }
+    if let Some(page) = g.frozen.get(&page_off) {
+        if let Some(meta) = page.hit(rel) {
+            return Some(Covered::Noted(meta));
+        }
+        if let Some(loc) = page.base.filter(|loc| loc.covers(rel)) {
+            return Some(Covered::File(loc));
+        }
+    }
+    let page = g.committed.get(&page_off)?;
+    page.loc.covers(rel).then_some(Covered::File(page.loc))
+}
+
+fn generation_file(g: &Inner, generation: u32) -> Arc<File> {
+    match g.gens.get(&generation) {
+        Some(file) => Arc::clone(file),
+        None => panic!("spend generation {generation} is not open"),
+    }
+}
+
+fn pread_generation(file: &File, path: &Path, offset: u64, buf: &mut [u8]) {
+    if let Err(err) = crate::file::handle_pread_all(file, path, offset, buf) {
+        panic!("spend generation read failed at {offset}: {err}");
+    }
+}
+
+fn read_loc_bytes(file: &File, path: &Path, loc: PageLoc) -> Vec<u8> {
+    let mut buf = vec![0u8; loc.image_len as usize];
+    if !buf.is_empty() {
+        pread_generation(file, path, loc.log_off, &mut buf);
+    }
+    buf
+}
+
+fn retarget_base(page: Option<&mut OpenPage>, loc: PageLoc) {
+    if let Some(page) = page {
+        if page.base.is_some() {
+            page.base = Some(loc);
+        }
+    }
+}
+
+fn gc_gens(g: &mut Inner) {
+    let mut live = HashSet::new();
+    for page in g.committed.values() {
+        live.insert(page.loc.generation);
+    }
+    for map in [&g.open, &g.later, &g.frozen] {
+        for page in map.values() {
+            if let Some(loc) = page.base {
+                live.insert(loc.generation);
+            }
+        }
+    }
+    if let Some(pending) = &g.pending {
+        live.insert(pending.generation);
+    }
+    g.gens.retain(|gen, _| live.contains(gen));
 }
 
 /// `None` when `rel` sits past the stored image. The body still holds it.
@@ -2016,12 +2347,18 @@ fn slot_in_image(image: &[u8], rel: u16) -> Option<[u8; SLOT]> {
 }
 
 /// Page 0's first 16 bytes are the file header. Fold never pwrites them.
-fn body_fold_span(page_off: u64, image: &[u8]) -> (u64, &[u8]) {
+fn fold_payload(page_off: u64, image: &[u8]) -> Option<(u64, &[u8])> {
     if page_off == 0 {
         let skip = crate::file::FILE_HEADER_LEN.min(image.len());
-        return (skip as u64, &image[skip..]);
+        if skip >= image.len() {
+            return None;
+        }
+        return Some((skip as u64, &image[skip..]));
     }
-    (page_off, image)
+    if image.is_empty() {
+        return None;
+    }
+    Some((page_off, image))
 }
 
 /// Decide what a held image does at this checkpoint.
@@ -2038,18 +2375,13 @@ fn body_fold_span(page_off: u64, image: &[u8]) -> (u64, &[u8]) {
 /// compose reads the body.
 fn apply_held_explode(
     g: &mut Inner,
-    held: &[(u64, Arc<[u8]>)],
+    live: &HashSet<u64>,
     restored: Vec<KeptPage>,
     cleared: Vec<BodyClear>,
-    published: u64,
     sampled_ticks: u64,
 ) -> Vec<BodyClear> {
     if cleared.is_empty() {
-        let spend_offs: HashSet<u64> = held
-            .iter()
-            .filter(|(off, image)| image_has_live_spend(*off, image, published))
-            .map(|(off, _)| *off)
-            .collect();
+        let spend_offs = live;
         if spend_offs.is_empty() {
             // No slot was walked. A disconnect that landed anyway must keep
             // the hold, or the next checkpoint folds this image.
