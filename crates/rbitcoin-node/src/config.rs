@@ -168,6 +168,12 @@ impl ListenOpts {
         !self.connect.is_empty() || !self.connect_dns.is_empty()
     }
 
+    /// Tor or I2P delivers inbound TCP from loopback, including an
+    /// operator `--external-ip` onion.
+    pub fn overlay_loopback_forward(&self) -> bool {
+        self.listen_onion || self.i2p_accept_incoming || !self.external_onions.is_empty()
+    }
+
     /// `--only-net` leaves IPv4 or IPv6 reachable (an empty list leaves all).
     pub fn clearnet_reachable(&self) -> bool {
         self.only_net.is_empty()
@@ -2185,5 +2191,31 @@ impl NodeConfig {
             None => true,
             Some(min) => tip_work_be >= min,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_onion_counts_as_loopback_forward() {
+        let listen = ListenOpts::default();
+        assert!(!listen.overlay_loopback_forward());
+        let onion = ListenOpts {
+            listen_onion: true,
+            ..ListenOpts::default()
+        };
+        assert!(onion.overlay_loopback_forward());
+        let i2p = ListenOpts {
+            i2p_accept_incoming: true,
+            ..ListenOpts::default()
+        };
+        assert!(i2p.overlay_loopback_forward());
+        let external = ListenOpts {
+            external_onions: vec!["external.onion".to_string()],
+            ..ListenOpts::default()
+        };
+        assert!(external.overlay_loopback_forward());
     }
 }

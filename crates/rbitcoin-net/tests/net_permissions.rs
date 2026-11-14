@@ -11,6 +11,100 @@ fn bind() -> SocketAddr {
 }
 
 #[test]
+fn loopback_forward_does_not_inherit_loopback_net_permission() {
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let mut t = NetPermTable::default();
+    t.whitelist
+        .push(parse_whitelist("noban,relay,forcerelay@127.0.0.1").unwrap());
+    t.whitebind
+        .push(parse_whitebind("noban@127.0.0.1:8335").unwrap());
+    peers.set_net_perms(t);
+    let loopback: SocketAddr = "127.0.0.1:40000".parse().unwrap();
+    let mapped: SocketAddr = "[::ffff:127.0.0.1]:40000".parse().unwrap();
+    let p2p: SocketAddr = "0.0.0.0:8333".parse().unwrap();
+    let wallet: SocketAddr = "127.0.0.1:8335".parse().unwrap();
+    let remote: SocketAddr = "203.0.113.9:8333".parse().unwrap();
+
+    assert!(peers
+        .permission_flags(loopback, true, p2p)
+        .has(NetPermissionFlags::NOBAN));
+
+    peers.set_overlay_loopback_forward(true);
+    for src in [loopback, mapped] {
+        let flags = peers.permission_flags(src, true, p2p);
+        assert!(
+            !flags.has(NetPermissionFlags::NOBAN),
+            "{src} took noban from the loopback subnet"
+        );
+        assert!(!flags.has(NetPermissionFlags::RELAY));
+        assert!(!flags.has(NetPermissionFlags::FORCE_RELAY));
+    }
+    assert!(peers
+        .permission_flags(loopback, true, wallet)
+        .has(NetPermissionFlags::NOBAN));
+    assert!(!peers
+        .permission_flags(loopback, true, wallet)
+        .has(NetPermissionFlags::RELAY));
+
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NONE,
+        timestamp: 0,
+        receiver: Address::new(&loopback, ServiceFlags::NONE),
+        sender: Address::new(&loopback, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let live = peers.register(
+        loopback,
+        p2p,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    assert!(
+        !live.session_noban(),
+        "a loopback inbound session still took noban"
+    );
+    assert!(!live.session_relay_perm());
+    assert!(!live.session_forcerelay());
+    let bound = peers.register(
+        loopback,
+        wallet,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    assert!(
+        bound.session_noban(),
+        "permission-bind on another port still grants"
+    );
+    assert!(!bound.session_relay_perm());
+
+    let mut wide = NetPermTable::default();
+    wide.whitelist
+        .push(parse_whitelist("relay@203.0.113.9").unwrap());
+    peers.set_net_perms(wide);
+    assert!(peers
+        .permission_flags(remote, true, p2p)
+        .has(NetPermissionFlags::RELAY));
+    assert!(!peers
+        .permission_flags(loopback, true, p2p)
+        .has(NetPermissionFlags::RELAY));
+
+    peers.set_net_perms(NetPermTable::default());
+    assert_eq!(
+        peers.permission_flags(loopback, true, p2p),
+        NetPermissionFlags::NONE
+    );
+}
+
+#[test]
 fn loopback_grant_does_not_cover_onion_or_i2p() {
     let mut t = NetPermTable::default();
     t.whitelist

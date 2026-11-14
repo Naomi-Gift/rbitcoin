@@ -10,6 +10,7 @@ use rbitcoin_primitives::Height;
 use std::borrow::Borrow;
 use std::hash::BuildHasherDefault;
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -847,6 +848,16 @@ impl ScriptVerifyFlags {
         }
     }
 
+    /// Unconfirmed-tx checks. Consensus history stays [`Self::consensus_at`].
+    /// Constant scriptCode is on so a legacy `OP_CODESEPARATOR` cannot force
+    /// a new sighash per signature. The interpreter also counts legacy sighash
+    /// bytes only while this flag is on.
+    pub const fn unconfirmed() -> Self {
+        let mut flags = Self::buried(true, true, true, true, true);
+        flags.const_scriptcode = true;
+        flags
+    }
+
     /// Core `GetBlockScriptFlags` for `block_hash` at `ctx`. `bip16_active` is
     /// false only for a BIP16 exception block or genesis.
     pub fn consensus_at(
@@ -983,6 +994,9 @@ pub struct ScriptCheckJob {
     /// Owned (tests) or shared wire block + index (confirm path).
     pub tx: JobTx,
     pub flags: ScriptVerifyFlags,
+    /// Legacy sighash bytes still allowed for this transaction. One budget
+    /// shared by every input. `u64::MAX` until an unconfirmed check starts.
+    pub(crate) legacy_sighash_left: AtomicU64,
     /// Lookup/structure `TxPrecompute`. Set on the confirm path; tests lazy-`from_tx`.
     pub pre: std::sync::OnceLock<JobPre>,
     skip_segwit_midstates: bool,
@@ -1101,6 +1115,7 @@ impl ScriptCheckJob {
             prevouts,
             tx,
             flags,
+            legacy_sighash_left: AtomicU64::new(u64::MAX),
             pre: std::sync::OnceLock::new(),
             skip_segwit_midstates,
         }

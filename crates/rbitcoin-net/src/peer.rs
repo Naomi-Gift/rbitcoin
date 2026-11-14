@@ -802,6 +802,13 @@ pub fn connected_to_self_log(addr: impl std::fmt::Display) -> String {
     format!("p2p: connected to self at {addr}, disconnecting")
 }
 
+pub fn log_connected_to_self(addr: impl std::fmt::Display) {
+    rbitcoin_log::info_repeated(
+        rbitcoin_log::RepeatedInfo::ConnectedToSelf,
+        format_args!("{}", connected_to_self_log(addr)),
+    );
+}
+
 pub fn version_handshake_timeout_log(peer: u64) -> String {
     format!("p2p: version handshake timeout, disconnecting peer={peer}")
 }
@@ -1541,7 +1548,7 @@ pub async fn application_handshake<R: FrameRead, W: FrameWrite>(
     if inbound {
         if let Some(peers) = policy.peers {
             if !peers.check_incoming_nonce(their_version.nonce) {
-                rbitcoin_log::info!("{}", connected_to_self_log(their_addr));
+                log_connected_to_self(their_addr);
                 return Err(NetError::Protocol("connected to self"));
             }
         }
@@ -5978,8 +5985,63 @@ fn queue_claimed_block_getdata(
             requested_blocks.remove(hash);
             hub.forget_asked_block(hash);
         }
+        return sent;
+    }
+    if compact {
+        for hash in &claimed {
+            if compact_getdata_near_tip(hub, hash) {
+                ask_other_hb_for_block(session, *hash);
+            }
+        }
     }
     sent
+}
+
+/// While one peer owes a body, ask other high-bandwidth compact peers too.
+/// At most two more, and an outbound when the announcer is inbound and one
+/// exists. The hub claim stays with the first ask.
+fn ask_other_hb_for_block(session: Option<&crate::peers::LivePeer>, hash: BlockHash) {
+    let Some(announcer) = session else {
+        return;
+    };
+    let Some(peers) = announcer.peer_hub() else {
+        return;
+    };
+    let mut rest: Vec<std::sync::Arc<crate::peers::LivePeer>> = peers
+        .live_peers()
+        .into_iter()
+        .filter(|p| {
+            p.id != announcer.id
+                && p.hb_to.load(Ordering::Relaxed)
+                && !p.stop.load(Ordering::Relaxed)
+                && p.writer().is_some()
+        })
+        .collect();
+    let mut picked = Vec::new();
+    if announcer.inbound {
+        if let Some(i) = rest.iter().position(|p| !p.inbound) {
+            picked.push(rest.remove(i));
+        }
+    }
+    for peer in rest {
+        if picked.len() >= 2 {
+            break;
+        }
+        picked.push(peer);
+    }
+    if picked.is_empty() || !announcer.claim_hb_body_fanout(hash) {
+        return;
+    }
+    for peer in picked {
+        let Some(out) = peer.writer() else {
+            continue;
+        };
+        let _ = queue_accounted(
+            Some(peer.as_ref()),
+            &out,
+            NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
+        );
+    }
 }
 
 /// Send a locator the header job already built. Same in-flight gate as
@@ -6474,6 +6536,17 @@ pub async fn on_cmpct_got_block(
         Err(e @ NetError::Store(_)) if !net_error_is_store_not_found(&e) => {
             note_store_fault_keep_session(hub, hash, &e);
         }
+        Err(e) if e.is_mutated() => {
+            hub.forget_asked_block(&hash);
+            follow.pending_headers.remove(&hash);
+            follow.requested_blocks.remove(&hash);
+            if let Some(s) = session {
+                s.note_failed_cmpct(hash);
+                s.release_cmpct_taken(hash);
+            }
+            follow.ban_score = follow.ban_score.saturating_add(10);
+            ask_other_hb_for_block(session, hash);
+        }
         _ => {
             if !hub.knows_header(&hsi.header.prev_blockhash) {
                 let _ = queue_getheaders(out_tx, hub, session, true, None);
@@ -6563,6 +6636,7 @@ pub fn on_cmpct_need_txn(
             txs_request: crate::compact::missing_request(hash, &missing),
         }),
     )?;
+    ask_other_hb_for_block(session, hash);
     rbitcoin_log::debug!("cmpct reconstruct {hash} missing={missing_n} awaiting blocktxn");
     Ok(())
 }
@@ -6591,7 +6665,7 @@ pub async fn on_blocktxn(
         Ok((block, fill)) => {
             on_blocktxn_got_block(hub, out_tx, follow, session, &pc, hash, block, fill).await
         }
-        Err(()) => on_blocktxn_apply_fail(out_tx, follow, session, &pc, hash),
+        Err(()) => on_blocktxn_apply_fail(hub, follow, session, &pc, hash),
     }
 }
 
@@ -6664,13 +6738,13 @@ pub async fn on_blocktxn_got_block(
             )
             .await
         }
-        Err(_) => on_blocktxn_unconnectable(out_tx, follow, session, hash),
+        Err(_) => on_blocktxn_unconnectable(hub, follow, session, hash),
     }
 }
 
 #[doc(hidden)]
 pub fn on_blocktxn_apply_fail(
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    hub: &ChainHub,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     pc: &PendingCmpct,
@@ -6682,16 +6756,15 @@ pub fn on_blocktxn_apply_fail(
         s.note_failed_cmpct(hash);
         s.release_cmpct_taken(hash);
     }
+    hub.forget_asked_block(&hash);
     follow.ban_score = follow.ban_score.saturating_add(10);
-    queue_out(
-        out_tx,
-        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-    )
+    ask_other_hb_for_block(session, hash);
+    Ok(())
 }
 
 #[doc(hidden)]
 pub fn on_blocktxn_unconnectable(
-    out_tx: &mpsc::UnboundedSender<PeerOut>,
+    hub: &ChainHub,
     follow: &mut PeerFollowState,
     session: Option<&crate::peers::LivePeer>,
     hash: BlockHash,
@@ -6701,11 +6774,10 @@ pub fn on_blocktxn_unconnectable(
         s.note_failed_cmpct(hash);
         s.release_cmpct_taken(hash);
     }
+    hub.forget_asked_block(&hash);
     follow.ban_score = follow.ban_score.saturating_add(10);
-    queue_out(
-        out_tx,
-        NetworkMessage::GetData(vec![Inventory::WitnessBlock(hash)]),
-    )
+    ask_other_hb_for_block(session, hash);
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

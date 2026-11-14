@@ -514,6 +514,8 @@ pub struct LivePeer {
     pub handshake_complete: AtomicBool,
     /// BIP324 transport finished. False while EARLY_KEY_RESPONSE / garbage.
     pub v2_transport_ready: AtomicBool,
+    /// Block hashes this session already asked other high-bandwidth peers to send.
+    hb_body_fanned: Mutex<HashSet<BlockHash>>,
     /// Plain v1 framing on a `v1@` wallet-sync listener.
     pub v1_transport: AtomicBool,
     /// Peer sent BIP155 `sendaddrv2` (use `addrv2` for self-announce / GETADDR).
@@ -1436,19 +1438,37 @@ impl LivePeer {
     }
 
     pub fn net_perm_flags(&self) -> crate::net_permissions::NetPermissionFlags {
-        self.owner
-            .upgrade()
-            .map(|h| {
-                h.net_perms
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .flags_for_net(self.net, self.inbound, self.addrbind)
-            })
-            .unwrap_or(crate::net_permissions::NetPermissionFlags::NONE)
+        let Some(h) = self.owner.upgrade() else {
+            return crate::net_permissions::NetPermissionFlags::NONE;
+        };
+        match self.net {
+            crate::NetAddr::Ip(addr) => h.permission_flags(addr, self.inbound, self.addrbind),
+            _ => h
+                .net_perms
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .flags_for_net(self.net, self.inbound, self.addrbind),
+        }
     }
 
     pub fn has_net_perm(&self, flag: crate::net_permissions::NetPermissionFlags) -> bool {
         self.net_perm_flags().has(flag)
+    }
+
+    /// First full-body ask of other high-bandwidth peers for `hash` returns true.
+    pub(crate) fn claim_hb_body_fanout(&self, hash: BlockHash) -> bool {
+        let mut set = self
+            .hb_body_fanned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !set.insert(hash) {
+            return false;
+        }
+        if set.len() > 256 {
+            set.clear();
+            set.insert(hash);
+        }
+        true
     }
 
     /// CIDR/bind table plus operator `--trusted`.
@@ -2035,6 +2055,11 @@ pub struct PeerHub {
     pub mempool: Mutex<Option<Weak<crate::tx_relay::MempoolHub>>>,
     /// Core `-whitelist` / `-whitebind` grants (`getpeerinfo.permissions`).
     pub net_perms: Mutex<crate::net_permissions::NetPermTable>,
+    /// Tor `ADD_ONION` or I2P `STREAM FORWARD` delivers inbound TCP from
+    /// loopback. A `--net-permission` subnet that matches that address must
+    /// not apply to those peers. `--net-permission-bind` still matches the
+    /// listen address.
+    overlay_loopback_forward: AtomicBool,
     /// Misbehavior keys → unix second the refusal ends. In memory only.
     pub discouraged_addrs: Mutex<HashMap<DiscourageKey, u64>>,
     /// Netgroup → unix second a slot-loss refusal ends.
@@ -2282,6 +2307,7 @@ impl PeerHub {
             asmap: Mutex::new(None),
             mempool: Mutex::new(None),
             net_perms: Mutex::new(crate::net_permissions::NetPermTable::default()),
+            overlay_loopback_forward: AtomicBool::new(false),
             discouraged_addrs: Mutex::new(HashMap::new()),
             discouraged_groups: Mutex::new(HashMap::new()),
             rate_strikes: Mutex::new(HashMap::new()),
@@ -2321,16 +2347,24 @@ impl PeerHub {
         *self.net_perms.lock().unwrap_or_else(|e| e.into_inner()) = t;
     }
 
+    /// `--listen-onion` or `--i2p-accept-incoming` forwards onto this node.
+    pub fn set_overlay_loopback_forward(&self, on: bool) {
+        self.overlay_loopback_forward.store(on, Ordering::Relaxed);
+    }
+
     pub fn permission_flags(
         &self,
         addr: SocketAddr,
         inbound: bool,
         bind: SocketAddr,
     ) -> crate::net_permissions::NetPermissionFlags {
+        let apply_whitelist = !(inbound
+            && self.overlay_loopback_forward.load(Ordering::Relaxed)
+            && addr.ip().to_canonical().is_loopback());
         self.net_perms
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .flags_for(addr.ip(), inbound, bind)
+            .flags_for_matched(addr.ip(), inbound, bind, apply_whitelist)
     }
 
     pub fn permission_strings(
@@ -3455,6 +3489,7 @@ impl PeerHub {
             tcp_shutdown: Mutex::new(None),
             handshake_complete: AtomicBool::new(false),
             v2_transport_ready: AtomicBool::new(false),
+            hb_body_fanned: Mutex::new(HashSet::new()),
             v1_transport: AtomicBool::new(false),
             wants_addrv2: AtomicBool::new(false),
             wtxid_relay: AtomicBool::new(false),

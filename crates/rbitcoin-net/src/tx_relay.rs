@@ -1367,6 +1367,23 @@ pub struct IsolatedLapCounts {
     pub no_targets: u64,
 }
 
+/// Constant-scriptCode and the legacy sighash cap are policy. A consensus
+/// script failure still uses [`AcceptError::Script`].
+fn unconfirmed_script_policy(e: &rbitcoin_consensus::ConsensusError) -> Option<&'static str> {
+    let rbitcoin_consensus::ConsensusError::Script(s) = e else {
+        return None;
+    };
+    if s.contains("legacy sighash work") {
+        Some("legacy sighash work")
+    } else if s.contains("OP_CODESEPARATOR") {
+        Some("OP_CODESEPARATOR")
+    } else if s.contains("SIG_FINDANDDELETE") {
+        Some("SIG_FINDANDDELETE")
+    } else {
+        None
+    }
+}
+
 impl MempoolHub {
     /// Short-id walks that entered the mempool, including a `try_read` miss.
     #[cfg(debug_assertions)]
@@ -2799,6 +2816,9 @@ impl MempoolHub {
     ) -> Result<rbitcoin_mempool::PreparedAdmit, AcceptError> {
         if let Err(e) = verified {
             stages.script_us = stages.script_us.saturating_add(script_us);
+            if let Some(policy) = unconfirmed_script_policy(&e) {
+                return Err(AcceptError::Policy(policy));
+            }
             let err = AcceptError::Script(e.to_string());
             let reason = err.mempool_reject_reason();
             if spec.waive && rbitcoin_consensus::reason_is_warn_and_apply(&reason) {
@@ -2813,8 +2833,8 @@ impl MempoolHub {
 
     /// Prepare under read lock; scripts off-lock. Parking is the caller's job.
     ///
-    /// Sync callers block in [`rbitcoin_consensus::verify_tx_scripts_detached`].
-    /// The async admit awaits [`rbitcoin_consensus::verify_tx_scripts_cpu`].
+    /// Sync callers block in [`rbitcoin_consensus::verify_tx_scripts_unconfirmed`].
+    /// The async admit awaits [`rbitcoin_consensus::verify_tx_scripts_unconfirmed_cpu`].
     #[doc(hidden)]
     pub fn admit_staged(
         &self,
@@ -2827,7 +2847,7 @@ impl MempoolHub {
         let prep = self.prepare_admit_only(tx, utxo, spec, stages, lock_us)?;
         let t_script = Instant::now();
         let verified =
-            rbitcoin_consensus::verify_tx_scripts_detached(prep.prevouts.clone(), tx.clone());
+            rbitcoin_consensus::verify_tx_scripts_unconfirmed(prep.prevouts.clone(), tx.clone());
         let script_us = t_script.elapsed().as_micros() as u64;
         Self::apply_script_admit(prep, verified, script_us, &spec, stages)
     }
@@ -3927,7 +3947,7 @@ impl MempoolHub {
     /// Accept without holding a Tokio blocking thread across script verify.
     ///
     /// Prepare and commit run on `rbtc-off-pool`. Scripts are awaited here via
-    /// [`rbitcoin_consensus::verify_tx_scripts_cpu`]. Sync [`Self::accept_tx_from`]
+    /// [`rbitcoin_consensus::verify_tx_scripts_unconfirmed_cpu`]. Sync [`Self::accept_tx_from`]
     /// stays for stack hubs and in-process dispatch. This is relay origin;
     /// RPC and the other local APIs pass [`TxOrigin::Local`].
     pub async fn accept_tx_async(
@@ -4120,8 +4140,11 @@ impl MempoolHub {
         *lock_us = lock_out;
         let prep = prepared?;
         let t_script = Instant::now();
-        let verified =
-            rbitcoin_consensus::verify_tx_scripts_cpu(prep.prevouts.clone(), tx.clone()).await;
+        let verified = rbitcoin_consensus::verify_tx_scripts_unconfirmed_cpu(
+            prep.prevouts.clone(),
+            tx.clone(),
+        )
+        .await;
         let script_us = t_script.elapsed().as_micros() as u64;
         Self::apply_script_admit(prep, verified, script_us, &spec, stages)
     }

@@ -544,9 +544,12 @@ pub fn header_reject(header: &Header, e: &rbitcoin_query::ConfirmError) -> NetEr
         rbitcoin_query::ConfirmError::Rules(r) => r,
     };
     let reason = rbitcoin_consensus::block_reject_reason(rules);
-    rbitcoin_log::info!(
-        "{}",
-        rbitcoin_consensus::block_reject_log_line(header.block_hash(), &reason)
+    rbitcoin_log::info_repeated(
+        rbitcoin_log::RepeatedInfo::HeaderReject,
+        format_args!(
+            "{}",
+            rbitcoin_consensus::block_reject_log_line(header.block_hash(), &reason)
+        ),
     );
     NetError::from_consensus(rules.clone())
 }
