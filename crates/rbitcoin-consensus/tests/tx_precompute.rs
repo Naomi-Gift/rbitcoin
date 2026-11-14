@@ -1,3 +1,5 @@
+use std::mem::size_of;
+
 use bitcoin::absolute::LockTime;
 use bitcoin::consensus::encode::Encodable;
 use bitcoin::hashes::{sha256, sha256d, Hash};
@@ -187,6 +189,16 @@ fn tx_precompute_matches_zero_input_bip144() {
     };
     assert_matches_rust_bitcoin(&tx);
     assert!(TxPrecompute::from_tx(&tx).has_witness);
+}
+
+/// A connect row is stored at the connect size. A script row still
+/// carries `sha_prevouts`.
+#[test]
+fn connect_row_is_the_connect_size() {
+    assert_eq!(size_of::<TxPrecompute>(), size_of::<TxConnectPrecompute>(),);
+    let tx = p2wpkh_like();
+    let row = TxPrecompute::from_tx(&tx);
+    assert_eq!(row.sha_prevouts(), Some(oracle_sha_prevouts(&tx)));
 }
 
 #[test]

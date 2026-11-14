@@ -63,13 +63,12 @@ impl Deref for TxScriptPrecompute {
 
 /// One block row: connect-only for a live mempool tx, script midstates otherwise.
 ///
-/// The script row is larger because it keeps the three midstates. Boxing it
-/// would allocate once per transaction on the confirm pres slice.
+/// The script arm is boxed so a connect row stays the connect size. A script
+/// row allocates once.
 #[derive(Clone, Debug)]
-#[allow(clippy::large_enum_variant)]
 pub enum TxPrecompute {
     Connect(TxConnectPrecompute),
-    Script(TxScriptPrecompute),
+    Script(Box<TxScriptPrecompute>),
 }
 
 impl Deref for TxPrecompute {
@@ -140,7 +139,7 @@ fn pack_precompute(connect: TxConnectPrecompute, mids: Option<[[u8; 32]; 3]>) ->
     let Some([sha_prevouts, sha_sequences, sha_outputs]) = mids else {
         return TxPrecompute::Connect(connect);
     };
-    TxPrecompute::Script(TxScriptPrecompute {
+    TxPrecompute::Script(Box::new(TxScriptPrecompute {
         connect,
         sha_prevouts,
         sha_sequences,
@@ -150,7 +149,7 @@ fn pack_precompute(connect: TxConnectPrecompute, mids: Option<[[u8; 32]; 3]>) ->
         prevouts_d: OnceLock::new(),
         sequences_d: OnceLock::new(),
         outputs_d: OnceLock::new(),
-    })
+    }))
 }
 
 struct MidEngines {
@@ -431,7 +430,7 @@ pub fn tip_precompute(tx: &Transaction, connect: TxConnectPrecompute, live: bool
     if live || !sighash_midstates_for(tx) {
         TxPrecompute::Connect(connect)
     } else {
-        TxPrecompute::Script(TxScriptPrecompute::from_connect(connect, tx))
+        TxPrecompute::Script(Box::new(TxScriptPrecompute::from_connect(connect, tx)))
     }
 }
 
