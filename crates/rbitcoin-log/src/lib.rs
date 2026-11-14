@@ -273,26 +273,27 @@ pub enum Style {
     Bold,
 }
 
-/// Peer-driven info lines that must not append once per event.
+/// Peer- and client-driven info lines that must not append once per event.
 ///
-/// The slot is the event class. A distinct header hash or peer address does
-/// not open a new slot.
+/// The slot is the event class. A distinct header hash, peer address, or
+/// client address does not open a new slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RepeatedInfo {
     ConnectedToSelf = 0,
     HeaderReject = 1,
+    RpcAtMaxConnections = 2,
 }
 
 const REPEATED_INFO_GAP_MS: u64 = 1_000;
 
 thread_local! {
-    static REPEATED_INFO_AT: RefCell<[Option<Instant>; 2]> = const { RefCell::new([None, None]) };
+    static REPEATED_INFO_AT: RefCell<[Option<Instant>; 3]> = const { RefCell::new([None; 3]) };
 }
 
 /// Forget this thread's last emit time. Tests start a burst from an empty window.
 #[doc(hidden)]
 pub fn reset_repeated_info() {
-    REPEATED_INFO_AT.with(|slot| *slot.borrow_mut() = [None, None]);
+    REPEATED_INFO_AT.with(|slot| *slot.borrow_mut() = [None; 3]);
 }
 
 /// [`log_at`] at info, at most once per second for `which` on this thread.
