@@ -543,7 +543,6 @@ impl SpendPageLog {
             i: usize,
             rel: u16,
             loc: PageLoc,
-            file: Arc<File>,
         }
         let mut order: Vec<(u64, u16, usize)> = abs
             .iter()
@@ -557,6 +556,7 @@ impl SpendPageLog {
         order.sort_unstable_by_key(|(page, _, i)| (*page, *i));
         let mut out = vec![None; abs.len()];
         let mut reads: Vec<PendingRead> = Vec::new();
+        let mut files: HashMap<u32, Arc<File>> = HashMap::new();
         {
             let g = self.lock();
             let mut start = 0;
@@ -569,12 +569,12 @@ impl SpendPageLog {
                 for &(_, rel, i) in &order[start..end] {
                     match covered_slot(&g, page_off, rel) {
                         Some(Covered::Noted(meta)) => out[i] = Some(meta),
-                        Some(Covered::File(loc)) => reads.push(PendingRead {
-                            i,
-                            rel,
-                            loc,
-                            file: generation_file(&g, loc.generation),
-                        }),
+                        Some(Covered::File(loc)) => {
+                            files
+                                .entry(loc.generation)
+                                .or_insert_with(|| generation_file(&g, loc.generation));
+                            reads.push(PendingRead { i, rel, loc });
+                        }
                         None => {}
                     }
                 }
@@ -593,7 +593,7 @@ impl SpendPageLog {
             {
                 end += 1;
             }
-            let image = read_loc_bytes(&reads[start].file, &path, loc);
+            let image = read_loc_bytes(&files[&loc.generation], &path, loc);
             for read in &reads[start..end] {
                 out[read.i] = slot_in_image(&image, read.rel);
             }
