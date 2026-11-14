@@ -30,8 +30,8 @@ pub const SPEND_PAGES_COMMIT_NAME: &str = "spend.pages.commit";
 pub const OPEN_EDGE_CAP: u64 = 2_000_000;
 /// Distinct open pages that ask for another checkpoint until the set drains.
 ///
-/// One dirty page becomes a full image at compose. The edge cap counts slots,
-/// so this bound is what keeps a generation from composing several gigabytes.
+/// One dirty page becomes a full image at compose. This budget asks for an
+/// earlier checkpoint. Confirm still waits on the edge cap, not on this count.
 pub const OPEN_PAGE_BUDGET: u64 = 65_536;
 /// On-disk `spend.pages` length that asks for a checkpoint before the ten-minute timer.
 pub const LOG_IMAGE_CAP: u64 = 1024 * 1024 * 1024;
@@ -429,6 +429,12 @@ impl SpendPageLog {
         if early {
             self.pace.arm();
         }
+    }
+
+    /// Open slot deltas [`Self::wait_open_edge_room`] waits on.
+    #[doc(hidden)]
+    pub fn open_edge_count(&self) -> u64 {
+        self.lock().open_edges
     }
 
     /// Block while the open directory is still at the edge cap.
@@ -2431,15 +2437,25 @@ fn apply_held_explode(
 
 /// Keep restored slots without covering a newer frozen note.
 ///
-/// `open` replaces a frozen slot on the next snapshot. Parking the older
-/// committed value there publishes that value and drops the note.
+/// When this checkpoint already froze pages, the slots stay in `frozen` and
+/// do not count toward the edge cap. Otherwise they park in `open`, and the
+/// next snapshot publishes them. A newer note already in `frozen` stays.
 fn restore_kept_slots(g: &mut Inner, page_off: u64, slots: PageSlots) {
-    if let Some(page) = g.frozen.get_mut(&page_off) {
-        overlay_missing_slots(page, slots);
-        page.base = None;
+    if g.frozen.contains_key(&page_off) || matches!(g.staged_freeze, Some(StagedFreeze::Pages(_))) {
+        park_frozen_slots(g, page_off, slots);
     } else {
         park_open_slots(g, page_off, slots);
     }
+}
+
+/// Put restored slots on the frozen page. Do not count them as open edges.
+fn park_frozen_slots(g: &mut Inner, page_off: u64, slots: PageSlots) {
+    if let Some(page) = g.frozen.get_mut(&page_off) {
+        overlay_missing_slots(page, slots);
+        page.base = None;
+        return;
+    }
+    g.frozen.insert(page_off, open_page(slots, None));
 }
 
 /// Copy slots that this page does not already name. A newer note stays.

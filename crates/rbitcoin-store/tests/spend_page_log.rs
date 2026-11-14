@@ -3421,6 +3421,67 @@ fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// A freeze already staged must not count a held restore toward the edge cap.
+///
+/// The first freeze leaves `frozen` non-empty, so the callback freeze is a
+/// reuse and does not reset `open_edges`. Restored slots parked in `open`
+/// fill that cap until install, and confirm blocks for the whole compose.
+#[test]
+fn held_restore_after_a_staged_freeze_does_not_fill_the_edge_cap() {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [5u8, 1, 2, 3, 4, 5, 6, 7];
+    let mut batch = Vec::with_capacity(4096);
+    let mut n = 0u64;
+    while n < OPEN_EDGE_CAP {
+        let page = 1 + n / 512;
+        let rel = n % 512;
+        batch.push((page * 4096 + rel * 8, slot));
+        n += 1;
+        if batch.len() == 4096 {
+            log.note_slots(&batch).unwrap();
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        log.note_slots(&batch).unwrap();
+    }
+    let pages = OPEN_EDGE_CAP.div_ceil(512);
+    let published = (1 + pages) * 4096;
+    log.commit_open(5, published, |_off, len| Ok(vec![0u8; len]), |_| Ok(true))
+        .unwrap();
+    log.hold_fold_above(0).unwrap();
+    let fresh = [6u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, fresh)]).unwrap();
+    log.freeze_open();
+    let wake = Arc::new((Mutex::new(false), Condvar::new()));
+    log.bind_sync_wake(Arc::clone(&wake));
+    log.prepare_commit_in(
+        0,
+        published,
+        |_off, len| Ok(vec![0u8; len]),
+        |_| Ok(true),
+        |page| {
+            assert!(
+                page.open_edge_count() < OPEN_EDGE_CAP,
+                "restored slots must not fill the edge cap before the callback freeze"
+            );
+            page.wait_open_edge_room();
+            assert_eq!(page.slot(4096), Some(slot));
+            page.freeze_open();
+            Ok(())
+        },
+        |_| Ok(0),
+    )
+    .unwrap();
+    log.install_commit().unwrap();
+    assert_eq!(log.slot(4096), Some(slot));
+    assert_eq!(log.slot(16), Some(fresh));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A spender sync that fails after the freeze must still wake confirm.
 ///
 /// The freeze has already moved the open notes and dropped the edge count.

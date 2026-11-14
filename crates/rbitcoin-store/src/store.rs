@@ -2048,7 +2048,9 @@ impl Store {
         // Freeze, and wake an edge-cap waiter, before the cooled-page copy.
         // The copy finishes before the next generation file is assembled.
         // The callback freezes again so notes taken during the copy join
-        // this generation. That second freeze is a reuse and does not notify.
+        // this generation. That freeze is a reuse, and does not notify, only
+        // when the first freeze moved pages. An empty first freeze is a fresh
+        // swap: it resets the edge count and notifies.
         self.txs.widen_for_checkpoint(height);
         let publish = &self.utxo_publish;
         let view = &self.utxo_view;

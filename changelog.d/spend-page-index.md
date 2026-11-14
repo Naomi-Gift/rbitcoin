@@ -5,4 +5,5 @@ Changed
   on demand, including an explicit zero. Fold copies those file bytes onto
   `spent.body`. The open set also asks for a checkpoint at 65,536 distinct
   pages and keeps asking until that set drains. Freeze wakes a confirm
-  thread blocked on the edge cap before the cooled-page copy.
+  thread blocked on the edge cap before the cooled-page copy. A held
+  generation restored after that freeze does not count toward the cap.
