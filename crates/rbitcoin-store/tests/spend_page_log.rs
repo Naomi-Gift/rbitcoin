@@ -20,22 +20,30 @@ fn dir() -> PathBuf {
 fn image_cap_schedules_one_followup_and_the_edge_cap_stays_due() {
     assert!(!spend_checkpoint_early(
         OPEN_EDGE_CAP - 1,
+        0,
         LOG_IMAGE_CAP - 1
     ));
-    assert!(spend_checkpoint_early(OPEN_EDGE_CAP, 0));
-    assert!(spend_checkpoint_early(0, LOG_IMAGE_CAP));
-    assert_eq!(pace_after_checkpoint(0, LOG_IMAGE_CAP, false), (true, true));
-    assert_eq!(pace_after_checkpoint(0, LOG_IMAGE_CAP, true), (false, true));
+    assert!(spend_checkpoint_early(OPEN_EDGE_CAP, 0, 0));
+    assert!(spend_checkpoint_early(0, 0, LOG_IMAGE_CAP));
     assert_eq!(
-        pace_after_checkpoint(OPEN_EDGE_CAP, LOG_IMAGE_CAP, true),
+        pace_after_checkpoint(0, 0, LOG_IMAGE_CAP, false),
         (true, true)
     );
-    assert_eq!(pace_after_checkpoint(0, 0, true), (false, false));
-    assert!(spend_note_arms(0, LOG_IMAGE_CAP, false));
-    assert!(!spend_note_arms(0, LOG_IMAGE_CAP, true));
-    assert!(spend_note_arms(OPEN_EDGE_CAP, LOG_IMAGE_CAP, true));
+    assert_eq!(
+        pace_after_checkpoint(0, 0, LOG_IMAGE_CAP, true),
+        (false, true)
+    );
+    assert_eq!(
+        pace_after_checkpoint(OPEN_EDGE_CAP, 0, LOG_IMAGE_CAP, true),
+        (true, true)
+    );
+    assert_eq!(pace_after_checkpoint(0, 0, 0, true), (false, false));
+    assert!(spend_note_arms(0, 0, LOG_IMAGE_CAP, false));
+    assert!(!spend_note_arms(0, 0, LOG_IMAGE_CAP, true));
+    assert!(spend_note_arms(OPEN_EDGE_CAP, 0, LOG_IMAGE_CAP, true));
     assert!(!spend_note_arms(
         OPEN_EDGE_CAP - 1,
+        0,
         LOG_IMAGE_CAP - 1,
         false
     ));
@@ -103,6 +111,96 @@ fn batched_slot_read_matches_the_single_offset_read() {
 fn zeros(off: u64, len: usize) -> Result<Vec<u8>, StoreError> {
     let _ = off;
     Ok(vec![0u8; len])
+}
+
+#[test]
+fn covered_slot_presence_does_not_read_the_generation_file() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    let pages = d.join(SPEND_PAGES_NAME);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&pages)
+        .unwrap();
+    file.set_len(0).unwrap();
+    assert!(
+        log.covers(16),
+        "a committed slot stays covered without reading the generation file"
+    );
+    assert!(
+        !log.covers(4096),
+        "a page the commit does not name is still the body"
+    );
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.slot(16)));
+    assert!(
+        read.is_err(),
+        "the truncated generation file is what the byte read hits"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Notes taken during the cooled copy sit in `open`. The snapshot already
+/// merged them with the frozen slots. Install must drop that page without
+/// reading the generation file.
+#[test]
+fn install_does_not_read_open_notes_already_in_the_generation() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let older = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let newer = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, older)]).unwrap();
+    log.freeze_before_cooled_copy();
+    log.note_slots(&[(24, newer)]).unwrap();
+    log.prepare_commit(5, 8192, zeros, |_| Ok(true)).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(d.join(SPEND_PAGES_NAME))
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    log.install_commit().unwrap();
+    assert!(
+        log.covers(16),
+        "the frozen slot stays covered without reading the generation file"
+    );
+    assert!(
+        log.covers(24),
+        "the note taken during the copy stays covered without that read"
+    );
+    assert_eq!(
+        log.open_edge_count(),
+        0,
+        "open notes already in the image leave open"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A note that lands after the snapshot is not in the image. Install keeps it.
+#[test]
+fn install_keeps_a_note_taken_after_the_snapshot() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let older = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let newer = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    let after = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, older)]).unwrap();
+    log.freeze_before_cooled_copy();
+    log.note_slots(&[(24, newer)]).unwrap();
+    log.prepare_commit(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(32, after)]).unwrap();
+    log.install_commit().unwrap();
+    assert_eq!(log.slot(16), Some(older));
+    assert_eq!(log.slot(24), Some(newer));
+    assert_eq!(log.slot(32), Some(after));
+    assert_eq!(
+        log.open_edge_count(),
+        1,
+        "a note taken after the snapshot stays open"
+    );
+    let _ = std::fs::remove_dir_all(&d);
 }
 
 #[test]
@@ -1782,6 +1880,84 @@ fn hold_between_prepare_and_install_is_not_folded() {
 }
 
 #[test]
+fn note_during_a_rejected_clear_keeps_the_page_image() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let stale = [0xabu8; 8];
+    log.note_slots(&[(16, stale)]).unwrap();
+    log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(1).unwrap();
+    let noted = std::sync::atomic::AtomicBool::new(false);
+    log.commit_open(
+        1,
+        8192,
+        |off, len| {
+            if off == 0 && !noted.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log.note_slots(&[(32, [1, 2, 3, 4, 5, 6, 7, 8])]).unwrap();
+            }
+            zeros(off, len)
+        },
+        |_| Ok(false),
+    )
+    .unwrap();
+    assert_eq!(
+        log.slot(16),
+        Some(stale),
+        "a covered slot still answers from the generation image"
+    );
+    assert_eq!(
+        log.slot(24),
+        Some([0u8; 8]),
+        "an explicit zero in that image suppresses the body"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn hold_during_the_clearing_image_keeps_the_commit_bit() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let stale = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, stale)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let calls = std::sync::atomic::AtomicU32::new(0);
+    let planted = [(16u64, stale)];
+    let read = body_with(&planted);
+    log.commit_open(
+        4,
+        8192,
+        |off, len| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+                log.hold_fold_above(1)?;
+            }
+            read(off, len)
+        },
+        |_| Ok(false),
+    )
+    .unwrap();
+    let buf = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    assert_eq!(
+        u16::from_le_bytes(buf[6..8].try_into().unwrap()),
+        1,
+        "a hold during the clearing image must stay on the new commit"
+    );
+    let loaded = SpendPageLog::load(&d).unwrap();
+    let mut writes = 0u32;
+    loaded
+        .fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(writes, 0, "a restart must not fold the old-chain image");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn redirtied_page_stays_in_the_commit_when_an_older_page_folds() {
     let d = dir();
     let log = SpendPageLog::create(&d);
@@ -3095,6 +3271,502 @@ fn review_1501_fold_spindle() {
         });
     }
     drop(s);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A published page is the generation file. A zero in that file hides the body.
+///
+/// The body a later compose would read is a different pattern. Lookup returns
+/// the file, including an explicit zero. A slot past the short image is not
+/// covered. Fold copies the file bytes, skipping the 16-byte header on page 0,
+/// and the directory then misses the page.
+#[test]
+fn published_image_is_the_generation_file_until_fold() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let spend = [4u8, 1, 2, 3, 4, 5, 6, 7];
+    let neighbor = [9u8, 9, 9, 9, 9, 9, 9, 9];
+    let zero = [0u8; 8];
+    let mut body = [0xabu8; 200];
+    body[16..24].copy_from_slice(&spend);
+    body[24..32].copy_from_slice(&neighbor);
+    let published = body.len() as u64;
+    log.note_slots(&[(16, spend)]).unwrap();
+    log.commit_open(
+        1,
+        published,
+        |_off, len| Ok(body[..len].to_vec()),
+        |_| Ok(true),
+    )
+    .unwrap();
+    log.note_slots(&[(24, zero)]).unwrap();
+    let later_body = [0x11u8; 200];
+    log.commit_open(
+        2,
+        published,
+        |_off, len| Ok(later_body[..len].to_vec()),
+        |_| Ok(true),
+    )
+    .unwrap();
+    let carried = std::fs::read(d.join(SPEND_PAGES_NAME)).unwrap();
+    assert_eq!(&carried[16..24], &spend);
+    assert_eq!(&carried[24..32], &zero);
+    assert_eq!(&carried[32..40], &body[32..40]);
+    assert_ne!(&carried[32..40], &later_body[32..40]);
+    assert_eq!(log.slot(16), Some(spend));
+    assert_eq!(
+        log.slot(24),
+        Some(zero),
+        "an explicit zero in the generation file hides the body"
+    );
+    assert_eq!(log.slot(32), Some(body[32..40].try_into().unwrap()));
+    assert_eq!(
+        log.slot(published),
+        None,
+        "a slot past the published image stays on spent.body"
+    );
+    assert_eq!(
+        log.resident_image_bytes(),
+        0,
+        "the installed directory keeps file coordinates, not page images"
+    );
+    log.commit_open(
+        3,
+        published,
+        |_off, len| Ok(later_body[..len].to_vec()),
+        |_| Ok(true),
+    )
+    .unwrap();
+    let mut folded = None;
+    log.fold_into(
+        |off, image| {
+            folded = Some((off, image.to_vec()));
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    let (off, image) = folded.expect("fold copies the generation file");
+    assert_eq!(off, 16);
+    assert_eq!(
+        image,
+        carried[16..],
+        "fold writes the generation-file bytes past the page-0 header"
+    );
+    assert_eq!(log.slot(16), None, "a folded page leaves the directory");
+    assert_eq!(log.slot(24), None);
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The distinct-page budget arms inside 64k..=128k and stays armed while the
+/// open set is still over it. The edge cap is unchanged.
+#[test]
+fn page_budget_stays_armed_and_the_edge_cap_is_unchanged() {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    assert_eq!(OPEN_EDGE_CAP, 2_000_000);
+    let budget = rbitcoin_store::spend_page_log::OPEN_PAGE_BUDGET;
+    assert!(
+        (65_536..=131_072).contains(&budget),
+        "the page budget must sit in the 64k..=128k band"
+    );
+    assert!(!spend_checkpoint_early(0, budget - 1, 0));
+    assert!(spend_checkpoint_early(0, budget, 0));
+    assert!(spend_checkpoint_early(OPEN_EDGE_CAP, 0, 0));
+    assert_eq!(
+        pace_after_checkpoint(0, budget, 0, true),
+        (true, true),
+        "a full page budget keeps requesting after the image follow-up is used"
+    );
+    assert_eq!(
+        pace_after_checkpoint(0, budget - 1, 0, true),
+        (false, false)
+    );
+    assert!(spend_note_arms(0, budget, 0, true));
+    assert!(!spend_note_arms(0, budget - 1, 0, true));
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let wake = Arc::new((Mutex::new(false), Condvar::new()));
+    log.bind_sync_wake(Arc::clone(&wake));
+    let slot = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    let mut batch = Vec::with_capacity(1024);
+    for i in 0..budget {
+        batch.push((i * 4096, slot));
+        if batch.len() == 1024 {
+            log.note_slots(&batch).unwrap();
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        log.note_slots(&batch).unwrap();
+    }
+    assert!(
+        log.checkpoint_early(),
+        "noting one slot on each budget page must arm a checkpoint"
+    );
+    log.relax_pace();
+    assert!(
+        log.checkpoint_early(),
+        "relaxing the pace must keep the checkpoint armed while those pages are open"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Freeze wakes an edge-cap waiter before the cooled body copy runs.
+#[cfg(debug_assertions)]
+#[test]
+fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Condvar, Mutex};
+    use std::time::Duration;
+
+    let d = dir();
+    let store = rbitcoin_store::Store::create_tiny(&d).unwrap();
+    let nbytes = 4096usize;
+    let prep = store
+        .txs
+        .spent
+        .prepare_batch_encode(1, nbytes, |_i, buf| {
+            buf.resize(buf.len() + nbytes, 0);
+        })
+        .unwrap()
+        .expect("one spent append");
+    store
+        .txs
+        .spent
+        .write_body_blob_bulk(prep.start, &prep.body_blob)
+        .unwrap();
+    store.txs.spent.finish_prepared(prep).unwrap();
+    let slot =
+        rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk::NULL, 0).unwrap();
+    store.note_open_spend_slots(&[(16, slot)]).unwrap();
+    store.checkpoint_spend_through(0).unwrap();
+    assert_eq!(store.spend_directory_slot(16), Some(slot));
+
+    let mut batch = Vec::with_capacity(4096);
+    let mut n = 0u64;
+    while n < OPEN_EDGE_CAP {
+        let page = 1 + n / 512;
+        let rel = n % 512;
+        batch.push((page * 4096 + rel * 8, slot));
+        n += 1;
+        if batch.len() == 4096 {
+            store.note_open_spend_slots(&batch).unwrap();
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        store.note_open_spend_slots(&batch).unwrap();
+    }
+    let wake = Arc::new((Mutex::new(false), Condvar::new()));
+    store.bind_spend_sync_wake(Arc::clone(&wake));
+    let (lock, cv) = &*wake;
+    let guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let released = AtomicBool::new(false);
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            store.wait_spend_edge_room();
+            released.store(true, Ordering::SeqCst);
+            let _ = done_tx.send(());
+        });
+        let (_guard, waited) = cv
+            .wait_timeout(guard, Duration::from_secs(30))
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !waited.timed_out(),
+            "confirm must be blocked on the edge cap before the checkpoint"
+        );
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let checkpoint = scope.spawn(|| {
+            FOLD_GATE.with(|slot| {
+                *slot.borrow_mut() = Some(FoldGate {
+                    entered: entered_tx,
+                    release: release_rx,
+                });
+            });
+            rbitcoin_store::Store::arm_spend_fold_probe(review_1501_fold_probe);
+            store.checkpoint_spend_through(0)
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the cooled copy must start");
+        let woke = done_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).expect("release fold");
+        woke.expect("freeze must wake the edge-cap waiter before the cooled copy finishes");
+        assert!(released.load(Ordering::SeqCst));
+        checkpoint
+            .join()
+            .unwrap()
+            .expect("checkpoint finishes after the copy");
+    });
+    rbitcoin_store::Store::disarm_spend_fold_probe();
+    assert_eq!(
+        store.spend_directory_slot(16),
+        None,
+        "the cooled page is copied from the generation file before the next one is assembled"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static SEAL_DURING_COPY: std::cell::RefCell<Option<std::sync::Arc<rbitcoin_store::Store>>> =
+        const { std::cell::RefCell::new(None) };
+    static SEAL_PROBE_RAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(debug_assertions)]
+fn seal_during_copy_probe() {
+    SEAL_PROBE_RAN.with(|ran| ran.set(true));
+    SEAL_DURING_COPY.with(|slot| {
+        let store = slot.borrow();
+        let store = store.as_ref().expect("store");
+        assert!(
+            !store.spend_log_above(7),
+            "publish_open_spend_pages must not seal tip 8 before the cooled copy"
+        );
+        assert!(
+            store.spend_log_above(4),
+            "the generation sealed at 5 stays above 4 during the copy"
+        );
+    });
+}
+
+#[cfg(debug_assertions)]
+struct ClearSealProbe;
+
+#[cfg(debug_assertions)]
+impl Drop for ClearSealProbe {
+    fn drop(&mut self) {
+        rbitcoin_store::Store::disarm_spend_fold_probe();
+        SEAL_DURING_COPY.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+/// The freeze before the cooled copy must not stamp the new tip.
+///
+/// The generation being copied was sealed at an older checkpoint. A disconnect
+/// below the new tip and at or above that generation has to fold those pages.
+/// Stamping the new tip first holds the fold, and the next checkpoint
+/// republishes them.
+#[test]
+fn early_freeze_does_not_seal_the_tip_before_the_cooled_copy() {
+    let d = dir();
+    let store = std::sync::Arc::new(rbitcoin_store::Store::create_tiny(&d).unwrap());
+    let nbytes = 8192usize;
+    let prep = store
+        .txs
+        .spent
+        .prepare_batch_encode(1, nbytes, |_i, buf| {
+            buf.resize(buf.len() + nbytes, 0);
+        })
+        .unwrap()
+        .expect("one spent append");
+    store
+        .txs
+        .spent
+        .write_body_blob_bulk(prep.start, &prep.body_blob)
+        .unwrap();
+    store.txs.spent.finish_prepared(prep).unwrap();
+    let slot =
+        rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk::NULL, 0).unwrap();
+    store.note_open_spend_slots(&[(16, slot)]).unwrap();
+    store.checkpoint_spend_through(5).unwrap();
+    assert!(
+        store.spend_log_above(4),
+        "the generation sealed at 5 is above 4"
+    );
+    assert!(
+        !store.spend_log_above(7),
+        "7 is still above that sealed generation"
+    );
+    store.note_open_spend_slots(&[(4096, slot)]).unwrap();
+    store.txs.freeze_open_spend_pages();
+    assert!(
+        !store.spend_log_above(7),
+        "freezing the open pages does not raise the sealed tip"
+    );
+    assert!(store.spend_log_above(4), "the older seal stays in place");
+    #[cfg(debug_assertions)]
+    {
+        let _clear = ClearSealProbe;
+        SEAL_PROBE_RAN.with(|ran| ran.set(false));
+        SEAL_DURING_COPY.with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::clone(&store)));
+        rbitcoin_store::Store::arm_spend_fold_probe(seal_during_copy_probe);
+        store.checkpoint_spend_through(8).unwrap();
+        assert!(
+            SEAL_PROBE_RAN.with(|ran| ran.get()),
+            "the cooled copy must run while the tip is still unsealed"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A disconnect to 7 during the cooled copy still folds a generation sealed at 5.
+///
+/// The early freeze must not stamp tip 8. `hold_fold_above(7)` then sees no
+/// height above 7, and the quiet page is copied.
+#[test]
+fn disconnect_during_the_cooled_copy_still_folds_the_sealed_generation() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let fresh = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(4096, fresh)]).unwrap();
+    log.widen_for_checkpoint(8);
+    log.freeze_before_cooled_copy();
+    log.hold_fold_above(7).unwrap();
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, _image| {
+            writes += 1;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        writes, 1,
+        "a quiet page sealed at 5 must fold when the tip falls to 7"
+    );
+    assert_eq!(log.slot(16), None);
+    assert_eq!(log.slot(4096), Some(fresh));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The early swap leaves `frozen` occupied and does not stage a snapshot.
+///
+/// Restored slots parked in `open` fill the edge cap, and the callback freeze
+/// is a reuse that does not reset it. They stay in `frozen` instead.
+#[test]
+fn held_restore_after_the_early_swap_does_not_fill_the_edge_cap() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [5u8, 1, 2, 3, 4, 5, 6, 7];
+    let mut noted = Vec::with_capacity(4);
+    for rel in 0..4u16 {
+        noted.push((4096 + u64::from(rel) * 8, slot));
+    }
+    log.note_slots(&noted).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(0).unwrap();
+    let fresh = [6u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, fresh)]).unwrap();
+    log.freeze_before_cooled_copy();
+    assert_eq!(
+        log.open_edge_count(),
+        0,
+        "the early swap moves the open note out of the edge cap"
+    );
+    log.prepare_commit_in(
+        0,
+        8192,
+        zeros,
+        |_| Ok(true),
+        |page| {
+            assert_eq!(
+                page.open_edge_count(),
+                0,
+                "restored slots must stay out of the edge cap when the early freeze only swapped"
+            );
+            page.freeze_open();
+            Ok(())
+        },
+        |_| Ok(0),
+    )
+    .unwrap();
+    log.install_commit().unwrap();
+    assert_eq!(log.slot(4096), Some(slot));
+    assert_eq!(log.slot(16), Some(fresh));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// An empty early freeze leaves `frozen` empty, so the callback freeze is a
+/// fresh swap and drops the edge count.
+#[test]
+fn empty_early_freeze_still_resets_edges_on_the_callback_freeze() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [7u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.freeze_before_cooled_copy();
+    log.note_slots(&[(4096, slot)]).unwrap();
+    assert_eq!(log.open_edge_count(), 1);
+    log.freeze_open();
+    assert_eq!(
+        log.open_edge_count(),
+        0,
+        "an empty early freeze leaves the callback freeze as a fresh swap"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A freeze already staged must not count a held restore toward the edge cap.
+///
+/// The first freeze leaves `frozen` non-empty, so the callback freeze is a
+/// reuse and does not reset `open_edges`. Restored slots parked in `open`
+/// fill that cap until install, and confirm blocks for the whole compose.
+#[test]
+fn held_restore_after_a_staged_freeze_does_not_fill_the_edge_cap() {
+    use std::sync::{Arc, Condvar, Mutex};
+
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [5u8, 1, 2, 3, 4, 5, 6, 7];
+    let mut batch = Vec::with_capacity(4096);
+    let mut n = 0u64;
+    while n < OPEN_EDGE_CAP {
+        let page = 1 + n / 512;
+        let rel = n % 512;
+        batch.push((page * 4096 + rel * 8, slot));
+        n += 1;
+        if batch.len() == 4096 {
+            log.note_slots(&batch).unwrap();
+            batch.clear();
+        }
+    }
+    if !batch.is_empty() {
+        log.note_slots(&batch).unwrap();
+    }
+    let pages = OPEN_EDGE_CAP.div_ceil(512);
+    let published = (1 + pages) * 4096;
+    log.commit_open(5, published, |_off, len| Ok(vec![0u8; len]), |_| Ok(true))
+        .unwrap();
+    log.hold_fold_above(0).unwrap();
+    let fresh = [6u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, fresh)]).unwrap();
+    log.freeze_open();
+    let wake = Arc::new((Mutex::new(false), Condvar::new()));
+    log.bind_sync_wake(Arc::clone(&wake));
+    log.prepare_commit_in(
+        0,
+        published,
+        |_off, len| Ok(vec![0u8; len]),
+        |_| Ok(true),
+        |page| {
+            assert!(
+                page.open_edge_count() < OPEN_EDGE_CAP,
+                "restored slots must not fill the edge cap before the callback freeze"
+            );
+            page.wait_open_edge_room();
+            assert_eq!(page.slot(4096), Some(slot));
+            page.freeze_open();
+            Ok(())
+        },
+        |_| Ok(0),
+    )
+    .unwrap();
+    log.install_commit().unwrap();
+    assert_eq!(log.slot(4096), Some(slot));
+    assert_eq!(log.slot(16), Some(fresh));
     let _ = std::fs::remove_dir_all(&d);
 }
 

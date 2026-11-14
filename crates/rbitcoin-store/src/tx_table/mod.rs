@@ -2506,7 +2506,7 @@ impl TxTable {
     }
 
     pub(crate) fn spend_log_serves(&self, abs: u64) -> bool {
-        self.spend_pages.slot(abs).is_some()
+        self.spend_pages.covers(abs)
     }
 
     /// True when the published body slot is exactly `(field, flags, vin)`.
@@ -2681,12 +2681,26 @@ impl TxTable {
         self.spend_pages.wait_open_edge_room();
     }
 
+    #[doc(hidden)]
+    pub fn spend_log_slot(&self, abs: u64) -> Option<[u8; 8]> {
+        self.spend_pages.slot(abs)
+    }
+
     pub(crate) fn hold_spend_fold_above(&self, tip: u32) -> Result<(), StoreError> {
         self.spend_pages.hold_fold_above(tip)
     }
 
     pub(crate) fn widen_for_checkpoint(&self, height: u32) {
         self.spend_pages.widen_for_checkpoint(height);
+    }
+
+    /// Swap open pages into `frozen` before the cooled copy.
+    ///
+    /// The confirmed tip is sealed after that copy. Sealing it here holds a
+    /// generation that does not contain the disconnected block.
+    #[doc(hidden)]
+    pub fn freeze_open_spend_pages(&self) {
+        self.spend_pages.freeze_before_cooled_copy();
     }
 
     pub(crate) fn spend_log_above(&self, tip: u32) -> bool {
@@ -2734,9 +2748,7 @@ impl TxTable {
         let slot_vin = if multi { 0 } else { vin };
         let meta = encode_spent_slot(flags, field, slot_vin)?;
         let published = self.spent.body_published_len();
-        if self.spend_pages.slot(abs).is_some()
-            || crate::spend_page_log::is_historical(published, abs)
-        {
+        if self.spend_pages.covers(abs) || crate::spend_page_log::is_historical(published, abs) {
             return self.note_historical_spend_slots(&[(abs, meta)]);
         }
         self.spent.write_body_pwrite(abs, &meta)
