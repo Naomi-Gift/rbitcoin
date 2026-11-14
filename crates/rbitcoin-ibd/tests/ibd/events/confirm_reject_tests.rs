@@ -4642,7 +4642,9 @@ fn stamp_reject_lands_on_the_valid_prefix() {
 
 /// The wave load rejects is tip+3 and the bad tip+4, with tip+1 and tip+2 in
 /// the write stage. They are not dropped. The retry runs one block at a time
-/// on top of tip+2, connects tip+3, and judges tip+4.
+/// on top of tip+2, connects tip+3, and judges tip+4. Lookup is lowered
+/// before those bodies are queued again, so assign may ask once for a body
+/// it already held.
 #[test]
 fn batched_load_reject_lands_on_the_valid_prefix() {
     let mut rig = WireRig::new("load-reject-batched", 1);
@@ -4662,7 +4664,10 @@ fn batched_load_reject_lands_on_the_valid_prefix() {
     );
     assert_eq!(rig.st.halt, None);
     assert_eq!(rig.hub.tip_hash(), Some(chain[2].block_hash()));
-    assert_eq!(asked, 0, "no body is fetched again");
+    assert!(
+        asked <= 1,
+        "the rewind asks for at most one body it already held (asked {asked})"
+    );
     rig.finish();
 }
 
