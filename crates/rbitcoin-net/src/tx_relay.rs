@@ -2813,8 +2813,8 @@ impl MempoolHub {
 
     /// Prepare under read lock; scripts off-lock. Parking is the caller's job.
     ///
-    /// Sync callers block in [`rbitcoin_consensus::verify_tx_scripts_detached`].
-    /// The async admit awaits [`rbitcoin_consensus::verify_tx_scripts_cpu`].
+    /// Sync callers block in [`rbitcoin_consensus::verify_tx_scripts_unconfirmed`].
+    /// The async admit awaits [`rbitcoin_consensus::verify_tx_scripts_unconfirmed_cpu`].
     #[doc(hidden)]
     pub fn admit_staged(
         &self,
@@ -2827,7 +2827,7 @@ impl MempoolHub {
         let prep = self.prepare_admit_only(tx, utxo, spec, stages, lock_us)?;
         let t_script = Instant::now();
         let verified =
-            rbitcoin_consensus::verify_tx_scripts_detached(prep.prevouts.clone(), tx.clone());
+            rbitcoin_consensus::verify_tx_scripts_unconfirmed(prep.prevouts.clone(), tx.clone());
         let script_us = t_script.elapsed().as_micros() as u64;
         Self::apply_script_admit(prep, verified, script_us, &spec, stages)
     }
@@ -3927,7 +3927,7 @@ impl MempoolHub {
     /// Accept without holding a Tokio blocking thread across script verify.
     ///
     /// Prepare and commit run on `rbtc-off-pool`. Scripts are awaited here via
-    /// [`rbitcoin_consensus::verify_tx_scripts_cpu`]. Sync [`Self::accept_tx_from`]
+    /// [`rbitcoin_consensus::verify_tx_scripts_unconfirmed_cpu`]. Sync [`Self::accept_tx_from`]
     /// stays for stack hubs and in-process dispatch. This is relay origin;
     /// RPC and the other local APIs pass [`TxOrigin::Local`].
     pub async fn accept_tx_async(
@@ -4120,8 +4120,11 @@ impl MempoolHub {
         *lock_us = lock_out;
         let prep = prepared?;
         let t_script = Instant::now();
-        let verified =
-            rbitcoin_consensus::verify_tx_scripts_cpu(prep.prevouts.clone(), tx.clone()).await;
+        let verified = rbitcoin_consensus::verify_tx_scripts_unconfirmed_cpu(
+            prep.prevouts.clone(),
+            tx.clone(),
+        )
+        .await;
         let script_us = t_script.elapsed().as_micros() as u64;
         Self::apply_script_admit(prep, verified, script_us, &spec, stages)
     }

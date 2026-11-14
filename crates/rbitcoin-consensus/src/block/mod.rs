@@ -847,6 +847,16 @@ impl ScriptVerifyFlags {
         }
     }
 
+    /// Unconfirmed-tx checks. Consensus history stays [`Self::consensus_at`].
+    /// Constant scriptCode is on so a legacy `OP_CODESEPARATOR` cannot force
+    /// a new sighash per signature. The interpreter also counts legacy sighash
+    /// bytes only while this flag is on.
+    pub const fn unconfirmed() -> Self {
+        let mut flags = Self::buried(true, true, true, true, true);
+        flags.const_scriptcode = true;
+        flags
+    }
+
     /// Core `GetBlockScriptFlags` for `block_hash` at `ctx`. `bip16_active` is
     /// false only for a BIP16 exception block or genesis.
     pub fn consensus_at(

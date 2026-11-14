@@ -2033,6 +2033,11 @@ pub struct PeerHub {
     pub mempool: Mutex<Option<Weak<crate::tx_relay::MempoolHub>>>,
     /// Core `-whitelist` / `-whitebind` grants (`getpeerinfo.permissions`).
     pub net_perms: Mutex<crate::net_permissions::NetPermTable>,
+    /// Tor `ADD_ONION` or I2P `STREAM FORWARD` delivers inbound TCP from
+    /// loopback. A `--net-permission` subnet that matches that address must
+    /// not apply to those peers. `--net-permission-bind` still matches the
+    /// listen address.
+    overlay_loopback_forward: AtomicBool,
     /// Misbehavior keys → unix second the refusal ends. In memory only.
     pub discouraged_addrs: Mutex<HashMap<DiscourageKey, u64>>,
     /// Netgroup → unix second a slot-loss refusal ends.
@@ -2280,6 +2285,7 @@ impl PeerHub {
             asmap: Mutex::new(None),
             mempool: Mutex::new(None),
             net_perms: Mutex::new(crate::net_permissions::NetPermTable::default()),
+            overlay_loopback_forward: AtomicBool::new(false),
             discouraged_addrs: Mutex::new(HashMap::new()),
             discouraged_groups: Mutex::new(HashMap::new()),
             rate_strikes: Mutex::new(HashMap::new()),
@@ -2319,16 +2325,24 @@ impl PeerHub {
         *self.net_perms.lock().unwrap_or_else(|e| e.into_inner()) = t;
     }
 
+    /// `--listen-onion` or `--i2p-accept-incoming` forwards onto this node.
+    pub fn set_overlay_loopback_forward(&self, on: bool) {
+        self.overlay_loopback_forward.store(on, Ordering::Relaxed);
+    }
+
     pub fn permission_flags(
         &self,
         addr: SocketAddr,
         inbound: bool,
         bind: SocketAddr,
     ) -> crate::net_permissions::NetPermissionFlags {
+        let apply_whitelist = !(inbound
+            && self.overlay_loopback_forward.load(Ordering::Relaxed)
+            && addr.ip().to_canonical().is_loopback());
         self.net_perms
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .flags_for(addr.ip(), inbound, bind)
+            .flags_for_matched(addr.ip(), inbound, bind, apply_whitelist)
     }
 
     pub fn permission_strings(

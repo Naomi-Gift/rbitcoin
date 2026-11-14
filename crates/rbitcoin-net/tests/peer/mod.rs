@@ -1869,6 +1869,37 @@ async fn open_decode_session_with(
     }
 }
 
+fn inbound_test_peer(
+    peers: &Arc<rbitcoin_net::peers::PeerHub>,
+    port: u16,
+) -> Arc<rbitcoin_net::peers::LivePeer> {
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NETWORK | ServiceFlags::WITNESS,
+        timestamp: 0,
+        receiver: Address::new(&addr, ServiceFlags::NONE),
+        sender: Address::new(&addr, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let peer = peers.register(
+        addr,
+        addr,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    peer.hb_to.store(true, Ordering::Relaxed);
+    peer
+}
+
 fn outbound_test_peer(
     peers: &Arc<rbitcoin_net::peers::PeerHub>,
     port: u16,
@@ -1908,12 +1939,19 @@ fn sent(out_rx: &mut mpsc::UnboundedReceiver<PeerOut>) -> Vec<NetworkMessage> {
     msgs
 }
 
-/// Core keeps a compact block that waits on `blocktxn` in the peer's
-/// blocks in flight. A high-bandwidth peer that never sends the
-/// `blocktxn` holds the ping timeout like a `getdata` does, and is then
-/// dropped by the block download timeout one block interval after the
-/// compact block arrived. Its session drop frees the compact slot, so
-/// another outbound peer can reconstruct the block.
+fn asked_witness(msgs: &[NetworkMessage], hash: BlockHash) -> bool {
+    msgs.iter().any(|m| match m {
+        NetworkMessage::GetData(inv) => inv
+            .iter()
+            .any(|i| matches!(i, Inventory::WitnessBlock(h) if *h == hash)),
+        _ => false,
+    })
+}
+
+/// A high-bandwidth peer that never sends `blocktxn` still holds its own
+/// download window, and the node asks another high-bandwidth peer for that
+/// body before the block-interval timeout. The silent peer is dropped when
+/// its window expires. Dropping it frees the compact slot.
 #[tokio::test]
 async fn silent_compact_peer_holds_the_ping_then_hits_the_download_timeout() {
     use bitcoin::bip152::{BlockTransactions, HeaderAndShortIds};
@@ -1924,7 +1962,10 @@ async fn silent_compact_peer_holds_the_ping_then_hits_the_download_timeout() {
     let start = 1_700_000_000;
     peers.set_mock_now(start);
     let silent = outbound_test_peer(&peers, 18448);
+    let other = outbound_test_peer(&peers, 18450);
     let (out_tx, mut out_rx) = mpsc::unbounded_channel();
+    let (other_tx, mut other_rx) = mpsc::unbounded_channel();
+    other.attach_out(other_tx.clone());
     let mut follow = PeerFollowState::new();
     follow.cmpct_version = 2;
     heartbeat_once(&hub, &out_tx, &mut follow, &silent).await;
@@ -1938,6 +1979,7 @@ async fn silent_compact_peer_holds_the_ping_then_hits_the_download_timeout() {
     let compact = CmpctBlock {
         compact_block: HeaderAndShortIds::from_block(&a, 0xbeef, 2, &[]).unwrap(),
     };
+    let hash = a.block_hash();
     // Five minutes before the ping is due, so the download window is still
     // open when it is.
     let asked = start + PING_TIMEOUT_SECS - BLOCK_INTERVAL_SECS / 2;
@@ -1949,7 +1991,12 @@ async fn silent_compact_peer_holds_the_ping_then_hits_the_download_timeout() {
         sent(&mut out_rx).as_slice(),
         [NetworkMessage::GetBlockTxn(_)]
     ));
+    assert!(
+        asked_witness(&sent(&mut other_rx), hash),
+        "another outbound high-bandwidth peer is asked while the first claim is open"
+    );
     assert!(follow.requested_blocks.is_empty());
+    assert!(!hub.is_block_invalid(&hash));
     peers.set_mock_now(start + PING_TIMEOUT_SECS + 1);
     heartbeat_once(&hub, &out_tx, &mut follow, &silent).await;
     assert!(
@@ -1969,23 +2016,8 @@ async fn silent_compact_peer_holds_the_ping_then_hits_the_download_timeout() {
         "a silent compact peer kept its block past the download timeout"
     );
 
-    let other = outbound_test_peer(&peers, 18450);
-    let (other_tx, mut other_rx) = mpsc::unbounded_channel();
     let mut other_follow = PeerFollowState::new();
     other_follow.cmpct_version = 2;
-    on_cmpctblock(
-        &hub,
-        &other_tx,
-        &mut other_follow,
-        Some(other.as_ref()),
-        &compact,
-    )
-    .await
-    .unwrap();
-    assert!(
-        sent(&mut other_rx).is_empty(),
-        "the silent peer still holds the outbound compact slot"
-    );
     peers.unregister(silent.id);
     assert_eq!(peers.peers_downloading_from.load(Ordering::Relaxed), 0);
     on_cmpctblock(
@@ -2017,6 +2049,64 @@ async fn silent_compact_peer_holds_the_ping_then_hits_the_download_timeout() {
         hub.tip_hash(),
         Some(a.block_hash()),
         "the other peer completes the block"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A compact body whose witness commitment does not match is not cached as
+/// an invalid header, and the announcing peer is not the only one asked
+/// for the body.
+#[tokio::test]
+async fn witness_reconstruct_fail_asks_another_peer() {
+    use bitcoin::p2p::message_compact_blocks::CmpctBlock;
+
+    let (dir, hub, [a, _]) = compact_spend_pair("cmpct-witness-fail");
+    let mut spend = a.txdata[1].clone();
+    spend.input[0].witness = bitcoin::Witness::from_slice(&[vec![1u8]]);
+    let block = rbitcoin_consensus::mine_regtest_paying(
+        hub.tip_hash().unwrap(),
+        a.header.time,
+        103,
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![spend],
+    );
+    let mut hsi = HeaderAndShortIds::from_block(&block, 0xbeef, 2, &[1]).unwrap();
+    assert!(hsi.short_ids.is_empty());
+    hsi.prefilled_txs[0].tx.input[0].witness = bitcoin::Witness::from_slice(&[vec![2u8; 32]]);
+    let hash = hsi.header.block_hash();
+    assert_eq!(hash, block.block_hash());
+
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let announcer = inbound_test_peer(&peers, 18451);
+    let other = outbound_test_peer(&peers, 18452);
+    let (ann_tx, mut ann_rx) = mpsc::unbounded_channel();
+    let (other_tx, mut other_rx) = mpsc::unbounded_channel();
+    announcer.attach_out(ann_tx.clone());
+    other.attach_out(other_tx);
+    let mut follow = PeerFollowState::new();
+    follow.cmpct_version = 2;
+    on_cmpctblock(
+        &hub,
+        &ann_tx,
+        &mut follow,
+        Some(announcer.as_ref()),
+        &CmpctBlock { compact_block: hsi },
+    )
+    .await
+    .unwrap();
+    let ann_msgs = sent(&mut ann_rx);
+    let other_msgs = sent(&mut other_rx);
+    assert!(
+        asked_witness(&other_msgs, hash),
+        "witness failure asks an outbound peer, announcer sent {ann_msgs:?}"
+    );
+    assert!(
+        !hub.is_block_invalid(&hash),
+        "a bad witness reconstruct is not a permanently invalid header"
+    );
+    assert!(
+        !hub.already_have_or_asked_block(&hash),
+        "the announcing peer's claim is dropped"
     );
     let _ = std::fs::remove_dir_all(dir);
 }
@@ -3531,13 +3621,9 @@ fn cmpct_helpers_with_mempool_skip_list_live() {
         .await
         .unwrap();
         assert!(follow.ban_score >= 10, "solicited bad blocktxn bans");
-        let gd = match out_rx.try_recv().expect("getdata").expect_msg() {
-            NetworkMessage::GetData(inv) => inv,
-            other => panic!("expected getdata, got {other:?}"),
-        };
         assert!(
-            matches!(gd.first(), Some(Inventory::WitnessBlock(_))),
-            "bad blocktxn falls back to full block: {gd:?}"
+            out_rx.try_recv().is_err(),
+            "a failed blocktxn does not ask this peer for the body"
         );
         let ban_after_fail = follow.ban_score;
         handle_peer_frame(

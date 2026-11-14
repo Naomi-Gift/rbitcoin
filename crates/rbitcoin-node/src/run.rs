@@ -747,6 +747,9 @@ pub async fn run_p2p(config: NodeConfig) -> Result<(), NodeError> {
         mempool.set_isolated_broadcast(true);
     }
     node.peers.set_net_perms(table.clone());
+    node.peers.set_overlay_loopback_forward(
+        config.listen.listen_onion || config.listen.i2p_accept_incoming,
+    );
     if let Some(secs) = config.listen.peer_timeout_secs {
         node.peers.set_peer_timeout_secs(secs);
     }

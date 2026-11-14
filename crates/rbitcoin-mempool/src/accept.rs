@@ -481,7 +481,7 @@ pub fn verify_tx_scripts(tx: &Transaction, prevouts: Vec<TxOut>) -> Result<(), A
     if prevouts.len() != tx.input.len() {
         return Err(AcceptError::Script("prevout count mismatch".into()));
     }
-    rbitcoin_consensus::verify_tx_scripts_detached(prevouts, tx.clone())
+    rbitcoin_consensus::verify_tx_scripts_unconfirmed(prevouts, tx.clone())
         .map_err(|e| AcceptError::Script(e.to_string()))
 }
 

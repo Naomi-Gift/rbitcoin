@@ -1196,6 +1196,7 @@ async fn rejected_header_logs_core_reason(hub: &rbitcoin_net::chain::ChainHub) {
     let (out_tx, _rx) = mpsc::unbounded_channel();
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(v3.block_hash());
+    rbitcoin_log::reset_repeated_info();
     rbitcoin_log::capture_logs(true);
     on_block(hub, &out_tx, &mut follow, None, &v3)
         .await
@@ -1218,6 +1219,7 @@ async fn rejected_header_logs_core_reason(hub: &rbitcoin_net::chain::ChainHub) {
     let future = rbitcoin_consensus::mine_regtest_paying(prev, now + 3 * 3600, 111, op_true(), vec![]);
     let mut follow = PeerFollowState::new();
     follow.requested_blocks.insert(future.block_hash());
+    rbitcoin_log::reset_repeated_info();
     rbitcoin_log::capture_logs(true);
     on_block(hub, &out_tx, &mut follow, None, &future)
         .await

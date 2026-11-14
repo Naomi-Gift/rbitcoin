@@ -2687,8 +2687,9 @@ fn chain_ops_big_sigops_cluster(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
     let h = cbs.take();
     let cb_val = generated_coinbase_value(ctx, h);
     let mut parent = spend_generated_coinbase(ctx, h, 0, ScriptBuf::new()).1;
-    // OP_0 OP_0 OP_CHECKSIG OP_1: one legacy sigop in the scriptSig.
-    parent.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00, 0x00, 0xac, 0x51]);
+    // OP_0 OP_IF OP_CHECKSIG OP_ENDIF OP_1: one legacy sigop, not executed.
+    // Admit rejects a CHECKSIG whose scriptCode loses an OP_0.
+    parent.input[0].script_sig = ScriptBuf::from_bytes(vec![0x00, 0x63, 0xac, 0x68, 0x51]);
     parent.output = (0..50)
         .map(|_| TxOut {
             value: Amount::from_sat(cb_val / 50),
@@ -2702,8 +2703,10 @@ fn chain_ops_big_sigops_cluster(ctx: &RpcContext, cbs: &mut TrueCoinbases) {
         let mut out = vec![
             TxOut {
                 value: Amount::from_sat(1_000),
-                // OP_0 OP_0 OP_0 OP_NOP OP_CHECKMULTISIG OP_1: 20 legacy sigops.
-                script_pubkey: ScriptBuf::from_bytes(vec![0x00, 0x00, 0x00, 0x61, 0xae, 0x51]),
+                // Unexecuted CHECKMULTISIG: 20 legacy sigops, scriptCode unchanged.
+                script_pubkey: ScriptBuf::from_bytes(vec![
+                    0x00, 0x63, 0x00, 0x00, 0x00, 0x61, 0xae, 0x68, 0x51,
+                ]),
             };
             20
         ];

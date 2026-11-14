@@ -68,6 +68,10 @@ pub const MAX_SCRIPT_SIZE_LEGACY: usize = 10_000;
 /// Legacy / witness-v0 non-push opcode budget. **Not** applied in tapscript (BIP342).
 #[doc(hidden)]
 pub const MAX_OPS_LEGACY: usize = 201;
+
+/// Legacy sighash bytes an unconfirmed tx may hash. Each base CHECKSIG counts
+/// the transaction's total size once. Block connect does not use this cap.
+pub const MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES: u64 = 400_000;
 #[doc(hidden)]
 pub const MAX_PUBKEYS_PER_MULTISIG: i64 = 20;
 
@@ -238,6 +242,9 @@ pub struct EvalContext<'a> {
     pub codeseparator_script_off: Cell<Option<usize>>,
     /// Legacy midstate. Created on first use (WitnessV0 uses `pre`, tapscript `tapscript`).
     pub cache: RefCell<Option<SighashCache<&'a Transaction>>>,
+    /// Bytes of legacy sighash still allowed. `u64::MAX` on the consensus path.
+    /// Unconfirmed checks start at [`MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES`].
+    pub legacy_sighash_left: Cell<u64>,
     /// Structure/lookup midstates (WitnessV0 BIP143).
     pub pre: Cow<'a, crate::TxScriptPrecompute>,
     /// BIP342 remaining validation weight (`50 + witness serialized size`).
@@ -354,6 +361,7 @@ impl<'a> EvalContext<'a> {
             codeseparator_pos: Cell::new(0xFFFF_FFFF),
             codeseparator_script_off: Cell::new(None),
             cache: RefCell::new(None),
+            legacy_sighash_left: Cell::new(u64::MAX),
             pre,
             validation_weight_left: Cell::new(tapscript_init_weight(
                 tx,
@@ -380,6 +388,10 @@ impl<'a> EvalContext<'a> {
         self.minimal_if = job.minimal_if;
         self.witness_pubkeytype = job.witness_pubkeytype;
         self.const_scriptcode = job.const_scriptcode;
+        if job.const_scriptcode {
+            self.legacy_sighash_left
+                .set(MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES);
+        }
         if job.low_s || job.strictenc {
             self.bip66_active = true;
         }
@@ -1478,8 +1490,12 @@ pub fn ecdsa_sig_matches(
     let Ok(pk) = crypto::parse_pubkey(pubkey) else {
         return Ok(false);
     };
-    let Ok(sighash) = sighash_for_script(ctx, sighash_ty, script_code, ver) else {
-        return Ok(false);
+    // Consensus keeps a sighash failure as a non-matching signature. Admit
+    // turns that into a hard error so the legacy hashed-work cap stops the script.
+    let sighash = match sighash_for_script(ctx, sighash_ty, script_code, ver) {
+        Ok(hash) => hash,
+        Err(e) if ctx.const_scriptcode => return Err(e),
+        Err(_) => return Ok(false),
     };
     Ok(crypto::verify_ecdsa(sighash, &ecdsa_sig, &pk))
 }
@@ -1573,6 +1589,14 @@ pub fn sighash_for_script(
         PreTapscript::Base => {
             // Raw hashtype 0 is not SIGHASH_ALL=1. The caller already dropped
             // a bare OP_CODESEPARATOR.
+            if ctx.const_scriptcode {
+                let cost = u64::try_from(ctx.tx.total_size()).unwrap_or(u64::MAX);
+                let left = ctx.legacy_sighash_left.get();
+                if cost > left {
+                    return Err(ConsensusError::Script("legacy sighash work".into()));
+                }
+                ctx.legacy_sighash_left.set(left - cost);
+            }
             let mut slot = ctx.cache.borrow_mut();
             let cache = slot.get_or_insert_with(|| SighashCache::new(ctx.tx));
             let h = cache

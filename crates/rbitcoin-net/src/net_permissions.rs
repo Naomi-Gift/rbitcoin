@@ -340,18 +340,32 @@ impl NetPermTable {
     }
 
     pub fn flags_for(&self, ip: IpAddr, inbound: bool, bind: SocketAddr) -> NetPermissionFlags {
+        self.flags_for_matched(ip, inbound, bind, true)
+    }
+
+    /// `apply_whitelist` is false for an inbound whose TCP address is the
+    /// Tor or I2P forwarder. `--net-permission-bind` still matches `bind`.
+    pub fn flags_for_matched(
+        &self,
+        ip: IpAddr,
+        inbound: bool,
+        bind: SocketAddr,
+        apply_whitelist: bool,
+    ) -> NetPermissionFlags {
         let mut flags = NetPermissionFlags::NONE;
-        for g in &self.whitelist {
-            if !g.subnet.contains(ip) {
-                continue;
+        if apply_whitelist {
+            for g in &self.whitelist {
+                if !g.subnet.contains(ip) {
+                    continue;
+                }
+                if inbound && !g.inbound {
+                    continue;
+                }
+                if !inbound && !g.outbound {
+                    continue;
+                }
+                flags |= g.flags;
             }
-            if inbound && !g.inbound {
-                continue;
-            }
-            if !inbound && !g.outbound {
-                continue;
-            }
-            flags |= g.flags;
         }
         if inbound {
             for g in &self.whitebind {

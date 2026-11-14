@@ -45,6 +45,30 @@ pub fn verify_tx_scripts_detached(
     verify_tx_scripts_detached_forks(prevouts, tx, true, true, true, true, true)
 }
 
+/// Mempool admit. Constant scriptCode and the legacy sighash byte cap.
+/// Block connect keeps [`ScriptVerifyFlags::consensus_at`].
+pub fn verify_tx_scripts_unconfirmed(
+    prevouts: Vec<bitcoin::TxOut>,
+    tx: bitcoin::Transaction,
+) -> Result<(), ConsensusError> {
+    script_pool::run_detached_join(move || {
+        verify_scripts_with_flags(prevouts, tx, crate::block::ScriptVerifyFlags::unconfirmed())
+    })
+    .unwrap_or(Err(ConsensusError::BadBlock("script worker disconnected")))
+}
+
+/// Await [`verify_tx_scripts_unconfirmed`] on the script pool.
+pub async fn verify_tx_scripts_unconfirmed_cpu(
+    prevouts: Vec<bitcoin::TxOut>,
+    tx: bitcoin::Transaction,
+) -> Result<(), ConsensusError> {
+    script_pool::run_cpu(move || {
+        verify_scripts_with_flags(prevouts, tx, crate::block::ScriptVerifyFlags::unconfirmed())
+    })
+    .await
+    .unwrap_or(Err(ConsensusError::BadBlock("script worker disconnected")))
+}
+
 fn verify_scripts_with_flags(
     prevouts: Vec<bitcoin::TxOut>,
     tx: bitcoin::Transaction,
@@ -82,8 +106,8 @@ pub fn verify_tx_scripts_detached_forks(
 
 /// Await [`verify_tx_scripts_detached`] on `rbtc-scripts-*` without a blocking thread.
 ///
-/// The caller parks. Mempool admit uses this from the request task. Sync admit
-/// keeps [`verify_tx_scripts_detached`].
+/// The caller parks. Block connect and the query oracle keep the consensus
+/// flag word. Sync admit keeps [`verify_tx_scripts_unconfirmed`].
 pub async fn verify_tx_scripts_cpu(
     prevouts: Vec<bitcoin::TxOut>,
     tx: bitcoin::Transaction,
