@@ -18,6 +18,12 @@ pub const MIN_RELAY_FEE_RATE_SAT_PER_KVB: u64 = 100;
 /// Absolute weight cap for a single transaction (4_000_000 = block weight).
 pub const MAX_STANDARD_TX_WEIGHT: u64 = 400_000;
 
+/// `getmempoolinfo.maxdatacarriersize`. Libre has no datacarrier cap, so this
+/// is the most an `OP_RETURN` script could hold under
+/// [`MAX_STANDARD_TX_WEIGHT`] (400000 / 4), which is also Core's default
+/// `-datacarriersize`.
+pub const MAX_DATACARRIER_REPORTED_BYTES: u64 = MAX_STANDARD_TX_WEIGHT / 4;
+
 /// BIP 431 TRUC: the `nVersion` that opts in (Core `TRUC_VERSION`).
 pub const TRUC_VERSION: i32 = 3;
 /// Largest TRUC tx, in sigop-adjusted vbytes (Core `TRUC_MAX_VSIZE`).

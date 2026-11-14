@@ -1190,8 +1190,9 @@ pub fn disconnected_block_value(
     if let Some(cb) = block.txdata.first() {
         obj["coinbase_tx"] = coinbase_tx_json(cb);
     }
+    // Core verbosity 1 and up carry size/strippedsize/weight on a side branch.
+    insert_block_size_fields(&mut obj, block);
     if verbosity >= 2 {
-        insert_block_size_fields(&mut obj, block);
         let undo = stored_block_fks(ctx, hash);
         obj["tx"] = json!(getblock_tx_json(ctx, block, undo.as_ref(), verbosity)?);
     }
