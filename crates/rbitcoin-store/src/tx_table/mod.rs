@@ -2506,7 +2506,7 @@ impl TxTable {
     }
 
     pub(crate) fn spend_log_serves(&self, abs: u64) -> bool {
-        self.spend_pages.slot(abs).is_some()
+        self.spend_pages.covers(abs)
     }
 
     /// True when the published body slot is exactly `(field, flags, vin)`.
@@ -2748,9 +2748,7 @@ impl TxTable {
         let slot_vin = if multi { 0 } else { vin };
         let meta = encode_spent_slot(flags, field, slot_vin)?;
         let published = self.spent.body_published_len();
-        if self.spend_pages.slot(abs).is_some()
-            || crate::spend_page_log::is_historical(published, abs)
-        {
+        if self.spend_pages.covers(abs) || crate::spend_page_log::is_historical(published, abs) {
             return self.note_historical_spend_slots(&[(abs, meta)]);
         }
         self.spent.write_body_pwrite(abs, &meta)

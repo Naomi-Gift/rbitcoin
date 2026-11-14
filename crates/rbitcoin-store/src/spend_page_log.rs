@@ -494,6 +494,7 @@ impl SpendPageLog {
     ///
     /// A covered slot is eight bytes of the generation file. A batch of slots
     /// on one page reads that image once in [`Self::slots_at`].
+    /// [`Self::covers`] answers the same directory question without that read.
     pub fn slot(&self, abs: u64) -> Option<[u8; SLOT]> {
         #[cfg(debug_assertions)]
         if crate::io_handle::hidden_after_pread() {
@@ -511,6 +512,20 @@ impl SpendPageLog {
         let mut buf = [0u8; SLOT];
         pread_generation(&file, &self.pages_path(), loc.slot_at(rel), &mut buf);
         Some(buf)
+    }
+
+    /// True when the directory serves `abs`, including an explicit zero.
+    ///
+    /// This does not read the generation file. [`Self::slot`] loads the bytes.
+    pub fn covers(&self, abs: u64) -> bool {
+        #[cfg(debug_assertions)]
+        if crate::io_handle::hidden_after_pread() {
+            return false;
+        }
+        let page_off = abs & !(BODY_PAGE_SIZE - 1);
+        let rel = ((abs - page_off) / SLOT as u64) as u16;
+        let g = self.lock();
+        covered_slot(&g, page_off, rel).is_some()
     }
 
     /// Same bytes as [`Self::slot`] for each offset. One directory lock for

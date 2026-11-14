@@ -114,6 +114,35 @@ fn zeros(off: u64, len: usize) -> Result<Vec<u8>, StoreError> {
 }
 
 #[test]
+fn covered_slot_presence_does_not_read_the_generation_file() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [9u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(3, 8192, zeros, |_| Ok(true)).unwrap();
+    let pages = d.join(SPEND_PAGES_NAME);
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&pages)
+        .unwrap();
+    file.set_len(0).unwrap();
+    assert!(
+        log.covers(16),
+        "a committed slot stays covered without reading the generation file"
+    );
+    assert!(
+        !log.covers(4096),
+        "a page the commit does not name is still the body"
+    );
+    let read = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.slot(16)));
+    assert!(
+        read.is_err(),
+        "the truncated generation file is what the byte read hits"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn second_generation_keeps_the_first_image_bytes() {
     let d = dir();
     let log = SpendPageLog::create(&d);
@@ -3421,6 +3450,43 @@ fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+#[cfg(debug_assertions)]
+thread_local! {
+    static SEAL_DURING_COPY: std::cell::RefCell<Option<std::sync::Arc<rbitcoin_store::Store>>> =
+        const { std::cell::RefCell::new(None) };
+    static SEAL_PROBE_RAN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(debug_assertions)]
+fn seal_during_copy_probe() {
+    SEAL_PROBE_RAN.with(|ran| ran.set(true));
+    SEAL_DURING_COPY.with(|slot| {
+        let store = slot.borrow();
+        let store = store.as_ref().expect("store");
+        assert!(
+            !store.spend_log_above(7),
+            "publish_open_spend_pages must not seal tip 8 before the cooled copy"
+        );
+        assert!(
+            store.spend_log_above(4),
+            "the generation sealed at 5 stays above 4 during the copy"
+        );
+    });
+}
+
+#[cfg(debug_assertions)]
+struct ClearSealProbe;
+
+#[cfg(debug_assertions)]
+impl Drop for ClearSealProbe {
+    fn drop(&mut self) {
+        rbitcoin_store::Store::disarm_spend_fold_probe();
+        SEAL_DURING_COPY.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
 /// The freeze before the cooled copy must not stamp the new tip.
 ///
 /// The generation being copied was sealed at an older checkpoint. A disconnect
@@ -3430,7 +3496,7 @@ fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
 #[test]
 fn early_freeze_does_not_seal_the_tip_before_the_cooled_copy() {
     let d = dir();
-    let store = rbitcoin_store::Store::create_tiny(&d).unwrap();
+    let store = std::sync::Arc::new(rbitcoin_store::Store::create_tiny(&d).unwrap());
     let nbytes = 8192usize;
     let prep = store
         .txs
@@ -3462,9 +3528,21 @@ fn early_freeze_does_not_seal_the_tip_before_the_cooled_copy() {
     store.txs.freeze_open_spend_pages();
     assert!(
         !store.spend_log_above(7),
-        "the early freeze must not seal tip 8 before the cooled copy"
+        "freezing the open pages does not raise the sealed tip"
     );
     assert!(store.spend_log_above(4), "the older seal stays in place");
+    #[cfg(debug_assertions)]
+    {
+        let _clear = ClearSealProbe;
+        SEAL_PROBE_RAN.with(|ran| ran.set(false));
+        SEAL_DURING_COPY.with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::clone(&store)));
+        rbitcoin_store::Store::arm_spend_fold_probe(seal_during_copy_probe);
+        store.checkpoint_spend_through(8).unwrap();
+        assert!(
+            SEAL_PROBE_RAN.with(|ran| ran.get()),
+            "the cooled copy must run while the tip is still unsealed"
+        );
+    }
     let _ = std::fs::remove_dir_all(&d);
 }
 
