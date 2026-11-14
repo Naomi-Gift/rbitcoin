@@ -2111,6 +2111,89 @@ async fn witness_reconstruct_fail_asks_another_peer() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+/// A header-path body ask stays with the announcing peer. Another
+/// high-bandwidth peer is not asked.
+#[tokio::test]
+async fn header_download_does_not_fan_out_to_high_bandwidth_peers() {
+    let (dir, hub, _) = compact_spend_pair("hdr-no-fanout");
+    let tip_time = u64::from(hub.tip_header().unwrap().time);
+    hub.clock
+        .set_mock(i64::try_from(tip_time).unwrap().saturating_add(1));
+    let next = rbitcoin_consensus::mine_regtest_paying(
+        hub.tip_hash().unwrap(),
+        hub.tip_header().unwrap().time.saturating_add(1),
+        hub.tip_height().unwrap().saturating_add(1),
+        ScriptBuf::from_bytes(vec![0x51]),
+        vec![],
+    );
+    let hash = next.block_hash();
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let announcer = inbound_test_peer(&peers, 18461);
+    let other = outbound_test_peer(&peers, 18462);
+    let (ann_tx, mut ann_rx) = mpsc::unbounded_channel();
+    let (other_tx, mut other_rx) = mpsc::unbounded_channel();
+    announcer.attach_out(ann_tx.clone());
+    other.attach_out(other_tx);
+    let mut follow = PeerFollowState::new();
+    on_headers(
+        &hub,
+        &ann_tx,
+        &mut follow,
+        Some(announcer.as_ref()),
+        &[next.header],
+    )
+    .await
+    .unwrap();
+    assert!(
+        asked_witness(&sent(&mut ann_rx), hash),
+        "the announcing peer is asked for the header's body"
+    );
+    assert!(
+        !asked_witness(&sent(&mut other_rx), hash),
+        "a normal body download does not ask another high-bandwidth peer"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+/// The first short-id miss asks one other high-bandwidth peer. A later miss
+/// of that same hash does not ask again.
+#[tokio::test]
+async fn compact_body_is_asked_of_another_peer_once() {
+    let (dir, hub, [a, _]) = compact_spend_pair("cmpct-fanout-once");
+    let peers = rbitcoin_net::peers::PeerHub::new();
+    let announcer = inbound_test_peer(&peers, 18471);
+    let other = outbound_test_peer(&peers, 18472);
+    let (ann_tx, mut ann_rx) = mpsc::unbounded_channel();
+    let (other_tx, mut other_rx) = mpsc::unbounded_channel();
+    announcer.attach_out(ann_tx.clone());
+    other.attach_out(other_tx);
+    let mut follow = PeerFollowState::new();
+    follow.cmpct_version = 2;
+    let hash = a.block_hash();
+    on_cmpctblock(
+        &hub,
+        &ann_tx,
+        &mut follow,
+        Some(announcer.as_ref()),
+        &CmpctBlock {
+            compact_block: HeaderAndShortIds::from_block(&a, 0xbeef, 2, &[]).unwrap(),
+        },
+    )
+    .await
+    .unwrap();
+    let _ = sent(&mut ann_rx);
+    assert!(
+        asked_witness(&sent(&mut other_rx), hash),
+        "the first short-id miss asks another high-bandwidth peer"
+    );
+    on_blocktxn_unconnectable(&hub, &mut follow, Some(announcer.as_ref()), hash).unwrap();
+    assert!(
+        !asked_witness(&sent(&mut other_rx), hash),
+        "the same hash is not asked of that peer again"
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[test]
 fn same_peer_pending_cmpct_does_not_getblocktxn_again() {
     use bitcoin::absolute::LockTime;

@@ -30,7 +30,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static DEBUG_LOG: Mutex<Option<File>> = Mutex::new(None);
 /// Set once the env is missing, empty, or the file cannot be opened.
@@ -286,31 +286,31 @@ pub enum RepeatedInfo {
 const REPEATED_INFO_GAP_MS: u64 = 1_000;
 
 thread_local! {
-    static REPEATED_INFO_AT_MS: RefCell<[u64; 2]> = const { RefCell::new([0, 0]) };
+    static REPEATED_INFO_AT: RefCell<[Option<Instant>; 2]> = const { RefCell::new([None, None]) };
 }
 
 /// Forget this thread's last emit time. Tests start a burst from an empty window.
 #[doc(hidden)]
 pub fn reset_repeated_info() {
-    REPEATED_INFO_AT_MS.with(|slot| *slot.borrow_mut() = [0, 0]);
+    REPEATED_INFO_AT.with(|slot| *slot.borrow_mut() = [None, None]);
 }
 
 /// [`log_at`] at info, at most once per second for `which` on this thread.
 ///
 /// A repeat inside the gap is dropped before capture and before stderr.
 /// The slot is the event class, so a new header hash does not open a new line.
+/// The clock is monotonic, so a wall-clock step does not silence the line.
 pub fn info_repeated(which: RepeatedInfo, args: fmt::Arguments<'_>) {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0);
-    let emit = REPEATED_INFO_AT_MS.with(|slot| {
+    let now = Instant::now();
+    let emit = REPEATED_INFO_AT.with(|slot| {
         let mut slot = slot.borrow_mut();
         let prev = slot[which as usize];
-        if prev != 0 && now_ms.saturating_sub(prev) < REPEATED_INFO_GAP_MS {
+        if prev.is_some_and(|t| {
+            now.saturating_duration_since(t) < Duration::from_millis(REPEATED_INFO_GAP_MS)
+        }) {
             return false;
         }
-        slot[which as usize] = now_ms;
+        slot[which as usize] = Some(now);
         true
     });
     if emit {

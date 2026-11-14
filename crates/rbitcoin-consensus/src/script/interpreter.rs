@@ -15,6 +15,7 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bitcoin::hashes::Hash;
 use bitcoin::script::{Instruction, Script};
@@ -69,8 +70,9 @@ pub const MAX_SCRIPT_SIZE_LEGACY: usize = 10_000;
 #[doc(hidden)]
 pub const MAX_OPS_LEGACY: usize = 201;
 
-/// Legacy sighash bytes an unconfirmed tx may hash. Each base CHECKSIG counts
-/// the transaction's total size once. Block connect does not use this cap.
+/// Legacy sighash bytes one unconfirmed transaction may hash. Each base
+/// CHECKSIG counts the non-witness size plus that input's scriptCode.
+/// Every input shares the budget. Block connect does not use this cap.
 pub const MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES: u64 = 400_000;
 #[doc(hidden)]
 pub const MAX_PUBKEYS_PER_MULTISIG: i64 = 20;
@@ -242,9 +244,12 @@ pub struct EvalContext<'a> {
     pub codeseparator_script_off: Cell<Option<usize>>,
     /// Legacy midstate. Created on first use (WitnessV0 uses `pre`, tapscript `tapscript`).
     pub cache: RefCell<Option<SighashCache<&'a Transaction>>>,
-    /// Bytes of legacy sighash still allowed. `u64::MAX` on the consensus path.
-    /// Unconfirmed checks start at [`MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES`].
-    pub legacy_sighash_left: Cell<u64>,
+    /// Bytes of legacy sighash still allowed when this context has no shared
+    /// job budget. `u64::MAX` on the consensus path.
+    pub legacy_sighash_left: AtomicU64,
+    /// The transaction's remaining legacy-sighash budget. Set by
+    /// [`Self::apply_job_flags`] so every input of one job shares it.
+    shared_legacy_sighash: Option<&'a AtomicU64>,
     /// Structure/lookup midstates (WitnessV0 BIP143).
     pub pre: Cow<'a, crate::TxScriptPrecompute>,
     /// BIP342 remaining validation weight (`50 + witness serialized size`).
@@ -361,7 +366,8 @@ impl<'a> EvalContext<'a> {
             codeseparator_pos: Cell::new(0xFFFF_FFFF),
             codeseparator_script_off: Cell::new(None),
             cache: RefCell::new(None),
-            legacy_sighash_left: Cell::new(u64::MAX),
+            legacy_sighash_left: AtomicU64::new(u64::MAX),
+            shared_legacy_sighash: None,
             pre,
             validation_weight_left: Cell::new(tapscript_init_weight(
                 tx,
@@ -379,7 +385,7 @@ impl<'a> EvalContext<'a> {
     }
 
     /// Copy standardness / fixture flags from a [`crate::block::ScriptCheckJob`].
-    pub fn apply_job_flags(mut self, job: &crate::block::ScriptCheckJob) -> Self {
+    pub fn apply_job_flags(mut self, job: &'a crate::block::ScriptCheckJob) -> Self {
         self.minimal_data = job.minimal_data;
         self.nullfail = job.nullfail;
         self.low_s = job.low_s;
@@ -389,8 +395,14 @@ impl<'a> EvalContext<'a> {
         self.witness_pubkeytype = job.witness_pubkeytype;
         self.const_scriptcode = job.const_scriptcode;
         if job.const_scriptcode {
-            self.legacy_sighash_left
-                .set(MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES);
+            let slot = &job.legacy_sighash_left;
+            let _ = slot.compare_exchange(
+                u64::MAX,
+                MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            );
+            self.shared_legacy_sighash = Some(slot);
         }
         if job.low_s || job.strictenc {
             self.bip66_active = true;
@@ -1590,12 +1602,32 @@ pub fn sighash_for_script(
             // Raw hashtype 0 is not SIGHASH_ALL=1. The caller already dropped
             // a bare OP_CODESEPARATOR.
             if ctx.const_scriptcode {
-                let cost = u64::try_from(ctx.tx.total_size()).unwrap_or(u64::MAX);
-                let left = ctx.legacy_sighash_left.get();
-                if cost > left {
-                    return Err(ConsensusError::Script("legacy sighash work".into()));
+                let slot = ctx
+                    .shared_legacy_sighash
+                    .unwrap_or(&ctx.legacy_sighash_left);
+                // Non-witness size plus this scriptCode. Witness bytes are
+                // not in a legacy sighash. scriptPubKey is, and it is not in
+                // the spending transaction.
+                let cost = u64::try_from(ctx.tx.base_size())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(u64::try_from(script_bytes.len()).unwrap_or(u64::MAX));
+                loop {
+                    let left = slot.load(Ordering::Relaxed);
+                    if cost > left {
+                        return Err(ConsensusError::Script("legacy sighash work".into()));
+                    }
+                    if slot
+                        .compare_exchange_weak(
+                            left,
+                            left - cost,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        )
+                        .is_ok()
+                    {
+                        break;
+                    }
                 }
-                ctx.legacy_sighash_left.set(left - cost);
             }
             let mut slot = ctx.cache.borrow_mut();
             let cache = slot.get_or_insert_with(|| SighashCache::new(ctx.tx));

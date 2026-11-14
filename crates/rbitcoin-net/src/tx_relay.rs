@@ -1367,6 +1367,23 @@ pub struct IsolatedLapCounts {
     pub no_targets: u64,
 }
 
+/// Constant-scriptCode and the legacy sighash cap are policy. A consensus
+/// script failure still uses [`AcceptError::Script`].
+fn unconfirmed_script_policy(e: &rbitcoin_consensus::ConsensusError) -> Option<&'static str> {
+    let rbitcoin_consensus::ConsensusError::Script(s) = e else {
+        return None;
+    };
+    if s.contains("legacy sighash work") {
+        Some("legacy sighash work")
+    } else if s.contains("OP_CODESEPARATOR") {
+        Some("OP_CODESEPARATOR")
+    } else if s.contains("SIG_FINDANDDELETE") {
+        Some("SIG_FINDANDDELETE")
+    } else {
+        None
+    }
+}
+
 impl MempoolHub {
     /// Short-id walks that entered the mempool, including a `try_read` miss.
     #[cfg(debug_assertions)]
@@ -2799,6 +2816,9 @@ impl MempoolHub {
     ) -> Result<rbitcoin_mempool::PreparedAdmit, AcceptError> {
         if let Err(e) = verified {
             stages.script_us = stages.script_us.saturating_add(script_us);
+            if let Some(policy) = unconfirmed_script_policy(&e) {
+                return Err(AcceptError::Policy(policy));
+            }
             let err = AcceptError::Script(e.to_string());
             let reason = err.mempool_reject_reason();
             if spec.waive && rbitcoin_consensus::reason_is_warn_and_apply(&reason) {

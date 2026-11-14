@@ -5987,8 +5987,12 @@ fn queue_claimed_block_getdata(
         }
         return sent;
     }
-    for hash in &claimed {
-        ask_other_hb_for_block(session, *hash);
+    if compact {
+        for hash in &claimed {
+            if compact_getdata_near_tip(hub, hash) {
+                ask_other_hb_for_block(session, *hash);
+            }
+        }
     }
     sent
 }
@@ -6024,6 +6028,9 @@ fn ask_other_hb_for_block(session: Option<&crate::peers::LivePeer>, hash: BlockH
             break;
         }
         picked.push(peer);
+    }
+    if picked.is_empty() || !announcer.claim_hb_body_fanout(hash) {
+        return;
     }
     for peer in picked {
         let Some(out) = peer.writer() else {

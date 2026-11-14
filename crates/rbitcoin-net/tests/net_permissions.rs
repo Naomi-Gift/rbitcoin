@@ -46,6 +46,46 @@ fn loopback_forward_does_not_inherit_loopback_net_permission() {
         .permission_flags(loopback, true, wallet)
         .has(NetPermissionFlags::RELAY));
 
+    use bitcoin::p2p::address::Address;
+    use bitcoin::p2p::message_network::VersionMessage;
+    use bitcoin::p2p::ServiceFlags;
+    let ver = VersionMessage {
+        version: 70016,
+        services: ServiceFlags::NONE,
+        timestamp: 0,
+        receiver: Address::new(&loopback, ServiceFlags::NONE),
+        sender: Address::new(&loopback, ServiceFlags::NONE),
+        nonce: 1,
+        user_agent: "/rbitcoin:test/".into(),
+        start_height: 0,
+        relay: true,
+    };
+    let live = peers.register(
+        loopback,
+        p2p,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    assert!(
+        !live.session_noban(),
+        "a loopback inbound session still took noban"
+    );
+    assert!(!live.session_relay_perm());
+    assert!(!live.session_forcerelay());
+    let bound = peers.register(
+        loopback,
+        wallet,
+        &ver,
+        true,
+        rbitcoin_net::peers::PeerConnType::Inbound,
+    );
+    assert!(
+        bound.session_noban(),
+        "permission-bind on another port still grants"
+    );
+    assert!(!bound.session_relay_perm());
+
     let mut wide = NetPermTable::default();
     wide.whitelist
         .push(parse_whitelist("relay@203.0.113.9").unwrap());

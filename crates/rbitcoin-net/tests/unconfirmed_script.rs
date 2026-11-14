@@ -145,6 +145,7 @@ fn admit_rejects_codeseparator_and_legacy_sighash_work_block_connect_accepts() {
         .accept_tx(&codesep_spend)
         .expect_err("constant scriptCode rejects OP_CODESEPARATOR");
     assert!(err.to_string().contains("OP_CODESEPARATOR"), "admit: {err}");
+    assert_eq!(rbitcoin_net::peer::tx_reject_ban_score(&err), 0);
     assert!(!mp.contains(&codesep_spend.compute_txid()));
 
     let prev = hub.tip_hash().unwrap();
@@ -172,6 +173,214 @@ fn admit_rejects_codeseparator_and_legacy_sighash_work_block_connect_accepts() {
         err.to_string().contains("legacy sighash work"),
         "admit: {err}"
     );
+    assert_eq!(rbitcoin_net::peer::tx_reject_ban_score(&err), 0);
     assert!(!mp.contains(&over.compute_txid()));
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+fn two_input(a: &Transaction, b: &Transaction, sig_a: ScriptBuf, sig_b: ScriptBuf) -> Transaction {
+    let value = a.output[0].value.to_sat() + b.output[0].value.to_sat() - 40_000;
+    Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![
+            TxIn {
+                previous_output: OutPoint {
+                    txid: a.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: sig_a,
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            },
+            TxIn {
+                previous_output: OutPoint {
+                    txid: b.compute_txid(),
+                    vout: 0,
+                },
+                script_sig: sig_b,
+                sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+                witness: Witness::new(),
+            },
+        ],
+        output: vec![TxOut {
+            value: Amount::from_sat(value),
+            script_pubkey: op_true(),
+        }],
+    }
+}
+
+/// Smallest repeat count where one input stays inside the cap and both do not.
+fn shared_budget_repeats(prev: &Transaction) -> u64 {
+    let mut repeats = 1u64;
+    loop {
+        let (sig, spk) = checksig_script(repeats);
+        let tx = two_input(prev, prev, sig.clone(), sig);
+        let per = repeats * (tx.base_size() as u64 + spk.len() as u64);
+        if per <= MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES
+            && per.saturating_mul(2) > MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES
+        {
+            return repeats;
+        }
+        repeats += 1;
+        assert!(
+            repeats <= 100,
+            "two inputs never cross the cap inside the script size limit"
+        );
+    }
+}
+
+/// Pad is executed and dropped. It sits in scriptCode and not in the spender.
+fn padded_checksig(pad_chunks: usize, repeats: u64) -> (ScriptBuf, ScriptBuf) {
+    let mut spk = Vec::new();
+    let chunk = [0x11u8; 520];
+    for _ in 0..pad_chunks {
+        spk.push(0x4d);
+        spk.extend_from_slice(&520u16.to_le_bytes());
+        spk.extend_from_slice(&chunk);
+        spk.push(0x75);
+    }
+    let push = push_sig_pubkey();
+    let mut script_sig = Vec::new();
+    for _ in 0..repeats {
+        script_sig.extend_from_slice(&push);
+        spk.push(0xac);
+        spk.push(0x75);
+    }
+    spk.push(0x51);
+    (
+        ScriptBuf::from_bytes(script_sig),
+        ScriptBuf::from_bytes(spk),
+    )
+}
+
+fn scriptcode_over_total_size(prev: &Transaction) -> (u64, usize) {
+    for pad in 1..=16 {
+        for repeats in 1..80 {
+            let (sig, spk) = padded_checksig(pad, repeats);
+            if sig.len() > 10_000 || spk.len() > 10_000 {
+                continue;
+            }
+            if pad + (repeats as usize) * 2 + 1 > 201 {
+                continue;
+            }
+            let tx = spend(prev, sig);
+            let by_total = repeats * tx.total_size() as u64;
+            let by_code = repeats * (tx.base_size() as u64 + spk.len() as u64);
+            if by_total <= MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES
+                && by_code > MAX_UNCONFIRMED_LEGACY_SIGHASH_BYTES
+            {
+                return (repeats, pad);
+            }
+        }
+    }
+    panic!("scriptCode charge is not distinguishable from total size");
+}
+
+fn findanddelete_scripts() -> (ScriptBuf, ScriptBuf) {
+    let mut sig_push = Vec::with_capacity(10);
+    sig_push.push(DUMMY_SIG.len() as u8);
+    sig_push.extend_from_slice(&DUMMY_SIG);
+    let mut spk = sig_push.clone();
+    spk.extend_from_slice(&[0x75, 0xac, 0x75, 0x51]);
+    let mut script_sig = sig_push;
+    script_sig.push(PUBKEY.len() as u8);
+    script_sig.extend_from_slice(&PUBKEY);
+    (
+        ScriptBuf::from_bytes(script_sig),
+        ScriptBuf::from_bytes(spk),
+    )
+}
+
+#[test]
+fn admit_shares_the_sighash_budget_and_counts_scriptcode() {
+    let probe = Transaction {
+        version: Version::TWO,
+        lock_time: LockTime::ZERO,
+        input: vec![TxIn {
+            previous_output: OutPoint {
+                txid: bitcoin::Txid::from_byte_array([1u8; 32]),
+                vout: 0,
+            },
+            script_sig: ScriptBuf::new(),
+            sequence: Sequence::ENABLE_RBF_NO_LOCKTIME,
+            witness: Witness::new(),
+        }],
+        output: vec![TxOut {
+            value: Amount::from_sat(50_0000_0000),
+            script_pubkey: op_true(),
+        }],
+    };
+    let shared_n = shared_budget_repeats(&probe);
+    let (shared_sig, shared_spk) = checksig_script(shared_n);
+    let (code_n, pad) = scriptcode_over_total_size(&probe);
+    let (code_sig, code_spk) = padded_checksig(pad, code_n);
+    let (delete_sig, delete_spk) = findanddelete_scripts();
+
+    let (dir, hub) = tiny_regtest_hub_labeled("unconf-script-budget");
+    hub.ensure_genesis().unwrap();
+    let mut prev = hub.tip_hash().unwrap();
+    let mut time = hub.tip_header().unwrap().time;
+    let mut height = 0u32;
+    let mut mine = |spk: ScriptBuf| {
+        height += 1;
+        time = time.saturating_add(1);
+        let block = mine_regtest_paying(prev, time, height, spk, vec![]);
+        prev = block.block_hash();
+        hub.accept_block(block).unwrap();
+    };
+    mine(shared_spk.clone());
+    mine(shared_spk);
+    mine(code_spk);
+    mine(delete_spk);
+    mine(ScriptBuf::from_bytes(vec![0x00]));
+    hub.confirm_empty_regtest(100).unwrap();
+
+    let mp = MempoolHub::open(dir.join("mp"), Arc::clone(&hub.query)).unwrap();
+    mp.set_relay_enabled(true);
+
+    let left = coinbase_at(&hub, 1);
+    let right = coinbase_at(&hub, 2);
+    let both = two_input(&left, &right, shared_sig.clone(), shared_sig.clone());
+    let err = mp
+        .accept_tx(&both)
+        .expect_err("two inputs share one legacy sighash budget");
+    assert!(
+        err.to_string().contains("legacy sighash work"),
+        "admit: {err}"
+    );
+    assert_eq!(rbitcoin_net::peer::tx_reject_ban_score(&err), 0);
+    assert!(!mp.contains(&both.compute_txid()));
+
+    let one = spend(&left, shared_sig);
+    mp.accept_tx(&one)
+        .expect("one input of that same script stays under the cap");
+    assert!(mp.contains(&one.compute_txid()));
+
+    let wide = spend(&coinbase_at(&hub, 3), code_sig);
+    let err = mp
+        .accept_tx(&wide)
+        .expect_err("scriptCode bytes count toward the cap");
+    assert!(
+        err.to_string().contains("legacy sighash work"),
+        "admit: {err}"
+    );
+    assert_eq!(rbitcoin_net::peer::tx_reject_ban_score(&err), 0);
+
+    let deleted = spend(&coinbase_at(&hub, 4), delete_sig);
+    let err = mp
+        .accept_tx(&deleted)
+        .expect_err("a signature inside scriptCode is policy");
+    assert!(
+        err.to_string().contains("SIG_FINDANDDELETE"),
+        "admit: {err}"
+    );
+    assert_eq!(rbitcoin_net::peer::tx_reject_ban_score(&err), 0);
+
+    let failed = spend(&coinbase_at(&hub, 5), ScriptBuf::new());
+    let err = mp
+        .accept_tx(&failed)
+        .expect_err("a false script is still a script failure");
+    assert_eq!(rbitcoin_net::peer::tx_reject_ban_score(&err), 10, "{err}");
     let _ = std::fs::remove_dir_all(dir);
 }

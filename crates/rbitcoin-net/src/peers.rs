@@ -514,6 +514,8 @@ pub struct LivePeer {
     pub handshake_complete: AtomicBool,
     /// BIP324 transport finished. False while EARLY_KEY_RESPONSE / garbage.
     pub v2_transport_ready: AtomicBool,
+    /// Block hashes this session already asked other high-bandwidth peers to send.
+    hb_body_fanned: Mutex<HashSet<BlockHash>>,
     /// Plain v1 framing on a `v1@` wallet-sync listener.
     pub v1_transport: AtomicBool,
     /// Peer sent BIP155 `sendaddrv2` (use `addrv2` for self-announce / GETADDR).
@@ -1436,19 +1438,37 @@ impl LivePeer {
     }
 
     pub fn net_perm_flags(&self) -> crate::net_permissions::NetPermissionFlags {
-        self.owner
-            .upgrade()
-            .map(|h| {
-                h.net_perms
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .flags_for_net(self.net, self.inbound, self.addrbind)
-            })
-            .unwrap_or(crate::net_permissions::NetPermissionFlags::NONE)
+        let Some(h) = self.owner.upgrade() else {
+            return crate::net_permissions::NetPermissionFlags::NONE;
+        };
+        match self.net {
+            crate::NetAddr::Ip(addr) => h.permission_flags(addr, self.inbound, self.addrbind),
+            _ => h
+                .net_perms
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .flags_for_net(self.net, self.inbound, self.addrbind),
+        }
     }
 
     pub fn has_net_perm(&self, flag: crate::net_permissions::NetPermissionFlags) -> bool {
         self.net_perm_flags().has(flag)
+    }
+
+    /// First full-body ask of other high-bandwidth peers for `hash` returns true.
+    pub(crate) fn claim_hb_body_fanout(&self, hash: BlockHash) -> bool {
+        let mut set = self
+            .hb_body_fanned
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !set.insert(hash) {
+            return false;
+        }
+        if set.len() > 256 {
+            set.clear();
+            set.insert(hash);
+        }
+        true
     }
 
     /// CIDR/bind table plus operator `--trusted`.
@@ -3467,6 +3487,7 @@ impl PeerHub {
             tcp_shutdown: Mutex::new(None),
             handshake_complete: AtomicBool::new(false),
             v2_transport_ready: AtomicBool::new(false),
+            hb_body_fanned: Mutex::new(HashSet::new()),
             v1_transport: AtomicBool::new(false),
             wants_addrv2: AtomicBool::new(false),
             wtxid_relay: AtomicBool::new(false),

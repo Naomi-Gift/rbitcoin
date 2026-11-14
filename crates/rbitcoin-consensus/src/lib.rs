@@ -104,25 +104,6 @@ pub fn verify_tx_scripts_detached_forks(
     .unwrap_or(Err(ConsensusError::BadBlock("script worker disconnected")))
 }
 
-/// Await [`verify_tx_scripts_detached`] on `rbtc-scripts-*` without a blocking thread.
-///
-/// The caller parks. Block connect and the query oracle keep the consensus
-/// flag word. Sync admit keeps [`verify_tx_scripts_unconfirmed`].
-pub async fn verify_tx_scripts_cpu(
-    prevouts: Vec<bitcoin::TxOut>,
-    tx: bitcoin::Transaction,
-) -> Result<(), ConsensusError> {
-    script_pool::run_cpu(move || {
-        verify_scripts_with_flags(
-            prevouts,
-            tx,
-            crate::block::ScriptVerifyFlags::buried(true, true, true, true, true),
-        )
-    })
-    .await
-    .unwrap_or(Err(ConsensusError::BadBlock("script worker disconnected")))
-}
-
 /// Same worker as [`verify_tx_scripts_detached`], with the caller's flag word.
 ///
 /// Block confirm and mempool admission keep [`ScriptVerifyFlags::consensus_at`]
