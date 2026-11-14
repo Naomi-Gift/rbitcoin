@@ -5,5 +5,5 @@ Fixed
   Verbosity 1 of a block off the active chain left out the three size fields
   that Core prints (verbosity 2 and 3 already had them). `maxdatacarriersize`
   was `null`, which typed clients that model it as an integer reject; it now
-  prints 100000, Core's default and the most an `OP_RETURN` script can hold in
-  a standard-weight transaction (Libre has no datacarrier cap).
+  prints 100000, Core 32.1's default cap. Libre does not enforce a datacarrier
+  cap, and that default does not bind a standard-weight transaction either.
