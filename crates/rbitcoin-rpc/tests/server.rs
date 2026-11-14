@@ -3330,6 +3330,59 @@ async fn accept_loop_leaves_when_shutdown_is_signaled() {
         .expect("serve task");
 }
 
+/// A burst of accepts past the cap logs fewer reject lines than connections.
+#[tokio::test]
+async fn accepts_past_the_cap_log_fewer_reject_lines_than_connections() {
+    use axum::Router;
+    use tokio::io::AsyncReadExt;
+    use tokio::net::{TcpListener, TcpStream};
+
+    const N: usize = 8;
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (tx, _) = tokio::sync::watch::channel(());
+    let flag = Arc::clone(&shutdown);
+    let tx_task = tx.clone();
+    rbitcoin_log::reset_repeated_info();
+    rbitcoin_log::capture_logs(true);
+    let _ = rbitcoin_log::take_logs();
+    // No permits, so every accept is past the cap.
+    let task = tokio::spawn(async move {
+        serve_rpc(
+            listener,
+            Router::new(),
+            Arc::new(Semaphore::new(0)),
+            flag,
+            tx_task,
+        )
+        .await;
+    });
+    for i in 0..N {
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+        let mut buf = [0u8; 1];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(2), stream.read(&mut buf)).await;
+        assert!(
+            matches!(read, Ok(Ok(0)) | Ok(Err(_))),
+            "accept {i} past the cap must be dropped, got {read:?}"
+        );
+    }
+    shutdown.store(true, Ordering::SeqCst);
+    tx.send(()).unwrap();
+    task.await.expect("serve task");
+    let lines = rbitcoin_log::take_logs();
+    rbitcoin_log::capture_logs(false);
+    let rejects = lines
+        .iter()
+        .filter(|(level, msg)| *level == rbitcoin_log::Level::Info && msg.contains("rpc: reject"))
+        .count();
+    assert!(
+        (1..N).contains(&rejects),
+        "reject lines {rejects} for {N} connections past the cap: {lines:?}"
+    );
+}
+
 /// A waited sibling must not mark the whole batch satisfied. On mainnet
 /// with no peers, `getblocktemplate` still returns "not connected".
 #[tokio::test]

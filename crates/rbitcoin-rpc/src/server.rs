@@ -79,7 +79,12 @@ pub async fn serve_rpc<L>(
             _ = stop_rx.changed() => break,
             (io, addr) = listener.accept() => {
                 let Ok(permit) = sem.clone().try_acquire_owned() else {
-                    info!("rpc: reject {addr:?} (at max connections={RPC_MAX_CONNECTIONS})");
+                    rbitcoin_log::info_repeated(
+                        rbitcoin_log::RepeatedInfo::RpcAtMaxConnections,
+                        format_args!(
+                            "rpc: reject {addr:?} (at max connections={RPC_MAX_CONNECTIONS})"
+                        ),
+                    );
                     continue;
                 };
                 let service = TowerToHyperService::new(app.clone());
