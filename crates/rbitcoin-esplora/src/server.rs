@@ -330,19 +330,27 @@ pub async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next:
         Err(()) => return not_found(),
     };
     let path = req.uri().path().to_string();
-    if path_uses_sh_view(&path) && !st.query.sh_history_available() {
+    // `/internal` is mounted on unix listen only. On TCP that path reaches the
+    // unknown-path fallback, which has no `MatchedPath`, and stays a plain 404.
+    let unmounted = path.starts_with("/internal/")
+        && req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .is_none();
+    let sh_view = !unmounted && path_uses_sh_view(&path);
+    if sh_view && !st.query.sh_history_available() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             rbitcoin_query::SCRIPTHASH_INDEX_DISABLED,
         )
             .into_response();
     }
-    if asof.is_some() && !path_accepts_asof(&path) {
+    if asof.is_some() && (unmounted || !path_accepts_asof(&path)) {
         return not_found();
     }
     let pre_view = if path_never_pins(&path) || asof.is_some() {
         None
-    } else if path_uses_sh_view(&path) {
+    } else if sh_view {
         let q = std::sync::Arc::clone(&st.query);
         match crate::handlers::store_blocking(move || q.pin_sh_chain_view()).await {
             Ok(Ok(v)) => v,
