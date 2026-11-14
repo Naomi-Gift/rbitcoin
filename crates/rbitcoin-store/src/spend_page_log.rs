@@ -1085,6 +1085,17 @@ impl SpendPageLog {
         out
     }
 
+    /// True when every open note is already in the image this generation wrote.
+    ///
+    /// The snapshot merges `frozen` with notes taken during the cooled copy,
+    /// so `open` can be a subset of the kept slots.
+    fn open_notes_are_kept(slots: &[OpenSlot], kept: Option<&HashSet<OpenSlot>>) -> bool {
+        match kept {
+            Some(set) => slots.iter().all(|slot| set.contains(slot)),
+            None => slots.is_empty(),
+        }
+    }
+
     /// Publish the composed generation into the directory.
     ///
     /// Call under `hold_utxo_view` so a reader cannot observe the swap. A hold
@@ -1131,14 +1142,8 @@ impl SpendPageLog {
                     .iter()
                     .filter_map(|&(page_off, _, _)| {
                         let page = g.open.get(&page_off)?;
-                        let kept = kept_by_page.get(&page_off);
-                        let unchanged = match kept {
-                            Some(set) => {
-                                page.slots.len() == set.len()
-                                    && page.slots.iter().all(|slot| set.contains(slot))
-                            }
-                            None => page.slots.is_empty(),
-                        };
+                        let unchanged =
+                            Self::open_notes_are_kept(&page.slots, kept_by_page.get(&page_off));
                         if unchanged {
                             None
                         } else {
@@ -1190,16 +1195,11 @@ impl SpendPageLog {
                     log_off,
                     image_len,
                 };
-                let kept = kept_by_page.get(&page_off);
                 let unchanged = match g.open.get(&page_off) {
                     None => true,
-                    Some(page) => match kept {
-                        Some(set) => {
-                            page.slots.len() == set.len()
-                                && page.slots.iter().all(|slot| set.contains(slot))
-                        }
-                        None => page.slots.is_empty(),
-                    },
+                    Some(page) => {
+                        Self::open_notes_are_kept(&page.slots, kept_by_page.get(&page_off))
+                    }
                 };
                 if unchanged {
                     if let Some(page) = g.open.remove(&page_off) {

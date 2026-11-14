@@ -142,6 +142,67 @@ fn covered_slot_presence_does_not_read_the_generation_file() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// Notes taken during the cooled copy sit in `open`. The snapshot already
+/// merged them with the frozen slots. Install must drop that page without
+/// reading the generation file.
+#[test]
+fn install_does_not_read_open_notes_already_in_the_generation() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let older = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let newer = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, older)]).unwrap();
+    log.freeze_before_cooled_copy();
+    log.note_slots(&[(24, newer)]).unwrap();
+    log.prepare_commit(5, 8192, zeros, |_| Ok(true)).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(d.join(SPEND_PAGES_NAME))
+        .unwrap()
+        .set_len(0)
+        .unwrap();
+    log.install_commit().unwrap();
+    assert!(
+        log.covers(16),
+        "the frozen slot stays covered without reading the generation file"
+    );
+    assert!(
+        log.covers(24),
+        "the note taken during the copy stays covered without that read"
+    );
+    assert_eq!(
+        log.open_edge_count(),
+        0,
+        "open notes already in the image leave open"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A note that lands after the snapshot is not in the image. Install keeps it.
+#[test]
+fn install_keeps_a_note_taken_after_the_snapshot() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let older = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let newer = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    let after = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, older)]).unwrap();
+    log.freeze_before_cooled_copy();
+    log.note_slots(&[(24, newer)]).unwrap();
+    log.prepare_commit(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(32, after)]).unwrap();
+    log.install_commit().unwrap();
+    assert_eq!(log.slot(16), Some(older));
+    assert_eq!(log.slot(24), Some(newer));
+    assert_eq!(log.slot(32), Some(after));
+    assert_eq!(
+        log.open_edge_count(),
+        1,
+        "a note taken after the snapshot stays open"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 #[test]
 fn second_generation_keeps_the_first_image_bytes() {
     let d = dir();
