@@ -229,6 +229,12 @@ enum StagedFreeze {
     Pages(CommitSnapshot),
 }
 
+/// The callback records a snapshot. The freeze before the cooled copy only swaps.
+enum FreezeRecord {
+    Snapshot,
+    Swap,
+}
+
 /// `Clear` writes the commit with the held bit off unless a hold landed
 /// during the image stream. RAM still has the old generation until that
 /// rename succeeds.
@@ -415,7 +421,8 @@ impl SpendPageLog {
     }
 
     /// After a checkpoint, arm one follow-up when the log is still over the
-    /// image cap, and keep arming while the open directory is over the edge cap.
+    /// image cap, and keep arming while the open directory is over the edge
+    /// cap or at the page budget.
     #[doc(hidden)]
     pub fn relax_pace(&self) {
         let (edges, pages, images) = {
@@ -799,11 +806,25 @@ impl SpendPageLog {
     /// after the view is released waits for the next checkpoint.
     #[doc(hidden)]
     pub fn freeze_open(&self) {
-        let staged = match self.snapshot_commit() {
+        let staged = match self.freeze_directory(FreezeRecord::Snapshot) {
             Some(pages) => StagedFreeze::Pages(pages),
             None => StagedFreeze::Empty,
         };
         self.lock().staged_freeze = Some(staged);
+    }
+
+    /// Move `open` into `frozen` and wake an edge waiter before the cooled copy.
+    ///
+    /// Does not stamp the confirmed tip. A disconnect below the checkpoint
+    /// height, and at or above the generation already sealed, must still fold
+    /// that generation. Does not clone a snapshot: the callback freeze records
+    /// the one compose publishes. An empty open set still advances
+    /// `cool_through` and leaves `frozen` empty, so that callback freeze is a
+    /// fresh swap and notifies.
+    #[doc(hidden)]
+    pub fn freeze_before_cooled_copy(&self) {
+        let _ = self.freeze_directory(FreezeRecord::Swap);
+        self.lock().staged_freeze = None;
     }
 
     #[doc(hidden)]
@@ -1231,8 +1252,9 @@ impl SpendPageLog {
     ///
     /// `keep` runs before any directory change. A `keep` error leaves the
     /// commit file and the committed images where they were. When a page
-    /// still has a rejected slot, live slots are copied into `open` and the
-    /// old image stays until that compose's rename returns. A zero image is
+    /// still has a rejected slot, live slots are restored into `frozen` when
+    /// that set already holds a page, and into `open` otherwise. The old image
+    /// stays until that compose's rename returns. A zero image is
     /// folded. An image whose slots are all still best-chain stays in
     /// `committed` and is republished from that image, not from the body.
     fn explode_held<K>(
@@ -1306,8 +1328,10 @@ impl SpendPageLog {
     ///
     /// The freeze is a swap. Confirm notes the next generation into `open`
     /// while this one is composed. A leftover frozen map stays put, and the
-    /// edges those later notes added stay counted.
-    fn snapshot_commit(&self) -> Option<CommitSnapshot> {
+    /// edges those later notes added stay counted. [`FreezeRecord::Swap`]
+    /// skips the page clone. The callback freeze builds the snapshot after
+    /// the cooled copy.
+    fn freeze_directory(&self, record: FreezeRecord) -> Option<CommitSnapshot> {
         let mut g = self.lock();
         g.holding_filter = false;
         let reuse = !g.frozen.is_empty();
@@ -1324,12 +1348,17 @@ impl SpendPageLog {
         } else {
             false
         };
-        let mut pages: SnapshotPages = g
-            .frozen
-            .iter()
-            .map(|(off, page)| (*off, page.clone()))
-            .collect();
-        fold_open_into_snapshot(&mut pages, &g.open, &g.committed);
+        let pages = if matches!(record, FreezeRecord::Snapshot) {
+            let mut pages: SnapshotPages = g
+                .frozen
+                .iter()
+                .map(|(off, page)| (*off, page.clone()))
+                .collect();
+            fold_open_into_snapshot(&mut pages, &g.open, &g.committed);
+            Some(pages)
+        } else {
+            None
+        };
         merge_later(&mut g, reset_edges);
         let froze = !reuse;
         drop(g);
@@ -1338,7 +1367,7 @@ impl SpendPageLog {
         if froze {
             self.pace.notify_room();
         }
-        Some(CommitSnapshot { pages })
+        pages.map(|pages| CommitSnapshot { pages })
     }
 
     fn scrub_open_notes<K>(&self, keep: &mut K) -> Result<(), StoreError>
@@ -1902,7 +1931,7 @@ impl Drop for ClearCompose<'_> {
     }
 }
 
-/// Puts notes taken during a held filter back into `open` if `snapshot_commit`
+/// Puts notes taken during a held filter back into `open` if the freeze
 /// did not.
 struct ReleaseLater<'a>(&'a SpendPageLog);
 
@@ -2386,9 +2415,10 @@ fn fold_payload(page_off: u64, image: &[u8]) -> Option<(u64, &[u8])> {
 /// A pure-zero image is folded: the file stays, and nothing is rebuilt from
 /// the body. An image that still has a spend, and no rejected slot, keeps
 /// those slots and stays in `committed`. A frozen note on that page stays.
-/// A slot the frozen page does not name yet is added beside it. With no
-/// frozen page, the slots move into `open`. Compose copies the stored
-/// image, so a zero on the page is kept, and this checkpoint does not fold
+/// A slot the frozen page does not name yet is added beside it. When
+/// `frozen` already holds a page, the slots stay there. Otherwise they
+/// move into `open`. Compose copies the stored image, so a zero on the
+/// page is kept, and this checkpoint does not fold
 /// it. The hold stays until the publish after the second `keep`. Clearing
 /// it here lets a disconnect during the first `keep` fold the old image.
 /// A rejected slot leaves the old image in place and clears `base` so
@@ -2437,11 +2467,13 @@ fn apply_held_explode(
 
 /// Keep restored slots without covering a newer frozen note.
 ///
-/// When this checkpoint already froze pages, the slots stay in `frozen` and
-/// do not count toward the edge cap. Otherwise they park in `open`, and the
-/// next snapshot publishes them. A newer note already in `frozen` stays.
+/// When `frozen` already holds a page, the slots stay there and do not count
+/// toward the edge cap. The early freeze only swaps, so there is no staged
+/// snapshot yet. An empty freeze leaves `frozen` empty: the slots park in
+/// `open`, and the callback freeze resets that count. A newer note already
+/// in `frozen` stays.
 fn restore_kept_slots(g: &mut Inner, page_off: u64, slots: PageSlots) {
-    if g.frozen.contains_key(&page_off) || matches!(g.staged_freeze, Some(StagedFreeze::Pages(_))) {
+    if !g.frozen.is_empty() {
         park_frozen_slots(g, page_off, slots);
     } else {
         park_open_slots(g, page_off, slots);

@@ -3421,6 +3421,155 @@ fn freeze_wakes_the_edge_cap_before_the_cooled_copy() {
     let _ = std::fs::remove_dir_all(&d);
 }
 
+/// The freeze before the cooled copy must not stamp the new tip.
+///
+/// The generation being copied was sealed at an older checkpoint. A disconnect
+/// below the new tip and at or above that generation has to fold those pages.
+/// Stamping the new tip first holds the fold, and the next checkpoint
+/// republishes them.
+#[test]
+fn early_freeze_does_not_seal_the_tip_before_the_cooled_copy() {
+    let d = dir();
+    let store = rbitcoin_store::Store::create_tiny(&d).unwrap();
+    let nbytes = 8192usize;
+    let prep = store
+        .txs
+        .spent
+        .prepare_batch_encode(1, nbytes, |_i, buf| {
+            buf.resize(buf.len() + nbytes, 0);
+        })
+        .unwrap()
+        .expect("one spent append");
+    store
+        .txs
+        .spent
+        .write_body_blob_bulk(prep.start, &prep.body_blob)
+        .unwrap();
+    store.txs.spent.finish_prepared(prep).unwrap();
+    let slot =
+        rbitcoin_store::tx_table::encode_spent_slot(0, rbitcoin_primitives::Fk::NULL, 0).unwrap();
+    store.note_open_spend_slots(&[(16, slot)]).unwrap();
+    store.checkpoint_spend_through(5).unwrap();
+    assert!(
+        store.spend_log_above(4),
+        "the generation sealed at 5 is above 4"
+    );
+    assert!(
+        !store.spend_log_above(7),
+        "7 is still above that sealed generation"
+    );
+    store.note_open_spend_slots(&[(4096, slot)]).unwrap();
+    store.txs.freeze_open_spend_pages();
+    assert!(
+        !store.spend_log_above(7),
+        "the early freeze must not seal tip 8 before the cooled copy"
+    );
+    assert!(store.spend_log_above(4), "the older seal stays in place");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// A disconnect to 7 during the cooled copy still folds a generation sealed at 5.
+///
+/// The early freeze must not stamp tip 8. `hold_fold_above(7)` then sees no
+/// height above 7, and the quiet page is copied.
+#[test]
+fn disconnect_during_the_cooled_copy_still_folds_the_sealed_generation() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [1u8, 1, 2, 3, 4, 5, 6, 7];
+    let fresh = [2u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.note_slots(&[(4096, fresh)]).unwrap();
+    log.widen_for_checkpoint(8);
+    log.freeze_before_cooled_copy();
+    log.hold_fold_above(7).unwrap();
+    let mut writes = 0u32;
+    log.fold_into(
+        |_off, _image| {
+            writes += 1;
+            Ok(())
+        },
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!(
+        writes, 1,
+        "a quiet page sealed at 5 must fold when the tip falls to 7"
+    );
+    assert_eq!(log.slot(16), None);
+    assert_eq!(log.slot(4096), Some(fresh));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// The early swap leaves `frozen` occupied and does not stage a snapshot.
+///
+/// Restored slots parked in `open` fill the edge cap, and the callback freeze
+/// is a reuse that does not reset it. They stay in `frozen` instead.
+#[test]
+fn held_restore_after_the_early_swap_does_not_fill_the_edge_cap() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [5u8, 1, 2, 3, 4, 5, 6, 7];
+    let mut noted = Vec::with_capacity(4);
+    for rel in 0..4u16 {
+        noted.push((4096 + u64::from(rel) * 8, slot));
+    }
+    log.note_slots(&noted).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(0).unwrap();
+    let fresh = [6u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, fresh)]).unwrap();
+    log.freeze_before_cooled_copy();
+    assert_eq!(
+        log.open_edge_count(),
+        0,
+        "the early swap moves the open note out of the edge cap"
+    );
+    log.prepare_commit_in(
+        0,
+        8192,
+        zeros,
+        |_| Ok(true),
+        |page| {
+            assert_eq!(
+                page.open_edge_count(),
+                0,
+                "restored slots must stay out of the edge cap when the early freeze only swapped"
+            );
+            page.freeze_open();
+            Ok(())
+        },
+        |_| Ok(0),
+    )
+    .unwrap();
+    log.install_commit().unwrap();
+    assert_eq!(log.slot(4096), Some(slot));
+    assert_eq!(log.slot(16), Some(fresh));
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// An empty early freeze leaves `frozen` empty, so the callback freeze is a
+/// fresh swap and drops the edge count.
+#[test]
+fn empty_early_freeze_still_resets_edges_on_the_callback_freeze() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let slot = [7u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, slot)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.freeze_before_cooled_copy();
+    log.note_slots(&[(4096, slot)]).unwrap();
+    assert_eq!(log.open_edge_count(), 1);
+    log.freeze_open();
+    assert_eq!(
+        log.open_edge_count(),
+        0,
+        "an empty early freeze leaves the callback freeze as a fresh swap"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
 /// A freeze already staged must not count a held restore toward the edge cap.
 ///
 /// The first freeze leaves `frozen` non-empty, so the callback freeze is a

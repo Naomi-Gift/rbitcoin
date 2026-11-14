@@ -2045,12 +2045,14 @@ impl Store {
         height: u32,
         keep: impl FnMut(&[u8; 8]) -> Result<bool, StoreError>,
     ) -> Result<(), StoreError> {
-        // Freeze, and wake an edge-cap waiter, before the cooled-page copy.
-        // The copy finishes before the next generation file is assembled.
-        // The callback freezes again so notes taken during the copy join
-        // this generation. That freeze is a reuse, and does not notify, only
-        // when the first freeze moved pages. An empty first freeze is a fresh
-        // swap: it resets the edge count and notifies.
+        // Swap the open pages into `frozen`, and wake an edge-cap waiter,
+        // before the cooled-page copy. Do not stamp the tip here: a disconnect
+        // below this checkpoint, and at or above the sealed generation, must
+        // still fold. Do not clone a snapshot. The callback freeze records the
+        // one compose publishes, after the copy. That freeze is a reuse, and
+        // does not notify, when this swap moved pages. An empty swap leaves
+        // `frozen` empty, so the callback freeze is a fresh swap: it resets
+        // the edge count and notifies.
         self.txs.widen_for_checkpoint(height);
         let publish = &self.utxo_publish;
         let view = &self.utxo_view;
@@ -2058,8 +2060,7 @@ impl Store {
         let spenders = &self.spenders;
         {
             let _g = hold_view(publish, view);
-            let tip = confirmed.tip_height().map(|h| h.0).unwrap_or(height);
-            self.txs.freeze_open_spend_pages(tip);
+            self.txs.freeze_open_spend_pages();
         }
         self.fold_sealed_spend_pages()?;
         self.txs.prepare_open_spend_pages(

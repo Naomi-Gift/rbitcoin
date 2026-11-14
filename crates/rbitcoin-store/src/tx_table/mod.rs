@@ -2694,9 +2694,13 @@ impl TxTable {
         self.spend_pages.widen_for_checkpoint(height);
     }
 
-    pub(crate) fn freeze_open_spend_pages(&self, tip: u32) {
-        self.spend_pages.cover_confirmed_tip(tip);
-        self.spend_pages.freeze_open();
+    /// Swap open pages into `frozen` before the cooled copy.
+    ///
+    /// The confirmed tip is sealed after that copy. Sealing it here holds a
+    /// generation that does not contain the disconnected block.
+    #[doc(hidden)]
+    pub fn freeze_open_spend_pages(&self) {
+        self.spend_pages.freeze_before_cooled_copy();
     }
 
     pub(crate) fn spend_log_above(&self, tip: u32) -> bool {
