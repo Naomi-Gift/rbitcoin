@@ -23,6 +23,34 @@ fn pin_with_txid(txid: [u8; 32]) -> CreatePin {
     )
 }
 
+/// Ids 10 and 12 leave a hole at 11. Dropping the higher of two pin packs
+/// that share a txid leaves the lower pin and its fk.
+#[test]
+fn out_base_keeps_a_hole_and_a_lower_pin() {
+    let mut m = InFlight::new();
+    let low = pin(10);
+    let high = pin(12);
+    m.note_pins([(Fk(10), &low)], Some(1));
+    m.note_pins([(Fk(12), &high)], Some(2));
+    assert_eq!(m.out_base(), Some(10));
+    assert!(m.get_out(11).is_none());
+    assert_eq!(m.get_out(12).map(|pin| pin.tx().txid), Some(high.tx().txid));
+
+    let txid = [0x44; 32];
+    let older = pin_with_txid(txid);
+    let newer = pin_with_txid(txid);
+    m.note_pins([(Fk(20), &older)], Some(3));
+    m.note_pins([(Fk(21), &newer)], Some(4));
+    m.drop_from_height(4);
+    assert_ne!(
+        m.get_create_fk(&txid),
+        Some(Fk(21)),
+        "creates must not point at the dropped pack"
+    );
+    assert!(m.get_out(20).is_some());
+    assert!(m.get_out(21).is_none());
+}
+
 #[test]
 fn creates_only_resolves_txid() {
     let mut m = InFlight::new();
