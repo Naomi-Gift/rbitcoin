@@ -52,6 +52,9 @@ joins with more than N creates: Esplora HTTP **503**, Electrum JSON-RPC error
 `scripthash join exceeds --max-sh-creates`. Stats stay full when under the cap.
 `--heavy-sh-creates N` (default **10000**; **0** = off) runs unpaged joins with
 more than N creates one at a time across the node; lighter joins stay parallel.
+A create is a transaction that pays the script, not an output. The unix-socket
+`/internal/address/:address` and `/internal/scripthash/:hash` stats skip
+`--max-sh-creates` (still under `--heavy-sh-creates`); see the `/internal/*` row.
 
 **Coins only.** Scripthash balance, Electrum `listunspent`, Esplora `/utxo`,
 the funded and spent counts in Esplora `chain_stats` and `mempool_stats`,
@@ -290,7 +293,7 @@ App `ServeLimits` always on (same model as Electrum).
 | `POST /tx` | done | broadcast via mempool hub; **503** if hub absent. `GET /broadcast` is not served (**404**). |
 | `POST /txs/test` | done | JSON array of hex (max 25) → `MempoolHub::test_accept` (no admit). `?maxfeerate=` is BTC/kvB like electrs (`0` unlimited; omitted → 0.1 BTC/kvB). |
 | `POST /txs/package` | done | JSON array of hex txs → `accept_package`; **503** without hub; max 25 txs |
-| electrs `/internal/*` | done | **Unix listen only.** TCP GET/POST `/internal/…` → **404** (same unknown-path fallback). `POST /internal/txs` (400 on unparseable id; missing omitted); `POST /internal/mempool/txs` (mempool only); `GET /internal/mempool/txs[/all or /:last]` (txid-sort pages, default `max_txs=10000`; `/all` registered first); `GET /internal/block/:hash/txs` (full list; public `/txs` stays 25/page); `POST /internal/txs/outspends/by-txid` (same-length slots, unknown → `[]`; at most 1,000 txids, else 400 `Too many txids requested`; output counts summed over the txids at most 250,000, else 400 `Too many outputs requested`); `POST /internal/txs/outspends/by-outpoint` (`txid:vout`; malformed → `{"spent":false}`). Snapshot JSON is published on the hub (no admit-path build). `GET /mempool/txids/page` is public electrs (both listeners). |
+| electrs `/internal/*` | done | **Unix listen only.** TCP GET/POST `/internal/…` → **404** (same unknown-path fallback). `POST /internal/txs` (400 on unparseable id; missing omitted); `POST /internal/mempool/txs` (mempool only); `GET /internal/mempool/txs[/all or /:last]` (txid-sort pages, default `max_txs=10000`; `/all` registered first); `GET /internal/block/:hash/txs` (full list; public `/txs` stays 25/page); `POST /internal/txs/outspends/by-txid` (same-length slots, unknown → `[]`; at most 1,000 txids, else 400 `Too many txids requested`; output counts summed over the txids at most 250,000, else 400 `Too many outputs requested`); `POST /internal/txs/outspends/by-outpoint` (`txid:vout`; malformed → `{"spent":false}`); `GET /internal/address/:address` and `GET /internal/scripthash/:hash` (the public stats body, `?asof=`, and chain-tip headers, not refused by `--max-sh-creates`; the public routes on the socket keep the cap; an unused scripthash such as 64 zeros is 200 with zero counters, so a client can probe for the route). Snapshot JSON is published on the hub (no admit-path build). `GET /mempool/txids/page` is public electrs (both listeners). |
 | Unix listen | done | `--esplora-listen` filesystem path (mode **0660**). Public REST plus `/internal/*`. TCP `--esplora-listen host:port` never mounts `/internal`. |
 | Unknown path | 404 | plain body (including `/address-prefix`) |
 | `GET /block-template` | opt-in | `--esplora-block-template` (default off → **404**). Same JSON as RPC `getblocktemplate` `{"rules":["segwit"]}` template mode. **503** without tip. `Cache-Control: no-store`. 15 s cache, invalidated on tip or mempool `template_updates`. No proposal/longpoll HTTP (parked **Q-64**). |

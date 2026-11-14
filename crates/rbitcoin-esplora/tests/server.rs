@@ -1200,6 +1200,17 @@ fn config_defaults_use_public_proxy_limits() {
     assert_eq!(cfg.limits, ServeLimits::for_public_proxy());
 }
 
+/// The socket's uncapped stats twins pin and accept `?asof=` like `/address/:a`.
+#[test]
+fn internal_stats_paths_pin_the_sh_view() {
+    for internal in ["/internal/address/bcrt1q", "/internal/scripthash/ab"] {
+        assert!(path_accepts_asof(internal), "{internal}");
+        assert!(path_uses_sh_view(internal), "{internal}");
+    }
+    assert!(!path_accepts_asof("/internal/block/ab/txs"));
+    assert!(!path_uses_sh_view("/internal/block/ab/txs"));
+}
+
 #[test]
 fn asof_query_is_gated_to_documented_routes() {
     assert!(path_accepts_asof("/tx/ab/status"));
