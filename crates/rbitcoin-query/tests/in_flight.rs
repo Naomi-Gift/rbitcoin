@@ -23,8 +23,9 @@ fn pin_with_txid(txid: [u8; 32]) -> CreatePin {
     )
 }
 
-/// Ids 10 and 12 leave a hole at 11. Dropping the higher of two pin packs
-/// that share a txid leaves the lower pin and its fk.
+/// Ids 10 and 12 leave a hole at 11. Dropping the low pin advances the base.
+/// Dropping the higher of two pin packs that share a txid leaves the lower
+/// pin and clears `creates` (the newer fk is gone, not restored).
 #[test]
 fn out_base_keeps_a_hole_and_a_lower_pin() {
     let mut m = InFlight::new();
@@ -35,6 +36,10 @@ fn out_base_keeps_a_hole_and_a_lower_pin() {
     assert_eq!(m.out_base(), Some(10));
     assert!(m.get_out(11).is_none());
     assert_eq!(m.get_out(12).map(|pin| pin.tx().txid), Some(high.tx().txid));
+    m.prune_below_height(Some(2));
+    assert_eq!(m.out_base(), Some(12));
+    assert!(m.get_out(10).is_none());
+    assert!(m.get_out(12).is_some());
 
     let txid = [0x44; 32];
     let older = pin_with_txid(txid);
@@ -42,13 +47,41 @@ fn out_base_keeps_a_hole_and_a_lower_pin() {
     m.note_pins([(Fk(20), &older)], Some(3));
     m.note_pins([(Fk(21), &newer)], Some(4));
     m.drop_from_height(4);
-    assert_ne!(
+    assert_eq!(
         m.get_create_fk(&txid),
-        Some(Fk(21)),
+        None,
         "creates must not point at the dropped pack"
     );
     assert!(m.get_out(20).is_some());
     assert!(m.get_out(21).is_none());
+}
+
+/// A creates-only row and a pin for the same txid can share a height.
+/// Pruning that height must not delete a newer pack's fk.
+#[test]
+fn merged_height_pin_keeps_the_newer_fk() {
+    let mut m = InFlight::new();
+    let txid = [0x55; 32];
+    let older = pin_with_txid(txid);
+    let newer = pin_with_txid(txid);
+    m.note_creates([(txid, Fk(1))], Some(1));
+    m.note_pins([(Fk(1), &older)], Some(1));
+    m.note_pins([(Fk(2), &newer)], Some(2));
+    m.prune_below_height(Some(2));
+    assert_eq!(m.get_create_fk(&txid), Some(Fk(2)));
+    assert!(m.get_out(2).is_some());
+    assert!(m.get_out(1).is_none());
+}
+
+#[test]
+fn null_fk_pin_does_not_keep_a_create() {
+    let mut m = InFlight::new();
+    let p = pin(1);
+    m.note_pins([(Fk(0), &p)], Some(1));
+    assert_eq!(m.get_create_fk(&p.tx().txid), None);
+    m.prune_below_height(Some(2));
+    assert!(m.is_empty());
+    assert_eq!(m.size_snapshot().2, 0);
 }
 
 #[test]
