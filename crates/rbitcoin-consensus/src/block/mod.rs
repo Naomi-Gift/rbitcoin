@@ -1155,9 +1155,9 @@ impl ScriptCheckJob {
             // Asked for midstates with no stored row. This is the script
             // fallback, including a coinbase-shaped fixture. IBD stores the
             // row for a non-coinbase segwit transaction and does not ask here.
-            JobPre::Owned(std::sync::Arc::new(crate::TxPrecompute::Script(
+            JobPre::Owned(std::sync::Arc::new(crate::TxPrecompute::Script(Box::new(
                 crate::TxScriptPrecompute::from_tx(&self.tx),
-            )))
+            ))))
         })
     }
 
