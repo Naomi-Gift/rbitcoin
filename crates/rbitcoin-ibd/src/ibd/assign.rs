@@ -139,10 +139,8 @@ pub fn need_path_lo_alt(st: &IbdWorkState, hub: &ChainHub, path_lo: u32) -> bool
     if path_lo_occupant_needs_body(st, hub, path_lo).is_some() {
         return true;
     }
-    // The occupant does not open the gate. A moved hash is not at this height.
-    let skip = st.height_to_hash.get(&path_lo).copied();
     for (&h, &ht) in &st.hash_height {
-        if ht != path_lo || skip == Some(h) {
+        if ht != path_lo {
             continue;
         }
         if need_body_dead(st, &h) {

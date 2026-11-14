@@ -92,8 +92,10 @@ fn path_lo_occupant_needs_body_when_the_slot_still_matches() {
         "a live competitor still opens the gate"
     );
 
-    st.hash_height.insert(occupant, path_lo.saturating_add(1));
-    st.body.mark_missing(occupant);
+    let moved = h(0x23);
+    st.record_height(moved, path_lo);
+    st.body.mark_missing(moved);
+    st.hash_height.insert(moved, path_lo.saturating_add(1));
     st.hash_height.remove(&other);
     assert_eq!(
         path_lo_occupant_needs_body(&st, &hub, path_lo),
