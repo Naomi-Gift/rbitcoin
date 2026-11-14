@@ -3378,7 +3378,7 @@ async fn accepts_past_the_cap_log_fewer_reject_lines_than_connections() {
         .filter(|(level, msg)| *level == rbitcoin_log::Level::Info && msg.contains("rpc: reject"))
         .count();
     assert!(
-        rejects >= 1 && rejects < N,
+        (1..N).contains(&rejects),
         "reject lines {rejects} for {N} connections past the cap: {lines:?}"
     );
 }
