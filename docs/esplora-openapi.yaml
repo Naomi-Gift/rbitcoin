@@ -25,8 +25,9 @@ info:
     ## Chain-view headers
     Pinned responses carry `X-Bitcoin-Chain-Tip` (block hash) and
     `X-Bitcoin-Chain-Tip-Height`. Both are CORS-exposed. Block, tx, and header
-    routes stamp the live tip. `/address/*`, `/scripthash/*`, `/addresses/*`, and
-    `/scripthashes/*` stamp the scripthash-index watermark, so the JSON matches
+    routes stamp the live tip. `/address/*`, `/scripthash/*`, `/addresses/*`,
+    `/scripthashes/*`, `/internal/address/*`, and `/internal/scripthash/*` stamp
+    the scripthash-index watermark, so the JSON matches
     the join that produced it, except `/address/{address}/txs/mempool` and
     `/scripthash/{scripthash}/txs/mempool`, which are not stamped. With `?asof=`,
     the stamp is the as-of block. Public `/mempool`, `/mempool/txids`, and
@@ -54,7 +55,8 @@ info:
     - Accepted only on the routes that declare the `asof` parameter below:
       `/tx/{txid}/status`, `/tx/{txid}/outspend/{vout}`, `/tx/{txid}/outspends`,
       and address/scripthash `/`, `/utxo`, `/txs`, `/txs/chain[/{last}]`,
-      `/txs/summary[/{last}]`.
+      `/txs/summary[/{last}]`, plus the unix-socket `/internal/address/{address}`
+      and `/internal/scripthash/{scripthash}`.
     - On any other route, `?asof=` is **404** (for example `/tx/{txid}`,
       `/mempool`, `/address/{addr}/txs/mempool`, and the POST multi-script routes).
     - An empty value, bad hex, an unknown hash, a hash that is not on the best
@@ -70,7 +72,9 @@ info:
     ## Scripthash index
     Address and scripthash routes need `--sh-index`. Without it they return
     **503** `scripthash index disabled`. Unpaged stats and `/utxo` above
-    `--max-sh-creates` are **503**; paged history is still served.
+    `--max-sh-creates` are **503**; paged history is still served. On the unix
+    socket, `/internal/address/{address}` and `/internal/scripthash/{scripthash}`
+    answer those stats without the `--max-sh-creates` 503.
 
     ## Errors
     Error bodies are `text/plain`. Unknown paths are **404** `Not Found`.
@@ -912,6 +916,35 @@ paths:
             application/json:
               schema: { type: array, items: { $ref: "#/components/schemas/Outspend" } }
         "400": { $ref: "#/components/responses/BadRequest" }
+  /internal/address/{address}:
+    get:
+      tags: [internal]
+      summary: "`/address/{address}` stats without `--max-sh-creates`"
+      description: |
+        Same body, `?asof=`, and chain-tip headers as `/address/{address}`, but
+        a script above `--max-sh-creates` is answered instead of 503.
+        `--heavy-sh-creates` still applies. The public routes keep the cap on
+        this socket too. Probe: `/internal/scripthash/` followed by 64 zeros is
+        200 with zero counters here and 404 on a node without the route.
+      parameters:
+        - { $ref: "#/components/parameters/Address" }
+        - { $ref: "#/components/parameters/AsOf" }
+      responses:
+        "200": { $ref: "#/components/responses/AddressStats" }
+        "404": { $ref: "#/components/responses/AsOfNotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
+  /internal/scripthash/{scripthash}:
+    get:
+      tags: [internal]
+      summary: "`/scripthash/{scripthash}` stats without `--max-sh-creates`"
+      description: See `/internal/address/{address}`.
+      parameters:
+        - { $ref: "#/components/parameters/Scripthash" }
+        - { $ref: "#/components/parameters/AsOf" }
+      responses:
+        "200": { $ref: "#/components/responses/AddressStats" }
+        "404": { $ref: "#/components/responses/AsOfNotFound" }
+        "503": { $ref: "#/components/responses/Unavailable" }
 
 components:
   headers:

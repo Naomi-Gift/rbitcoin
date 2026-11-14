@@ -1084,25 +1084,10 @@ pub async fn address_info(
     AsOf(asof): AsOf,
     JoinClient(client): JoinClient,
 ) -> Response {
-    match resolve_address_sh(&addr_s, st.network) {
-        Ok(sh) => {
-            spawn_join(move || {
-                match sh_stats_json(
-                    &st,
-                    &sh,
-                    Some(addr_s.as_str()),
-                    None,
-                    asof,
-                    client.as_deref(),
-                ) {
-                    Ok((v, view)) => maybe_attach_view(json_reply_here(v), view),
-                    Err(r) => r,
-                }
-            })
-            .await
-        }
-        Err(_) => not_found(),
-    }
+    let Ok(sh) = resolve_address_sh(&addr_s, st.network) else {
+        return not_found();
+    };
+    spawn_join(move || sh_info_reply(&st, &sh, Some(&addr_s), None, asof, client.as_deref())).await
 }
 
 pub async fn scripthash_info(
@@ -1114,20 +1099,23 @@ pub async fn scripthash_info(
     let Ok(sh) = parse_hash32(&sh_hex) else {
         return not_found();
     };
-    spawn_join(move || {
-        match sh_stats_json(
-            &st,
-            &sh,
-            None,
-            Some(sh_hex.as_str()),
-            asof,
-            client.as_deref(),
-        ) {
-            Ok((v, view)) => maybe_attach_view(json_reply_here(v), view),
-            Err(r) => r,
-        }
-    })
-    .await
+    spawn_join(move || sh_info_reply(&st, &sh, None, Some(&sh_hex), asof, client.as_deref())).await
+}
+
+/// `/address/:a` and `/scripthash/:h` totals, run on the blocking pool.
+#[doc(hidden)]
+pub fn sh_info_reply(
+    st: &AppState,
+    sh: &[u8; 32],
+    address: Option<&str>,
+    scripthash_hex: Option<&str>,
+    asof: Option<[u8; 32]>,
+    client: Option<&str>,
+) -> Response {
+    match sh_stats_json(st, sh, address, scripthash_hex, asof, client) {
+        Ok((v, view)) => maybe_attach_view(json_reply_here(v), view),
+        Err(r) => r,
+    }
 }
 
 pub async fn address_utxo(

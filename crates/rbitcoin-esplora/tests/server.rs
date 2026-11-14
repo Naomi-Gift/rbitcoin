@@ -923,6 +923,29 @@ fn get_with_client(path: &str, client: &str) -> axum::http::Request<axum::body::
         .unwrap()
 }
 
+/// TCP mounts no `/internal` route, so with the SH index off an internal
+/// stats path is still the unknown-path 404 while the public twin is 503.
+#[tokio::test]
+async fn tcp_internal_stats_path_is_404_without_sh_index() {
+    let (_dir, q) = temp_query("esplora-internal-sh-off");
+    q.set_sh_index_enabled(false);
+    let (h0, cb0) = coinbase(0, Fk::NULL, None);
+    q.connect_block(Height(0), &h0, &[cb0]).unwrap();
+    let cfg = EsploraConfig::with_network("127.0.0.1:0".parse().unwrap(), Network::Regtest);
+    let handle = run_esplora(cfg, Arc::new(q), None).await.expect("listen");
+    let zeros = "00".repeat(32);
+    let (st, body) = http_get(handle.local_addr, &format!("/scripthash/{zeros}")).await;
+    assert_eq!(st, 503, "{body}");
+    for p in [
+        format!("/internal/scripthash/{zeros}"),
+        format!("/internal/address/bcrt1q?asof={zeros}"),
+    ] {
+        let (st, body) = http_get(handle.local_addr, &p).await;
+        assert_eq!((st, body.as_str()), (404, "Not Found"), "{p}");
+    }
+    handle.shutdown().await;
+}
+
 #[tokio::test]
 async fn address_without_sh_index_is_503_disabled() {
     let (dir, q) = temp_query("esplora-sh-off");
@@ -1198,6 +1221,17 @@ fn output_by_position_paths_accept_asof() {
 fn config_defaults_use_public_proxy_limits() {
     let cfg = EsploraConfig::new("0.0.0.0:3000".parse().unwrap());
     assert_eq!(cfg.limits, ServeLimits::for_public_proxy());
+}
+
+/// The socket's uncapped stats twins pin and accept `?asof=` like `/address/:a`.
+#[test]
+fn internal_stats_paths_pin_the_sh_view() {
+    for internal in ["/internal/address/bcrt1q", "/internal/scripthash/ab"] {
+        assert!(path_accepts_asof(internal), "{internal}");
+        assert!(path_uses_sh_view(internal), "{internal}");
+    }
+    assert!(!path_accepts_asof("/internal/block/ab/txs"));
+    assert!(!path_uses_sh_view("/internal/block/ab/txs"));
 }
 
 #[test]

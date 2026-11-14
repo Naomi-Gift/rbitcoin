@@ -154,8 +154,25 @@ Electrum/Esplora **start without** `--sh-index`. Address/scripthash methods then
 Electrum history or full stats join with more than N creates is refused
 before Class A expand: Esplora **503** / Electrum JSON-RPC error
 `scripthash join exceeds --max-sh-creates (<creates> creates, cap <N>)`. **0** is unlimited.
-A history request that names a page (Esplora's 25, or any caller that sets a
-limit) is still served: the join stops once that page is full.
+A create is a transaction that pays the script, not an output: the index
+keeps one transaction key per create, so two outputs to the script in one
+transaction count once. A history request that names a page (Esplora's 25, or
+any caller that sets a limit) is still served: the join stops once that page
+is full.
+
+On the Esplora unix socket, `GET /internal/address/:address` and
+`GET /internal/scripthash/:hash` answer the totals of `/address/:address` and
+`/scripthash/:hash` (same JSON, `?asof=`, and chain-tip headers) with no
+`--max-sh-creates`. They are for a trusted local process, such as an explorer
+that reads a large script's totals once and then follows blocks itself. TCP
+Esplora does not mount them, Electrum has no such method, and the public routes
+on the socket keep the cap. Whoever can open the socket (mode 0660, owner and
+group) can start these joins, so keep that group to processes you trust.
+`--heavy-sh-creates` still runs them one at a time. There is no separate
+ceiling for these routes. On one operator's signet node with the cap off,
+totals for seven scripts with 22,000 to 1.9 million creates each took 0.3 s to
+21 s and raised node memory by up to 0.6 GB. Time and memory do not follow the
+create count: the largest took 8 s, a pay-to-anchor script with 77,000 took 21 s.
 
 `--heavy-sh-creates N` (conf `heavy_sh_creates=`, default **10000**, **0** off)
 lets one unpaged join with more than N creates run at a time across the

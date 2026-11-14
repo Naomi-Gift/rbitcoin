@@ -242,10 +242,13 @@ pub fn path_uses_sh_view(path: &str) -> bool {
         || path.starts_with("/scripthash/")
         || path.starts_with("/addresses/")
         || path.starts_with("/scripthashes/")
+        || path.starts_with("/internal/address/")
+        || path.starts_with("/internal/scripthash/")
 }
 
 /// COMPAT.md: `?asof=` on tx status/outspend(s), confirmed output and
-/// tx-by-position reads, and address/scripthash `/`, `/utxo`, `/txs`,
+/// tx-by-position reads, and address/scripthash `/` (and its `/internal`
+/// twin), `/utxo`, `/txs`,
 /// `/txs/chain`, `/txs/summary` (not `/txs/mempool`, not `GET /tx/{txid}`).
 #[doc(hidden)]
 pub fn path_accepts_asof(path: &str) -> bool {
@@ -261,6 +264,8 @@ pub fn path_accepts_asof(path: &str) -> bool {
             | ["block-heights", "txs", "outs"]
             | ["address", _]
             | ["scripthash", _]
+            | ["internal", "address", _]
+            | ["internal", "scripthash", _]
             | ["address", _, "utxo"]
             | ["scripthash", _, "utxo"]
             | ["address", _, "txs"]
@@ -325,19 +330,27 @@ pub async fn stamp_chain_view_mw(State(st): State<AppState>, req: Request, next:
         Err(()) => return not_found(),
     };
     let path = req.uri().path().to_string();
-    if path_uses_sh_view(&path) && !st.query.sh_history_available() {
+    // `/internal` is mounted on unix listen only. On TCP that path reaches the
+    // unknown-path fallback, which has no `MatchedPath`, and stays a plain 404.
+    let unmounted = path.starts_with("/internal/")
+        && req
+            .extensions()
+            .get::<axum::extract::MatchedPath>()
+            .is_none();
+    let sh_view = !unmounted && path_uses_sh_view(&path);
+    if sh_view && !st.query.sh_history_available() {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             rbitcoin_query::SCRIPTHASH_INDEX_DISABLED,
         )
             .into_response();
     }
-    if asof.is_some() && !path_accepts_asof(&path) {
+    if asof.is_some() && (unmounted || !path_accepts_asof(&path)) {
         return not_found();
     }
     let pre_view = if path_never_pins(&path) || asof.is_some() {
         None
-    } else if path_uses_sh_view(&path) {
+    } else if sh_view {
         let q = std::sync::Arc::clone(&st.query);
         match crate::handlers::store_blocking(move || q.pin_sh_chain_view()).await {
             Ok(Ok(v)) => v,
@@ -987,6 +1000,14 @@ pub fn internal_routes() -> Router<AppState> {
         .route(
             "/internal/txs/outspends/by-outpoint",
             post(crate::internal::post_outspends_by_outpoint),
+        )
+        .route(
+            "/internal/address/{addr}",
+            get(crate::internal::get_internal_address),
+        )
+        .route(
+            "/internal/scripthash/{hash}",
+            get(crate::internal::get_internal_scripthash),
         )
 }
 

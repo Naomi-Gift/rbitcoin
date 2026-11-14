@@ -207,6 +207,9 @@ surface: [`COMPAT.md`](../../COMPAT.md).
 
 Conf: `sh_index=1` and `esplora_listen=127.0.0.1:3000`. Default is **disabled**.
 Leave `--max-sh-creates` at **10000** (or **0** for an unlimited unpaged join) for explorer backends. Paged history still stops at the page.
+An explorer on the unix socket can read one script's totals above the cap with
+`GET /internal/address/:address` or `/internal/scripthash/:hash`, without
+raising the cap for Electrum or TCP Esplora ([`storage.md`](storage.md)).
 
 TCP Esplora does not keep a mempool of `Arc<Transaction>`. `GET /mempool` loads
 the fee snapshot (count/vsize/total_fee + histogram). Unix `/internal` mempool-tx

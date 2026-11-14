@@ -1,14 +1,14 @@
 //! mempool/electrs `/internal/*` bulk REST and `/mempool/txids/page`.
 
-#[cfg(unix)]
-use crate::handlers::outspend_json;
 use crate::handlers::{confirmed_output_count, spawn_join, write_outspends};
 #[cfg(unix)]
-use crate::server::not_found;
+use crate::handlers::{outspend_json, resolve_address_sh, sh_info_reply};
 use crate::server::{
     block_hash_hex, json_bytes_reply, json_reply_here, parse_hash32, pin_or_reject, store_err,
     AppState,
 };
+#[cfg(unix)]
+use crate::server::{not_found, AsOf};
 #[cfg(unix)]
 use crate::tx_json::{
     build_tx_json, build_tx_json_from_tx, build_tx_json_from_tx_with_status, tx_status_json,
@@ -313,6 +313,45 @@ pub async fn get_internal_block_txs(
             }
         }
         json_reply_here(out)
+    })
+    .await
+}
+
+/// `GET /address/:a` totals without `--max-sh-creates`, for the socket's
+/// trusted caller: an explorer seeding its own running totals for a large
+/// script once, pinned with `?asof=`. `--heavy-sh-creates` still takes turns.
+/// No join client: the lifted join never lands in a slot a public route
+/// could reuse.
+#[cfg(unix)]
+pub async fn get_internal_address(
+    State(st): State<AppState>,
+    Path(addr_s): Path<String>,
+    AsOf(asof): AsOf,
+) -> Response {
+    let Ok(sh) = resolve_address_sh(&addr_s, st.network) else {
+        return not_found();
+    };
+    spawn_join(move || {
+        let _lift = rbitcoin_query::scripthash::lift_max_sh_creates();
+        sh_info_reply(&st, &sh, Some(&addr_s), None, asof, None)
+    })
+    .await
+}
+
+/// `GET /scripthash/:h` totals without `--max-sh-creates`. See
+/// [`get_internal_address`].
+#[cfg(unix)]
+pub async fn get_internal_scripthash(
+    State(st): State<AppState>,
+    Path(sh_hex): Path<String>,
+    AsOf(asof): AsOf,
+) -> Response {
+    let Ok(sh) = parse_hash32(&sh_hex) else {
+        return not_found();
+    };
+    spawn_join(move || {
+        let _lift = rbitcoin_query::scripthash::lift_max_sh_creates();
+        sh_info_reply(&st, &sh, None, Some(&sh_hex), asof, None)
     })
     .await
 }
