@@ -229,8 +229,9 @@ enum StagedFreeze {
     Pages(CommitSnapshot),
 }
 
-/// `Clear` writes the commit with the held bit off. RAM still has the old
-/// generation until that rename succeeds.
+/// `Clear` writes the commit with the held bit off unless a hold landed
+/// during the image stream. RAM still has the old generation until that
+/// rename succeeds.
 enum PublishHold {
     Sample,
     Clear,
@@ -1077,6 +1078,10 @@ impl SpendPageLog {
             generation_file(&g, generation)
         };
         let path = self.pages_path();
+        let page_at: HashMap<u64, (u64, u32)> = pages
+            .iter()
+            .map(|&(off, log_off, image_len)| (off, (log_off, image_len)))
+            .collect();
         loop {
             let snaps = {
                 let g = self.lock();
@@ -1102,23 +1107,18 @@ impl SpendPageLog {
             };
             let mut fresh = HashMap::new();
             for (page_off, slots) in &snaps {
-                let Some(&(off, log_off, image_len)) = pages.iter().find(|rec| rec.0 == *page_off)
-                else {
+                let Some(&(log_off, image_len)) = page_at.get(page_off) else {
                     continue;
                 };
-                debug_assert_eq!(off, *page_off);
                 let loc = PageLoc {
                     generation,
                     log_off,
                     image_len,
                 };
+                let image = read_loc_bytes(&file, &path, loc);
                 let mut got = Vec::with_capacity(slots.len());
                 for &(rel, _) in slots {
-                    let mut buf = [0u8; SLOT];
-                    if loc.covers(rel) {
-                        pread_generation(&file, &path, loc.slot_at(rel), &mut buf);
-                    }
-                    got.push(buf);
+                    got.push(slot_in_image(&image, rel).unwrap_or([0u8; SLOT]));
                 }
                 fresh.insert(*page_off, got);
             }
@@ -1386,7 +1386,15 @@ impl SpendPageLog {
         F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
     {
         let (generation, file, recs) = self.publish_generation(
-            height, published, composed, kept, clears, carried, read_page, plan.hold,
+            height,
+            published,
+            composed,
+            kept,
+            clears,
+            carried,
+            read_page,
+            plan.hold,
+            plan.hold_ticks,
         )?;
         let fresh: HashSet<u64> = composed.iter().copied().collect();
         let written: HashSet<u64> = recs
@@ -1468,6 +1476,7 @@ impl SpendPageLog {
         carried: &[(u64, CommittedPage)],
         read_page: &mut F,
         hold: PublishHold,
+        sampled_ticks: u64,
     ) -> Result<(u32, Arc<File>, Vec<PageRec>), StoreError>
     where
         F: FnMut(u64, usize) -> Result<Vec<u8>, StoreError>,
@@ -1527,14 +1536,15 @@ impl SpendPageLog {
         })?;
         let file = Arc::new(File::open(&gen_path).map_err(|e| StoreError::io(&gen_path, e))?);
         // Sample the hold and write the commit under one lock. A hold that
-        // lands during the image stream has already stored `fold_held`. A
-        // hold that arrives after this lock patches the commit just written.
+        // lands during the image stream bumps `hold_ticks`. Clear still
+        // writes the held bit when those ticks differ. A hold that arrives
+        // after this lock patches the commit just written.
         let _io = self.commit_io.lock().unwrap_or_else(|e| e.into_inner());
         let (held, sealed_tip) = {
             let g = self.lock();
             let held = match hold {
                 PublishHold::Sample => g.fold_held,
-                PublishHold::Clear => false,
+                PublishHold::Clear => g.hold_ticks != sampled_ticks,
             };
             (held, g.sealed_tip.unwrap_or(height))
         };
@@ -1575,7 +1585,7 @@ impl SpendPageLog {
             let mut g = self.lock();
             g.log_bytes = 0;
             g.commit_height = None;
-            g.gens.clear();
+            gc_gens(&mut g);
         }
     }
 
@@ -1746,27 +1756,8 @@ impl SpendPageLog {
         } else {
             self.dir.join(SPEND_PAGES_NAME)
         };
-        let opened = match File::open(&pages_path) {
-            Ok(file) => Some(file),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                if parsed.committed_len == 0 && parsed.recs.is_empty() {
-                    None
-                } else {
-                    return Err(StoreError::Corrupt("spend.pages short"));
-                }
-            }
-            Err(e) => return Err(StoreError::io(&pages_path, e)),
-        };
-        let file_len = match &opened {
-            Some(file) => file
-                .metadata()
-                .map_err(|e| StoreError::io(&pages_path, e))?
-                .len(),
-            None => 0,
-        };
-        if file_len < parsed.committed_len {
-            return Err(StoreError::Corrupt("spend.pages short"));
-        }
+        let opened =
+            open_committed_pages(&pages_path, parsed.committed_len, parsed.recs.is_empty())?;
         let limit = parsed.committed_len;
         for rec in &parsed.recs {
             let end = rec.log_off.saturating_add(u64::from(rec.image_len));
@@ -1867,6 +1858,33 @@ impl SpendPageLog {
         }
         Ok(())
     }
+}
+
+/// Open the generation file named by a commit, or `None` when that commit
+/// stores no page bytes and the file is already gone.
+fn open_committed_pages(
+    pages_path: &Path,
+    committed_len: u64,
+    recs_empty: bool,
+) -> Result<Option<File>, StoreError> {
+    let file = match File::open(pages_path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && committed_len == 0 && recs_empty => {
+            return Ok(None);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(StoreError::Corrupt("spend.pages short"));
+        }
+        Err(e) => return Err(StoreError::io(pages_path, e)),
+    };
+    let file_len = file
+        .metadata()
+        .map_err(|e| StoreError::io(pages_path, e))?
+        .len();
+    if file_len < committed_len {
+        return Err(StoreError::Corrupt("spend.pages short"));
+    }
+    Ok(Some(file))
 }
 
 /// Clears `compose_height` on every `prepare_commit` return, including errors.
@@ -2013,11 +2031,7 @@ fn clears_by_page(clears: &[BodyClear]) -> HashMap<u64, Vec<(u16, [u8; SLOT])>> 
 
 fn compose_offs(kept: &[(u64, OpenPage)], clears: &[BodyClear]) -> Vec<u64> {
     let mut offs: Vec<u64> = kept.iter().map(|(off, _)| *off).collect();
-    for clear in clears {
-        if !offs.contains(&clear.page_off) {
-            offs.push(clear.page_off);
-        }
-    }
+    offs.extend(clears.iter().map(|clear| clear.page_off));
     offs.sort_unstable();
     offs.dedup();
     offs

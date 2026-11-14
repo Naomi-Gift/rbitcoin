@@ -1790,6 +1790,84 @@ fn hold_between_prepare_and_install_is_not_folded() {
 }
 
 #[test]
+fn note_during_a_rejected_clear_keeps_the_page_image() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let stale = [0xabu8; 8];
+    log.note_slots(&[(16, stale)]).unwrap();
+    log.commit_open(9, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(1).unwrap();
+    let noted = std::sync::atomic::AtomicBool::new(false);
+    log.commit_open(
+        1,
+        8192,
+        |off, len| {
+            if off == 0 && !noted.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log.note_slots(&[(32, [1, 2, 3, 4, 5, 6, 7, 8])]).unwrap();
+            }
+            zeros(off, len)
+        },
+        |_| Ok(false),
+    )
+    .unwrap();
+    assert_eq!(
+        log.slot(16),
+        Some(stale),
+        "a covered slot still answers from the generation image"
+    );
+    assert_eq!(
+        log.slot(24),
+        Some([0u8; 8]),
+        "an explicit zero in that image suppresses the body"
+    );
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
+fn hold_during_the_clearing_image_keeps_the_commit_bit() {
+    let d = dir();
+    let log = SpendPageLog::create(&d);
+    let stale = [3u8, 1, 2, 3, 4, 5, 6, 7];
+    log.note_slots(&[(16, stale)]).unwrap();
+    log.commit_open(5, 8192, zeros, |_| Ok(true)).unwrap();
+    log.hold_fold_above(4).unwrap();
+    let calls = std::sync::atomic::AtomicU32::new(0);
+    let planted = [(16u64, stale)];
+    let read = body_with(&planted);
+    log.commit_open(
+        4,
+        8192,
+        |off, len| {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 1 {
+                log.hold_fold_above(1)?;
+            }
+            read(off, len)
+        },
+        |_| Ok(false),
+    )
+    .unwrap();
+    let buf = std::fs::read(d.join(SPEND_PAGES_COMMIT_NAME)).unwrap();
+    assert_eq!(
+        u16::from_le_bytes(buf[6..8].try_into().unwrap()),
+        1,
+        "a hold during the clearing image must stay on the new commit"
+    );
+    let loaded = SpendPageLog::load(&d).unwrap();
+    let mut writes = 0u32;
+    loaded
+        .fold_into(
+            |_off, _image| {
+                writes += 1;
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+    assert_eq!(writes, 0, "a restart must not fold the old-chain image");
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+#[test]
 fn redirtied_page_stays_in_the_commit_when_an_older_page_folds() {
     let d = dir();
     let log = SpendPageLog::create(&d);
